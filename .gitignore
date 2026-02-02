@@ -2,10 +2,9 @@
 data/raw/
 data/processed/
 
-# Results (generated)
-results/models/
-results/figures/
-results/tables/
+# Results and logs (generated)
+results/
+logs/
 
 # Notebooks
 .ipynb_checkpoints/
