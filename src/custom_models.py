@@ -32,17 +32,13 @@ def rebuild_top(model_base, kind="cla") -> Sequential:
     model.add(model_base)
 
     # Rebuild top
-    # FIXME: en el codigo original de keras, esto es un Conv2D-relu-dropout-conv2d-flatten-dense ¿esta bien como lo armé?
-    #   based on: https://stackoverflow.com/questions/54537674/modify-resnet50-output-layer-for-regression?rq=3
-    
+    #   Based on: https://github.com/MarkusRosen/keras-efficientnet-regression/blob/master/efficient_net_keras_regression.py    
     model.add(layers.GlobalAveragePooling2D())
-    model.add(layers.BatchNormalization())
-    model.add(layers.BatchNormalization())
+    x = layers.GlobalAveragePooling2D(name="avg_pool")(model.output)
+    x = layers.BatchNormalization()(x)
     top_dropout_rate = 0.4
-    model.add(layers.Dropout(top_dropout_rate, name="top_dropout"))
-
-    # Compile
-    model = keras.Model(inputs, outputs, name="EfficientNet")
+    x = layers.Dropout(top_dropout_rate, name="top_dropout")(x)
+    outputs = layers.Dense(1, name="pred")(x)
 
     if kind == "cla":
         # Add fully conected layers
