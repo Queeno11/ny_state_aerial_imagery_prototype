@@ -19,5 +19,8 @@ RESULTS_DIR = PROJECT_ROOT / "results"
 # Logs
 LOGS_DIR = PROJECT_ROOT / "logs"
 
+# Models
+MODELS_DIR = PROJECT_ROOT / "models"
+
 # External imagery
 IMAGERY_ROOT = Path(os.getenv("IMAGERY_ROOT"))
