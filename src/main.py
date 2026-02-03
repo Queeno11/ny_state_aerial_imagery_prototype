@@ -216,9 +216,9 @@ def create_datasets(
             iteration += 1
 
         if iteration >= 5:
-            print(
-                f"More than 5 interations for GEOID {df_subset.iloc[i]['GEOID']}, moving to next link..."
-            )
+            # print(
+            #     f"More than 5 interations for GEOID {df_subset.iloc[i]['GEOID']}, moving to next link..."
+            # )
             image = np.zeros(shape=(resizing_size, resizing_size, total_bands))
             value = 0
             return image, value
@@ -378,17 +378,45 @@ def get_callbacks(
     """
 
     class CustomLossCallback(tf.keras.callbacks.Callback):
-        def __init__(self, log_dir):
+        def __init__(self, log_dir, savename):
             super(CustomLossCallback, self).__init__()
             self.log_dir = log_dir
+            self.savename = savename
+            self.param_log_path = f"{PROCESSED_DATA_DIR}/models_by_epoch/{savename}/{savename}_optimizer_params.csv"
 
         def on_epoch_end(self, epoch, logs=None):
-            # Save model
-            os.makedirs(f"{PROCESSED_DATA_DIR}/models_by_epoch/{savename}", exist_ok=True)
-            self.model.save(
-                f"{PROCESSED_DATA_DIR}/models_by_epoch/{savename}/{savename}_{epoch}.keras",
-                include_optimizer=True,
-            )
+            # 1. Save model
+            epoch_dir = f"{PROCESSED_DATA_DIR}/models_by_epoch/{self.savename}"
+            os.makedirs(epoch_dir, exist_ok=True)
+            model_path = f"{epoch_dir}/{self.savename}_{epoch}.keras"
+            self.model.save(model_path, include_optimizer=True)
+
+            # 2. Extract Optimizer Parameters
+            opt = self.model.optimizer
+            
+            # In TF/Keras, some attributes might be tracked as variables or simple floats
+            # This handles both cases safely
+            def get_val(attr):
+                val = getattr(opt, attr, "N/A")
+                if hasattr(val, "numpy"):
+                    return val.numpy()
+                return val
+
+            current_params = {
+                "epoch": epoch,
+                "learning_rate": get_val("learning_rate"),
+                "beta_1": get_val("beta_1"),
+                "beta_2": get_val("beta_2"),
+                "epsilon": get_val("epsilon"),
+                "iterations": get_val("iterations")
+            }
+
+            # 3. Store to CSV
+            df_params = pd.DataFrame([current_params])
+            if not os.path.isfile(self.param_log_path):
+                df_params.to_csv(self.param_log_path, index=False)
+            else:
+                df_params.to_csv(self.param_log_path, mode='a', header=False, index=False)
 
     tensorboard_callback = TensorBoard(
         log_dir=logdir, histogram_freq=1  # , profile_batch="100,200"
@@ -396,7 +424,7 @@ def get_callbacks(
     # use tensorboard --logdir logs/scalars in your command line to startup tensorboard with the correct logs
 
     # Create an instance of your custom callback
-    custom_loss_callback = CustomLossCallback(log_dir=logdir)
+    custom_loss_callback = CustomLossCallback(log_dir=logdir, savename=savename)
 
     early_stopping_callback = EarlyStopping(
         monitor="val_loss",
@@ -407,9 +435,9 @@ def get_callbacks(
         mode="auto",  # the model is stopped when the quantity monitored has stopped decreasing
         restore_best_weights=True,  # restore the best model with the lowest validation error
     )
-    # reduce_lr = keras.callbacks.ReduceLROnPlateau(
-    #     monitor="val_loss", factor=0.2, patience=10, min_lr=0.0000001
-    # )
+    reduce_lr = keras.callbacks.ReduceLROnPlateau(
+        monitor="val_loss", factor=0.3, patience=10, min_lr=0.000001
+    )
     model_checkpoint_callback = ModelCheckpoint(
         f"{PROCESSED_DATA_DIR}/models/{savename}.keras",
         monitor="val_loss",
@@ -880,7 +908,7 @@ if __name__ == "__main__":
         "learning_rate": 0.0005,
         "sat_data": "aerial",
         "years": [2016, 2018, 2020, 2022, 2024], # Only the data inside WSL! all data is: [2010, 2012, 2014, 2016, 2018, 2020, 2022, 2024],
-        "extra": "",
+        "extra": "_Pooling",
     }
 
     # Run full pipeline
