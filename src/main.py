@@ -32,6 +32,9 @@ import warnings
 from typing import Iterator, List, Union, Tuple, Any
 from datetime import datetime
 from sklearn.model_selection import train_test_split
+from tensorflow.keras import mixed_precision
+
+mixed_precision.set_global_policy('mixed_float16')
 
 # Mute TF low_level warnings: https://stackoverflow.com/questions/76912213/tf2-13-local-rendezvous-recv-item-cancelled
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "1"
@@ -297,7 +300,7 @@ def create_datasets(
     # Map using the wrapper
     train_dataset = train_dataset.map(train_mapper, num_parallel_calls=tf.data.AUTOTUNE)
     
-    train_dataset = train_dataset.batch(64)
+    train_dataset = train_dataset.batch(128)
     
     if sample > 1:
         train_dataset = train_dataset.repeat(sample)
@@ -694,9 +697,9 @@ def set_model_and_loss_function(
         loss = keras.losses.MeanSquaredError()
         # loss = keras.losses.MeanAbsoluteError()
         metrics = [
-            # keras.metrics.MeanAbsoluteError(),
-            keras.metrics.RootMeanSquaredError(),
-            keras.metrics.MeanAbsolutePercentageError(),
+            keras.metrics.MeanAbsoluteError(),
+            # keras.metrics.RootMeanSquaredError(),
+            # keras.metrics.MeanAbsolutePercentageError(),
         ]
 
     elif kind == "cla":
@@ -874,7 +877,7 @@ if __name__ == "__main__":
         "sample_size": 1,
         "small_sample": False,
         "n_epochs": 150,
-        "learning_rate": 0.0001,
+        "learning_rate": 0.0005,
         "sat_data": "aerial",
         "years": [2016, 2018, 2020, 2022, 2024], # Only the data inside WSL! all data is: [2010, 2012, 2014, 2016, 2018, 2020, 2022, 2024],
         "extra": "",

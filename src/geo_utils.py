@@ -501,3 +501,4 @@ def augment_image(img):
     img = color.hsv2rgb(img_hsv)
 
     return img
+

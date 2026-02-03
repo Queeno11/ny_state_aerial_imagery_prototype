@@ -858,3 +858,15 @@ def generate_matrix_of_datasets(datasets):
             matrix += [rows_ds]
     return matrix
 
+# Add this function to main.py or geo_utils.py
+def get_gpu_augmentation_layer():
+    return tf.keras.Sequential([
+        # Random Flips (replaces np.flip)
+        tf.keras.layers.RandomFlip("horizontal_and_vertical"),
+        
+        # Random Contrast (replaces skimage gamma/contrast)
+        tf.keras.layers.RandomContrast(0.2),
+        
+        # Random Brightness (replaces percentile scaling somewhat)
+        tf.keras.layers.RandomBrightness(0.2),
+    ])

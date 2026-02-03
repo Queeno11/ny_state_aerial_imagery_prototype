@@ -245,8 +245,6 @@ def get_gridded_predictions_for_grid(
             # print(
             #     f"Could not retrieve a valid image for point {raster_point} (id: {id_point}), moving to next image..."
             # )
-            if id_point == 769303:
-                print("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")
             image = np.zeros(shape=(resizing_size, resizing_size, total_bands))
             return image
 
