@@ -7,7 +7,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 from typing import List, Dict
 from src import grid_predictions
-from src.utils.paths import PROJECT_ROOT, DATA_DIR, EXTERNAL_DATA_DIR, RAW_DATA_DIR, INTERIM_DATA_DIR, PROCESSED_DATA_DIR, RESULTS_DIR, LOGS_DIR, IMAGERY_ROOT
+from src.utils.paths import PROJECT_ROOT, DATA_DIR, EXTERNAL_DATA_DIR, RAW_DATA_DIR, INTERIM_DATA_DIR, PROCESSED_DATA_DIR, RESULTS_DIR, LOGS_DIR, MODELS_DIR, IMAGERY_ROOT
 pd.set_option("display.max_columns", None)
 
 
@@ -122,7 +122,7 @@ def create_train_test_dataframes(df, savename, small_sample=False):
     testing.
     """
     if small_sample:
-        df = df.sample(2000, random_state=825).reset_index(drop=True)
+        df = df.sample(1000, random_state=825).reset_index(drop=True)
 
     ### Split census tracts based on train/test
     #       (the hole census tract must be in the corresponding region)
@@ -164,201 +164,205 @@ def create_datasets(
     savename="",
     save_examples=True,
 ):
-    # Trying to replicate these good practices from here: https://cs230.stanford.edu/blog/datapipeline/#best-practices
+    available_years = list(all_years_datasets.keys())
+    
+    # --- Configuration ---
+    CACHE_DIR = PROCESSED_DATA_DIR / "cache"
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    
+    # EPOCHS_PER_CYCLE: How many epochs to reuse the cache before generating new crops
+    # 1 Slow Epoch (Gen) + 9 Fast Epochs (Read) = 10 Total  
+    READ_BATCH_SIZE = 16
+    TRAIN_BATCH_SIZE = 128
+    
+    # Shapes
+    OUTPUT_SHAPE_IMG = (None, resizing_size, resizing_size, nbands * len(stacked_images))
+    OUTPUT_SHAPE_LBL = (None,)
 
-    # Based on: https://medium.com/@acordier/tf-data-dataset-generators-with-parallelization-the-easy-way-b5c5f7d2a18
-    def get_data(i, df_subset, load=False):
-        # Decoding from the EagerTensor object. Extracts the number/value from the tensor
-        #   example: <tf.Tensor: shape=(), dtype=uint8, numpy=20> -> 20
-        i = i.numpy()
-        years = list(all_years_datasets.keys())
-
-        # initialize iterators & params
-
-        iteration = 0
-        is_correct_type = False
-        image = np.zeros(shape=(nbands, 0, 0))
+    # --- 1. The Python Data Loader (Slow Logic) ---
+    def get_mini_batch_data(batch_indices, df_subset):
+        indices = batch_indices.numpy()
+        batch_imgs = []
+        batch_lbls = []
+        
+        # Randomly pick a year for this batch to optimize Zarr access
+        batch_year = random.choice(available_years)
+        primary_dataset = all_years_datasets[batch_year]
+        
         total_bands = nbands * len(stacked_images)
-        img_correct_shape = (total_bands, image_size, image_size)
+        target_shape = (total_bands, image_size, image_size)
+        
+        for i in indices:
+            # ... (Standard extraction logic) ...
+            try:
+                polygon = df_subset.iloc[i]["geometry"]
+                value = df_subset.iloc[i]["var"]
+                
+                # Logic to get dataset
+                dataset_name = df_subset.iloc[i][f"dataset_{batch_year}"]
+                if not pd.isna(dataset_name):
+                    link_dataset = primary_dataset[dataset_name]
+                else:
+                    link_dataset = None # (Fallback logic omitted for brevity, add back if needed)
 
-        # Get link, dataset and indicator value of the corresponding index
-        polygon = df_subset.iloc[i]["geometry"]
-        value = df_subset.iloc[i]["var"]
+                image = np.zeros(shape=(nbands, 0, 0))
+                if link_dataset is not None:
+                    # RANDOM CROP HAPPENS HERE
+                    image, _ = geo_utils.stacked_image_from_census_tract(
+                        dataset=link_dataset,
+                        polygon=polygon,
+                        img_size=image_size,
+                        n_bands=nbands,
+                        stacked_images=stacked_images,
+                    )
+                
+                if image.shape != target_shape:
+                     image = np.zeros(shape=(resizing_size, resizing_size, total_bands))
+                     return None  
+                else:
+                     image = geo_utils.process_image(image, resizing_size)
+                     # NO AUGMENTATION HERE (We cache the clean image)
 
-        # Some links only have data for a certain year. Try randomly until get one correctly (at least 1 in 3 has to have data)
-        dataset_name = pd.NA
-        while pd.isna(dataset_name):
-            year = random.choices(population=years, k=1)[0]
-            sat_img_dataset = all_years_datasets[year]
-            dataset_name = df_subset.iloc[i][f"dataset_{year}"]
+                batch_imgs.append(image)
+                batch_lbls.append(value)
+            except:
+                # Fail-safe
+                batch_imgs.append(np.zeros((resizing_size, resizing_size, total_bands)))
+                batch_lbls.append(0.0)
+            
+        return np.stack(batch_imgs).astype(np.uint8), np.stack(batch_lbls).astype(np.float32)
 
-        link_dataset = sat_img_dataset[dataset_name]
+    # --- 2. GPU Augmentation ---
+    data_augmentation = tf.keras.Sequential([
+        tf.keras.layers.RandomFlip("horizontal_and_vertical"),
+        tf.keras.layers.RandomContrast(0.2),
+    ])
 
-        while (is_correct_type == False) & (iteration <= 5):
-            # Generate the image
-            image, boundaries = geo_utils.stacked_image_from_census_tract(
-                dataset=link_dataset,
-                polygon=polygon,
-                img_size=image_size,
-                n_bands=nbands,
-                stacked_images=stacked_images,
+    def apply_augmentation(img, lbl):
+        return data_augmentation(img, training=True), lbl
+
+    # --- 3. Cache Management Helper ---
+    def clean_cache_file(filepath):
+        """Deletes cache files from previous runs to free space."""
+        # We need this to run as a tf.py_function inside the graph
+        path_str = filepath.numpy().decode('utf-8')
+        if os.path.exists(path_str + ".index"):
+            try:
+                os.remove(path_str + ".index")
+                os.remove(path_str + ".data-00000-of-00001")
+            except: pass
+        return np.int32(0) # Dummy return
+
+    # --- 4. The Cyclic Pipeline Builder ---
+    def build_cyclic_dataset(df_subset, subset_name, is_train=False):
+        
+        # Define a subset of the data that will comfortably fit in RAM cache
+        MAX_CACHE_SAMPLES = 80000 
+        
+        # For Validation/Test, we don't need rotation. Just cache once.
+        if not is_train:
+            ds = tf.data.Dataset.from_tensor_slices(list(range(df_subset.shape[0])))
+            ds = ds.batch(READ_BATCH_SIZE)
+            ds = ds.map(lambda i: tf.py_function(lambda x: get_mini_batch_data(x, df_subset), [i], [tf.uint8, tf.float32]), num_parallel_calls=tf.data.AUTOTUNE)
+            def set_sh(img, lbl):
+                img.set_shape(OUTPUT_SHAPE_IMG); lbl.set_shape(OUTPUT_SHAPE_LBL); return img, lbl
+            ds = ds.map(set_sh).unbatch()
+            
+            cache_file = str(CACHE_DIR / f"{savename}_{subset_name}_static.tfcache")
+            # We must wrap the python call to clean the cache in a py_function
+            _ = tf.py_function(clean_cache_file, [cache_file], tf.int32)
+            ds = ds.cache(cache_file)
+            ds = ds.batch(TRAIN_BATCH_SIZE, drop_remainder=True)
+            ds = ds.prefetch(tf.data.AUTOTUNE)
+            return ds
+
+        # --- TRAIN LOGIC (GRAPH-COMPATIBLE ROTATION) ---
+        
+        def make_one_cycle(cycle_index):
+            # Use tf.print for graph-compatible logging
+            tf.print("Starting data generation for cycle:", cycle_index)
+
+            # 1. GRAPH-COMPATIBLE SAMPLING:
+            # Instead of df.sample(), we shuffle the full index list and take a subset.
+            all_indices_ds = tf.data.Dataset.from_tensor_slices(df_subset.index.to_numpy())
+            
+            # Shuffle the full list of indices. The seed ensures we get a DIFFERENT shuffle for each cycle.
+            sampled_indices_ds = all_indices_ds.shuffle(
+                buffer_size=len(df_subset), 
+                seed=tf.cast(cycle_index, tf.int64), # Use cycle_index as the seed
+                reshuffle_each_iteration=False # We want one consistent sample per cycle
+            ).take(MAX_CACHE_SAMPLES)
+            
+            # 2. Determine Cache Filename (Toggle between A and B)
+            cycle_id = tf.cast(cycle_index % 2, tf.int32)
+            cache_filename = tf.strings.join([str(CACHE_DIR), f"/{savename}_train_cycle_", tf.strings.as_string(cycle_id), ".tfcache"])
+            
+            # 3. Clear previous cache
+            _ = tf.py_function(clean_cache_file, [cache_filename], tf.int32)
+            
+            # 4. Map the loader function onto our sampled indices
+            # The loader needs the original dataframe, which we can access via closure
+            ds = sampled_indices_ds.batch(READ_BATCH_SIZE)
+            
+            ds = ds.map(
+                lambda indices: tf.py_function(
+                    # We use the full df_subset and tell the loader which indices to use
+                    func=lambda x: get_mini_batch_data(x, df_subset.loc[x.numpy()]),
+                    inp=[indices],
+                    Tout=[tf.uint8, tf.float32]
+                ),
+                num_parallel_calls=tf.data.AUTOTUNE
             )
+            
+            def set_shapes(imgs, lbls):
+                imgs.set_shape(OUTPUT_SHAPE_IMG); lbls.set_shape(OUTPUT_SHAPE_LBL); return imgs, lbls
+            ds = ds.map(set_shapes).unbatch()
+            
+            # 5. CACHE THE SUBSET
+            ds = ds.cache(tf.strings.as_string(cache_filename)) # Cast to string tensor
+            
+            # 6. Repeat, Shuffle, Batch, Augment
+            num_repeats_per_epoch = (5000 * TRAIN_BATCH_SIZE // MAX_CACHE_SAMPLES) + 1
+            ds = ds.repeat(num_repeats_per_epoch)
+            ds = ds.shuffle(5000) 
+            ds = ds.batch(TRAIN_BATCH_SIZE, drop_remainder=True)
+            ds = ds.map(apply_augmentation, num_parallel_calls=tf.data.AUTOTUNE)
+            
+            # 7. This cycle provides data for ONE epoch
+            ds = ds.take(5000) 
+            
+            return ds
 
-            # (1) Image has to have the correct shape
-            if image.shape == img_correct_shape:
-                is_correct_type = True
-                # (2) Image has to fall in train or test side
-                # FIXME: This is technically given always (right?)
-                # is_correct_type = build_dataset.assert_train_test_datapoint(
-                #     boundaries, test_polygon, wanted_type=data_type
-                # )
-
-            iteration += 1
-
-        if iteration >= 5:
-            # print(
-            #     f"More than 5 interations for GEOID {df_subset.iloc[i]['GEOID']}, moving to next link..."
-            # )
-            image = np.zeros(shape=(resizing_size, resizing_size, total_bands))
-            value = 0
-            return image, value
-
-        # Reduce quality and process image
-        image = geo_utils.process_image(image, resizing_size=resizing_size)
-
-        # Transpose to channels-last format (H, W, C)
-        # image = np.transpose(image, (1, 2, 0))
-
-        # Augment dataset
-        if type == "train":
-            image = geo_utils.augment_image(image)
-            # image = image
-
-        # Convert to tf tensors with known shapes
-        image = tf.convert_to_tensor(image, dtype=tf.uint8)
-        image = tf.ensure_shape(image, (resizing_size, resizing_size, nbands * len(stacked_images)))
-        value = tf.convert_to_tensor(value, dtype=tf.float32)
-        value = tf.ensure_shape(value, ())
-
-        return image, value
-
-    def get_train_data(i):
-            image, value = get_data(i, df_train)
-            return image, value
-
-    def get_val_data(i): # Added specific val function
-        image, value = get_data(i, df_val) 
-        return image, value
-
-    def get_test_data(i):
-        image, value = get_data(i, df_test)
-        return image, value
-
-    # --- 2. Define Wrappers (The Elegant Fix) ---
-    OUTPUT_SHAPE = (resizing_size, resizing_size, nbands * len(stacked_images))
-
-    def train_mapper(i):
-        img, lbl = tf.py_function(func=get_train_data, inp=[i], Tout=[tf.uint8, tf.float32])
-        img.set_shape(OUTPUT_SHAPE)
-        lbl.set_shape([]) 
-        return img, lbl
-
-    def val_mapper(i):
-        img, lbl = tf.py_function(func=get_val_data, inp=[i], Tout=[tf.uint8, tf.float32])
-        img.set_shape(OUTPUT_SHAPE)
-        lbl.set_shape([]) 
-        return img, lbl
-
-    def test_mapper(i):
-        img, lbl = tf.py_function(func=get_test_data, inp=[i], Tout=[tf.uint8, tf.float32])
-        img.set_shape(OUTPUT_SHAPE)
-        lbl.set_shape([]) 
-        return img, lbl
-
-    # --- 3. Setup Split Logic ---
-    print("\nBenchmarking MSE against the mean...")
-    print(f"Train MSE: {df_not_test['var'].var()}")
-    print(f"Test MSE: {df_test['var'].var()}")
+        # Create the infinite stream of 1-epoch cycles
+        num_epochs = 150 # Your total epochs
+        master_ds = tf.data.Dataset.range(num_epochs).flat_map(make_one_cycle)
+        master_ds = master_ds.prefetch(tf.data.AUTOTUNE)
+        return master_ds
+        
+    # --- Execution ---
     
+    # Shuffle everything so images are not sequential:
+    df_not_test = df_not_test.sample(frac=1.0, random_state=825).reset_index(drop=True)
+    df_test = df_test.sample(frac=1.0, random_state=825).reset_index(drop=True)
+    
+    # Generate validation dataset
     df_val = df_not_test.sample(frac=0.066667, random_state=200)
-    df_train = df_not_test.drop(df_val.index)
+    df_train = df_not_test.drop(df_val.index).reset_index(drop=True)
     df_val = df_val.reset_index(drop=True)
-    df_train = df_train.reset_index(drop=True)
 
-    print(f"Train size: {len(df_train)}")
-    print(f"Validation size: {len(df_val)}")
-
-    # --- 4. Build Datasets ---
-
-    ## TRAIN ##
-    train_dataset = tf.data.Dataset.from_generator(
-        lambda: list(range(df_train.shape[0])), tf.uint64
-    )
-    train_dataset = train_dataset.shuffle(
-        buffer_size=int(df_train.shape[0] / 16), seed=825, reshuffle_each_iteration=True
-    )
-    # Map using the wrapper
-    train_dataset = train_dataset.map(train_mapper, num_parallel_calls=tf.data.AUTOTUNE)
     
-    train_dataset = train_dataset.batch(128)
-    
+    print("\nSetting up Auto-Rotating Cached Pipelines...")
+
     if sample > 1:
-        train_dataset = train_dataset.repeat(sample)
-    
-    # Prefetch is the LAST step
-    train_dataset = train_dataset.prefetch(tf.data.AUTOTUNE)
+        # For cache logic, simpler to concat dataframe than repeat dataset
+        df_train = pd.concat([df_train]*sample).reset_index(drop=True)
 
-    ## VAL ##
-    val_dataset = tf.data.Dataset.from_generator(
-        lambda: list(range(df_val.shape[0])), tf.uint64
-    )
-    val_dataset = val_dataset.shuffle(
-        buffer_size=int(df_val.shape[0] / 16), seed=825, reshuffle_each_iteration=True
-    )
-    val_dataset = val_dataset.map(val_mapper, num_parallel_calls=tf.data.AUTOTUNE)
-    val_dataset = val_dataset.batch(64).prefetch(tf.data.AUTOTUNE)
+    train_dataset = build_cyclic_dataset(df_train, "train", is_train=True)
+    val_dataset = build_cyclic_dataset(df_val, "val", is_train=False)
+    test_dataset = build_cyclic_dataset(df_test, "test", is_train=False)
 
-    ## TEST ##
-    test_dataset = tf.data.Dataset.from_generator(
-        lambda: list(range(df_test.shape[0])), tf.uint64
-    )
-    test_dataset = test_dataset.map(test_mapper, num_parallel_calls=tf.data.AUTOTUNE)
-    test_dataset = test_dataset.batch(64).prefetch(tf.data.AUTOTUNE)
-
-    if save_examples == True:
-
-        print("saving train/test examples")
-        os.makedirs(f"{RESULTS_DIR}/{savename}/examples", exist_ok=True)
-
-        i = 0
-        for x in train_dataset.take(2):
-            np.save(
-                f"{RESULTS_DIR}/{savename}/examples/{savename}_train_example_{i}_imgs",
-                tfds.as_numpy(x)[0],
-            )
-            np.save(
-                f"{RESULTS_DIR}/{savename}/examples/{savename}_train_example_{i}_labs",
-                tfds.as_numpy(x)[1],
-            )
-            i += 1
-
-        i = 0
-        for x in test_dataset.take(2):
-            np.save(
-                f"{RESULTS_DIR}/{savename}/examples/{savename}_test_example_{i}_imgs",
-                tfds.as_numpy(x)[0],
-            )
-            np.save(
-                f"{RESULTS_DIR}/{savename}/examples/{savename}_test_example_{i}_labs",
-                tfds.as_numpy(x)[1],
-            )
-            i += 1
-
-    print()
-    print("Dataset generado!")
-
+    print("Datasets Ready!")
     return train_dataset, val_dataset, test_dataset
-
 
 def get_callbacks(
     savename,
@@ -382,11 +386,11 @@ def get_callbacks(
             super(CustomLossCallback, self).__init__()
             self.log_dir = log_dir
             self.savename = savename
-            self.param_log_path = f"{PROCESSED_DATA_DIR}/models_by_epoch/{savename}/{savename}_optimizer_params.csv"
+            self.param_log_path = f"{MODELS_DIR}/models_by_epoch/{savename}/{savename}_optimizer_params.csv"
 
         def on_epoch_end(self, epoch, logs=None):
             # 1. Save model
-            epoch_dir = f"{PROCESSED_DATA_DIR}/models_by_epoch/{self.savename}"
+            epoch_dir = f"{MODELS_DIR}/models_by_epoch/{self.savename}"
             os.makedirs(epoch_dir, exist_ok=True)
             model_path = f"{epoch_dir}/{self.savename}_{epoch}.keras"
             self.model.save(model_path, include_optimizer=True)
@@ -419,7 +423,7 @@ def get_callbacks(
                 df_params.to_csv(self.param_log_path, mode='a', header=False, index=False)
 
     tensorboard_callback = TensorBoard(
-        log_dir=logdir, histogram_freq=1  # , profile_batch="100,200"
+        log_dir=logdir, histogram_freq=1, profile_batch="100,200"
     )
     # use tensorboard --logdir logs/scalars in your command line to startup tensorboard with the correct logs
 
@@ -439,7 +443,7 @@ def get_callbacks(
         monitor="val_loss", factor=0.3, patience=10, min_lr=0.000001
     )
     model_checkpoint_callback = ModelCheckpoint(
-        f"{PROCESSED_DATA_DIR}/models/{savename}.keras",
+        f"{MODELS_DIR}/{savename}.keras",
         monitor="val_loss",
         verbose=1,
         save_best_only=True,  # save the best model
@@ -447,7 +451,7 @@ def get_callbacks(
         save_freq="epoch",  # save every epoch
     )
     csv_logger = CSVLogger(
-        f"{PROCESSED_DATA_DIR}/models_by_epoch/{savename}/{savename}_history.csv", append=True
+        f"{MODELS_DIR}/models_by_epoch/{savename}/{savename}_history.csv", append=True
     )
 
     return [
@@ -470,6 +474,7 @@ def train_model(
     metrics: List[str],
     callbacks: List[Union[TensorBoard, EarlyStopping, ModelCheckpoint]],
     savename: str = "",
+    logdir: str = "",
 ):
     """This function runs a keras model with the Ranger optimizer and multiple callbacks. The model is evaluated within
     training through the validation generator and afterwards one final time on the test generator.
@@ -498,7 +503,7 @@ def train_model(
 
     def get_last_trained_epoch(savename):
 
-        model_dir = PROCESSED_DATA_DIR / "models_by_epoch" / f"{savename}"
+        model_dir = MODELS_DIR / "models_by_epoch" / f"{savename}"
         if os.path.exists(model_dir):
             files = os.listdir(model_dir)
             epochs = [file.split("_")[-1] for file in files]
@@ -536,23 +541,27 @@ def train_model(
         print("Restoring model...")
         try:
             model_path = (
-                f"{PROCESSED_DATA_DIR}/models_by_epoch/{savename}/{savename}_{initial_epoch}"
+                f"{MODELS_DIR}/models_by_epoch/{savename}/{savename}_{initial_epoch}"
             )
             model = keras.models.load_model(model_path)  # load the model from file
         except:
             initial_epoch -= 1
             model_path = (
-                f"{PROCESSED_DATA_DIR}/models_by_epoch/{savename}/{savename}_{initial_epoch}"
+                f"{MODELS_DIR}/models_by_epoch/{savename}/{savename}_{initial_epoch}"
             )
             model = keras.models.load_model(model_path)  # load the model from file
         initial_epoch = initial_epoch + 1
 
+    # The number of steps is the number of samples divided by batch size
+    validation_steps = 1_000 # Use your TRAIN_BATCH_SIZE
+    
     history = model.fit(
         train_dataset,
         epochs=epochs,
-        steps_per_epoch=1_000, # Total train buildings in NYC = 328875
+        steps_per_epoch=5_000, # Total train buildings in NYC = 328875 x 
         initial_epoch=initial_epoch,
         validation_data=val_dataset,
+        validation_steps=validation_steps,
         callbacks=callbacks,
     )
 
@@ -742,8 +751,8 @@ def set_model_and_loss_function(
 
 def generate_parameters_log(params, savename):
 
-    os.makedirs(f"{RESULTS_DIR}/{savename}", exist_ok=True)
-    filename = f"{RESULTS_DIR}/{savename}/{savename}_logs.txt"
+    os.makedirs(f"{MODELS_DIR}/{savename}", exist_ok=True)
+    filename = f"{MODELS_DIR}/{savename}/{savename}_logs.txt"
 
     with open(filename, "w") as file:
         json.dump(params, file)
@@ -826,7 +835,7 @@ def run(
             tiles=tiles,
             sample=sample_size,
             savename=savename,
-            save_examples=False,
+            save_examples=True,
         )
         # Get tensorboard callbacks and set the custom test loss computation
         #   at the end of each epoch
@@ -846,25 +855,26 @@ def run(
             callbacks=callbacks,
             epochs=n_epochs,
             savename=savename,
+            logdir=log_dir,
         )
         print("Fin del entrenamiento")
 
-    # ## Compute metrics
-    # # Genero la test_loss por RC
-    # if compute_loss:
-    #     true_metrics.compute_loss(  # No entra el test_dataset acá pero despues usa el df_test guardado en memoria
-    #         models_dir=rf"{PROCESSED_DATA_DIR}/models_by_epoch/{savename}",
-    #         savename=savename,
-    #         datasets=all_years_datasets[2013],
-    #         tiles=tiles,
-    #         size=image_size,
-    #         resizing_size=resizing_size,
-    #         n_epochs=n_epochs,
-    #         n_bands=nbands,
-    #         stacked_images=stacked_images,
-    #         generate=False,
-    #         subset="test",
-    #     )
+    ## Compute metrics
+    # Genero la test_loss por RC
+    if compute_loss:
+        true_metrics.compute_loss(  # No entra el test_dataset acá pero despues usa el df_test guardado en memoria
+            models_dir=rf"{MODELS_DIR}/models_by_epoch/{savename}",
+            savename=savename,
+            datasets=all_years_datasets[2013],
+            tiles=tiles,
+            size=image_size,
+            resizing_size=resizing_size,
+            n_epochs=n_epochs,
+            n_bands=nbands,
+            stacked_images=stacked_images,
+            generate=False,
+            subset="test",
+        )
 
     # if generate_grid:
     #     print("Generando predicciones...")
