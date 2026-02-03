@@ -33,12 +33,10 @@ def rebuild_top(model_base, kind="cla") -> Sequential:
 
     # Rebuild top
     #   Based on: https://github.com/MarkusRosen/keras-efficientnet-regression/blob/master/efficient_net_keras_regression.py    
-    model.add(layers.GlobalAveragePooling2D())
-    x = layers.GlobalAveragePooling2D(name="avg_pool")(model.output)
-    x = layers.BatchNormalization()(x)
+    model.add(layers.GlobalAveragePooling2D(name="avg_pool"))
+    model.add(layers.BatchNormalization())
     top_dropout_rate = 0.4
-    x = layers.Dropout(top_dropout_rate, name="top_dropout")(x)
-    outputs = layers.Dense(1, name="pred")(x)
+    model.add(layers.Dropout(top_dropout_rate, name="top_dropout"))
 
     if kind == "cla":
         # Add fully conected layers
