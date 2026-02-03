@@ -34,7 +34,8 @@ def rebuild_top(model_base, kind="cla") -> Sequential:
     # Rebuild top
     # FIXME: en el codigo original de keras, esto es un Conv2D-relu-dropout-conv2d-flatten-dense ¿esta bien como lo armé?
     #   based on: https://stackoverflow.com/questions/54537674/modify-resnet50-output-layer-for-regression?rq=3
-    model.add(layers.Flatten())
+    
+    model.add(layers.GlobalAveragePooling2D())
 
     if kind == "cla":
         # Add fully conected layers
