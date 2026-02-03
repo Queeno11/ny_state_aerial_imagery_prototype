@@ -140,13 +140,12 @@ def image_from_point(dataset, point, img_size=128):
 
     # Find the rearest raster of this random point
     idx_x, idx_y = find_index_of_point_in_dataset(dataset, point)
-
     image = filter_datasets_by_idx_and_buffer(dataset, idx_x, idx_y, img_size)
 
     if image is None:
         return np.zeros(shape=(1, 1, 1))
 
-    image = image.band
+    image = image.value
 
     if image.chunks is not None:
         # If the image is not computed, compute it
@@ -294,7 +293,8 @@ def stacked_image_from_census_tract(
             images_to_stack += [image]
 
         except Exception as e:
-            # print(e)
+            print(e)
+
             image = np.zeros(shape=(n_bands, 1, 1))
             if bounds:
                 return image, bounds
@@ -379,7 +379,7 @@ def random_tiled_image_from_census_tract(
                 max_bias = 0
                 if start_point is None:
                     x, y = random_point_from_geometry(
-                        icpag.loc[icpag["link"] == link], tile_size
+                        icpag.loc[icpag["GEOID"] == link], tile_size
                     )
                     point = (x[0], y[0])
                 else:
@@ -388,7 +388,7 @@ def random_tiled_image_from_census_tract(
                 max_bias = bias * size
                 # Obtengo un punto aleatorio del radio censal con un buffer de tamaño size
                 x, y = random_point_from_geometry(
-                    icpag.loc[icpag["link"] == link], tile_size
+                    icpag.loc[icpag["GEOID"] == link], tile_size
                 )
                 point = (x[0], y[0])
 

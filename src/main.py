@@ -1,5 +1,6 @@
 ##############      Configuración      ##############
 import os
+import shutil
 import pandas as pd
 import seaborn as sns
 import matplotlib.pyplot as plt
@@ -136,7 +137,7 @@ def create_train_test_dataframes(df, savename, small_sample=False):
     df_train = df[df["type"] == "train"].copy().reset_index(drop=True)
     assert df_train.shape[0] > 0, f"Empty train dataset!"
 
-    test_dataframe_path = PROCESSED_DATA_DIR / "test_datasets" / f"{savename}_test_dataframe.feather",
+    test_dataframe_path = PROCESSED_DATA_DIR / "test_datasets" / f"{savename}_test_dataframe.feather"
     df_test.to_feather(test_dataframe_path)
     print("Se creó el archivo:", test_dataframe_path)
 
@@ -167,7 +168,6 @@ def create_datasets(
         # Decoding from the EagerTensor object. Extracts the number/value from the tensor
         #   example: <tf.Tensor: shape=(), dtype=uint8, numpy=20> -> 20
         i = i.numpy()
-
         years = list(all_years_datasets.keys())
 
         # initialize iterators & params
@@ -214,7 +214,7 @@ def create_datasets(
 
         if iteration >= 5:
             print(
-                f"More than 5 interations for link {df_subset.iloc[i]['link']}, moving to next link..."
+                f"More than 5 interations for GEOID {df_subset.iloc[i]['GEOID']}, moving to next link..."
             )
             image = np.zeros(shape=(resizing_size, resizing_size, total_bands))
             value = 0
@@ -223,102 +223,104 @@ def create_datasets(
         # Reduce quality and process image
         image = geo_utils.process_image(image, resizing_size=resizing_size)
 
+        # Transpose to channels-last format (H, W, C)
+        # image = np.transpose(image, (1, 2, 0))
+
         # Augment dataset
         if type == "train":
             image = geo_utils.augment_image(image)
             # image = image
 
-        # np.save(fr"/mnt/d/Maestría/Tesis/Repo/data/data_out/test_arrays/img_{i}_{df_subset.iloc[i].link}.npy", image)
+        # Convert to tf tensors with known shapes
+        image = tf.convert_to_tensor(image, dtype=tf.uint8)
+        image = tf.ensure_shape(image, (resizing_size, resizing_size, nbands * len(stacked_images)))
+        value = tf.convert_to_tensor(value, dtype=tf.float32)
+        value = tf.ensure_shape(value, ())
+
         return image, value
 
     def get_train_data(i):
-        image, value = get_data(i, df_train, data_type="train")
+            image, value = get_data(i, df_train)
+            return image, value
+
+    def get_val_data(i): # Added specific val function
+        image, value = get_data(i, df_val) 
         return image, value
 
     def get_test_data(i):
-        image, value = get_data(i, df_test, data_type="test")
+        image, value = get_data(i, df_test)
         return image, value
 
-    print()
-    print("Benchmarking MSE against the mean")
+    # --- 2. Define Wrappers (The Elegant Fix) ---
+    OUTPUT_SHAPE = (resizing_size, resizing_size, nbands * len(stacked_images))
+
+    def train_mapper(i):
+        img, lbl = tf.py_function(func=get_train_data, inp=[i], Tout=[tf.uint8, tf.float32])
+        img.set_shape(OUTPUT_SHAPE)
+        lbl.set_shape([]) 
+        return img, lbl
+
+    def val_mapper(i):
+        img, lbl = tf.py_function(func=get_val_data, inp=[i], Tout=[tf.uint8, tf.float32])
+        img.set_shape(OUTPUT_SHAPE)
+        lbl.set_shape([]) 
+        return img, lbl
+
+    def test_mapper(i):
+        img, lbl = tf.py_function(func=get_test_data, inp=[i], Tout=[tf.uint8, tf.float32])
+        img.set_shape(OUTPUT_SHAPE)
+        lbl.set_shape([]) 
+        return img, lbl
+
+    # --- 3. Setup Split Logic ---
+    print("\nBenchmarking MSE against the mean...")
     print(f"Train MSE: {df_not_test['var'].var()}")
     print(f"Test MSE: {df_test['var'].var()}")
-
-    print(f"Sample size: {sample}")
-
-    ### Generate Datasets
-
-    # Split the data
+    
     df_val = df_not_test.sample(frac=0.066667, random_state=200)
     df_train = df_not_test.drop(df_val.index)
-    df_val = df_val.reset_index()
-    df_train = df_train.reset_index()
-    print()
-    print(
-        f"Train size: {len(df_train)} ({round(len(df_train)/len(df_not_test)*100,2)}%)"
-    )
-    print(
-        f"Validation size: {len(df_val)} ({round(len(df_val)/len(df_not_test)*100,2)}%)"
-    )
+    df_val = df_val.reset_index(drop=True)
+    df_train = df_train.reset_index(drop=True)
+
+    print(f"Train size: {len(df_train)}")
+    print(f"Validation size: {len(df_val)}")
+
+    # --- 4. Build Datasets ---
 
     ## TRAIN ##
-    # Generator for the index
     train_dataset = tf.data.Dataset.from_generator(
-        lambda: list(range(df_train.shape[0])),  # The index generator,
-        tf.uint32,
-    )  # Creates a dataset with only the indexes (0, 1, 2, 3, etc.)
-
+        lambda: list(range(df_train.shape[0])), tf.uint64
+    )
     train_dataset = train_dataset.shuffle(
-        buffer_size=int(df_train.shape[0]),
-        seed=825,
-        reshuffle_each_iteration=True,
+        buffer_size=int(df_train.shape[0] / 32), seed=825, reshuffle_each_iteration=True
     )
-
-    train_dataset = train_dataset.map(
-        lambda i: tf.py_function(  # The actual data generator. Passes the index to the function that will process the data.
-            func=get_train_data, inp=[i], Tout=[tf.uint8, tf.float32]
-        ),
-    )
-
+    # Map using the wrapper
+    train_dataset = train_dataset.map(train_mapper, num_parallel_calls=tf.data.AUTOTUNE)
+    
     train_dataset = train_dataset.batch(64)
+    
     if sample > 1:
-        train_dataset = train_dataset.repeat(sample).prefetch(tf.data.AUTOTUNE)
-    else:
-        train_dataset = train_dataset.prefetch(tf.data.AUTOTUNE)
+        train_dataset = train_dataset.repeat(sample)
+    
+    # Prefetch is the LAST step
+    train_dataset = train_dataset.prefetch(tf.data.AUTOTUNE)
 
     ## VAL ##
-    # Generator for the index
     val_dataset = tf.data.Dataset.from_generator(
-        lambda: list(range(df_val.shape[0])),  # The index generator,
-        tf.uint32,
-    )  # Creates a dataset with only the indexes (0, 1, 2, 3, etc.)
+        lambda: list(range(df_val.shape[0])), tf.uint64
+    )
     val_dataset = val_dataset.shuffle(
-        buffer_size=int(df_val.shape[0]),
-        seed=825,
-        reshuffle_each_iteration=True,
+        buffer_size=int(df_val.shape[0] / 32), seed=825, reshuffle_each_iteration=True
     )
-    val_dataset = val_dataset.map(
-        lambda i: tf.py_function(  # The actual data generator. Passes the index to the function that will process the data.
-            func=get_test_data, inp=[i], Tout=[tf.uint8, tf.float32]
-        ),
-    )
-    val_dataset = val_dataset.batch(128).repeat(5)
+    val_dataset = val_dataset.map(val_mapper, num_parallel_calls=tf.data.AUTOTUNE)
+    val_dataset = val_dataset.batch(64).prefetch(tf.data.AUTOTUNE)
 
     ## TEST ##
-    # Generator for the index
     test_dataset = tf.data.Dataset.from_generator(
-        lambda: list(range(df_test.shape[0])),  # The index generator,
-        tf.uint8,
-    )  # Creates a dataset with only the indexes (0, 1, 2, 3, etc.)
-
-    test_dataset = test_dataset.map(
-        lambda i: tf.py_function(  # The actual data generator. Passes the index to the function that will process the data.
-            func=get_test_data, inp=[i], Tout=[tf.uint8, tf.float32]
-        ),
-        num_parallel_calls=1,  # tf.data.experimental.AUTOTUNE,
+        lambda: list(range(df_test.shape[0])), tf.uint64
     )
-
-    test_dataset = test_dataset.batch(128).repeat(5)
+    test_dataset = test_dataset.map(test_mapper, num_parallel_calls=tf.data.AUTOTUNE)
+    test_dataset = test_dataset.batch(64).prefetch(tf.data.AUTOTUNE)
 
     if save_examples == True:
 
@@ -326,7 +328,7 @@ def create_datasets(
         os.makedirs(f"{RESULTS_DIR}/{savename}/examples", exist_ok=True)
 
         i = 0
-        for x in train_dataset.take(5):
+        for x in train_dataset.take(2):
             np.save(
                 f"{RESULTS_DIR}/{savename}/examples/{savename}_train_example_{i}_imgs",
                 tfds.as_numpy(x)[0],
@@ -338,7 +340,7 @@ def create_datasets(
             i += 1
 
         i = 0
-        for x in test_dataset.take(5):
+        for x in test_dataset.take(2):
             np.save(
                 f"{RESULTS_DIR}/{savename}/examples/{savename}_test_example_{i}_imgs",
                 tfds.as_numpy(x)[0],
@@ -381,7 +383,7 @@ def get_callbacks(
             # Save model
             os.makedirs(f"{PROCESSED_DATA_DIR}/models_by_epoch/{savename}", exist_ok=True)
             self.model.save(
-                f"{PROCESSED_DATA_DIR}/models_by_epoch/{savename}/{savename}_{epoch}",
+                f"{PROCESSED_DATA_DIR}/models_by_epoch/{savename}/{savename}_{epoch}.keras",
                 include_optimizer=True,
             )
 
@@ -406,7 +408,7 @@ def get_callbacks(
     #     monitor="val_loss", factor=0.2, patience=10, min_lr=0.0000001
     # )
     model_checkpoint_callback = ModelCheckpoint(
-        f"{PROCESSED_DATA_DIR}/models/{savename}",
+        f"{PROCESSED_DATA_DIR}/models/{savename}.keras",
         monitor="val_loss",
         verbose=1,
         save_best_only=True,  # save the best model
@@ -464,13 +466,21 @@ def train_model(
     import tensorflow.python.keras.backend as K
 
     def get_last_trained_epoch(savename):
-        try:
-            files = os.listdir(f"{PROCESSED_DATA_DIR}/models_by_epoch/{savename}")
+
+        model_dir = PROCESSED_DATA_DIR / "models_by_epoch" / f"{savename}"
+        if os.path.exists(model_dir):
+            files = os.listdir(model_dir)
             epochs = [file.split("_")[-1] for file in files]
             epochs = [int(epoch) for epoch in epochs if epoch.isdigit()]
-            initial_epoch = max(epochs)
-        except:
-            os.makedirs(f"{PROCESSED_DATA_DIR}/models_by_epoch/{savename}")
+            if not epochs:
+                # Directory exists but has no saved model epochs (only history.csv or similar), remove it to start fresh
+                shutil.rmtree(model_dir)
+                os.makedirs(model_dir)
+                print("Model not found, running from begining")
+                initial_epoch = None
+
+        else:
+            os.makedirs(model_dir)
             print("Model not found, running from begining")
             initial_epoch = None
 
@@ -486,7 +496,7 @@ def train_model(
 
         # optimizer = tf.keras.optimizers.SGD(learning_rate=lr)
         # optimizer = tf.keras.optimizers.Adam(learning_rate=lr)
-        optimizer = tf.keras.optimizers.experimental.Nadam(learning_rate=lr)
+        optimizer = tf.keras.optimizers.Nadam(learning_rate=lr)
 
         model.compile(optimizer=optimizer, loss=loss, metrics=metrics)
         initial_epoch = 0
@@ -509,11 +519,10 @@ def train_model(
     history = model.fit(
         train_dataset,
         epochs=epochs,
-        steps_per_epoch=50_000, # Total train buildings in NYC = 328875
+        steps_per_epoch=1_000, # Total train buildings in NYC = 328875
         initial_epoch=initial_epoch,
         validation_data=val_dataset,
         callbacks=callbacks,
-        workers=2,  # adjust this according to the number of CPU cores of your machine
     )
 
     return model, history  # type: ignore
@@ -786,7 +795,7 @@ def run(
             tiles=tiles,
             sample=sample_size,
             savename=savename,
-            save_examples=True,
+            save_examples=False,
         )
         # Get tensorboard callbacks and set the custom test loss computation
         #   at the end of each epoch
@@ -867,7 +876,7 @@ if __name__ == "__main__":
         "n_epochs": 150,
         "learning_rate": 0.0001,
         "sat_data": "aerial",
-        "years": [2010, 2012, 2014, 2016, 2018, 2020, 2022, 2024],
+        "years": [2016, 2018, 2020, 2022, 2024], # Only the data inside WSL! all data is: [2010, 2012, 2014, 2016, 2018, 2020, 2022, 2024],
         "extra": "",
     }
 

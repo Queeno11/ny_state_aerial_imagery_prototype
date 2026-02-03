@@ -39,9 +39,9 @@ def load_satellite_datasets(year=2014, stretch=False, engine="zarr"):
 
     print(f"Loading {len(files)} files from {dataset_path}...")
     if not os.path.exists(dataset_path):
-        raise ValueError(f"Year {year} images not found. Check they are stored in WSL!")
+        raise ValueError(f"Year {year} images not found: {dataset_path} does exist! Check they are stored in WSL!")
     datasets = {
-        f: (filter_black_pixels(xr.open_dataset(dataset_path / f, engine=engine)))
+        f: (filter_black_pixels(xr.open_dataset(dataset_path / f, engine=engine,  mask_and_scale=False)))
         for f in files
     }
 
@@ -104,6 +104,10 @@ def load_income_dataset(variable="avg_hh_inc", trim=False):
     # FIXME: Probably it's a good idea to reproject all the zarr so I can scale this to anywhere...
     gdf = gdf.to_crs("EPSG:6539")
     gdf = gdf[gdf[variable]>0]  # Remove ct with no income data 
+
+    # FIXME: I forgot to add Bronx for some reason... Should add it later
+    gdf = gdf[gdf[variable]>0]
+
     if trim:
         # Should not be needed with these models
         gdf = gdf[gdf["Area"] <= 200000]  # Remove ct that are too big
@@ -207,7 +211,6 @@ def assign_datasets_to_gdf(
 
 def get_test_area_from_file(filename = "Test_NYC_Area.parquet"):
     test = gpd.read_parquet(RAW_DATA_DIR / filename)
-    print(test.crs)
     test_polygon = test.dissolve().geometry.iloc[0]
     return test_polygon
 
@@ -290,7 +293,7 @@ def assert_train_test_datapoint(bounds, test_polygon, wanted_type="train", buffe
     return actual_type == wanted_type
 
 
-def get_dataset_for_gdf(icpag, datasets, link, year=2013, id_var="link"):
+def get_dataset_for_gdf(icpag, datasets, link, year=2013, id_var="GEOID"):
     """Get dataset where the census tract is located.
 
     Parameters
@@ -318,7 +321,7 @@ def get_dataset_for_gdf(icpag, datasets, link, year=2013, id_var="link"):
 
 def crop_dataset_to_link(ds, icpag, link):
     # obtengo el poligono correspondiente al link
-    gdf_slice = icpag.loc[icpag["link"] == link]
+    gdf_slice = icpag.loc[icpag["GEOID"] == link]
     # Get bounds of the shapefile's polygon
     bbox_img = gdf_slice.bounds
 
@@ -374,7 +377,7 @@ def get_gridded_images_for_link(
 
     link_dataset = crop_dataset_to_link(ds, icpag, link)
     # FIXME: add margin to the bounding box so left and bottom tiles are not cut. Margin should be the size of the tile - 1
-    link_geometry = icpag.loc[icpag["link"] == link, "geometry"].values[0]
+    link_geometry = icpag.loc[icpag["GEOID"] == link, "geometry"].values[0]
 
     # Iterate over the center points of each image:
     # - Start point is the center of the image (tile_size / 2, start_index)
@@ -395,7 +398,7 @@ def get_gridded_images_for_link(
                 number_imgs = 0
                 counter = 0  # Limit the times to try to sample the images
                 while (number_imgs < sample) & (counter < sample * 2):
-                    polygon = icpag.loc[icpag["link"] == link, "geometry"].item()
+                    polygon = icpag.loc[icpag["GEOID"] == link, "geometry"].item()
                     image, bound = geo_utils.stacked_image_from_census_tract(
                         dataset=ds,
                         polygon=polygon,
@@ -486,7 +489,7 @@ def get_gridded_images_for_dataset(
                 continue
 
             real_value = radio_censal["var"].values[0]
-            link_name = radio_censal["link"].values[0]
+            link_name = radio_censal["GEOID"].values[0]
 
             # Check if the centroid of the image is within the original polygon:
             #   - if it is, then generate the n images
@@ -548,7 +551,7 @@ def get_gridded_images_for_dataset(
 
     # Creo dataframe para exportar:
     d = {
-        "link": all_link_names,
+        "GEOID": all_link_names,
         "predictions": all_predictions,
         "real_value": all_real_values,
     }
@@ -593,7 +596,7 @@ def get_random_images_for_link(
 
     link_dataset = crop_dataset_to_link(ds, icpag, link)
     # FIXME: add margin to the bounding box so left and bottom tiles are not cut. Margin should be the size of the tile - 1
-    link_geometry = icpag.loc[icpag["link"] == link, "geometry"].values[0]
+    link_geometry = icpag.loc[icpag["GEOID"] == link, "geometry"].values[0]
 
     number_imgs = 0
     counter = 0  # Limit the times to try to sample the images

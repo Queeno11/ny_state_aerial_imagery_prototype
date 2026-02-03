@@ -15,7 +15,7 @@ pd.set_option("display.max_columns", None)
 ###############################################
 import src.prediction_tools as prediction_tools
 import src.custom_models as custom_models
-import src.build_dataset
+import src.build_dataset as build_dataset
 import src.geo_utils as geo_utils
 import src.main as main
 
@@ -76,7 +76,7 @@ def generate_gridded_images(
 
     # Filtro Radios demasiado grandes (tardan horas en generar la cuadrícula y es puro campo...)
     df_test = df_test[df_test["AREA"] <= 200000]  # Remove rc that are too big
-    links = df_test["link"].unique()
+    links = df_test["GEOID"].unique()
     valid_links = []
 
     # Loop por radio censal. Si está la imagen la usa, sino la genera.
@@ -202,7 +202,7 @@ def get_gridded_predictions_for_grid(
         grid["point"] = grid.centroid
         grid["bounds_geom"] = grid["geometry"]
         grid = grid.set_geometry("point")
-        grid = grid.sjoin(icpag[["link", "var", "geometry"]], predicate="intersects")
+        grid = grid.sjoin(icpag[["GEOID", "var", "geometry"]], predicate="intersects")
         grid = grid.reset_index(drop=True)
         gc.collect()
         print("data loaded")
@@ -412,7 +412,7 @@ def compute_custom_loss_all_epochs(
 
     for link in tqdm(links):
         # Obtener las imágenes del radio censal
-        link_real_value = df.loc[df["link"] == link, "var"].values[0]
+        link_real_value = df.loc[df["GEOID"] == link, "var"].values[0]
         link_images = np.load(rf"{folder}/test_{link}.npy")
         q_images = link_images.shape[0]
 
@@ -443,11 +443,11 @@ def compute_custom_loss_all_epochs(
         if os.path.exists(filename):
             df_preds = pd.read_csv(filename)
             df_preds["mean_prediction"] = df_preds.groupby(
-                by="link"
+                by="GEOID"
             ).predictions.transform("mean")
             df_preds["error"] = df_preds["mean_prediction"] - df_preds["real_value"]
             df_preds["sq_error"] = df_preds["error"] ** 2
-            mse = df_preds.drop_duplicates(subset=["link"]).sq_error.mean()
+            mse = df_preds.drop_duplicates(subset=["GEOID"]).sq_error.mean()
 
             print(f"Epoch {epoch}/{n_epochs}: True Mean Squared Error: {mse}")
 
@@ -471,18 +471,18 @@ def compute_custom_loss_all_epochs(
 
         # Creo dataframe para exportar:
         d = {
-            "link": link_names,
+            "GEOID": link_names,
             "predictions": predictions,
             "real_value": real_values,
         }
         df_preds = pd.DataFrame(data=d)
 
-        df_preds["mean_prediction"] = df_preds.groupby(by="link").predictions.transform(
+        df_preds["mean_prediction"] = df_preds.groupby(by="GEOID").predictions.transform(
             "mean"
         )
         df_preds["error"] = df_preds["mean_prediction"] - df_preds["real_value"]
         df_preds["sq_error"] = df_preds["error"] ** 2
-        mse = df_preds.drop_duplicates(subset=["link"]).sq_error.mean()
+        mse = df_preds.drop_duplicates(subset=["GEOID"]).sq_error.mean()
 
         # enablePrint()
         print(f"Epoch {epoch}/{n_epochs}: True Mean Squared Error: {mse}")
@@ -607,7 +607,7 @@ def compute_custom_loss_for_epoch(
 
     for link in tqdm(links):
         # Obtener las imágenes del radio censal
-        link_real_value = df.loc[df["link"] == link, "var"].values[0]
+        link_real_value = df.loc[df["GEOID"] == link, "var"].values[0]
         link_images = np.load(rf"{folder}/test_{link}.npy")
         q_images = link_images.shape[0]
 
@@ -641,19 +641,19 @@ def compute_custom_loss_for_epoch(
 
     # Creo dataframe para exportar:
     d = {
-        "link": link_names,
+        "GEOID": link_names,
         "predictions": predictions,
         "real_value": real_values,
     }
     df_preds = pd.DataFrame(data=d)
 
-    df_preds["mean_prediction"] = df_preds.groupby(by="link").predictions.transform(
+    df_preds["mean_prediction"] = df_preds.groupby(by="GEOID").predictions.transform(
         "mean"
     )
     df_preds["error"] = df_preds["mean_prediction"] - df_preds["real_value"]
     df_preds["sq_error"] = df_preds["error"] ** 2
-    mse = df_preds.drop_duplicates(subset=["link"]).sq_error.mean()
-    variance = df_preds.drop_duplicates(subset=["link"]).real_value.var()
+    mse = df_preds.drop_duplicates(subset=["GEOID"]).sq_error.mean()
+    variance = df_preds.drop_duplicates(subset=["GEOID"]).real_value.var()
     r2 = 1 - mse / variance
     # enablePrint()
     print(f"TEST Mean Squared Error: {mse} (Epoch {epoch}/{n_epochs})")
@@ -718,7 +718,7 @@ def plot_predictions_vs_real(
     # Open dataset
     best_case = pd.read_csv(rf"{folder}/{modelname}_test_{selected_epoch}.csv")
     best_case = (
-        best_case.groupby("link")[["real_value", "mean_prediction"]]
+        best_case.groupby("GEOID")[["real_value", "mean_prediction"]]
         .mean()
         .reset_index()
     )
@@ -736,7 +736,7 @@ def plot_predictions_vs_real(
     import seaborn as sns
 
     fig = px.scatter(
-        best_case, x="real_value", y="mean_prediction", hover_data=["link"], title=title
+        best_case, x="real_value", y="mean_prediction", hover_data=["GEOID"], title=title
     )
     fig.update_yaxes(range=axis_range)
     fig.update_xaxes(range=axis_range)
