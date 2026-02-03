@@ -36,6 +36,13 @@ def rebuild_top(model_base, kind="cla") -> Sequential:
     #   based on: https://stackoverflow.com/questions/54537674/modify-resnet50-output-layer-for-regression?rq=3
     
     model.add(layers.GlobalAveragePooling2D())
+    model.add(layers.BatchNormalization())
+    model.add(layers.BatchNormalization())
+    top_dropout_rate = 0.4
+    model.add(layers.Dropout(top_dropout_rate, name="top_dropout"))
+
+    # Compile
+    model = keras.Model(inputs, outputs, name="EfficientNet")
 
     if kind == "cla":
         # Add fully conected layers
