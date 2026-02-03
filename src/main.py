@@ -295,7 +295,7 @@ def create_datasets(
         lambda: list(range(df_train.shape[0])), tf.uint64
     )
     train_dataset = train_dataset.shuffle(
-        buffer_size=int(df_train.shape[0] / 32), seed=825, reshuffle_each_iteration=True
+        buffer_size=int(df_train.shape[0] / 16), seed=825, reshuffle_each_iteration=True
     )
     # Map using the wrapper
     train_dataset = train_dataset.map(train_mapper, num_parallel_calls=tf.data.AUTOTUNE)
@@ -313,7 +313,7 @@ def create_datasets(
         lambda: list(range(df_val.shape[0])), tf.uint64
     )
     val_dataset = val_dataset.shuffle(
-        buffer_size=int(df_val.shape[0] / 32), seed=825, reshuffle_each_iteration=True
+        buffer_size=int(df_val.shape[0] / 16), seed=825, reshuffle_each_iteration=True
     )
     val_dataset = val_dataset.map(val_mapper, num_parallel_calls=tf.data.AUTOTUNE)
     val_dataset = val_dataset.batch(64).prefetch(tf.data.AUTOTUNE)
