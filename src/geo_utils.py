@@ -494,11 +494,11 @@ def augment_image(img):
     img = skimage.exposure.rescale_intensity(img, in_range=(v_min, v_max))
 
     # Rescale saturation
-    rand_sat = 0.5 + np.random.rand()  # Random number between 0.5 and 1.5
-    img_hsv = color.rgb2hsv(img)  # hue-saturation-value
-    img_hsv[:, :, 1] *= rand_sat
-    img_hsv[:, :, 1] = np.clip(img_hsv[:, :, 1], 0, 255)
-    img = color.hsv2rgb(img_hsv)
+    # rand_sat = 0.5 + np.random.rand()  # Random number between 0.5 and 1.5
+    # img_hsv = color.rgb2hsv(img)  # hue-saturation-value
+    # img_hsv[:, :, 1] *= rand_sat
+    # img_hsv[:, :, 1] = np.clip(img_hsv[:, :, 1], 0, 255)
+    # img = color.hsv2rgb(img_hsv)
 
     return img
 
