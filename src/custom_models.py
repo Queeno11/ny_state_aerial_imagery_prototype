@@ -14,7 +14,7 @@ from tensorflow.keras.applications import (
     Xception,
     MobileNetV3Large,
     EfficientNetB0,
-    EfficientNetV2B3,
+    EfficientNetV2B1,
     EfficientNetV2S,
     EfficientNetV2M,
     EfficientNetV2L,
@@ -95,9 +95,9 @@ def efficientnet_v2M(resizing_size, bands=8, kind="reg", weights=None) -> Sequen
     return model
 
 
-def efficientnet_v2L(resizing_size, bands=8, kind="reg", weights=None) -> Sequential:
+def efficientnet_v2B1(resizing_size, bands=8, kind="reg", weights=None) -> Sequential:
 
-    model_base = EfficientNetV2L(
+    model_base = EfficientNetV2B1(
         include_top=False,
         input_shape=(resizing_size, resizing_size, bands),
         weights=weights,

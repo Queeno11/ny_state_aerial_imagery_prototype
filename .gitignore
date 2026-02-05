@@ -76,6 +76,12 @@ target/
 *.rdb
 *.tif
 *.xml
+*.csv
+*.feather
+*.npy
+*.parquet
+*.h5
+*.keras
 
 # Pycharm
 .idea

@@ -61,7 +61,7 @@ def enablePrint():
     sys.stdout = sys.__stdout__
 
 
-def generate_gridded_images(
+def generate_prediction_images(
     df_test,
     sat_img_datasets,
     test_folder,
@@ -73,15 +73,15 @@ def generate_gridded_images(
     year=2013,
 ):
     import geopandas as gpd
+    from tqdm import tqdm
 
     # Filtro Radios demasiado grandes (tardan horas en generar la cuadrícula y es puro campo...)
-    df_test = df_test[df_test["AREA"] <= 200000]  # Remove rc that are too big
     links = df_test["GEOID"].unique()
     valid_links = []
 
     # Loop por radio censal. Si está la imagen la usa, sino la genera.
     os.makedirs(test_folder, exist_ok=True)
-    for n, link in enumerate(links):
+    for link in tqdm(links):
         # print(f"{link}: {n}/{len_links}")
         # Genera la imagen
         file = rf"{test_folder}/test_{link}.npy"
@@ -373,8 +373,12 @@ def compute_custom_loss_all_epochs(
         df_not_test = gpd.read_feather(
             rf"{PROCESSED_DATA_DIR}/train_datasets/{savename}_train_dataframe.feather"
         )
+        # Sample data so it's correctly split (just as in main.py)
+        # FIXME: some refactor could be done to avoid code duplication!
+        df_not_test = df_not_test.sample(frac=1.0, random_state=825).reset_index(drop=True)
         df = df_not_test.sample(frac=0.066667, random_state=200)
         df = df.reset_index()
+        os.makedirs(rf"{PROCESSED_DATA_DIR}/val_datasets/", exist_ok=True)
         df.to_feather(rf"{PROCESSED_DATA_DIR}/val_datasets/{savename}_val_dataframe.feather")
     print("Data loaded!")
 
@@ -387,7 +391,7 @@ def compute_custom_loss_all_epochs(
     # Genero las imágenes
     if generate or ~os.path.isfile(rf"{folder}/valid_links.npy"):
         print("Generando imágenes en grilla...")
-        folder = generate_gridded_images(
+        folder = generate_prediction_images(
             df,
             datasets,
             folder,
@@ -582,7 +586,7 @@ def compute_custom_loss_for_epoch(
     # Genero las imágenes
     if generate or ~os.path.isfile(rf"{folder}/valid_links.npy"):
         print("Generando imágenes en grilla...")
-        folder = generate_gridded_images(
+        folder = generate_prediction_images(
             df,
             datasets,
             folder,

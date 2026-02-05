@@ -293,12 +293,12 @@ def assert_train_test_datapoint(bounds, test_polygon, wanted_type="train", buffe
     return actual_type == wanted_type
 
 
-def get_dataset_for_gdf(icpag, datasets, link, year=2013, id_var="GEOID"):
+def get_dataset_for_gdf(gdf, datasets, link, year=2013, id_var="GEOID"):
     """Get dataset where the census tract is located.
 
     Parameters
     ----------
-    - icpag: geopandas.GeoDataFrame, shapefile with the census tracts
+    - gdf: geopandas.GeoDataFrame, shapefile with the census tracts
     - datasets: dict, dictionary with the satellite datasets. Names of the datasets are the keys and xarray.Datasets are the values.
     - link: str, 9 digits that identify the census tract
 
@@ -306,7 +306,7 @@ def get_dataset_for_gdf(icpag, datasets, link, year=2013, id_var="GEOID"):
     -------
     - current_ds: xarray.Dataset, dataset where the census tract is located
     """
-    current_ds_name = icpag.loc[icpag[id_var] == link, f"dataset_{year}"].squeeze()
+    current_ds_name = gdf.loc[gdf[id_var] == link, f"dataset_{year}"].squeeze()
 
     if hasattr(current_ds_name, "__iter__"):
         current_ds = [datasets[ds_name] for ds_name in current_ds_name]
@@ -318,13 +318,33 @@ def get_dataset_for_gdf(icpag, datasets, link, year=2013, id_var="GEOID"):
         current_ds = datasets[current_ds_name]
     return current_ds
 
+def add_buffer(bounds, buffer):
+    """Add buffer to bounds.
 
-def crop_dataset_to_link(ds, icpag, link):
+    Parameters:
+    -----------
+    bounds: tuple, (minx, miny, maxx, maxy)
+    buffer: int, buffer to add to bounds
+
+    Returns:
+    --------
+    bounds: dict, {'minx': minx-buffer, 'miny': miny-buffer, 'maxx': maxx+buffer, 'maxy': maxy+buffer}
+    """
+    minx, miny, maxx, maxy = bounds
+    return {
+        "minx": minx - buffer,
+        "miny": miny - buffer,
+        "maxx": maxx + buffer,
+        "maxy": maxy + buffer,
+    }
+
+def crop_dataset_to_link(ds, gdf, link):
+
     # obtengo el poligono correspondiente al link
-    gdf_slice = icpag.loc[icpag["GEOID"] == link]
+    multipolygon = gdf.loc[gdf["GEOID"] == link].dissolve()["geometry"][0]
     # Get bounds of the shapefile's polygon
-    bbox_img = gdf_slice.bounds
-
+    bbox_img = add_buffer(multipolygon.bounds, 1000)
+    
     # Filter dataset based on the bounds of the shapefile's polygon
     image_ds = ds.sel(
         x=slice(float(bbox_img["minx"]), float(bbox_img["maxx"])),
@@ -333,9 +353,9 @@ def crop_dataset_to_link(ds, icpag, link):
     return image_ds
 
 
-def get_gridded_images_for_link(
+def get_prediction_images_for_link(
     ds,
-    icpag,
+    gdf,
     link,
     tiles,
     size,
@@ -352,7 +372,7 @@ def get_gridded_images_for_link(
     Parameters:
     -----------
     ds: xarray.Dataset, dataset con las imágenes de satélite
-    icpag: geopandas.GeoDataFrame, shapefile con los radios censales
+    gdf: geopandas.GeoDataFrame, shapefile con los radios censales
     link: str, 9 dígitos que identifican el radio censal
     tiles: int, cantidad de imágenes a generar por lado
     size: int, tamaño de la imagen a generar, en píxeles
@@ -367,64 +387,43 @@ def get_gridded_images_for_link(
     points: list, lista con los puntos centrales de cada imagen
     bounds: list, lista con los bounding boxes de cada imagen
     """
-    # FIXME: algunos radios censales no se generan bien. Ejemplo: 065150101. ¿Que pasa ahi?
+
     images = []
     points = []
     bounds = []
-    tile_size = size // tiles
-    tiles_generated = 0
     total_bands = len(stacked_images) * n_bands
 
-    link_dataset = crop_dataset_to_link(ds, icpag, link)
-    # FIXME: add margin to the bounding box so left and bottom tiles are not cut. Margin should be the size of the tile - 1
-    link_geometry = icpag.loc[icpag["GEOID"] == link, "geometry"].values[0]
+    link_dataset = crop_dataset_to_link(ds, gdf, link)
+    link_geometries = gdf.loc[gdf["GEOID"] == link, "geometry"].values
+    for building_geometry in link_geometries:
 
-    # Iterate over the center points of each image:
-    # - Start point is the center of the image (tile_size / 2, start_index)
-    # - End point is the maximum possible center point (link_dataset.y.size)
-    # - Step is the size of each image (tile_size)
-    start_index = int(tile_size / 2)
-    for idy in range(start_index, link_dataset.y.size, tile_size):
-        # Iterate over columns
-        for idx in range(start_index, link_dataset.x.size, tile_size):
-            # Get the center point of the image
-            image_point = (float(link_dataset.x[idx]), float(link_dataset.y[idy]))
-            point_geom = sg.Point(image_point)
-            point = point_geom.coords[0]
+        image_point = building_geometry.centroid
+        point = image_point.coords[0]
+        image, bound = geo_utils.stacked_image_from_census_tract(
+            dataset=link_dataset,
+            polygon=building_geometry,
+            point=point,
+            img_size=size,
+            n_bands=n_bands,
+            stacked_images=stacked_images,
+        )
 
-            # Check if the centroid of the image is within the original polygon:
-            #   - if it is, then generate the n images
-            if link_geometry.contains(point_geom):  # or intersects
-                number_imgs = 0
-                counter = 0  # Limit the times to try to sample the images
-                while (number_imgs < sample) & (counter < sample * 2):
-                    polygon = icpag.loc[icpag["GEOID"] == link, "geometry"].item()
-                    image, bound = geo_utils.stacked_image_from_census_tract(
-                        dataset=ds,
-                        polygon=polygon,
-                        point=point,
-                        img_size=size,
-                        n_bands=n_bands,
-                        stacked_images=stacked_images,
-                    )
-                    counter += 1
+        if image.shape == (total_bands, size, size):
+            # TODO: add a check to see if the image is contained in test bounds
+            image = geo_utils.process_image(image, resizing_size)
 
-                    if image.shape == (total_bands, size, size):
-                        # TODO: add a check to see if the image is contained in test bounds
-                        image = geo_utils.process_image(image, resizing_size)
+            images += [image]
+            bounds += [bound]
+            number_imgs += 1
 
-                        images += [image]
-                        bounds += [bound]
-                        number_imgs += 1
-
-                    else:
-                        print("Image failed")
+        else:
+            print("Image failed")
 
     return images, points, bounds
 
 
 def get_gridded_images_for_dataset(
-    model, ds, icpag, tiles, size, resizing_size, bias, sample, to8bit
+    model, ds, gdf, tiles, size, resizing_size, bias, sample, to8bit
 ):
     """
     Itera sobre el bounding box de un dataset (raster de imagenes), tomando imagenes de tamño sizexsize
@@ -435,7 +434,7 @@ def get_gridded_images_for_dataset(
     Parameters:
     -----------
     ds: xarray.Dataset, dataset con las imágenes de satélite
-    icpag: geopandas.GeoDataFrame, shapefile con los radios censales
+    gdf: geopandas.GeoDataFrame, shapefile con los radios censales
     tiles: int, cantidad de imágenes a generar por lado
     size: int, tamaño de la imagen a generar, en píxeles
     resizing_size: int, tamaño al que se redimensiona la imagen
@@ -472,8 +471,8 @@ def get_gridded_images_for_dataset(
     # - End point is the maximum possible center point (link_dataset.y.size)
     # - Step is the size of each image (tile_size)
 
-    # FIXME: para mejorar la eficiencia, convendría hacer un dissolve de icpag y verificar que
-    # point_geom este en ese polygono y no en todo el df
+    # FIXME: para mejorar la eficiencia, convendría hacer un dissolve de gdf y verificar que
+    # image_point este en ese polygono y no en todo el df
     start_index = int(tile_size / 2)
     for idy in range(start_index, ds.y.size, tile_size):
         # Iterate over columns
@@ -483,7 +482,7 @@ def get_gridded_images_for_dataset(
             point_geom = sg.Point(image_point)
 
             # Get data for selected point
-            radio_censal = icpag.loc[icpag.contains(point_geom)]
+            radio_censal = gdf.loc[gdf.contains(point_geom)]
             if radio_censal.empty:
                 # El radio censal no existe, es el medio del mar...
                 continue
@@ -496,7 +495,7 @@ def get_gridded_images_for_dataset(
 
             image, point, bound, tbound = geo_utils.random_image_from_census_tract(
                 ds,
-                icpag,
+                gdf,
                 link_name,
                 start_point=image_point,
                 tiles=tiles,
@@ -559,87 +558,6 @@ def get_gridded_images_for_dataset(
     df_preds = gpd.GeoDataFrame(d, geometry=all_bounds, crs="epsg:6539")
 
     return df_preds
-
-
-def get_random_images_for_link(
-    ds, icpag, link, tiles, size, resizing_size, bias, sample, to8bit
-):
-    """
-    Genera n imagenes del poligono del radio censal, tomando imagenes de tamño sizexsize
-    Si dicha imagen se encuentra dentro del polinogo, se genera el composite con dicha imagen mas otras tiles**2 -1 imagenes
-    Devuelve un array con todas las imagenes generadas, un array con los puntos centrales de cada imagen y un array con los bounding boxes de cada imagen.
-
-    Parameters:
-    -----------
-    ds: xarray.Dataset, dataset con las imágenes de satélite
-    icpag: geopandas.GeoDataFrame, shapefile con los radios censales
-    link: str, 9 dígitos que identifican el radio censal
-    tiles: int, cantidad de imágenes a generar por lado
-    size: int, tamaño de la imagen a generar, en píxeles
-    resizing_size: int, tamaño al que se redimensiona la imagen
-    bias: int, cantidad de píxeles que se mueve el punto aleatorio de las tiles
-    sample: int, cantidad de imágenes a generar por box (util cuando tiles > 1)
-    to8bit: bool, si es True, convierte la imagen a 8 bits
-
-    Returns:
-    --------
-    images: list, lista con las imágenes generadas
-    points: list, lista con los puntos centrales de cada imagen
-    bounds: list, lista con los bounding boxes de cada imagen
-    """
-    # FIXME: algunos radios censales no se generan bien. Ejemplo: 065150101. ¿Que pasa ahi?
-    images = []
-    points = []
-    bounds = []
-    tile_size = size // tiles
-    tiles_generated = 0
-
-    link_dataset = crop_dataset_to_link(ds, icpag, link)
-    # FIXME: add margin to the bounding box so left and bottom tiles are not cut. Margin should be the size of the tile - 1
-    link_geometry = icpag.loc[icpag["GEOID"] == link, "geometry"].values[0]
-
-    number_imgs = 0
-    counter = 0  # Limit the times to try to sample the images
-    while (number_imgs < sample) & (counter < sample * 2):
-        # Generate a random point
-        x_point = np.random.uniform(link_dataset.x.min(), link_dataset.x.max())
-        y_point = np.random.uniform(link_dataset.y.min(), link_dataset.y.max())
-
-        # Get the center point of the image
-        image_point = (x_point, y_point)
-        point_geom = sg.Point(image_point)
-
-        # Check if the centroid of the image is within the original polygon:
-        #   - if it is, then generate the n images
-        if link_geometry.contains(point_geom):  # or intersects
-            img, point, bound, tbound = geo_utils.random_image_from_census_tract(
-                ds,
-                icpag,
-                link,
-                start_point=image_point,
-                tiles=tiles,
-                size=size,
-                bias=bias,
-                to8bit=to8bit,
-            )
-
-            counter += 1
-
-            if img is not None:
-                # TODO: add a check to see if the image is contained in test bounds
-                img = geo_utils.process_image(img, resizing_size)
-
-                images += [img]
-                points += [point]
-                bounds += [bound]
-                number_imgs += 1
-
-            else:
-                print("Image failed")
-
-    return images, points, bounds
-
-    return images, real_values, links, points, bounds
 
 
 def stretch_dataset(ds, pixel_depth=32_767):

@@ -7,7 +7,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 from typing import List, Dict
 from src import grid_predictions
-from src.utils.paths import PROJECT_ROOT, DATA_DIR, EXTERNAL_DATA_DIR, RAW_DATA_DIR, INTERIM_DATA_DIR, PROCESSED_DATA_DIR, RESULTS_DIR, LOGS_DIR, MODELS_DIR, IMAGERY_ROOT
+from src.utils.paths import PROJECT_ROOT, DATA_DIR, EXTERNAL_DATA_DIR, RAW_DATA_DIR, INTERIM_DATA_DIR, PROCESSED_DATA_DIR, CACHE_DIR, RESULTS_DIR, LOGS_DIR, MODELS_DIR, IMAGERY_ROOT
 pd.set_option("display.max_columns", None)
 
 
@@ -33,6 +33,7 @@ from typing import Iterator, List, Union, Tuple, Any
 from datetime import datetime
 from sklearn.model_selection import train_test_split
 from tensorflow.keras import mixed_precision
+from keras import backend as K
 
 mixed_precision.set_global_policy('mixed_float16')
 
@@ -57,6 +58,8 @@ try:
 except:
     print("No GPU set. Is the GPU already initialized?")
 
+# Define a subset of the data that will comfortably fit in RAM cache
+CACHE_SIZE = 800*128 # Around 100k images (128 batch size)
 
 # Disable
 def blockPrint():
@@ -167,9 +170,10 @@ def create_datasets(
     available_years = list(all_years_datasets.keys())
     
     # --- Configuration ---
-    CACHE_DIR = PROCESSED_DATA_DIR / "cache"
-    os.makedirs(CACHE_DIR, exist_ok=True)
-    
+    DEBUG_DIR = PROCESSED_DATA_DIR / "debug_examples"
+    os.makedirs(DEBUG_DIR, exist_ok=True)
+    fname = f"{savename}_example"
+
     # EPOCHS_PER_CYCLE: How many epochs to reuse the cache before generating new crops
     # 1 Slow Epoch (Gen) + 9 Fast Epochs (Read) = 10 Total  
     READ_BATCH_SIZE = 16
@@ -191,15 +195,15 @@ def create_datasets(
         
         total_bands = nbands * len(stacked_images)
         target_shape = (total_bands, image_size, image_size)
-        
+
         for i in indices:
             # ... (Standard extraction logic) ...
             try:
-                polygon = df_subset.iloc[i]["geometry"]
-                value = df_subset.iloc[i]["var"]
+                polygon = df_subset.loc[i]["geometry"]
+                value = df_subset.loc[i]["var"]
                 
                 # Logic to get dataset
-                dataset_name = df_subset.iloc[i][f"dataset_{batch_year}"]
+                dataset_name = df_subset.loc[i][f"dataset_{batch_year}"]
                 if not pd.isna(dataset_name):
                     link_dataset = primary_dataset[dataset_name]
                 else:
@@ -217,19 +221,26 @@ def create_datasets(
                     )
                 
                 if image.shape != target_shape:
+                    #  print("Image shape mismatch:", image.shape, "expected:", target_shape)
                      image = np.zeros(shape=(resizing_size, resizing_size, total_bands))
-                     return None  
+
                 else:
                      image = geo_utils.process_image(image, resizing_size)
                      # NO AUGMENTATION HERE (We cache the clean image)
 
                 batch_imgs.append(image)
                 batch_lbls.append(value)
-            except:
+                
+            except Exception as e:
+                print(e)
                 # Fail-safe
                 batch_imgs.append(np.zeros((resizing_size, resizing_size, total_bands)))
                 batch_lbls.append(0.0)
-            
+
+        if save_examples and not os.path.exists(DEBUG_DIR / f"{fname}_img.npy"):
+            np.save(DEBUG_DIR / f"{fname}_img.npy", np.stack(batch_imgs).astype(np.uint8))
+            np.save(DEBUG_DIR / f"{fname}_lbl.npy", np.stack(batch_lbls).astype(np.float32))
+
         return np.stack(batch_imgs).astype(np.uint8), np.stack(batch_lbls).astype(np.float32)
 
     # --- 2. GPU Augmentation ---
@@ -256,9 +267,6 @@ def create_datasets(
     # --- 4. The Cyclic Pipeline Builder ---
     def build_cyclic_dataset(df_subset, subset_name, is_train=False):
         
-        # Define a subset of the data that will comfortably fit in RAM cache
-        MAX_CACHE_SAMPLES = 80000 
-        
         # For Validation/Test, we don't need rotation. Just cache once.
         if not is_train:
             ds = tf.data.Dataset.from_tensor_slices(list(range(df_subset.shape[0])))
@@ -272,7 +280,7 @@ def create_datasets(
             # We must wrap the python call to clean the cache in a py_function
             _ = tf.py_function(clean_cache_file, [cache_file], tf.int32)
             ds = ds.cache(cache_file)
-            ds = ds.batch(TRAIN_BATCH_SIZE, drop_remainder=True)
+            ds = ds.batch(TRAIN_BATCH_SIZE)
             ds = ds.prefetch(tf.data.AUTOTUNE)
             return ds
 
@@ -288,10 +296,10 @@ def create_datasets(
             
             # Shuffle the full list of indices. The seed ensures we get a DIFFERENT shuffle for each cycle.
             sampled_indices_ds = all_indices_ds.shuffle(
-                buffer_size=len(df_subset), 
+                len(df_subset), 
                 seed=tf.cast(cycle_index, tf.int64), # Use cycle_index as the seed
                 reshuffle_each_iteration=False # We want one consistent sample per cycle
-            ).take(MAX_CACHE_SAMPLES)
+            ).take(CACHE_SIZE)
             
             # 2. Determine Cache Filename (Toggle between A and B)
             cycle_id = tf.cast(cycle_index % 2, tf.int32)
@@ -303,7 +311,6 @@ def create_datasets(
             # 4. Map the loader function onto our sampled indices
             # The loader needs the original dataframe, which we can access via closure
             ds = sampled_indices_ds.batch(READ_BATCH_SIZE)
-            
             ds = ds.map(
                 lambda indices: tf.py_function(
                     # We use the full df_subset and tell the loader which indices to use
@@ -322,15 +329,11 @@ def create_datasets(
             ds = ds.cache(tf.strings.as_string(cache_filename)) # Cast to string tensor
             
             # 6. Repeat, Shuffle, Batch, Augment
-            num_repeats_per_epoch = (5000 * TRAIN_BATCH_SIZE // MAX_CACHE_SAMPLES) + 1
-            ds = ds.repeat(num_repeats_per_epoch)
-            ds = ds.shuffle(5000) 
-            ds = ds.batch(TRAIN_BATCH_SIZE, drop_remainder=True)
+            ds = ds.shuffle(1000) 
+            ds = ds.batch(TRAIN_BATCH_SIZE)
             ds = ds.map(apply_augmentation, num_parallel_calls=tf.data.AUTOTUNE)
-            
-            # 7. This cycle provides data for ONE epoch
-            ds = ds.take(5000) 
-            
+            CYCLES_TO_SURVIVE = 5 
+            ds = ds.repeat(CYCLES_TO_SURVIVE)            
             return ds
 
         # Create the infinite stream of 1-epoch cycles
@@ -423,7 +426,7 @@ def get_callbacks(
                 df_params.to_csv(self.param_log_path, mode='a', header=False, index=False)
 
     tensorboard_callback = TensorBoard(
-        log_dir=logdir, histogram_freq=1, profile_batch="100,200"
+        log_dir=logdir, histogram_freq=1, profile_batch=0
     )
     # use tensorboard --logdir logs/scalars in your command line to startup tensorboard with the correct logs
 
@@ -444,7 +447,7 @@ def get_callbacks(
     )
     model_checkpoint_callback = ModelCheckpoint(
         f"{MODELS_DIR}/{savename}.keras",
-        monitor="val_loss",
+        monitor="loss",
         verbose=1,
         save_best_only=True,  # save the best model
         mode="auto",
@@ -534,7 +537,7 @@ def train_model(
         # optimizer = tf.keras.optimizers.Adam(learning_rate=lr)
         optimizer = tf.keras.optimizers.Nadam(learning_rate=lr)
 
-        model.compile(optimizer=optimizer, loss=loss, metrics=metrics)
+        model.compile(optimizer=optimizer, loss=loss, metrics=metrics, jit_compile=False)
         initial_epoch = 0
 
     else:
@@ -553,15 +556,16 @@ def train_model(
         initial_epoch = initial_epoch + 1
 
     # The number of steps is the number of samples divided by batch size
-    validation_steps = 1_000 # Use your TRAIN_BATCH_SIZE
-    
+    validation_steps = 100 # Use your TRAIN_BATCH_SIZE
+    steps_per_epoch = CACHE_SIZE // 128
+
     history = model.fit(
         train_dataset,
         epochs=epochs,
-        steps_per_epoch=5_000, # Total train buildings in NYC = 328875 x 
+        steps_per_epoch=steps_per_epoch, # Total train buildings in NYC = 328875 x 
         initial_epoch=initial_epoch,
-        validation_data=val_dataset,
-        validation_steps=validation_steps,
+        # validation_data=val_dataset,
+        # validation_steps=validation_steps,
         callbacks=callbacks,
     )
 
@@ -709,7 +713,7 @@ def set_model_and_loss_function(
         "effnet_v2M": custom_models.efficientnet_v2M(
             resizing_size, bands=bands, kind=kind, weights=weights
         ),
-        "effnet_v2L": custom_models.efficientnet_v2L(
+        "effnet_v2B1": custom_models.efficientnet_v2B1(
             resizing_size, bands=bands, kind=kind, weights=weights
         ),
         "spatialecon_cnn": custom_models.spatialecon_cnn(
@@ -728,13 +732,13 @@ def set_model_and_loss_function(
 
     # Get model
     model = get_model_from_name[model_name]
-
-    # Set loss and metrics
+        # Set loss and metrics
     if kind == "reg":
         loss = keras.losses.MeanSquaredError()
         # loss = keras.losses.MeanAbsoluteError()
         metrics = [
-            keras.metrics.MeanAbsoluteError(),
+            # keras.metrics.MeanAbsoluteError(),
+            keras.metrics.R2Score(),
             # keras.metrics.RootMeanSquaredError(),
             # keras.metrics.MeanAbsolutePercentageError(),
         ]
@@ -802,7 +806,7 @@ def run(
     generate_parameters_log(params, savename)
 
     all_years_datasets, all_years_extents, df = open_datasets(
-        sat_data=sat_data, years=years
+        sat_data=sat_data, years=[2022] # FIXME! 
     )
 
     if train:
@@ -865,14 +869,14 @@ def run(
         true_metrics.compute_loss(  # No entra el test_dataset acá pero despues usa el df_test guardado en memoria
             models_dir=rf"{MODELS_DIR}/models_by_epoch/{savename}",
             savename=savename,
-            datasets=all_years_datasets[2013],
+            datasets=all_years_datasets[2022],
             tiles=tiles,
             size=image_size,
             resizing_size=resizing_size,
             n_epochs=n_epochs,
             n_bands=nbands,
             stacked_images=stacked_images,
-            generate=False,
+            generate=True,
             subset="test",
         )
 
@@ -904,7 +908,7 @@ if __name__ == "__main__":
 
     # Selection of parameters
     params = {
-        "model_name": "effnet_v2S",
+        "model_name": "effnet_v2B1",
         "kind": "reg",
         "weights": None,
         "image_size": 128,
@@ -914,7 +918,7 @@ if __name__ == "__main__":
         "stacked_images": [1, 4],
         "sample_size": 1,
         "small_sample": False,
-        "n_epochs": 150,
+        "n_epochs": 500,
         "learning_rate": 0.0005,
         "sat_data": "aerial",
         "years": [2016, 2018, 2020, 2022, 2024], # Only the data inside WSL! all data is: [2010, 2012, 2014, 2016, 2018, 2020, 2022, 2024],
@@ -922,4 +926,4 @@ if __name__ == "__main__":
     }
 
     # Run full pipeline
-    run(params, train=True, compute_loss=True, generate_grid=True)
+    run(params, train=False, compute_loss=True, generate_grid=False)

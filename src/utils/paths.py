@@ -16,8 +16,9 @@ PROCESSED_DATA_DIR = DATA_DIR / "processed"
 # Results
 RESULTS_DIR = PROJECT_ROOT / "results"
 
-# Logs
+# Logs and Cache
 LOGS_DIR = PROJECT_ROOT / "logs"
+CACHE_DIR = Path("/home/abbatenicolas/data/cache")
 
 # Models
 MODELS_DIR = PROJECT_ROOT / "models"
