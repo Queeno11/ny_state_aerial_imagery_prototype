@@ -1,6 +1,7 @@
 ##############      Configuración      ##############
 import os
 import shutil
+from xml.parsers.expat import model
 import pandas as pd
 import seaborn as sns
 import matplotlib.pyplot as plt
@@ -190,8 +191,6 @@ def create_datasets(
         batch_lbls = []
         
         # Randomly pick a year for this batch to optimize Zarr access
-        batch_year = random.choice(available_years)
-        primary_dataset = all_years_datasets[batch_year]
         
         total_bands = nbands * len(stacked_images)
         target_shape = (total_bands, image_size, image_size)
@@ -199,6 +198,8 @@ def create_datasets(
         for i in indices:
             # ... (Standard extraction logic) ...
             try:
+                batch_year = random.choice(available_years)
+                primary_dataset = all_years_datasets[batch_year]
                 polygon = df_subset.loc[i]["geometry"]
                 value = df_subset.loc[i]["var"]
                 
@@ -337,7 +338,7 @@ def create_datasets(
             return ds
 
         # Create the infinite stream of 1-epoch cycles
-        num_epochs = 150 # Your total epochs
+        num_epochs = 500 # Your total epochs
         master_ds = tf.data.Dataset.range(num_epochs).flat_map(make_one_cycle)
         master_ds = master_ds.prefetch(tf.data.AUTOTUNE)
         return master_ds
@@ -454,7 +455,7 @@ def get_callbacks(
         save_freq="epoch",  # save every epoch
     )
     csv_logger = CSVLogger(
-        f"{MODELS_DIR}/models_by_epoch/{savename}/{savename}_history.csv", append=True
+        f"{MODELS_DIR}/models_by_epoch/{savename}/history.csv", append=True
     )
 
     return [
@@ -512,9 +513,9 @@ def train_model(
             epochs = [file.split("_")[-1] for file in files]
             epochs = [int(epoch) for epoch in epochs if epoch.isdigit()]
             if not epochs:
-                # Directory exists but has no saved model epochs (only history.csv or similar), remove it to start fresh
-                shutil.rmtree(model_dir)
-                os.makedirs(model_dir)
+                # # Directory exists but has no saved model epochs (only history.csv or similar), remove it to start fresh
+                # shutil.rmtree(model_dir)
+                # os.makedirs(model_dir)
                 print("Model not found, running from begining")
                 initial_epoch = None
 
@@ -732,6 +733,10 @@ def set_model_and_loss_function(
 
     # Get model
     model = get_model_from_name[model_name]
+    model.load_weights(MODELS_DIR / "effnet_v2B1_lr0.0005_size128_y2016-2018-2020-2022-2024_stack1-4_Pooling.keras")
+    print(f"Loaded weights from {MODELS_DIR / 'effnet_v2B1_lr0.0005_size128_y2016-2018-2020-2022-2024_stack1-4_Pooling.keras'}")
+    print("Ensure this is ok!")
+    print("*"*1000)
         # Set loss and metrics
     if kind == "reg":
         loss = keras.losses.MeanSquaredError()
@@ -806,9 +811,11 @@ def run(
     generate_parameters_log(params, savename)
 
     all_years_datasets, all_years_extents, df = open_datasets(
-        sat_data=sat_data, years=[2022] # FIXME! 
+        sat_data=sat_data, years=years# FIXME! 
     )
-
+    # print("**"*10)
+    # print("CORRIENDO SOLO CON 2022 PARA TESTEAR. SI TE APARECE ESTO, REVISAR!!!")
+    # print("**"*10)
     if train:
 
         ## Set Model & loss function
@@ -918,7 +925,7 @@ if __name__ == "__main__":
         "stacked_images": [1, 4],
         "sample_size": 1,
         "small_sample": False,
-        "n_epochs": 500,
+        "n_epochs": 200,
         "learning_rate": 0.0005,
         "sat_data": "aerial",
         "years": [2016, 2018, 2020, 2022, 2024], # Only the data inside WSL! all data is: [2010, 2012, 2014, 2016, 2018, 2020, 2022, 2024],
@@ -926,4 +933,4 @@ if __name__ == "__main__":
     }
 
     # Run full pipeline
-    run(params, train=False, compute_loss=True, generate_grid=False)
+    run(params, train=True, compute_loss=True, generate_grid=False)

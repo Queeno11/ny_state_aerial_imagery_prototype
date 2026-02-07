@@ -5,8 +5,9 @@ import pandas as pd
 import seaborn as sns
 import matplotlib.pyplot as plt
 import numpy as np
+from tensorflow import keras
 from typing import List, Dict
-from src.utils.paths import PROJECT_ROOT, DATA_DIR, EXTERNAL_DATA_DIR, RAW_DATA_DIR, INTERIM_DATA_DIR, PROCESSED_DATA_DIR, RESULTS_DIR, LOGS_DIR, IMAGERY_ROOT
+from src.utils.paths import PROJECT_ROOT, DATA_DIR, EXTERNAL_DATA_DIR, RAW_DATA_DIR, INTERIM_DATA_DIR, PROCESSED_DATA_DIR, RESULTS_DIR, LOGS_DIR, IMAGERY_ROOT, MODELS_DIR
 pd.set_option("display.max_columns", None)
 
 # path_programas  = globales[7]
@@ -184,7 +185,7 @@ def generate_grid(
     # Cargo datasets
     icpag = build_dataset.load_income_dataset(trim=False)
     hist_df = pd.read_csv(
-        rf"{PROCESSED_DATA_DIR}/models_by_epoch/{savename}/{savename}_val_metrics_over_epochs.csv"
+        rf"{MODELS_DIR}/models_by_epoch/{savename}/val_metrics_over_epochs.csv"
     )
     best_epoch = hist_df[hist_df.mse_test_rc.min() == hist_df.mse_test_rc].index.item()
     del hist_df
@@ -196,7 +197,7 @@ def generate_grid(
 
         # Cargo modelo
         model_path = (
-            f"{PROCESSED_DATA_DIR}/models_by_epoch/{savename}/{savename}_{best_epoch}"
+            f"{MODELS_DIR}/models_by_epoch/{savename}/{best_epoch}"
         )
         model = keras.models.load_model(model_path)  # load the model from file
 

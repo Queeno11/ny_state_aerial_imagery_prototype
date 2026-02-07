@@ -294,29 +294,26 @@ def assert_train_test_datapoint(bounds, test_polygon, wanted_type="train", buffe
 
 
 def get_dataset_for_gdf(gdf, datasets, link, year=2013, id_var="GEOID"):
-    """Get dataset where the census tract is located.
+    """Get dataset where the census tract is located."""
+    
+    # 1. Get all matches as a Series (do not squeeze)
+    matches = gdf.loc[gdf[id_var] == link, f"dataset_{year}"]
 
-    Parameters
-    ----------
-    - gdf: geopandas.GeoDataFrame, shapefile with the census tracts
-    - datasets: dict, dictionary with the satellite datasets. Names of the datasets are the keys and xarray.Datasets are the values.
-    - link: str, 9 digits that identify the census tract
+    # 2. Check if we found anything
+    if matches.empty:
+        return None
 
-    Returns
-    -------
-    - current_ds: xarray.Dataset, dataset where the census tract is located
-    """
-    current_ds_name = gdf.loc[gdf[id_var] == link, f"dataset_{year}"].squeeze()
+    # 3. Take the first match. 
+    # Whether there is 1 row or 100 duplicates, this safely gets the first string.
+    current_ds_name = matches.iloc[0]
 
-    if hasattr(current_ds_name, "__iter__"):
-        current_ds = [datasets[ds_name] for ds_name in current_ds_name]
-    else:
-        if pd.isna(current_ds_name):
-            # No dataset for this census tract this year...
-            current_ds = None
-            return current_ds
-        current_ds = datasets[current_ds_name]
-    return current_ds
+    # 4. Handle NaNs (if the cell was empty)
+    if pd.isna(current_ds_name):
+        return None
+
+    # 5. Return the dataset
+    # using .get() is safer than brackets [], but brackets are fine if you trust your data keys
+    return datasets.get(current_ds_name)
 
 def add_buffer(bounds, buffer):
     """Add buffer to bounds.
@@ -414,7 +411,6 @@ def get_prediction_images_for_link(
 
             images += [image]
             bounds += [bound]
-            number_imgs += 1
 
         else:
             print("Image failed")

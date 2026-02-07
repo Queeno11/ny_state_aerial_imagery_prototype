@@ -6,7 +6,7 @@ import seaborn as sns
 import matplotlib.pyplot as plt
 import numpy as np
 from typing import List, Dict
-from src.utils.paths import PROJECT_ROOT, DATA_DIR, EXTERNAL_DATA_DIR, RAW_DATA_DIR, INTERIM_DATA_DIR, PROCESSED_DATA_DIR, RESULTS_DIR, LOGS_DIR, IMAGERY_ROOT
+from src.utils.paths import PROJECT_ROOT, DATA_DIR, EXTERNAL_DATA_DIR, RAW_DATA_DIR, INTERIM_DATA_DIR, PROCESSED_DATA_DIR, RESULTS_DIR, LOGS_DIR, IMAGERY_ROOT, MODELS_DIR
 pd.set_option("display.max_columns", None)
 
 
@@ -38,6 +38,7 @@ from tensorflow.keras.callbacks import (
     ModelCheckpoint,
 )
 from tensorflow.keras.models import Sequential
+from tensorflow.keras import backend as K
 import cv2
 import skimage
 
@@ -82,6 +83,7 @@ def generate_prediction_images(
     # Loop por radio censal. Si está la imagen la usa, sino la genera.
     os.makedirs(test_folder, exist_ok=True)
     for link in tqdm(links):
+
         # print(f"{link}: {n}/{len_links}")
         # Genera la imagen
         file = rf"{test_folder}/test_{link}.npy"
@@ -91,8 +93,12 @@ def generate_prediction_images(
         )
         if link_dataset is None:
             continue
+        if os.path.isfile(file):
+            # print(f"El archivo {file} ya existe, se saltea la generación de imágenes...")
+            valid_links += [link]
+            continue
 
-        images, points, bounds = build_dataset.get_gridded_images_for_link(
+        images, points, bounds = build_dataset.get_prediction_images_for_link(
             link_dataset,
             df_test,
             link,
@@ -390,7 +396,7 @@ def compute_custom_loss_all_epochs(
 
     # Genero las imágenes
     if generate or ~os.path.isfile(rf"{folder}/valid_links.npy"):
-        print("Generando imágenes en grilla...")
+        print("Generando imágenes por edificio...")
         folder = generate_prediction_images(
             df,
             datasets,
@@ -400,7 +406,7 @@ def compute_custom_loss_all_epochs(
             resizing_size,
             n_bands,
             stacked_images,
-            year=2013,
+            year=2022,
         )
 
     links = np.load(rf"{folder}/valid_links.npy")
@@ -437,9 +443,9 @@ def compute_custom_loss_all_epochs(
         weights=None,
     )
 
-    for epoch in range(0, n_epochs):
+    for epoch in range(150, n_epochs,2):
         filename = (
-            f"{PROCESSED_DATA_DIR}/models_by_epoch/{savename}/{savename}_{subset}_{epoch}.csv"
+            f"{MODELS_DIR}/models_by_epoch/{savename}/{subset}_{epoch}.csv"
         )
 
         if os.path.exists(filename):
@@ -451,7 +457,7 @@ def compute_custom_loss_all_epochs(
             df_preds["sq_error"] = df_preds["error"] ** 2
             mse = df_preds.drop_duplicates(subset=["GEOID"]).sq_error.mean()
 
-            print(f"Epoch {epoch}/{n_epochs}: True Mean Squared Error: {mse}")
+            print(f"Epoch {epoch}/{n_epochs} (previously computed): True Mean Squared Error: {mse}")
 
             # Store MSE value in dict and full predictions
             mse_epochs[epoch] = mse
@@ -459,14 +465,16 @@ def compute_custom_loss_all_epochs(
             continue
 
         try:
-            model.load_weights(
-                f"{models_dir}/{savename}_{epoch}/variables/variables"
-            ).expect_partial()
+            model = keras.models.load_model(                
+                f"{MODELS_DIR}/models_by_epoch/{savename}/{savename}_{epoch}.keras"
+            )
 
             # model = tf.keras.models.load_model(
             #     f"{models_dir}/{savename}_{epoch}", compile=True
             # )
             predictions = get_batch_predictions(model, images)
+            K.clear_session()
+
         except Exception as error:
             print("Error en epoca:", epoch, error)
             predictions = real_values
@@ -478,19 +486,21 @@ def compute_custom_loss_all_epochs(
             "real_value": real_values,
         }
         df_preds = pd.DataFrame(data=d)
+        df_preds = df_preds[df_preds.predictions != df_preds.predictions.mode().squeeze()] # FIXME: This removes black pixels! Probably there's a more elegant way to do it... 
 
         df_preds["mean_prediction"] = df_preds.groupby(by="GEOID").predictions.transform(
             "mean"
         )
         df_preds["error"] = df_preds["mean_prediction"] - df_preds["real_value"]
         df_preds["sq_error"] = df_preds["error"] ** 2
-        mse = df_preds.drop_duplicates(subset=["GEOID"]).sq_error.mean()
+        mse = df_preds.drop_duplicates("GEOID").sq_error.mean()
+        r2 = 1 - mse / df_preds.drop_duplicates("GEOID").real_value.var()
 
         # enablePrint()
-        print(f"Epoch {epoch}/{n_epochs}: True Mean Squared Error: {mse}")
+        print(f"Epoch {epoch}/{n_epochs}: True Mean Squared Error: {mse}, R2: {r2}")
 
         # Store MSE value in dict and full predictions
-        mse_epochs[epoch] = mse
+        mse_epochs[epoch] = {"MSE": mse, "R2": r2}
         df_preds.to_csv(filename)
 
     # Export csv with all MSE
@@ -498,7 +508,7 @@ def compute_custom_loss_all_epochs(
         mse_epochs, orient="index", columns=["mse_test_rc"]
     )
     mse_train = pd.read_csv(
-        f"{PROCESSED_DATA_DIR}/models_by_epoch/{savename}/{savename}_history.csv"
+        f"{MODELS_DIR}/models_by_epoch/{savename}/history.csv"
     )[["loss", "val_loss"]]
     metrics_epochs = (
         mse_train.join(mse_test, how="outer")
@@ -508,11 +518,11 @@ def compute_custom_loss_all_epochs(
         )
     )
     metrics_epochs.to_csv(
-        f"{PROCESSED_DATA_DIR}/models_by_epoch/{savename}/{savename}_{subset}_metrics_over_epochs.csv"
+        f"{MODELS_DIR}/models_by_epoch/{savename}/{subset}_metrics_over_epochs.csv"
     )
     print(
         "Se creo el archivo:",
-        f"{PROCESSED_DATA_DIR}/models_by_epoch/{savename}/{savename}_{subset}_metrics_over_epochs.csv",
+        f"{MODELS_DIR}/models_by_epoch/{savename}/{subset}_metrics_over_epochs.csv",
     )
 
     return metrics_epochs
@@ -585,7 +595,7 @@ def compute_custom_loss_for_epoch(
 
     # Genero las imágenes
     if generate or ~os.path.isfile(rf"{folder}/valid_links.npy"):
-        print("Generando imágenes en grilla...")
+        print("Generando imágenes por edificio...")
         folder = generate_prediction_images(
             df,
             datasets,
@@ -595,7 +605,7 @@ def compute_custom_loss_for_epoch(
             resizing_size,
             n_bands,
             stacked_images,
-            year=2013,
+            year=2022,
         )
 
     links = np.load(rf"{folder}/valid_links.npy")
@@ -633,8 +643,8 @@ def compute_custom_loss_for_epoch(
     )
 
     model.load_weights(
-        f"{models_dir}/{savename}_{epoch}/variables/variables"
-    ).expect_partial()
+        f"{models_dir}/{savename}_{epoch}.keras"
+    )
 
     # model = tf.keras.models.load_model(
     #     f"{models_dir}/{savename}_{epoch}", compile=True
@@ -664,7 +674,7 @@ def compute_custom_loss_for_epoch(
     # Store MSE value in dict and full predictions
     results = {"mse": mse, "variance": variance, "Rsquared": r2}
     with open(
-        f"{PROCESSED_DATA_DIR}/models_by_epoch/{savename}/{savename}_{subset}_results.txt",
+        f"{MODELS_DIR}/models_by_epoch/{savename}/{subset}_results.txt",
         "w",
     ) as file:
         # Write each key-value pair in the dictionary to the file
@@ -673,7 +683,7 @@ def compute_custom_loss_for_epoch(
 
     # Store full df for scatterplots and analysis
     df_preds.to_csv(
-        f"{PROCESSED_DATA_DIR}/models_by_epoch/{savename}/{savename}_{subset}_{epoch}.csv"
+        f"{MODELS_DIR}/models_by_epoch/{savename}/{subset}_{epoch}.csv"
     )
 
     return df_preds
@@ -715,7 +725,7 @@ def plot_predictions_vs_real(
     import plotly.express as px
     from plotly import graph_objects as go
 
-    folder = f"{PROCESSED_DATA_DIR}/models_by_epoch/{modelname}"
+    folder = f"{MODELS_DIR}/models_by_epoch/{modelname}"
 
     # Open dataset
     best_case = pd.read_csv(rf"{folder}/{modelname}_test_{selected_epoch}.csv")
@@ -822,7 +832,7 @@ def compute_loss(
     )
 
     metrics_epochs = pd.read_csv(
-        f"{PROCESSED_DATA_DIR}/models_by_epoch/{savename}/{savename}_val_metrics_over_epochs.csv"
+        f"{MODELS_DIR}/models_by_epoch/{savename}/val_metrics_over_epochs.csv"
     )
 
     plot_mse_over_epochs(metrics_epochs, savename, metric="mse", save=True)
@@ -883,7 +893,7 @@ def rerun_train_val_metrics(
     # Compute metrics
     # Check if the CSV file exists, if not, create it with the column names
     csv_history_path = (
-        f"{PROCESSED_DATA_DIR}/models_by_epoch/{savename}/{savename}_history.csv"
+        f"{MODELS_DIR}/models_by_epoch/{savename}/history.csv"
     )
     store_dict = {
         "epoch": [],
@@ -896,11 +906,11 @@ def rerun_train_val_metrics(
     }
     pd.DataFrame(columns=store_dict.keys()).to_csv(csv_history_path, index=False)
 
-    for epoch in range(0, n_epochs, 5):
+    for epoch in range(0, n_epochs):
         print("Epoch", epoch + 1)
         store_dict["epoch"] = epoch
         model = keras.models.load_model(
-            f"{PROCESSED_DATA_DIR}/models_by_epoch/{savename}/{savename}_{epoch}"
+            f"{MODELS_DIR}/models_by_epoch/{savename}/{savename}_{epoch}.keras"
         )  # load the model from file
 
         losses = model.evaluate(train_dataset, steps=10_000 * sample_size / batch_size)
@@ -927,12 +937,12 @@ def rerun_train_val_metrics(
 
     # Plot metrics - Seteo bien el indice
     hist_df = pd.read_csv(
-        rf"{PROCESSED_DATA_DIR}/models_by_epoch/{savename}/{savename}_history.csv"
+        rf"{MODELS_DIR}/models_by_epoch/{savename}/history.csv"
     ).set_index("epoch")
-    hist_df.to_csv(rf"{PROCESSED_DATA_DIR}/models_by_epoch/{savename}/{savename}_history.csv")
+    hist_df.to_csv(rf"{MODELS_DIR}/models_by_epoch/{savename}/history.csv")
 
     plot_results(
-        models_dir=rf"{PROCESSED_DATA_DIR}/models_by_epoch/{savename}",
+        models_dir=rf"{MODELS_DIR}/models_by_epoch/{savename}",
         savename=savename,
         tiles=tiles,
         size=image_size,
@@ -991,6 +1001,6 @@ if __name__ == "__main__":
         stacked_images=[1],
         n_epochs=99,
         initial_epoch=initial_epoch,
-        model_path=f"{path_repo}/data/data_out/models_by_epoch/{model}_size{image_size}_tiles{tiles}_sample{sample_size}{extra}/{model}_size{image_size}_tiles{tiles}_sample{sample_size}{extra}_{initial_epoch}",
+        # model_path=f"{path_repo}/data/data_out/models_by_epoch/{model}_size{image_size}_tiles{tiles}_sample{sample_size}{extra}/{model}_size{image_size}_tiles{tiles}_sample{sample_size}{extra}_{initial_epoch}",
         extra="_nostack",
     )

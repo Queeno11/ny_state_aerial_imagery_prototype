@@ -6,7 +6,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 from typing import List, Dict
 from src import custom_models
-from src.utils.paths import PROJECT_ROOT, DATA_DIR, EXTERNAL_DATA_DIR, RAW_DATA_DIR, INTERIM_DATA_DIR, PROCESSED_DATA_DIR, RESULTS_DIR, LOGS_DIR, IMAGERY_ROOT
+from src.utils.paths import PROJECT_ROOT, DATA_DIR, EXTERNAL_DATA_DIR, RAW_DATA_DIR, INTERIM_DATA_DIR, PROCESSED_DATA_DIR, RESULTS_DIR, LOGS_DIR, IMAGERY_ROOT, MODELS_DIR
 pd.set_option("display.max_columns", None)
 
 # path_programas  = globales[7]
@@ -54,7 +54,7 @@ def get_true_val_loss(params):
     savename = main.generate_savename(
         model_name, image_size, learning_rate, stacked_images, years, extra
     )
-    metrics_path = rf"{PROCESSED_DATA_DIR}/models_by_epoch/{savename}/{savename}_test_metrics_over_epochs.csv"
+    metrics_path = rf"{MODELS_DIR}/models_by_epoch/{savename}/test_metrics_over_epochs.csv"
     if not os.path.exists(metrics_path):
 
         all_years_datasets, all_years_extents, df = main.open_datasets(
@@ -62,7 +62,7 @@ def get_true_val_loss(params):
         )
 
         metrics_epochs = true_metrics.compute_custom_loss_all_epochs(
-            rf"{PROCESSED_DATA_DIR}/models_by_epoch/{savename}",
+            rf"{MODELS_DIR}/models_by_epoch/{savename}",
             savename,
             all_years_datasets[
                 2013
