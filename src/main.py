@@ -267,54 +267,59 @@ def create_datasets(
 
     # --- 4. The Cyclic Pipeline Builder ---
     def build_cyclic_dataset(df_subset, subset_name, is_train=False):
-        
-        # For Validation/Test, we don't need rotation. Just cache once.
+        # Validation/Test logic remains the same (Static cache)
         if not is_train:
-            ds = tf.data.Dataset.from_tensor_slices(list(range(df_subset.shape[0])))
-            ds = ds.batch(READ_BATCH_SIZE)
-            ds = ds.map(lambda i: tf.py_function(lambda x: get_mini_batch_data(x, df_subset), [i], [tf.uint8, tf.float32]), num_parallel_calls=tf.data.AUTOTUNE)
-            def set_sh(img, lbl):
-                img.set_shape(OUTPUT_SHAPE_IMG); lbl.set_shape(OUTPUT_SHAPE_LBL); return img, lbl
-            ds = ds.map(set_sh).unbatch()
-            
-            cache_file = str(CACHE_DIR / f"{savename}_{subset_name}_static.tfcache")
-            # We must wrap the python call to clean the cache in a py_function
-            _ = tf.py_function(clean_cache_file, [cache_file], tf.int32)
-            ds = ds.cache(cache_file)
-            ds = ds.batch(TRAIN_BATCH_SIZE)
-            ds = ds.prefetch(tf.data.AUTOTUNE)
-            return ds
+            # ... (Keep your existing validation logic) ...
+            pass 
 
-        # --- TRAIN LOGIC (GRAPH-COMPATIBLE ROTATION) ---
+        # --- TRAIN LOGIC: SLIDING WINDOW ---
         
-        def make_one_cycle(cycle_index):
-            # Use tf.print for graph-compatible logging
-            tf.print("Starting data generation for cycle:", cycle_index)
+        # Configuration
+        ACTIVE_CYCLES = 5          # Number of files active at once (The Window Width)
+        EPOCHS_TO_SURVIVE = 5      # How long a standard file lives
+        TOTAL_CACHE_SLOTS = 20     # File naming pool
+        
+        def generator_func(cycle_index):
+            # 1. Determine Cache Lifecycle (The Stagger Logic)
+            # If this is one of the very first files (0-4), we give it a shorter life
+            # to ensure they don't all expire at the same time.
+            # File 0 -> Lives 1 epoch  (Dies after Ep 1)
+            # File 1 -> Lives 2 epochs (Dies after Ep 2)
+            # ...
+            # File 5+ -> Lives 5 epochs
+            
+            # We use int64 for comparison to match cycle_index tensor type
+            idx_chk = tf.cast(cycle_index, tf.int64)
+            active_chk = tf.cast(ACTIVE_CYCLES, tf.int64)
+            
+            repeats = tf.cond(
+                idx_chk < active_chk,
+                lambda: idx_chk + 1,        # Warmup phase: Staggered death
+                lambda: tf.cast(EPOCHS_TO_SURVIVE, tf.int64) # Stable phase: Full life
+            )
 
-            # 1. GRAPH-COMPATIBLE SAMPLING:
-            # Instead of df.sample(), we shuffle the full index list and take a subset.
-            all_indices_ds = tf.data.Dataset.from_tensor_slices(df_subset.index.to_numpy())
+            # 2. File Naming (Cyclic slots 0-19)
+            file_slot = tf.cast(cycle_index % TOTAL_CACHE_SLOTS, tf.int32)
+            cache_filename = tf.strings.join([
+                str(CACHE_DIR), f"/{savename}_{subset_name}_slot_", tf.strings.as_string(file_slot), ".tfcache"
+            ])
             
-            # Shuffle the full list of indices. The seed ensures we get a DIFFERENT shuffle for each cycle.
-            sampled_indices_ds = all_indices_ds.shuffle(
-                len(df_subset), 
-                seed=tf.cast(cycle_index, tf.int64), # Use cycle_index as the seed
-                reshuffle_each_iteration=False # We want one consistent sample per cycle
-            ).take(CACHE_SIZE)
-            
-            # 2. Determine Cache Filename (Toggle between A and B)
-            cycle_id = tf.cast(cycle_index % 2, tf.int32)
-            cache_filename = tf.strings.join([str(CACHE_DIR), f"/{savename}_train_cycle_", tf.strings.as_string(cycle_id), ".tfcache"])
-            
-            # 3. Clear previous cache
+            # 3. Clean old file
             _ = tf.py_function(clean_cache_file, [cache_filename], tf.int32)
             
-            # 4. Map the loader function onto our sampled indices
-            # The loader needs the original dataframe, which we can access via closure
+            # 4. Generate Data (Slow part, runs once per file lifecycle)
+            # Standardize size to avoid sync issues. 
+            # CACHE_SIZE should be approx (Total_Train_Size / 5).
+            all_indices_ds = tf.data.Dataset.from_tensor_slices(df_subset.index.to_numpy())
+            sampled_indices_ds = all_indices_ds.shuffle(
+                len(df_subset), 
+                seed=tf.cast(cycle_index, tf.int64),
+                reshuffle_each_iteration=False
+            ).take(CACHE_SIZE) 
+            
             ds = sampled_indices_ds.batch(READ_BATCH_SIZE)
             ds = ds.map(
                 lambda indices: tf.py_function(
-                    # We use the full df_subset and tell the loader which indices to use
                     func=lambda x: get_mini_batch_data(x, df_subset.loc[x.numpy()]),
                     inp=[indices],
                     Tout=[tf.uint8, tf.float32]
@@ -323,26 +328,40 @@ def create_datasets(
             )
             
             def set_shapes(imgs, lbls):
-                imgs.set_shape(OUTPUT_SHAPE_IMG); lbls.set_shape(OUTPUT_SHAPE_LBL); return imgs, lbls
+                imgs.set_shape(OUTPUT_SHAPE_IMG)
+                lbls.set_shape(OUTPUT_SHAPE_LBL)
+                return imgs, lbls
+            
             ds = ds.map(set_shapes).unbatch()
             
-            # 5. CACHE THE SUBSET
-            ds = ds.cache(tf.strings.as_string(cache_filename)) # Cast to string tensor
+            # 5. Save to Cache
+            ds = ds.cache(tf.strings.as_string(cache_filename))
             
-            # 6. Repeat, Shuffle, Batch, Augment
-            ds = ds.shuffle(1000) 
-            ds = ds.batch(TRAIN_BATCH_SIZE)
-            ds = ds.map(apply_augmentation, num_parallel_calls=tf.data.AUTOTUNE)
-            CYCLES_TO_SURVIVE = 5 
-            ds = ds.repeat(CYCLES_TO_SURVIVE)            
+            # 6. Repeat based on the Stagger Logic
+            ds = ds.repeat(repeats)
+            
             return ds
 
-        # Create the infinite stream of 1-epoch cycles
-        num_epochs = 500 # Your total epochs
-        master_ds = tf.data.Dataset.range(num_epochs).flat_map(make_one_cycle)
-        master_ds = master_ds.prefetch(tf.data.AUTOTUNE)
-        return master_ds
+        # --- THE ENGINE ---
         
+        # We start 5 workers immediately. 
+        # Note: The very first step of training will take time as it generates 5 files.
+        master_ds = tf.data.Dataset.range(100000) \
+            .interleave(
+                generator_func,
+                cycle_length=ACTIVE_CYCLES, # Keep 5 files open
+                block_length=1,             # Take 1 batch from A, 1 from B... (Mix perfectly)
+                num_parallel_calls=tf.data.AUTOTUNE,
+                deterministic=False
+            )
+
+        # 7. Standard Pipeline
+        master_ds = master_ds.shuffle(1000) 
+        master_ds = master_ds.batch(TRAIN_BATCH_SIZE)
+        master_ds = master_ds.map(apply_augmentation, num_parallel_calls=tf.data.AUTOTUNE)
+        master_ds = master_ds.prefetch(tf.data.AUTOTUNE)
+        
+        return master_ds    
     # --- Execution ---
     
     # Shuffle everything so images are not sequential:
@@ -506,11 +525,10 @@ def train_model(
     import tensorflow.python.keras.backend as K
 
     def get_last_trained_epoch(savename):
-
         model_dir = MODELS_DIR / "models_by_epoch" / f"{savename}"
         if os.path.exists(model_dir):
             files = os.listdir(model_dir)
-            epochs = [file.split("_")[-1] for file in files]
+            epochs = [file.split("_")[-1].replace(".keras", "") for file in files]
             epochs = [int(epoch) for epoch in epochs if epoch.isdigit()]
             
             if epochs:
@@ -806,11 +824,11 @@ def run(
     generate_parameters_log(params, savename)
 
     all_years_datasets, all_years_extents, df = open_datasets(
-        sat_data=sat_data, years=years# FIXME! 
+        sat_data=sat_data, years=[2022]# FIXME! 
     )
-    # print("**"*10)
-    # print("CORRIENDO SOLO CON 2022 PARA TESTEAR. SI TE APARECE ESTO, REVISAR!!!")
-    # print("**"*10)
+    print("**"*10)
+    print("CORRIENDO SOLO CON 2022 PARA TESTEAR. SI TE APARECE ESTO, REVISAR!!!")
+    print("**"*10)
     if train:
 
         ## Set Model & loss function
@@ -878,7 +896,7 @@ def run(
             n_epochs=n_epochs,
             n_bands=nbands,
             stacked_images=stacked_images,
-            generate=True,
+            generate=False,
             subset="test",
         )
 
@@ -920,7 +938,7 @@ if __name__ == "__main__":
         "stacked_images": [1, 4],
         "sample_size": 1,
         "small_sample": False,
-        "n_epochs": 200,
+        "n_epochs": 100,
         "learning_rate": 0.0005,
         "sat_data": "aerial",
         "years": [2016, 2018, 2020, 2022, 2024], # Only the data inside WSL! all data is: [2010, 2012, 2014, 2016, 2018, 2020, 2022, 2024],
@@ -928,4 +946,4 @@ if __name__ == "__main__":
     }
 
     # Run full pipeline
-    run(params, train=True, compute_loss=True, generate_grid=False)
+    run(params, train=False, compute_loss=True, generate_grid=False)

@@ -1,4 +1,5 @@
 ##############      Configuración      ##############
+from ast import Return
 import os
 import pickle
 from tokenize import String
@@ -336,12 +337,31 @@ def add_buffer(bounds, buffer):
     }
 
 def crop_dataset_to_link(ds, gdf, link):
-
     # obtengo el poligono correspondiente al link
-    multipolygon = gdf.loc[gdf["GEOID"] == link].dissolve()["geometry"][0]
+    gdf_sub = gdf.loc[gdf["GEOID"] == link].copy() 
+    if gdf_sub.empty:
+        return None
+
+    # Try to repair invalid geometries (common fix: buffer(0) or shapely.make_valid)
+    try:
+
+        # use unary_union (avoids groupby/dissolve topology issues)
+        multipolygon = gdf_sub.unary_union
+
+        if multipolygon is None or multipolygon.is_empty:
+            return None
+
+        if not multipolygon.is_valid:
+            multipolygon = multipolygon.buffer(0)
+
+    except Exception as e:
+        # Log and skip problematic geometry (caller handles None)
+        print(f"Warning: invalid geometry for link {link}: {e}")
+        return None
+
     # Get bounds of the shapefile's polygon
     bbox_img = add_buffer(multipolygon.bounds, 1000)
-    
+
     # Filter dataset based on the bounds of the shapefile's polygon
     image_ds = ds.sel(
         x=slice(float(bbox_img["minx"]), float(bbox_img["maxx"])),

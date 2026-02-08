@@ -363,7 +363,7 @@ def compute_custom_loss_all_epochs(
     import geopandas as gpd
     from tqdm import tqdm
 
-    mse_epochs = {epoch: None for epoch in range(n_epochs)}
+    mse_epochs = {epoch: 99 for epoch in range(n_epochs)}
     if verbose == False:
         blockPrint()
 
@@ -421,7 +421,7 @@ def compute_custom_loss_all_epochs(
     for link in tqdm(links):
         # Obtener las imágenes del radio censal
         link_real_value = df.loc[df["GEOID"] == link, "var"].values[0]
-        link_images = np.load(rf"{folder}/test_{link}.npy")
+        link_images = np.load(rf"{folder}/test_{link}.npy", mmap_mode="r")
         q_images = link_images.shape[0]
 
         link_names += [link] * q_images
@@ -443,7 +443,7 @@ def compute_custom_loss_all_epochs(
         weights=None,
     )
 
-    for epoch in range(150, n_epochs,2):
+    for epoch in range(0, n_epochs,5):
         filename = (
             f"{MODELS_DIR}/models_by_epoch/{savename}/{subset}_{epoch}.csv"
         )
@@ -524,7 +524,12 @@ def compute_custom_loss_all_epochs(
         "Se creo el archivo:",
         f"{MODELS_DIR}/models_by_epoch/{savename}/{subset}_metrics_over_epochs.csv",
     )
-
+    
+    # Garbage collect:
+    del images, link_names, real_values, df_preds
+    images, link_names, real_values, df_preds = None, None, None, None
+    gc.collect()
+    
     return metrics_epochs
 
 
