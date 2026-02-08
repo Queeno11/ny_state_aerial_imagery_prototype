@@ -512,19 +512,17 @@ def train_model(
             files = os.listdir(model_dir)
             epochs = [file.split("_")[-1] for file in files]
             epochs = [int(epoch) for epoch in epochs if epoch.isdigit()]
-            if not epochs:
-                # # Directory exists but has no saved model epochs (only history.csv or similar), remove it to start fresh
-                # shutil.rmtree(model_dir)
-                # os.makedirs(model_dir)
-                print("Model not found, running from begining")
-                initial_epoch = None
-
+            
+            if epochs:
+                # Return the maximum epoch found
+                return max(epochs)
+            else:
+                print("Model not found, running from beginning")
+                return None
         else:
             os.makedirs(model_dir)
-            print("Model not found, running from begining")
-            initial_epoch = None
-
-        return initial_epoch
+            print("Model not found, running from beginning")
+            return None
 
     initial_epoch = get_last_trained_epoch(savename)
 
@@ -545,13 +543,13 @@ def train_model(
         print("Restoring model...")
         try:
             model_path = (
-                f"{MODELS_DIR}/models_by_epoch/{savename}/{savename}_{initial_epoch}"
+                f"{MODELS_DIR}/models_by_epoch/{savename}/{savename}_{initial_epoch}.keras"
             )
             model = keras.models.load_model(model_path)  # load the model from file
         except:
             initial_epoch -= 1
             model_path = (
-                f"{MODELS_DIR}/models_by_epoch/{savename}/{savename}_{initial_epoch}"
+                f"{MODELS_DIR}/models_by_epoch/{savename}/{savename}_{initial_epoch}.keras"
             )
             model = keras.models.load_model(model_path)  # load the model from file
         initial_epoch = initial_epoch + 1
@@ -733,11 +731,8 @@ def set_model_and_loss_function(
 
     # Get model
     model = get_model_from_name[model_name]
-    model.load_weights(MODELS_DIR / "effnet_v2B1_lr0.0005_size128_y2016-2018-2020-2022-2024_stack1-4_Pooling.keras")
-    print(f"Loaded weights from {MODELS_DIR / 'effnet_v2B1_lr0.0005_size128_y2016-2018-2020-2022-2024_stack1-4_Pooling.keras'}")
-    print("Ensure this is ok!")
-    print("*"*1000)
-        # Set loss and metrics
+
+    # Set loss and metrics
     if kind == "reg":
         loss = keras.losses.MeanSquaredError()
         # loss = keras.losses.MeanAbsoluteError()
