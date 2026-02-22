@@ -856,7 +856,7 @@ def compute_loss(
     generate=False,
     subset="val",
 ):
-    Computo val_loss por RC
+    # Computo val_loss por RC
     metrics_epochs = compute_custom_loss_for_epochs(
         models_dir=models_dir,
         savename=savename,
