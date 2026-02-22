@@ -248,6 +248,7 @@ def create_datasets(
     data_augmentation = tf.keras.Sequential([
         tf.keras.layers.RandomFlip("horizontal_and_vertical"),
         tf.keras.layers.RandomContrast(0.2),
+        tf.keras.layers.RandomRotation(0.25),
     ])
 
     def apply_augmentation(img, lbl):
@@ -770,6 +771,151 @@ def set_model_and_loss_function(
 
     return model, loss, metrics
 
+def get_image_wrapper(idx, gdf, datasets, dataset_col, config):
+    """
+    Worker function that fetches one image. 
+    We pass 'idx' and look up the data in the global/passed variables.
+    """
+    # Convert tensor to numpy int
+    idx = int(idx)
+    row = gdf.iloc[idx]
+    
+    # Default placeholder (black image)
+    placeholder = np.zeros((config['resizing_size'], config['resizing_size'], config['nbands']), dtype=np.float32)
+
+    dataset_name = row[dataset_col]
+    if pd.isna(dataset_name) or dataset_name not in datasets:
+        return placeholder
+
+    ds = datasets[dataset_name]
+    geom = row.geometry
+
+    # Handle Point vs Polygon
+    if geom.geom_type != 'Point':
+        point = (geom.centroid.x, geom.centroid.y)
+        polygon = geom
+    else:
+        point = (geom.x, geom.y)
+        polygon = geom.buffer(10)
+
+    try:
+        # Heavy IO operation
+        image, _ = geo_utils.stacked_image_from_census_tract(
+            dataset=ds,
+            polygon=polygon,
+            point=point,
+            img_size=config['image_size'],
+            n_bands=config['nbands'],
+            stacked_images=config['stacked_images'],
+            bounds=True
+        )
+        
+        # Preprocessing
+        processed_img = geo_utils.process_image(
+            image, 
+            resizing_size=config['resizing_size'], 
+            moveaxis=True 
+        )
+        return processed_img.astype(np.float32)
+        
+    except Exception:
+        return placeholder
+
+
+def predict_buildings_income(
+    model, 
+    year=2022, 
+    batch_size=128,  # Increased batch size for GPU efficiency
+    image_size=128, 
+    resizing_size=128, 
+    nbands=4, 
+    stacked_images=[1],
+    output_name="predictions"
+):
+    from tqdm import tqdm 
+
+    # --- 2. Setup Data (Main Thread) ---
+    # 1. Load the Building Data
+    gdf = build_dataset.load_income_dataset()
+
+    print(f"Loading Satellite Imagery for {year}...")
+    datasets, extents = build_dataset.load_satellite_datasets(year=year)
+    
+    print("Mapping buildings to tiles...")
+    gdf = build_dataset.assign_datasets_to_gdf(
+        gdf, extents, year=year, centroid=True, buffer=False
+    )
+    dataset_col = f"dataset_{year}"
+    
+    # Configuration dict to pass to workers
+    config = {
+        'image_size': image_size,
+        'resizing_size': resizing_size,
+        'nbands': nbands,
+        'stacked_images': stacked_images
+    }
+
+    # --- 3. Build the TF.Data Pipeline ---
+    print("Building Parallel Pipeline...")
+    
+    # Create a dataset of INDICES (0, 1, 2, ... N)
+    indices_ds = tf.data.Dataset.range(len(gdf))
+
+    def map_func(idx):
+        img = tf.py_function(
+            func=lambda i: get_image_wrapper(i, gdf, datasets, dataset_col, config),
+            inp=[idx],
+            Tout=tf.float32
+        )
+        # Explicitly set shape so TensorFlow knows the dimensions
+        img.set_shape([resizing_size, resizing_size, nbands * len(stacked_images)])
+        return idx, img
+
+    # Apply map and batching
+    dataset = indices_ds.map(map_func, num_parallel_calls=tf.data.AUTOTUNE)
+    dataset = dataset.batch(batch_size).prefetch(tf.data.AUTOTUNE)
+
+    # Define augmentation layer
+    aug_layer = tf.keras.Sequential([
+        tf.keras.layers.RandomFlip("horizontal_and_vertical"),
+        tf.keras.layers.RandomContrast(0.2), # <--- This is likely the key factor
+    ])
+
+
+    # --- Setup Output File ---
+    output_file = RESULTS_DIR / f"{year}_{output_name}.csv"
+    # Create file with headers (overwrites if exists)
+    pd.DataFrame(columns=['index', 'predicted_value']).to_csv(output_file, index=False)
+    print(f"Saving incremental progress to: {output_file}")
+
+    # --- Start Iteration ---
+    print(f"Starting prediction on {len(gdf)} buildings...")
+    total_batches = int(np.ceil(len(gdf) / batch_size))
+
+    # Manually iterate over the dataset
+    for batch_indices, batch_images in tqdm(dataset, total=total_batches, desc="Predicting"):
+        
+        # 1. Predict on the current batch (runs on GPU)
+        batch_images = aug_layer(batch_images, training=True) # Force the transformation
+        batch_preds = model.predict_on_batch(batch_images)
+        
+        # 2. Convert to numpy and flatten
+        ids = batch_indices.numpy()
+        vals = batch_preds.flatten()
+        
+        # 3. Create a temporary DataFrame
+        batch_df = pd.DataFrame({
+            'index': ids, 
+            'predicted_value': vals
+        })
+        
+        # 4. Append to CSV immediately
+        # mode='a' appends, header=False avoids repeating headers
+        batch_df.to_csv(output_file, mode='a', header=False, index=False)
+
+    print("Prediction complete!")    
+
+    return gdf
 
 def generate_parameters_log(params, savename):
 
@@ -787,7 +933,7 @@ def run(
     params=None,
     train=True,
     compute_loss=True,
-    generate_grid=False,
+    generate_predictions=False,
 ):
     """Run all the code of this file.
 
@@ -823,12 +969,12 @@ def run(
 
     generate_parameters_log(params, savename)
 
+    # print("**"*10)
+    # print("CORRIENDO SOLO CON 2022 PARA TESTEAR. SI TE APARECE ESTO, REVISAR!!!")
+    # print("**"*10)
     all_years_datasets, all_years_extents, df = open_datasets(
-        sat_data=sat_data, years=[2022]# FIXME! 
+        sat_data=sat_data, years=years
     )
-    print("**"*10)
-    print("CORRIENDO SOLO CON 2022 PARA TESTEAR. SI TE APARECE ESTO, REVISAR!!!")
-    print("**"*10)
     if train:
 
         ## Set Model & loss function
@@ -889,37 +1035,62 @@ def run(
         true_metrics.compute_loss(  # No entra el test_dataset acá pero despues usa el df_test guardado en memoria
             models_dir=rf"{MODELS_DIR}/models_by_epoch/{savename}",
             savename=savename,
-            datasets=all_years_datasets[2022],
+            datasets=all_years_datasets,
             tiles=tiles,
             size=image_size,
             resizing_size=resizing_size,
             n_epochs=n_epochs,
             n_bands=nbands,
             stacked_images=stacked_images,
-            generate=False,
+            generate=True,
             subset="test",
         )
 
-    # if generate_grid:
-    #     print("Generando predicciones...")
-    #     # Generate gridded predictions & plot examples
-    #     for year in [2013, 2018, 2022]:  # all_years_datasets.keys():
-    #         grid_preds = grid_predictions.generate_grid(
-    #             savename,
-    #             all_years_datasets,
-    #             all_years_extents,
-    #             image_size,
-    #             resizing_size,
-    #             nbands,
-    #             stacked_images,
-    #             year=year,
-    #             generate=True,
-    #         )
-    #         if year==2013:
-    #             grid_preds_2013 =  grid_preds
-    #         grid_predictions.plot_all_examples(
-    #             all_years_datasets, all_years_extents, grid_preds, grid_preds_2013, savename, year
-    #         )
+    if generate_predictions:
+        print("Generando predicciones...")
+        model = tf.keras.models.load_model(MODELS_DIR / "models_by_epoch" / savename / f"{savename}_199.keras", compile=False)  # Load the best model saved during training
+        df_result = predict_buildings_income(
+            model=model,
+            image_size=image_size, 
+            resizing_size=resizing_size, 
+            nbands=nbands, 
+            stacked_images=stacked_images,
+            year=2022, 
+            output_name=f"predictions_{savename}"
+        )
+        df_result.to_parquet( RESULTS_DIR / "nyc_buildings_with_predictions.parquet")
+
+        df = pd.read_csv(RESULTS_DIR / f"2022_predictions_{savename}.csv")
+        gdf = build_dataset.load_income_dataset()
+        gdf = gdf.join(df, how="inner")
+        gdf.to_parquet(RESULTS_DIR / f"2022_predictions_{savename}.parquet")
+
+        # Fix broken geometries and dissolve by census tract to get tract-level predictions
+        gdf['geometry'] = gdf.geometry.buffer(0)
+        gdf_by_census_tract = gdf.dissolve(
+            "GEOID", 
+            aggfunc={'var': 'mean', 'predicted_value': 'mean'}
+        )
+        gdf_by_census_tract.to_parquet(RESULTS_DIR / f"2022_predictions_by_tract_{savename}.parquet")
+
+        # # Generate gridded predictions & plot examples
+        # for year in [2022]:  # all_years_datasets.keys():
+        #     grid_preds = grid_predictions.generate_grid(
+        #         savename,
+        #         all_years_datasets,
+        #         all_years_extents,
+        #         image_size,
+        #         resizing_size,
+        #         nbands,
+        #         stacked_images,
+        #         year=year,
+        #         generate=True,
+        #     )
+        #     if year==2013:
+        #         grid_preds_2013 =  grid_preds
+        #     grid_predictions.plot_all_examples(
+        #         all_years_datasets, all_years_extents, grid_preds, grid_preds_2013, savename, year
+        #     )
 
 
 if __name__ == "__main__":
@@ -938,7 +1109,7 @@ if __name__ == "__main__":
         "stacked_images": [1, 4],
         "sample_size": 1,
         "small_sample": False,
-        "n_epochs": 100,
+        "n_epochs": 1200,
         "learning_rate": 0.0005,
         "sat_data": "aerial",
         "years": [2016, 2018, 2020, 2022, 2024], # Only the data inside WSL! all data is: [2010, 2012, 2014, 2016, 2018, 2020, 2022, 2024],
@@ -946,4 +1117,4 @@ if __name__ == "__main__":
     }
 
     # Run full pipeline
-    run(params, train=False, compute_loss=True, generate_grid=False)
+    run(params, train=False, compute_loss=True, generate_predictions=True)

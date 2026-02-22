@@ -13,8 +13,6 @@ pd.set_option("display.max_columns", None)
 
 # path_programas  = globales[7]
 ###############################################
-import src.prediction_tools as prediction_tools
-import src.custom_models as custom_models
 import src.build_dataset as build_dataset
 import src.geo_utils as geo_utils
 import src.main as main
@@ -91,11 +89,13 @@ def generate_prediction_images(
         link_dataset = build_dataset.get_dataset_for_gdf(
             df_test, sat_img_datasets, link, year=year
         )
-        if link_dataset is None:
-            continue
         if os.path.isfile(file):
-            # print(f"El archivo {file} ya existe, se saltea la generación de imágenes...")
+            print(f"El archivo {file} ya existe, se saltea la generación de imágenes...")
             valid_links += [link]
+            continue
+
+        if link_dataset is None:
+            print(f"No dataset found for link {link}, skipping... I think there is a bug here...") 
             continue
 
         images, points, bounds = build_dataset.get_prediction_images_for_link(
@@ -118,7 +118,9 @@ def generate_prediction_images(
             np.save(file, images)
             valid_links += [link]
 
+    print(f"Se generaron imágenes para {len(valid_links)} radios censales.")
     valid_links = np.array(valid_links)
+    print(f"Se generaron imágenes para {len(valid_links)} radios censales.")
     np.save(rf"{test_folder}/valid_links.npy", valid_links)
     print("Imagenes generadas!")
 
@@ -189,7 +191,7 @@ def get_gridded_predictions_for_grid(
         from shapely import Polygon
 
         # Get convex hull of icpag
-        exterior = icpag.geometry.unary_union.convex_hull
+        exterior = icpag.geometry.union_all().convex_hull
 
         # Clip
         grid = grid[grid.centroid.within(exterior)]
@@ -325,7 +327,7 @@ def get_batch_predictions(model, batch_images):
     return predictions
 
 
-def compute_custom_loss_all_epochs(
+def compute_custom_loss_for_epochs(
     models_dir,
     savename,
     datasets,
@@ -339,6 +341,8 @@ def compute_custom_loss_all_epochs(
     generate=False,
     verbose=False,
     kind="reg",
+    epochs_to_compute=None,
+    year=2022
 ):
     """
     Calcula el ECM del conjunto de predicción.
@@ -386,16 +390,21 @@ def compute_custom_loss_all_epochs(
         df = df.reset_index()
         os.makedirs(rf"{PROCESSED_DATA_DIR}/val_datasets/", exist_ok=True)
         df.to_feather(rf"{PROCESSED_DATA_DIR}/val_datasets/{savename}_val_dataframe.feather")
+        print(len(df), "rows in val set")
     print("Data loaded!")
 
     # dir of the images
     stacked_names = "-".join(
         str(x) for x in stacked_images
     )  # Transforms list [1,2] to string like "1-2"
-    folder = rf"{IMAGERY_ROOT}/{subset}_datasets/{subset}_size{size}_tiles{tiles}_stacked{stacked_names}"
+    if subset=="val":
+        folder = rf"{IMAGERY_ROOT}/{subset}_datasets/{subset}_size{size}_tiles{tiles}_stacked{stacked_names}"
+    else:
+        folder = rf"{IMAGERY_ROOT}/{subset}_datasets/{subset}_size{size}_tiles{tiles}_stacked{stacked_names}/{year}"
+
 
     # Genero las imágenes
-    if generate or ~os.path.isfile(rf"{folder}/valid_links.npy"):
+    if generate or not os.path.isfile(rf"{folder}/valid_links.npy"):        
         print("Generando imágenes por edificio...")
         folder = generate_prediction_images(
             df,
@@ -406,34 +415,62 @@ def compute_custom_loss_all_epochs(
             resizing_size,
             n_bands,
             stacked_images,
-            year=2022,
+            year=year,
         )
-
     links = np.load(rf"{folder}/valid_links.npy")
 
-    # Cargo todas las imágenes en memoria
-    print("Cargando arrays en memoria...")
-    # blockPrint()
-    link_names = []
-    real_values = []
-    images = []
-
+    print("Creating TF Dataset pipeline...")
+        
+    # 1. Create a flat list of metadata
+    # We need to know exactly which file and which index corresponds to every single image
+    image_pointers = []
+    real_values_flat = []
+    geoids_flat = []
+    print(len(links), "links to process")
     for link in tqdm(links):
-        # Obtener las imágenes del radio censal
-        link_real_value = df.loc[df["GEOID"] == link, "var"].values[0]
-        link_images = np.load(rf"{folder}/test_{link}.npy", mmap_mode="r")
-        q_images = link_images.shape[0]
+        path = rf"{folder}/test_{link}.npy"
+        # Just peek at shape
+        assert os.path.isfile(path), f"File {path} not found. Check if images were generated correctly."
+        n_imgs = np.load(path).shape[0]
+        assert n_imgs > 0, f"No images found in file {path}. Check if images were generated correctly."
+        val = df.loc[df["GEOID"] == link, "var"].values[0]
+        for i in range(n_imgs):
+            # Store tuple: (path_to_file, index_in_file)
+            image_pointers.append((path, i))
+            real_values_flat.append(val)
+            geoids_flat.append(link)
 
-        link_names += [link] * q_images
-        real_values += [link_real_value] * q_images
-        images += [link_images]
+    # Convert to numpy arrays for TF
+    print(len(image_pointers), "images to predict")
+    image_pointers_arr = np.array(image_pointers)
+    real_values_flat = np.array(real_values_flat)
+    geoids_flat = np.array(geoids_flat)
 
-    # Agrega al batch de valores reales / imagenes para la prediccion
-    images = np.concatenate(images, axis=0)
-    link_names = np.array(link_names)
-    real_values = np.array(real_values)
-    print("Arrays cargados!")
+    # 2. Define the loader function
+    def load_img(path_idx):
+        path = path_idx[0].numpy().decode('utf-8')
+        idx = int(path_idx[1])
+        # Load specific row from disk using mmap
+        # This is very fast on SSD
+        arr = np.load(path, mmap_mode='r')
+        img = arr[idx].astype(np.float32) # Ensure float32
+        return img
 
+    # 3. Build Dataset
+    ds = tf.data.Dataset.from_tensor_slices(image_pointers_arr)
+    
+    # Wrap python load function
+    ds = ds.map(lambda x: tf.py_function(load_img, [x], tf.float32), 
+                num_parallel_calls=tf.data.AUTOTUNE)
+    
+    # Set shape (Critical for Keras!)
+    # Assuming standard shape, e.g. (128, 128, bands)
+    ds = ds.map(lambda x: tf.ensure_shape(x, [resizing_size, resizing_size, n_bands * len(stacked_images)]))
+    
+    ds = ds.batch(256).prefetch(tf.data.AUTOTUNE)
+
+
+    #### Load model
     model_name = savename.split("_")[0] + "_" + savename.split("_")[1]
     model, _, _ = main.set_model_and_loss_function(
         model_name=model_name,
@@ -443,47 +480,53 @@ def compute_custom_loss_all_epochs(
         weights=None,
     )
 
-    for epoch in range(0, n_epochs,5):
+    if epochs_to_compute is None:
+        epochs_to_compute = range(0, n_epochs, 5)  # Default: every 5 epochs
+    
+    for epoch in epochs_to_compute:
+
         filename = (
             f"{MODELS_DIR}/models_by_epoch/{savename}/{subset}_{epoch}.csv"
         )
 
-        if os.path.exists(filename):
-            df_preds = pd.read_csv(filename)
-            df_preds["mean_prediction"] = df_preds.groupby(
-                by="GEOID"
-            ).predictions.transform("mean")
-            df_preds["error"] = df_preds["mean_prediction"] - df_preds["real_value"]
-            df_preds["sq_error"] = df_preds["error"] ** 2
-            mse = df_preds.drop_duplicates(subset=["GEOID"]).sq_error.mean()
+        # if os.path.exists(filename):
+        #     df_preds = pd.read_csv(filename)
+        #     df_preds["mean_prediction"] = df_preds.groupby(
+        #         by="GEOID"
+        #     ).predictions.transform("mean")
+        #     df_preds["error"] = df_preds["mean_prediction"] - df_preds["real_value"]
+        #     df_preds["sq_error"] = df_preds["error"] ** 2
+        #     mse = df_preds.drop_duplicates(subset=["GEOID"]).sq_error.mean()
+        #     r2 = 1 - mse / df_preds.drop_duplicates(subset=["GEOID"]).real_value.var()
+        #     print(f"Epoch {epoch}/{n_epochs} (previously computed): True Mean Squared Error: {mse}, , R2: {r2} ")
 
-            print(f"Epoch {epoch}/{n_epochs} (previously computed): True Mean Squared Error: {mse}")
+        #     # Store MSE value in dict and full predictions
+        #     mse_epochs[epoch] = mse
 
-            # Store MSE value in dict and full predictions
-            mse_epochs[epoch] = mse
-
-            continue
+        #     continue
 
         try:
-            model = keras.models.load_model(                
+            model = keras.models.load_model(
                 f"{MODELS_DIR}/models_by_epoch/{savename}/{savename}_{epoch}.keras"
             )
-
-            # model = tf.keras.models.load_model(
-            #     f"{models_dir}/{savename}_{epoch}", compile=True
-            # )
-            predictions = get_batch_predictions(model, images)
+            
+            # Keras predict handles the batching automatically now
+            predictions = model.predict(ds, verbose=1)
+            
+            # Flatten predictions if needed (sometimes returns list of lists)
+            predictions = predictions.flatten() 
+            
             K.clear_session()
 
         except Exception as error:
             print("Error en epoca:", epoch, error)
-            predictions = real_values
+            predictions = real_values_flat
 
         # Creo dataframe para exportar:
         d = {
-            "GEOID": link_names,
+            "GEOID": geoids_flat,
             "predictions": predictions,
-            "real_value": real_values,
+            "real_value": real_values_flat,
         }
         df_preds = pd.DataFrame(data=d)
         df_preds = df_preds[df_preds.predictions != df_preds.predictions.mode().squeeze()] # FIXME: This removes black pixels! Probably there's a more elegant way to do it... 
@@ -524,11 +567,6 @@ def compute_custom_loss_all_epochs(
         "Se creo el archivo:",
         f"{MODELS_DIR}/models_by_epoch/{savename}/{subset}_metrics_over_epochs.csv",
     )
-    
-    # Garbage collect:
-    del images, link_names, real_values, df_preds
-    images, link_names, real_values, df_preds = None, None, None, None
-    gc.collect()
     
     return metrics_epochs
 
@@ -719,13 +757,19 @@ def plot_mse_over_epochs(mse_df, modelname, metric="mse", save=False):
     )
 
     if save:
-        fig.write_image(
-            f"{RESULTS_DIR}/{modelname}/mse_best_prediction_{modelname}.png"
-        )
+        try:
+            fig.write_image(
+                f"{RESULTS_DIR}/figures/mse_best_prediction_{modelname}.png"
+            )
+        except RuntimeError:
+            # Fallback to HTML if Chrome/Kaleido is not available
+            fig.write_html(
+                f"{RESULTS_DIR}/figures/mse_best_prediction_{modelname}.html"
+            )
 
 
 def plot_predictions_vs_real(
-    modelname, selected_epoch, quantiles=False, last_training=False, save=False
+    modelname, selected_epoch, quantiles=False, last_training=False, save=False, year=None
 ):
     import plotly.express as px
     from plotly import graph_objects as go
@@ -733,7 +777,7 @@ def plot_predictions_vs_real(
     folder = f"{MODELS_DIR}/models_by_epoch/{modelname}"
 
     # Open dataset
-    best_case = pd.read_csv(rf"{folder}/{modelname}_test_{selected_epoch}.csv")
+    best_case = pd.read_csv(rf"{folder}/test_{selected_epoch[0]}.csv")
     best_case = (
         best_case.groupby("GEOID")[["real_value", "mean_prediction"]]
         .mean()
@@ -776,13 +820,25 @@ def plot_predictions_vs_real(
 
     if save:
         if quantiles:
-            fig.write_image(
-                f"{RESULTS_DIR}/{modelname}/prediction_vs_real_best_prediction_{modelname}_q.png"
-            )
+            try:
+                fig.write_image(
+                    f"{RESULTS_DIR}/figures/prediction_vs_real_best_prediction_{modelname}_q_{year}.png"
+                )
+            except RuntimeError:
+                # Fallback to HTML if Chrome/Kaleido is not available
+                fig.write_html(
+                    f"{RESULTS_DIR}/figures/prediction_vs_real_best_prediction_{modelname}_q_{year}.html"
+                )
         else:
-            fig.write_image(
-                f"{RESULTS_DIR}/{modelname}/prediction_vs_real_best_prediction_{modelname}.png"
-            )
+            try:
+                fig.write_image(
+                    f"{RESULTS_DIR}/figures/prediction_vs_real_best_prediction_{modelname}_{year}.png"
+                )
+            except RuntimeError:
+                # Fallback to HTML if Chrome/Kaleido is not available
+                fig.write_html(
+                    f"{RESULTS_DIR}/figures/prediction_vs_real_best_prediction_{modelname}_{year}.html"
+                )
 
     return fig
 
@@ -790,7 +846,7 @@ def plot_predictions_vs_real(
 def compute_loss(
     models_dir,
     savename,
-    datasets,  # Only for 2013!! all_years_datasets have to be filtered before
+    datasets,
     tiles=1,
     size=128,
     resizing_size=128,
@@ -800,8 +856,8 @@ def compute_loss(
     generate=False,
     subset="val",
 ):
-    # Computo val_loss por RC
-    metrics_epochs = compute_custom_loss_all_epochs(
+    Computo val_loss por RC
+    metrics_epochs = compute_custom_loss_for_epochs(
         models_dir=models_dir,
         savename=savename,
         datasets=datasets,
@@ -814,39 +870,42 @@ def compute_loss(
         verbose=True,
         generate=generate,
         subset="val",
+        epochs_to_compute=range(0, n_epochs, 5),
     )
     optimal_epoch = metrics_epochs.loc[
         metrics_epochs["mse_test_rc"] == metrics_epochs["mse_test_rc"].min()
-    ].index.values[0]
-
+    ].index.values
+    # optimal_epoch = [1132]
     # Computo test_loss por RC
-    metrics_epochs = compute_custom_loss_for_epoch(
-        models_dir=models_dir,
-        savename=savename,
-        datasets=datasets,
-        tiles=tiles,
-        size=size,
-        resizing_size=resizing_size,
-        n_epochs=n_epochs,
-        n_bands=n_bands,
-        stacked_images=stacked_images,
-        verbose=True,
-        generate=generate,
-        subset=subset,
-        epoch=optimal_epoch,
-    )
+    for year in [2022]:#[2016, 2018, 2020, 2022, 2024]:
+        metrics_epochs = compute_custom_loss_for_epochs(
+            models_dir=models_dir,
+            savename=savename,
+            datasets=datasets[year],
+            tiles=tiles,
+            size=size,
+            resizing_size=resizing_size,
+            n_epochs=n_epochs,
+            n_bands=n_bands,
+            stacked_images=stacked_images,
+            verbose=True,
+            generate=generate,
+            subset=subset,
+            epochs_to_compute=optimal_epoch,
+            year=year
+        )
 
-    metrics_epochs = pd.read_csv(
-        f"{MODELS_DIR}/models_by_epoch/{savename}/val_metrics_over_epochs.csv"
-    )
+        # metrics_epochs = pd.read_csv(
+        #     f"{MODELS_DIR}/models_by_epoch/{savename}/val_metrics_over_epochs.csv"
+        # )
 
-    plot_mse_over_epochs(metrics_epochs, savename, metric="mse", save=True)
-    plot_predictions_vs_real(
-        savename, selected_epoch=optimal_epoch, quantiles=False, save=True
-    )
-    plot_predictions_vs_real(
-        savename, selected_epoch=optimal_epoch, quantiles=True, save=True
-    )
+        # plot_mse_over_epochs(metrics_epochs, savename, metric="mse", save=True)
+        plot_predictions_vs_real(
+            savename, selected_epoch=optimal_epoch, quantiles=False, save=True, year=year
+        )
+    # plot_predictions_vs_real(
+    #     savename, selected_epoch=optimal_epoch, quantiles=True, save=True
+    # )
 
 
 def rerun_train_val_metrics(

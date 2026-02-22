@@ -440,7 +440,7 @@ def random_tiled_image_from_census_tract(
     return composition, point, boundaries, total_boundaries
 
 
-def process_image(img, resizing_size, moveaxis=True):
+def process_image(img, resizing_size, moveaxis=True, dtype=np.uint8):
     if moveaxis:
         img = np.moveaxis(
             img, 0, 2
@@ -454,6 +454,7 @@ def process_image(img, resizing_size, moveaxis=True):
             img, dsize=(resizing_size, resizing_size), interpolation=cv2.INTER_CUBIC
         )
 
+    img = img.astype(dtype)
     return img
 
 

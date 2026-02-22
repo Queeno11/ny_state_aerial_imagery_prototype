@@ -96,7 +96,7 @@ def load_satellite_datasets(year=2014, stretch=False, engine="zarr"):
 #     return datasets, extents
 
 
-def load_income_dataset(variable="avg_hh_inc", trim=False):
+def load_income_dataset(variable="avg_hh_inc", trim=False, log=True):
     """Open income dataset and merge with ELL estimation (small area estimates)."""
 
     # Open SAE dataset
@@ -115,6 +115,10 @@ def load_income_dataset(variable="avg_hh_inc", trim=False):
 
     # Normalize ELL estimation:
     # FIXME: I should do this normalization based on census tract estimates, not buildings...
+    if log:
+        gdf[variable + "_log"] = gdf[variable].apply(lambda x: np.log(x))
+        variable = variable + "_log"
+
     var_mean = gdf[variable].mean()
     var_std = gdf[variable].std()
     gdf["var"] = (gdf[variable] - var_mean) / var_std
@@ -124,7 +128,8 @@ def load_income_dataset(variable="avg_hh_inc", trim=False):
     pd.DataFrame().from_dict(data_dict, orient="index", columns=[variable]).to_csv(
         PROCESSED_DATA_DIR / f"scalars_{variable}_trim{trim}_{date}.csv"
     )
-
+    gdf.to_parquet(PROCESSED_DATA_DIR / f"gdf_{variable}_trim{trim}_{date}.parquet")
+    
     return gdf
 
 
@@ -346,7 +351,7 @@ def crop_dataset_to_link(ds, gdf, link):
     try:
 
         # use unary_union (avoids groupby/dissolve topology issues)
-        multipolygon = gdf_sub.unary_union
+        multipolygon = gdf_sub.union_all()
 
         if multipolygon is None or multipolygon.is_empty:
             return None
