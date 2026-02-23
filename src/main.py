@@ -576,16 +576,99 @@ def train_model(
     # The number of steps is the number of samples divided by batch size
     validation_steps = 100 # Use your TRAIN_BATCH_SIZE
     steps_per_epoch = CACHE_SIZE // 128
+    # Create a persistent Python generator to shield the dataset from Keras 3 resets
+    _train_iter = iter(train_dataset)
+    def persistent_generator():
+        while True:
+            yield next(_train_iter)
+            
+    train_gen = persistent_generator()
 
-    history = model.fit(
-        train_dataset,
-        epochs=epochs,
-        steps_per_epoch=steps_per_epoch, # Total train buildings in NYC = 328875 x 
-        initial_epoch=initial_epoch,
-        # validation_data=val_dataset,
-        # validation_steps=validation_steps,
-        callbacks=callbacks,
-    )
+    # Extract the base model (EfficientNet, MobileNet, etc.) which is the first layer
+    base_model = model.layers[0]
+    
+    # Check if we are using a transfer learning model or a custom from-scratch CNN
+    is_transfer_learning = False #isinstance(base_model, tf.keras.Model)
+
+    if is_transfer_learning:
+        # Define Epoch Boundaries
+        phase1_epochs = 3  # First 10% of epochs
+        phase2_epochs = int(epochs * 0.5)  # Up to 30% of epochs
+
+        # ==========================================
+        # PHASE 1: Train Head Only
+        # ==========================================
+        if initial_epoch < phase1_epochs:
+            print(f"\n--- PHASE 1: Training Head Only (Epochs {initial_epoch} to {phase1_epochs}) ---")
+            base_model.trainable = False
+            
+            optimizer = tf.keras.optimizers.Nadam(learning_rate=lr)
+            model.compile(optimizer=optimizer, loss=loss, metrics=metrics, jit_compile=False)
+            
+            history = model.fit(
+                train_gen, epochs=phase1_epochs, steps_per_epoch=steps_per_epoch,
+                initial_epoch=initial_epoch, callbacks=callbacks,
+                # validation_data=val_dataset, validation_steps=validation_steps,
+            )
+            initial_epoch = phase1_epochs # Update for next phase
+
+        # ==========================================
+        # PHASE 2: Unfreeze Top 20 Layers
+        # ==========================================
+        if initial_epoch < phase2_epochs:
+            print(f"\n--- PHASE 2: Unfreezing Top 20 Layers (Epochs {initial_epoch} to {phase2_epochs}) ---")
+            base_model.trainable = True
+            
+            # Re-freeze everything EXCEPT the top 20 layers
+            for layer in base_model.layers[:-20]:
+                layer.trainable = False
+            
+            for layer in base_model.layers:
+                if isinstance(layer, tf.keras.layers.BatchNormalization):
+                    layer.trainable = False
+
+            # CRITICAL: Recompile with a smaller learning rate!
+            optimizer = tf.keras.optimizers.Nadam(learning_rate=lr * 0.1)
+            model.compile(optimizer=optimizer, loss=loss, metrics=metrics, jit_compile=False)
+
+            history = model.fit(
+                train_gen, epochs=phase2_epochs, steps_per_epoch=steps_per_epoch,
+                initial_epoch=initial_epoch, callbacks=callbacks,
+                # validation_data=val_dataset, validation_steps=validation_steps,
+            )
+            initial_epoch = phase2_epochs
+
+        # ==========================================
+        # PHASE 3: Unfreeze Entire Network
+        # ==========================================
+        if initial_epoch < epochs:
+            print(f"\n--- PHASE 3: Unfreezing Entire Network (Epochs {initial_epoch} to {epochs}) ---")
+            base_model.trainable = True # Unfreeze everything
+
+            for layer in base_model.layers:
+                if isinstance(layer, tf.keras.layers.BatchNormalization):
+                    layer.trainable = False
+
+            
+            # CRITICAL: Recompile with an even smaller learning rate!
+            optimizer = tf.keras.optimizers.Nadam(learning_rate=lr * 0.05)
+            model.compile(optimizer=optimizer, loss=loss, metrics=metrics, jit_compile=False)
+
+            history = model.fit(
+                train_gen, epochs=epochs, steps_per_epoch=steps_per_epoch,
+                initial_epoch=initial_epoch, callbacks=callbacks,
+                # validation_data=val_dataset, validation_steps=validation_steps,
+            )
+    else:
+        history = model.fit(
+            train_dataset,
+            epochs=epochs,
+            steps_per_epoch=steps_per_epoch, # Total train buildings in NYC = 328875 x 
+            initial_epoch=initial_epoch,
+            # validation_data=val_dataset,
+            # validation_steps=validation_steps,
+            callbacks=callbacks,
+        )
 
     return model, history  # type: ignore
 
@@ -654,6 +737,7 @@ def validate_parameters(params, default_params):
     nbands = params["nbands"]
     years = params["years"]
     resizing_size = params["resizing_size"]
+    weights = params["weights"]
 
     sat_options = ["aerial", "pleiades", "landsat"]
     if sat_data not in sat_options:
@@ -717,28 +801,30 @@ def fill_params_defaults(params):
 
 
 def set_model_and_loss_function(
-    model_name: str, kind: str, resizing_size: int, weights: str, bands: int = 4
+    model_name: str, kind: str, resizing_size: int, bands: int = 4, weights: str = None
 ):
+        
     # Diccionario de modelos
     get_model_from_name = {
         "small_cnn": custom_models.small_cnn(resizing_size),  # kind=kind),
         "mobnet_v3_large": custom_models.mobnet_v3_large(
-            resizing_size, bands=bands, kind=kind, weights=weights
+            resizing_size, bands=bands, kind=kind,
         ),
         "effnet_v2S": custom_models.efficientnet_v2S(
-            resizing_size, bands=bands, kind=kind, weights=weights
+            resizing_size, bands=bands, kind=kind,
         ),
         "effnet_v2M": custom_models.efficientnet_v2M(
-            resizing_size, bands=bands, kind=kind, weights=weights
+            resizing_size, bands=bands, kind=kind,
         ),
         "effnet_v2B1": custom_models.efficientnet_v2B1(
-            resizing_size, bands=bands, kind=kind, weights=weights
+            resizing_size, bands=bands, kind=kind,
         ),
         "spatialecon_cnn": custom_models.spatialecon_cnn(
             resizing_size,
             bands=bands,
         ),
     }
+
 
     # Validación de parámetros
     assert kind in ["reg", "cla"], "kind must be either 'reg' or 'cla'"
@@ -750,6 +836,12 @@ def set_model_and_loss_function(
 
     # Get model
     model = get_model_from_name[model_name]
+
+    # Load weights if provided
+    if weights is not None and weights not in ["imagenet"]:
+        model.load_weights(weights)
+        print(f"\n--- 🚀 Successfully loaded custom weights from: {weights} ---")
+
 
     # Set loss and metrics
     if kind == "reg":
@@ -961,14 +1053,13 @@ def run(
     years = params["years"]
     extra = params["extra"]
 
-    #
     savename = generate_savename(
         model_name, image_size, learning_rate, stacked_images, years, extra
     )
     log_dir = f"{LOGS_DIR}/{model_name}_{datetime.now().strftime('%Y%m%d-%H%M%S')}"
 
     generate_parameters_log(params, savename)
-
+    learning_rate = learning_rate / 2
     # print("**"*10)
     # print("CORRIENDO SOLO CON 2022 PARA TESTEAR. SI TE APARECE ESTO, REVISAR!!!")
     # print("**"*10)
@@ -1101,20 +1192,20 @@ if __name__ == "__main__":
     params = {
         "model_name": "effnet_v2B1",
         "kind": "reg",
-        "weights": None,
-        "image_size": 128,
+        "weights": None,#str(MODELS_DIR / "effnet_v2B1_lr0.0005_size128_y2016-2018-2020-2022-2024_stack1-4_Pooling.keras"),
+        "image_size": 128*3,
         "resizing_size": 128,
         "tiles": 1,
         "nbands": 4,
-        "stacked_images": [1, 4],
+        "stacked_images": [1, 3],
         "sample_size": 1,
         "small_sample": False,
-        "n_epochs": 1200,
-        "learning_rate": 0.0005,
+        "n_epochs": 200,
+        "learning_rate": 0.01,
         "sat_data": "aerial",
         "years": [2016, 2018, 2020, 2022, 2024], # Only the data inside WSL! all data is: [2010, 2012, 2014, 2016, 2018, 2020, 2022, 2024],
-        "extra": "_Pooling",
+        "extra": "_transferfrom_stacked_1-4_Pooling",  # Extra info to add to the savename (e.g. for ablation studies)
     }
 
     # Run full pipeline
-    run(params, train=False, compute_loss=True, generate_predictions=True)
+    run(params, train=True, compute_loss=True, generate_predictions=True)
