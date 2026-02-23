@@ -83,6 +83,8 @@ target/
 *.h5
 *.keras
 
+# Docs
+docs/
 
 # Pycharm
 .idea
