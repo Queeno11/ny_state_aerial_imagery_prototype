@@ -22,7 +22,7 @@ from tensorflow.keras.applications import (
 )
 
 
-def rebuild_top(model_base, kind="cla") -> Sequential:
+def rebuild_top(model_base, kind="cla", legacy=False) -> Sequential:
     """Rebuild top of a pre-trained model to make it suitable for classification or regression."""
 
     assert kind in ["cla", "reg"], "kind must be either cla or reg"
@@ -31,12 +31,16 @@ def rebuild_top(model_base, kind="cla") -> Sequential:
 
     model.add(model_base)
 
-    # Rebuild top
-    #   Based on: https://github.com/MarkusRosen/keras-efficientnet-regression/blob/master/efficient_net_keras_regression.py    
-    model.add(layers.GlobalAveragePooling2D(name="avg_pool"))
-    model.add(layers.BatchNormalization())
-    top_dropout_rate = 0.4
-    model.add(layers.Dropout(top_dropout_rate, name="top_dropout"))
+    if legacy is False:
+        # Rebuild top
+        #   Based on: https://github.com/MarkusRosen/keras-efficientnet-regression/blob/master/efficient_net_keras_regression.py    
+        model.add(layers.GlobalAveragePooling2D(name="avg_pool"))
+        model.add(layers.BatchNormalization())
+        top_dropout_rate = 0.4
+        model.add(layers.Dropout(top_dropout_rate, name="top_dropout"))
+
+    else: 
+        model.add(layers.Flatten())
 
     if kind == "cla":
         # Add fully conected layers
@@ -76,7 +80,7 @@ def efficientnet_v2S(resizing_size, bands=8, kind="reg", weights=None) -> Sequen
     if weights is not None:
         model_base.trainable = False
 
-    model = rebuild_top(model_base, kind=kind)
+    model = rebuild_top(model_base, kind=kind, legacy=True)
     return model
 
 
