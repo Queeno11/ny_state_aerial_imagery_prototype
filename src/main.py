@@ -499,6 +499,7 @@ def train_model(
     callbacks: List[Union[TensorBoard, EarlyStopping, ModelCheckpoint]],
     savename: str = "",
     logdir: str = "",
+    unfreeze_base: bool = True,
 ):
     """This function runs a keras model with the Ranger optimizer and multiple callbacks. The model is evaluated within
     training through the validation generator and afterwards one final time on the test generator.
@@ -548,7 +549,13 @@ def train_model(
     if initial_epoch is None:
         # constructs the model and compiles it
         model = model_function
-        model.summary()
+        # Optionally unfreeze the base model (if a nested functional model is present)
+        if unfreeze_base:
+            # Use helper in custom_models to unfreeze nested base or top-level layers
+            try:
+                custom_models.unfreeze_base_model(model)
+            except Exception:
+                model.trainable = True
         # keras.utils.plot_model(model, to_file=model_name + ".png", show_shapes=True)
 
         # optimizer = tf.keras.optimizers.SGD(learning_rate=lr)
@@ -584,91 +591,26 @@ def train_model(
             
     train_gen = persistent_generator()
 
-    # Extract the base model (EfficientNet, MobileNet, etc.) which is the first layer
-    base_model = model.layers[0]
-    
-    # Check if we are using a transfer learning model or a custom from-scratch CNN
-    is_transfer_learning = False #isinstance(base_model, tf.keras.Model)
+    # Optionally unfreeze the base model after restoring from disk
+    if unfreeze_base:
+        try:
+            custom_models.unfreeze_base_model(model)
+        except Exception:
+            model.trainable = True
+    # Recompile with the optimizer after changing trainable flags
+    optimizer = tf.keras.optimizers.Nadam(learning_rate=lr)
+    model.compile(optimizer=optimizer, loss=loss, metrics=metrics, jit_compile=False)
+    model.summary()
 
-    if is_transfer_learning:
-        # Define Epoch Boundaries
-        phase1_epochs = 3  # First 10% of epochs
-        phase2_epochs = int(epochs * 0.5)  # Up to 30% of epochs
-
-        # ==========================================
-        # PHASE 1: Train Head Only
-        # ==========================================
-        if initial_epoch < phase1_epochs:
-            print(f"\n--- PHASE 1: Training Head Only (Epochs {initial_epoch} to {phase1_epochs}) ---")
-            base_model.trainable = False
-            
-            optimizer = tf.keras.optimizers.Nadam(learning_rate=lr)
-            model.compile(optimizer=optimizer, loss=loss, metrics=metrics, jit_compile=False)
-            
-            history = model.fit(
-                train_gen, epochs=phase1_epochs, steps_per_epoch=steps_per_epoch,
-                initial_epoch=initial_epoch, callbacks=callbacks,
-                # validation_data=val_dataset, validation_steps=validation_steps,
-            )
-            initial_epoch = phase1_epochs # Update for next phase
-
-        # ==========================================
-        # PHASE 2: Unfreeze Top 20 Layers
-        # ==========================================
-        if initial_epoch < phase2_epochs:
-            print(f"\n--- PHASE 2: Unfreezing Top 20 Layers (Epochs {initial_epoch} to {phase2_epochs}) ---")
-            base_model.trainable = True
-            
-            # Re-freeze everything EXCEPT the top 20 layers
-            for layer in base_model.layers[:-20]:
-                layer.trainable = False
-            
-            for layer in base_model.layers:
-                if isinstance(layer, tf.keras.layers.BatchNormalization):
-                    layer.trainable = False
-
-            # CRITICAL: Recompile with a smaller learning rate!
-            optimizer = tf.keras.optimizers.Nadam(learning_rate=lr * 0.1)
-            model.compile(optimizer=optimizer, loss=loss, metrics=metrics, jit_compile=False)
-
-            history = model.fit(
-                train_gen, epochs=phase2_epochs, steps_per_epoch=steps_per_epoch,
-                initial_epoch=initial_epoch, callbacks=callbacks,
-                # validation_data=val_dataset, validation_steps=validation_steps,
-            )
-            initial_epoch = phase2_epochs
-
-        # ==========================================
-        # PHASE 3: Unfreeze Entire Network
-        # ==========================================
-        if initial_epoch < epochs:
-            print(f"\n--- PHASE 3: Unfreezing Entire Network (Epochs {initial_epoch} to {epochs}) ---")
-            base_model.trainable = True # Unfreeze everything
-
-            for layer in base_model.layers:
-                if isinstance(layer, tf.keras.layers.BatchNormalization):
-                    layer.trainable = False
-
-            
-            # CRITICAL: Recompile with an even smaller learning rate!
-            optimizer = tf.keras.optimizers.Nadam(learning_rate=lr * 0.05)
-            model.compile(optimizer=optimizer, loss=loss, metrics=metrics, jit_compile=False)
-
-            history = model.fit(
-                train_gen, epochs=epochs, steps_per_epoch=steps_per_epoch,
-                initial_epoch=initial_epoch, callbacks=callbacks,
-                # validation_data=val_dataset, validation_steps=validation_steps,
-            )
-    else:
-        history = model.fit(
-            train_dataset,
-            epochs=epochs,
-            steps_per_epoch=steps_per_epoch, # Total train buildings in NYC = 328875 x 
-            initial_epoch=initial_epoch,
-            # validation_data=val_dataset,
-            # validation_steps=validation_steps,
-            callbacks=callbacks,
-        )
+    history = model.fit(
+        train_dataset,
+        epochs=epochs,
+        steps_per_epoch=steps_per_epoch, # Total train buildings in NYC = 328875 x 
+        initial_epoch=initial_epoch,
+        # validation_data=val_dataset,
+        # validation_steps=validation_steps,
+        callbacks=callbacks,
+    )
 
     return model, history  # type: ignore
 
@@ -937,6 +879,7 @@ def predict_buildings_income(
     gdf = build_dataset.assign_datasets_to_gdf(
         gdf, extents, year=year, centroid=True, buffer=False
     )
+
     dataset_col = f"dataset_{year}"
     
     # Configuration dict to pass to workers
@@ -988,7 +931,7 @@ def predict_buildings_income(
     for batch_indices, batch_images in tqdm(dataset, total=total_batches, desc="Predicting"):
         
         # 1. Predict on the current batch (runs on GPU)
-        batch_images = aug_layer(batch_images, training=True) # Force the transformation
+        # batch_images = aug_layer(batch_images, training=True) # Force the transformation
         batch_preds = model.predict_on_batch(batch_images)
         
         # 2. Convert to numpy and flatten
@@ -1059,10 +1002,11 @@ def run(
     log_dir = f"{LOGS_DIR}/{model_name}_{datetime.now().strftime('%Y%m%d-%H%M%S')}"
 
     generate_parameters_log(params, savename)
-    learning_rate = learning_rate / 2
+
     # print("**"*10)
     # print("CORRIENDO SOLO CON 2022 PARA TESTEAR. SI TE APARECE ESTO, REVISAR!!!")
     # print("**"*10)
+    years = [2022]
     all_years_datasets, all_years_extents, df = open_datasets(
         sat_data=sat_data, years=years
     )
@@ -1139,7 +1083,7 @@ def run(
 
     if generate_predictions:
         print("Generando predicciones...")
-        model = tf.keras.models.load_model(MODELS_DIR / "models_by_epoch" / savename / f"{savename}_199.keras", compile=False)  # Load the best model saved during training
+        model = tf.keras.models.load_model(MODELS_DIR / f"{savename}.keras", compile=False)  # Load the best model saved during training
         df_result = predict_buildings_income(
             model=model,
             image_size=image_size, 
@@ -1147,7 +1091,7 @@ def run(
             nbands=nbands, 
             stacked_images=stacked_images,
             year=2022, 
-            output_name=f"predictions_{savename}"
+            output_name=f"testing_predictions_{savename}"
         )
         df_result.to_parquet( RESULTS_DIR / "nyc_buildings_with_predictions.parquet")
 
@@ -1192,20 +1136,20 @@ if __name__ == "__main__":
     params = {
         "model_name": "effnet_v2B1",
         "kind": "reg",
-        "weights": None,#str(MODELS_DIR / "effnet_v2B1_lr0.0005_size128_y2016-2018-2020-2022-2024_stack1-4_Pooling.keras"),
-        "image_size": 128*3,
+        "weights": None,
+        "image_size": 128,
         "resizing_size": 128,
         "tiles": 1,
         "nbands": 4,
-        "stacked_images": [1, 3],
+        "stacked_images": [1, 4],
         "sample_size": 1,
         "small_sample": False,
-        "n_epochs": 200,
-        "learning_rate": 0.01,
+        "n_epochs": 400,
+        "learning_rate": 0.0005,
         "sat_data": "aerial",
         "years": [2016, 2018, 2020, 2022, 2024], # Only the data inside WSL! all data is: [2010, 2012, 2014, 2016, 2018, 2020, 2022, 2024],
-        "extra": "_transferfrom_stacked_1-4_Pooling",  # Extra info to add to the savename (e.g. for ablation studies)
+        "extra": "_Pooling",  # Extra info to add to the savename (e.g. for ablation studies)
     }
 
     # Run full pipeline
-    run(params, train=True, compute_loss=True, generate_predictions=True)
+    run(params, train=False, compute_loss=False, generate_predictions=True)
