@@ -50,6 +50,9 @@ def rebuild_top(model_base, kind="cla", legacy=False) -> Sequential:
     if kind == "reg":
         model.add(layers.Dense(1, name="predictions", activation="linear"))
 
+    base = model.layers[0]            # base model is the first layer in your Sequential
+    base.trainable = True
+
     return model
 
 
@@ -77,8 +80,6 @@ def efficientnet_v2S(resizing_size, bands=8, kind="reg", weights=None) -> Sequen
         weights=weights,
         include_preprocessing=False,
     )
-    if weights is not None:
-        model_base.trainable = False
 
     model = rebuild_top(model_base, kind=kind, legacy=True)
     return model
@@ -239,3 +240,28 @@ def spatialecon_cnn(resizing_size, bands=8):
     return make_level_model(
         resizing_size, bands, 32, 0.5
     )  # 32 filters, 0.5 dropout rate	- original parameters from the paper
+
+
+def unfreeze_base_model(model: tf.keras.Model) -> bool:
+    """Unfreeze the nested base (functional) model if present, or the top-level layers.
+
+    This sets `.trainable = True` on either the first nested `tf.keras.Model` found
+    or on all top-level layers. Returns True if operation completed, False on exception.
+    """
+    try:
+        base = next((l for l in model.layers if isinstance(l, tf.keras.Model)), None)
+        if base is None:
+            model.trainable = True
+            for lay in model.layers:
+                lay.trainable = True
+        else:
+            base.trainable = True
+            for lay in base.layers:
+                lay.trainable = True
+        return True
+    except Exception:
+        try:
+            model.trainable = True
+        except Exception:
+            pass
+        return False
