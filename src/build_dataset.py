@@ -101,6 +101,7 @@ def load_income_dataset(variable="avg_hh_inc", trim=False, log=True):
 
     # Open SAE dataset
     gdf = gpd.read_parquet(PROCESSED_DATA_DIR / "nyc_buildings_with_sae.parquet")
+    gdf["building_id"] = gdf.index
 
     # FIXME: Probably it's a good idea to reproject all the zarr so I can scale this to anywhere...
     gdf = gdf.to_crs("EPSG:6539")
@@ -112,6 +113,7 @@ def load_income_dataset(variable="avg_hh_inc", trim=False, log=True):
     if trim:
         # Should not be needed with these models
         gdf = gdf[gdf["Area"] <= 200000]  # Remove ct that are too big
+    gdf = gdf.reset_index(drop=True)
 
     # Normalize ELL estimation:
     # FIXME: I should do this normalization based on census tract estimates, not buildings...
@@ -128,6 +130,7 @@ def load_income_dataset(variable="avg_hh_inc", trim=False, log=True):
     pd.DataFrame().from_dict(data_dict, orient="index", columns=[variable]).to_csv(
         PROCESSED_DATA_DIR / f"scalars_{variable}_trim{trim}_{date}.csv"
     )
+
     gdf.to_parquet(PROCESSED_DATA_DIR / f"gdf_{variable}_trim{trim}_{date}.parquet")
     
     return gdf
