@@ -74,7 +74,7 @@ except ImportError:
 # ══════════════════════════════════════════════════════════════════════════════
 API_KEY     = os.environ.get("CENSUS_API_KEY", "364fb9378fe05cc52fda7a590e1cf616cf18e9b6")
 STATE       = "36"           # FIPS — 36 = New York
-START_YEAR  = 2009           # first ACS 5-yr release
+START_YEAR  = 2012           # first ACS 5-yr release
 END_YEAR    = 2024           # inclusive; update as new vintages drop
 MAX_VARS    = 45             # variables per API call (Census hard-cap ~50)
 RETRY_MAX   = 1              # max retries on transient HTTP errors
@@ -112,6 +112,7 @@ RAW_VARS: dict[str, Optional[str]] = {
     # Income
     "B19013_001E": "median_hh_income_usd",
     "B19301_001E": "per_capita_income_usd",
+    "B19301_001M": "per_capita_income_usd_error",
     # Vehicle availability (B08201)
     "B08201_001E": None,   # total households
     "B08201_002E": None,   # no vehicle
@@ -150,6 +151,7 @@ FINAL_COLS: dict[str, str] = {
     "B25064_001E":         "median_gross_rent_usd",
     "B19013_001E":         "median_hh_income_usd",
     "B19301_001E":         "per_capita_income_usd",
+    "B19301_001M":         "per_capita_income_usd_error",
     "B08135_001E":         "mean_commute_unadjusted_min",
     # Derived
     "pct_no_vehicle":      "pct_hh_no_vehicle",
