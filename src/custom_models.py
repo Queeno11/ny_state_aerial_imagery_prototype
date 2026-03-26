@@ -1,5 +1,7 @@
 import tensorflow as tf
 from tensorflow import keras
+import keras_hub
+from typing import Literal
 
 from tensorflow.keras import layers, models, Model
 from tensorflow.python.keras.callbacks import (
@@ -114,6 +116,113 @@ def efficientnet_v2B1(resizing_size, bands=8, kind="reg", weights=None) -> Seque
     model = rebuild_top(model_base, kind=kind)
     return model
 
+def dinov2_model(
+    resizing_size, 
+    channels=3, 
+    freeze_dino=True, 
+    n_covariates=1, 
+    head: Literal["multimodal_fusion", "late_linear_fusion", "neural_ridge"] = "multimodal_fusion"
+) -> Model:
+    """
+    DINOv2 (Small) model mixed with generic covariates using Keras Hub.
+    Requires `pip install keras-hub`.
+    """
+    
+    # 1. IMAGE INPUT
+    img_input = layers.Input(shape=(resizing_size, resizing_size, channels), name="image_input")
+    x = img_input
+    
+    # DINOv2 strictly requires 3 channels (RGB).
+    if x.shape[-1] > 3:
+        print("Warning: DINOv2 expects 3 channels. Slicing to first 3 channels (RGB).")
+        x = img_input[:, :, :, :3]
+        
+    # Resize to standard DINOv2 spatial constraints (must be divisible by patch size 14)
+    x = tf.image.resize(x, (224, 224))
+    
+    # 2. PREPROCESSING
+    x = x / 255.0
+    mean = tf.constant([0.485, 0.456, 0.406], shape=[1, 1, 1, 3])
+    std = tf.constant([0.229, 0.224, 0.225], shape=[1, 1, 1, 3])
+    x = (x - mean) / std
+
+    # 3. FOUNDATION MODEL
+    dino_base = keras_hub.models.Dinov2Backbone.from_preset("dinov2_vits14")
+    if freeze_dino:
+        dino_base.trainable = False
+
+    dino_outputs = dino_base(x)
+    
+    if isinstance(dino_outputs, dict):
+        cls_token = dino_outputs.get("class_token", dino_outputs.get("sequence_output")[:, 0, :])
+    else:
+        cls_token = dino_outputs[:, 0, :]
+
+
+    # ==========================================
+    # HEAD 1: CS Standard (Multimodal Fusion)
+    # ==========================================
+    if head == "multimodal_fusion":
+        if n_covariates > 0:
+            commute_input = layers.Input(shape=(n_covariates,), name="covariates")
+            fused = layers.Concatenate(name="concat_features")([cls_token, commute_input])
+        else:
+            fused = cls_token
+        
+        h = layers.Dense(128, activation="relu", name="mlp_dense_1")(fused)
+        h = layers.BatchNormalization()(h)
+        h = layers.Dropout(0.4, name="mlp_dropout")(h)
+        
+        output = layers.Dense(1, activation="linear", name="predictions")(h)
+        
+        if n_covariates > 0:
+            model = Model(inputs=[img_input, commute_input], outputs=output, name="Dinov2_Multimodal")
+        else:
+            model = Model(inputs=img_input, outputs=output, name="Dinov2_ImageOnly")
+
+    # ==========================================
+    # HEAD 2: Mixed Approach (Late Linear Fusion)
+    # ==========================================
+    elif head == "late_linear_fusion":
+        h = layers.Dense(128, activation="relu", name="visual_dense")(cls_token)
+        h = layers.BatchNormalization()(h)
+        h = layers.Dropout(0.4)(h)
+        visual_wealth_feature = layers.Dense(1, activation="linear", name="visual_wealth")(h)
+
+        if n_covariates > 0:
+            commute_input = layers.Input(shape=(n_covariates,), name="covariates")
+            fused = layers.Concatenate(name="concat_final")([visual_wealth_feature, commute_input])
+            output = layers.Dense(1, activation="linear", name="predictions")(fused)
+            
+            model = Model(inputs=[img_input, commute_input], outputs=output, name="Dinov2_LateLinear")
+        else:
+            model = Model(inputs=img_input, outputs=visual_wealth_feature, name="Dinov2_ImageOnly_Late")
+
+    # ==========================================
+    # HEAD 3: Pure Econ (Neural Ridge Regression)
+    # ==========================================
+    elif head == "neural_ridge":
+        # Pure linear projection of the 384 DINOv2 dimensions using an L2 penalty (Ridge equivalent)
+        visual_wealth_feature = layers.Dense(
+            1, 
+            activation="linear", 
+            kernel_regularizer=keras.regularizers.l2(0.01),
+            name="visual_ridge_projection"
+        )(cls_token)
+
+        if n_covariates > 0:
+            commute_input = layers.Input(shape=(n_covariates,), name="covariates")
+            fused = layers.Concatenate(name="concat_final")([visual_wealth_feature, commute_input])
+            output = layers.Dense(1, activation="linear", name="predictions")(fused)
+            
+            model = Model(inputs=[img_input, commute_input], outputs=output, name="Dinov2_NeuralRidge")
+        else:
+            model = Model(inputs=img_input, outputs=visual_wealth_feature, name="Dinov2_ImageOnly_Ridge")
+
+    else:
+        raise ValueError(f"Unknown head type: {head}")
+
+    return model
 
 def small_cnn(resizing_size=200) -> Sequential:
     """layer normalization entre cada capa y su activación. Batch norm no funca
