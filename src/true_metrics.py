@@ -486,7 +486,7 @@ def compute_custom_loss_for_epochs(
     for epoch in epochs_to_compute:
 
         filename = (
-            f"{MODELS_DIR}/models_by_epoch/{savename}/{subset}_{epoch}.csv"
+            f"{MODELS_DIR}/{savename}_{subset}.csv"
         )
 
         # if os.path.exists(filename):
@@ -507,7 +507,7 @@ def compute_custom_loss_for_epochs(
 
         try:
             model = keras.models.load_model(
-                f"{MODELS_DIR}/models_by_epoch/{savename}/{savename}_{epoch}.keras"
+                f"{MODELS_DIR}/{savename}.keras"
             )
             
             # Keras predict handles the batching automatically now
