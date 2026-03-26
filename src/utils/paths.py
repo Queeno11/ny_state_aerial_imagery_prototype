@@ -23,5 +23,6 @@ CACHE_DIR = Path("/home/abbatenicolas/data/cache")
 # Models
 MODELS_DIR = PROJECT_ROOT / "models"
 
-# External imagery
+# External Datasets
 IMAGERY_ROOT = Path(os.getenv("IMAGERY_ROOT"))
+ACS_ROOT_DIR = Path(os.getenv("ACS_ROOT_DIR"))
