@@ -74,7 +74,7 @@ except ImportError:
 # ══════════════════════════════════════════════════════════════════════════════
 API_KEY     = os.environ.get("CENSUS_API_KEY", "364fb9378fe05cc52fda7a590e1cf616cf18e9b6")
 STATE       = "36"           # FIPS — 36 = New York
-START_YEAR  = 2012           # first ACS 5-yr release
+START_YEAR  = 2013           # first ACS 5-yr release
 END_YEAR    = 2024           # inclusive; update as new vintages drop
 MAX_VARS    = 45             # variables per API call (Census hard-cap ~50)
 RETRY_MAX   = 1              # max retries on transient HTTP errors
