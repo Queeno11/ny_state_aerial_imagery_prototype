@@ -1,0 +1,55 @@
+\documentclass[12pt]{article}
+\usepackage[utf8]{inputenc}
+\usepackage{amsmath}
+\usepackage{amsfonts}
+\usepackage{geometry}
+\geometry{a4paper, margin=1in}
+
+\begin{document}
+
+\section{Methodology: Data Processing and Label Engineering}
+
+To train a computer vision model to detect long-term capital accumulation, we must first isolate true structural neighborhood change from the high-variance sampling noise inherent in American Community Survey (ACS) 5-year estimates. If the network is trained on raw survey data, it risks optimizing for transient economic shocks or survey artifacts rather than physical infrastructure changes. We construct a robust, smoothed longitudinal panel ($t \in \{2013, 2018, 2024\}$) using the following procedure.
+
+\subsection{Spatial Alignment}
+To resolve the Modifiable Areal Unit Problem (MAUP) caused by shifting census boundaries, we define the 2024 census tracts as our fixed spatial geometry. Historical tracts from 2013 and 2018 are spatially mapped to the 2024 baseline using a Maximum Area Overlap criterion, ensuring a consistent longitudinal spatial unit $i$ across all periods $t$.
+
+\subsection{Log-Normalization and the Delta Method}
+Let $Y_{i,t}$ denote the raw Per Capita Income for tract $i$ in year $t$, and let $MOE_{i,t}$ denote the Census-reported 90\% Margin of Error. Because income is right-skewed and we evaluate proportional growth, we apply a natural logarithmic transformation. The standard errors are first extracted from the 90\% confidence interval, $SE(Y_{i,t}) = MOE_{i,t} / 1.645$, and then transformed into logarithmic space utilizing the first-order Taylor series approximation (the Delta Method):
+\begin{equation}
+SE(\ln Y_{i,t}) \approx \frac{SE(Y_{i,t})}{Y_{i,t}}
+\end{equation}
+
+\subsection{Relative Cross-Sectional Ranking}
+To strip out city-wide macroeconomic inflation and aggregate growth trends, we convert the logged incomes into cross-sectional Z-scores relative to the city-wide distribution for each specific year. Let $\mu_t$ and $\sigma_t$ be the city-wide mean and standard deviation of $\ln Y_{i,t}$. The relative structural wealth score $Z_{i,t}$ and its corresponding relative standard error $\tilde{SE}_{i,t}$ are defined as:
+\begin{equation}
+Z_{i,t} = \frac{\ln Y_{i,t} - \mu_t}{\sigma_t}, \quad \tilde{SE}_{i,t} = \frac{SE(\ln Y_{i,t})}{\sigma_t}
+\end{equation}
+
+\subsection{Structural Break Identification and Transient Shock Filtering}
+To separate structural change from sampling noise, we conduct two-tailed Z-tests on the differences between periods. The test statistic for the difference between year $t$ and year $t-k$ is given by:
+\begin{equation}
+S_{i, (t, t-k)} = \frac{|Z_{i,t} - Z_{i,t-k}|}{\sqrt{\tilde{SE}_{i,t}^2 + \tilde{SE}_{i,t-k}^2}}
+\end{equation}
+We establish a binary indicator for statistical significance at the 95\% confidence level ($p < 0.05$) across all three temporal pairs (2013–2018, 2018–2024, and 2013–2024). 
+
+Crucially, we apply a ``Macro Gate'' to filter out transient ``Yo-Yo'' shocks---defined as tracts exhibiting a statistically significant positive jump in one period followed immediately by a significant negative drop in the next, or vice versa. Let $I_{i}^{valid}$ be a boolean indicator equal to 1 if tract $i$ exhibits at least one statistically significant change across any temporal pair and is \textit{not} classified as a transient Yo-Yo shock.
+
+\subsection{Inverse-Variance Weighted Smoothing}
+For tracts that do not exhibit valid, sustained structural change ($I_{i}^{valid} = 0$), we assume the underlying physical capital stock remained stable. To provide a noise-free ground truth for these tracts, we compute a single, static structural wealth baseline across all periods using an Inverse-Variance Weighted Mean. The weight $w_{i,t}$ relies most heavily on the survey year with the lowest margin of error:
+\begin{equation}
+w_{i,t} = \frac{1}{\tilde{SE}_{i,t}^2 + \epsilon}, \quad \bar{Z}_i = \frac{\sum_{t \in T} w_{i,t} Z_{i,t}}{\sum_{t \in T} w_{i,t}}
+\end{equation}
+
+\subsection{Siamese Network Training Labels}
+The final econometric labels $L_{i,t}$ fed into the Contrastive Loss function of the Longitudinal Siamese Network are assigned conditionally:
+\begin{equation}
+L_{i,t} = 
+\begin{cases} 
+Z_{i,t} & \text{if } I_{i}^{valid} = 1 \\ 
+\bar{Z}_i & \text{if } I_{i}^{valid} = 0 
+\end{cases}
+\end{equation}
+By forcing mathematically identical labels ($\bar{Z}_i$) on stable tracts for both the base and target years, the loss gradient for these tracts is driven to zero. This strictly optimizes the network to map variations in extracted physical infrastructure features directly to valid, long-term socioeconomic shifts.
+
+\end{document}
