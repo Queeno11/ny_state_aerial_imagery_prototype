@@ -224,6 +224,67 @@ def dinov2_model(
 
     return model
 
+def build_siamese_dinov2(
+    resizing_size, 
+    n_covariates, 
+    head_type="multimodal_fusion"
+) -> Model:
+    """
+    Wraps the dinov2_model into a Siamese architecture for pairwise comparison.
+    """
+    
+    # 1. Instantiate the base model ONCE. 
+    # This is the template for both towers and ensures weight sharing.
+    # The head (g_phi) and the frozen backbone (f_theta) are contained within.
+    base_model = dinov2_model(
+        resizing_size=resizing_size,
+        n_covariates=n_covariates,
+        head=head_type,
+        freeze_dino=True 
+    )
+
+    # 2. Define the inputs for the two towers (A and B)
+    # Tower A Inputs
+    img_A = layers.Input(shape=(resizing_size, resizing_size, 3), name="image_A")
+    
+    # Tower B Inputs
+    img_B = layers.Input(shape=(resizing_size, resizing_size, 3), name="image_B")
+
+    # Handle covariates if they exist
+    if n_covariates > 0:
+        cov_A = layers.Input(shape=(n_covariates,), name="covariates_A")
+        cov_B = layers.Input(shape=(n_covariates,), name="covariates_B")
+        
+        # Pass inputs through the shared base_model
+        score_A = base_model([img_A, cov_A])
+        score_B = base_model([img_B, cov_B])
+        
+        # Define the full model's inputs
+        model_inputs = [img_A, cov_A, img_B, cov_B]
+        
+    else: # Image-only case
+        # Pass inputs through the shared base_model
+        score_A = base_model(img_A)
+        score_B = base_model(img_B)
+        
+        # Define the full model's inputs
+        model_inputs = [img_A, img_B]
+
+    # 3. Define the final output for the Margin Ranking Loss
+    # The loss function operates on the difference between the two ranking scores.
+    # This layer simply calculates that difference for the model's output.
+    # Note: The actual loss calculation happens outside the model, during compilation/training.
+    output_diff = layers.Subtract(name="ranking_score_difference")([score_A, score_B])
+
+    # 4. Create the final Siamese Model
+    siamese_network = Model(
+        inputs=model_inputs,
+        outputs=output_diff,
+        name=f"Siamese_{head_type}_Dinov2"
+    )
+    
+    return siamese_network
+
 def small_cnn(resizing_size=200) -> Sequential:
     """layer normalization entre cada capa y su activación. Batch norm no funca
     porque uso batches de 1, se supone que no funciona bien para muestras de
