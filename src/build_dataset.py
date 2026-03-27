@@ -236,7 +236,7 @@ def split_train_test(gdf, buffer=500):
     test_polygon = get_test_area_from_file()
 
     # Initialize column with NaNs
-    gdf["type"] = np.nan
+    gdf["type"] = "Unassigned"
 
     # 1. Identify TEST rows
     # "within" checks if the feature is fully contained inside the test polygon

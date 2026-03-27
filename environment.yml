@@ -1,0 +1,48 @@
+name: tf_updated
+channels:
+  - defaults
+  - conda-forge
+dependencies:
+  - python=3.11
+  - pandas
+  - scikit-learn
+  - notebook
+  - pyyaml
+  - rasterio
+  - xarray
+  - matplotlib
+  - jupyter
+  - netcdf4
+  - dask
+  - distributed
+  - bokeh
+  - h5py
+  - h5netcdf
+  - imageio
+  - opencv
+  - plotly
+  - pyarrow
+  - pyogrio
+  - rioxarray
+  - scikit-image
+  - seaborn
+  - zarr
+  - pytest
+  - ruff
+  - pre-commit
+  - tqdm
+  - rich
+  - python-dotenv
+  
+  # --- Core Machine Learning (Best installed via Pip) ---
+  - pip
+  - pip:
+    - tensorflow
+    - tensorflow-text
+    - tensorflow-datasets
+    - keras
+    - keras-hub
+    - kagglehub
+    - earthpy
+    - pygris
+    - pydap

@@ -1,0 +1,15 @@
+name: tf
+channels:
+  - defaults
+dependencies:
+  - python=3.9
+  - pandas
+  - scikit-learn
+  - notebook
+  - pyyaml
+  - rasterio
+  - xarray
+  - matplotlib
+  - jupyter
+  - netcdf4
+prefix: /home/abbatenicolas/miniconda3/envs/tf

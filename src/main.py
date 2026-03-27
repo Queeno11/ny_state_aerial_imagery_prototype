@@ -178,7 +178,7 @@ def create_datasets(
     # EPOCHS_PER_CYCLE: How many epochs to reuse the cache before generating new crops
     # 1 Slow Epoch (Gen) + 9 Fast Epochs (Read) = 10 Total  
     READ_BATCH_SIZE = 16
-    TRAIN_BATCH_SIZE = 128
+    TRAIN_BATCH_SIZE = 8 #128
     
     # Shapes
     OUTPUT_SHAPE_IMG = (None, resizing_size, resizing_size, nbands * len(stacked_images))
@@ -231,7 +231,7 @@ def create_datasets(
 
                 batch_imgs.append(image)
                 batch_lbls.append(value)
-                
+
             except Exception as e:
                 print(e)
                 # Fail-safe
@@ -276,8 +276,8 @@ def create_datasets(
         # --- TRAIN LOGIC: SLIDING WINDOW ---
         
         # Configuration
-        ACTIVE_CYCLES = 5          # Number of files active at once (The Window Width)
-        EPOCHS_TO_SURVIVE = 5      # How long a standard file lives
+        ACTIVE_CYCLES = 1          # Number of files active at once (The Window Width)
+        EPOCHS_TO_SURVIVE = 50000      # How long a standard file lives
         TOTAL_CACHE_SLOTS = 20     # File naming pool
         
         def generator_func(cycle_index):
@@ -359,7 +359,7 @@ def create_datasets(
         # 7. Standard Pipeline
         master_ds = master_ds.shuffle(1000) 
         master_ds = master_ds.batch(TRAIN_BATCH_SIZE)
-        master_ds = master_ds.map(apply_augmentation, num_parallel_calls=tf.data.AUTOTUNE)
+        # master_ds = master_ds.map(apply_augmentation, num_parallel_calls=tf.data.AUTOTUNE)
         master_ds = master_ds.prefetch(tf.data.AUTOTUNE)
         
         return master_ds    
@@ -499,7 +499,7 @@ def train_model(
     callbacks: List[Union[TensorBoard, EarlyStopping, ModelCheckpoint]],
     savename: str = "",
     logdir: str = "",
-    unfreeze_base: bool = True,
+    retrain: bool = False,
 ):
     """This function runs a keras model with the Ranger optimizer and multiple callbacks. The model is evaluated within
     training through the validation generator and afterwards one final time on the test generator.
@@ -524,7 +524,6 @@ def train_model(
     History
         The history of the keras model as a History object. To access it as a Dict, use history.history.
     """
-    import tensorflow.python.keras.backend as K
 
     def get_last_trained_epoch(savename):
         model_dir = MODELS_DIR / "models_by_epoch" / f"{savename}"
@@ -545,19 +544,12 @@ def train_model(
             return None
 
     initial_epoch = get_last_trained_epoch(savename)
+    if retrain:
+        initial_epoch = None
 
     if initial_epoch is None:
         # constructs the model and compiles it
         model = model_function
-        # Optionally unfreeze the base model (if a nested functional model is present)
-        if unfreeze_base:
-            # Use helper in custom_models to unfreeze nested base or top-level layers
-            try:
-                custom_models.unfreeze_base_model(model)
-            except Exception:
-                model.trainable = True
-        # keras.utils.plot_model(model, to_file=model_name + ".png", show_shapes=True)
-
         # optimizer = tf.keras.optimizers.SGD(learning_rate=lr)
         # optimizer = tf.keras.optimizers.Adam(learning_rate=lr)
         optimizer = tf.keras.optimizers.Nadam(learning_rate=lr)
@@ -583,23 +575,6 @@ def train_model(
     # The number of steps is the number of samples divided by batch size
     validation_steps = 100 # Use your TRAIN_BATCH_SIZE
     steps_per_epoch = CACHE_SIZE // 128
-    # Create a persistent Python generator to shield the dataset from Keras 3 resets
-    _train_iter = iter(train_dataset)
-    def persistent_generator():
-        while True:
-            yield next(_train_iter)
-            
-    train_gen = persistent_generator()
-
-    # Optionally unfreeze the base model after restoring from disk
-    if unfreeze_base:
-        try:
-            custom_models.unfreeze_base_model(model)
-        except Exception:
-            model.trainable = True
-    # Recompile with the optimizer after changing trainable flags
-    optimizer = tf.keras.optimizers.Nadam(learning_rate=lr)
-    model.compile(optimizer=optimizer, loss=loss, metrics=metrics, jit_compile=False)
     model.summary()
 
     history = model.fit(
@@ -749,6 +724,10 @@ def set_model_and_loss_function(
     # Diccionario de modelos
     get_model_from_name = {
         "small_cnn": custom_models.small_cnn(resizing_size),  # kind=kind),
+        "dinov2_model": custom_models.dinov2_model(
+            resizing_size, bands=3, head="image_only", n_covariates=0, freeze_dino=False,
+        ),
+
         "mobnet_v3_large": custom_models.mobnet_v3_large(
             resizing_size, bands=bands, kind=kind,
         ),
@@ -969,6 +948,7 @@ def run(
     train=True,
     compute_loss=True,
     generate_predictions=False,
+    retrain=False,
 ):
     """Run all the code of this file.
 
@@ -1002,7 +982,7 @@ def run(
     log_dir = f"{LOGS_DIR}/{model_name}_{datetime.now().strftime('%Y%m%d-%H%M%S')}"
 
     generate_parameters_log(params, savename)
-
+    
     # print("**"*10)
     # print("CORRIENDO SOLO CON 2022 PARA TESTEAR. SI TE APARECE ESTO, REVISAR!!!")
     # print("**"*10)
@@ -1052,7 +1032,7 @@ def run(
         # Run model
         model, history = train_model(
             model_function=model,
-            lr=learning_rate,
+            lr=0.00005,
             train_dataset=train_dataset,
             val_dataset=val_dataset,
             loss=loss,
@@ -1061,6 +1041,7 @@ def run(
             epochs=n_epochs,
             savename=savename,
             logdir=log_dir,
+            retrain=retrain,
         )
         print("Fin del entrenamiento")
 
@@ -1134,22 +1115,22 @@ if __name__ == "__main__":
 
     # Selection of parameters
     params = {
-        "model_name": "effnet_v2B1",
+        "model_name": "dinov2_model",
         "kind": "reg",
         "weights": None,
-        "image_size": 128,
-        "resizing_size": 128,
+        "image_size": 224,
+        "resizing_size": 224,
         "tiles": 1,
-        "nbands": 4,
-        "stacked_images": [1, 4],
+        "nbands": 3,
+        "stacked_images": [1],
         "sample_size": 1,
         "small_sample": False,
-        "n_epochs": 400,
-        "learning_rate": 0.0005,
+        "n_epochs": 100,
+        "learning_rate": 0.001,
         "sat_data": "aerial",
-        "years": [2016, 2018, 2020, 2022, 2024], # Only the data inside WSL! all data is: [2010, 2012, 2014, 2016, 2018, 2020, 2022, 2024],
-        "extra": "_Pooling",  # Extra info to add to the savename (e.g. for ablation studies)
+        "years": [2022], # Only the data inside WSL! all data is: [2010, 2012, 2014, 2016, 2018, 2020, 2022, 2024],
+        "extra": "",  # Extra info to add to the savename (e.g. for ablation studies)
     }
 
     # Run full pipeline
-    run(params, train=False, compute_loss=True, generate_predictions=False)
+    run(params, train=True, retrain=True, compute_loss=False, generate_predictions=False)
