@@ -32,47 +32,18 @@ import xarray as xr
 import warnings
 from typing import Iterator, List, Union, Tuple, Any
 from datetime import datetime
+
+import wandb
+import torch
+import torch.nn as nn
+import torchvision.transforms.v2 as transforms
+from torch.utils.data import Dataset, DataLoader
+
 from sklearn.model_selection import train_test_split
-from tensorflow.keras import mixed_precision
-from keras import backend as K
 
-mixed_precision.set_global_policy('mixed_float16')
-
-# Mute TF low_level warnings: https://stackoverflow.com/questions/76912213/tf2-13-local-rendezvous-recv-item-cancelled
-os.environ["TF_CPP_MIN_LOG_LEVEL"] = "1"
-import tensorflow as tf
-from tensorflow import keras
-import tensorflow_datasets as tfds
-
-from tensorflow.keras import layers, models, Model
-from tensorflow.keras.callbacks import (
-    TensorBoard,
-    EarlyStopping,
-    ModelCheckpoint,
-    CSVLogger,
-)
-from tensorflow.keras.models import Sequential
-# the next 3 lines of code are for my machine and setup due to https://github.com/tensorflow/tensorflow/issues/43174
-try:
-    physical_devices = tf.config.list_physical_devices("GPU")
-    tf.config.experimental.set_memory_growth(physical_devices[0], True)
-except:
-    print("No GPU set. Is the GPU already initialized?")
 
 # Define a subset of the data that will comfortably fit in RAM cache
 CACHE_SIZE = 800*128 # Around 100k images (128 batch size)
-
-# Disable
-def blockPrint():
-    sys.__stdout__ = sys.stdout
-    sys.stdout = open(os.devnull, "w")
-
-
-# Restore
-def enablePrint():
-    sys.stdout.close()
-    sys.stdout = sys.__stdout__
-
 
 def generate_savename(
     model_name, image_size, learning_rate, stacked_images, years, extra
@@ -118,6 +89,116 @@ def open_datasets(sat_data="aerial", years=[2013, 2018, 2022]):
     return datasets_all_years, extents_all_years, df
 
 
+class SatelliteDataset(Dataset):
+    def __init__(self, df, all_years_datasets, image_size, resizing_size, nbands=4, stacked_images=[1], transform=None, mode="train", fixed_year=None):
+        """
+        Unified PyTorch Dataset for both Training (RAM Prefetch) and Prediction (Lazy Load).
+        
+        Args:
+            mode: "train", "eval", or "predict". 
+                  - "train" and "eval" prefetch to RAM and return (image, label).
+                  - "predict" loads lazily and returns (image, GEOID).
+            fixed_year: Optional. If provided (e.g., for prediction), forces the dataset to only use that year.
+        """
+        self.df = df.reset_index(drop=True)
+        self.all_years_datasets = all_years_datasets
+        self.available_years = list(all_years_datasets.keys())
+        self.image_size = image_size
+        self.resizing_size = resizing_size
+        self.nbands = nbands
+        self.stacked_images = stacked_images
+        self.transform = transform
+        self.mode = mode
+        self.fixed_year = fixed_year
+        
+        self.total_bands = self.nbands * len(self.stacked_images)
+        self.target_shape = (self.total_bands, self.image_size, self.image_size)
+        
+        # If we are training or evaluating, we prefetch the data into RAM
+        if self.mode in ["train", "eval"]:
+            self.cached_images = []
+            self.cached_labels = []
+            print(f"[{self.mode.upper()}] Pre-fetching {len(self.df)} samples into RAM...")
+            self._prefetch_data()
+        elif self.mode == "predict":
+            print(f"[PREDICT] Initialized lazy-loading dataset for {len(self.df)} samples.")
+
+    def _extract_image(self, row):
+        """
+        Core geospatial extraction logic. Reused by both prefetching and lazy loading.
+        """
+        polygon = row["geometry"]
+        
+        # Pick the year (fixed for prediction, random for training robustness)
+        batch_year = self.fixed_year if self.fixed_year is not None else random.choice(self.available_years)
+        
+        primary_dataset = self.all_years_datasets[batch_year]
+        dataset_name = row.get(f"dataset_{batch_year}")
+        
+        image = np.zeros(shape=(self.nbands, 0, 0))
+        
+        try:
+            if not pd.isna(dataset_name):
+                link_dataset = primary_dataset.get(dataset_name)
+                if link_dataset is not None:
+                    image, _ = geo_utils.stacked_image_from_census_tract(
+                        dataset=link_dataset,
+                        polygon=polygon,
+                        img_size=self.image_size,
+                        n_bands=self.nbands,
+                        stacked_images=self.stacked_images,
+                    )
+        except Exception:
+            pass # Silent fail handled by shape check below
+
+        # Validate shape and process
+        if image.shape != self.target_shape:
+            processed_image = np.zeros(shape=(self.resizing_size, self.resizing_size, self.total_bands), dtype=np.uint8)
+        else:
+            processed_image = geo_utils.process_image(image, self.resizing_size)
+
+        # Return as PyTorch (C, H, W) tensor
+        return torch.tensor(processed_image, dtype=torch.uint8).permute(2, 0, 1)
+
+    def _prefetch_data(self):
+        """Populates the RAM cache. Only called if mode is 'train' or 'eval'."""
+        for idx in range(len(self.df)):
+            row = self.df.iloc[idx]
+            
+            # Extract image
+            image_tensor = self._extract_image(row)
+            
+            # Extract label
+            label_tensor = torch.tensor(row["var"], dtype=torch.float32)
+            
+            self.cached_images.append(image_tensor)
+            self.cached_labels.append(label_tensor)
+
+    def __len__(self):
+        return len(self.df)
+    
+    def __getitem__(self, idx):
+        if self.mode in ["train", "eval"]:
+            # 1. FAST PATH: Return cached image and label
+            img = self.cached_images[idx]
+            lbl = self.cached_labels[idx]
+            
+            if self.transform:
+                img = self.transform(img)
+                
+            return img, lbl
+            
+        elif self.mode == "predict":
+            # 2. LAZY PATH: Extract image on the fly and return GEOID
+            row = self.df.iloc[idx]
+            img = self._extract_image(row)
+            geoid = row["GEOID"]
+            
+            if self.transform:
+                img = self.transform(img)
+                
+            return img, geoid
+        
 def create_train_test_dataframes(df, savename, small_sample=False):
     """Create train and test dataframes with the links and xr.datasets to use for training and testing
 
@@ -141,8 +222,17 @@ def create_train_test_dataframes(df, savename, small_sample=False):
 
     df_test = df[df["type"] == "test"].copy().reset_index(drop=True)
     assert df_test.shape[0] > 0, f"Empty test dataset!"
-    df_train = df[df["type"] == "train"].copy().reset_index(drop=True)
-    assert df_train.shape[0] > 0, f"Empty train dataset!"
+    df_not_test = df[df["type"] == "train"].copy().reset_index(drop=True)
+    assert df_not_test.shape[0] > 0, f"Empty train dataset!"
+
+
+    # Shuffle everything so images are not sequential:
+    df_test = df_test.sample(frac=1.0, random_state=825).reset_index(drop=True)
+    df_not_test = df_not_test.sample(frac=1.0, random_state=825).reset_index(drop=True)
+    
+    # Generate validation dataset
+    df_val = df_not_test.sample(frac=0.066667, random_state=200).reset_index(drop=True)
+    df_train = df_not_test.drop(df_val.index).reset_index(drop=True)
 
     test_dataframe_path = PROCESSED_DATA_DIR / "test_datasets" / f"{savename}_test_dataframe.feather"
     df_test.to_feather(test_dataframe_path)
@@ -152,495 +242,78 @@ def create_train_test_dataframes(df, savename, small_sample=False):
     df_train.to_feather(train_dataframe_path)
     print("Se creó el archivo:", train_dataframe_path)
 
-    return df_train, df_test
+    val_dataframe_path = PROCESSED_DATA_DIR / "val_datasets" / f"{savename}_val_dataframe.feather"
+    df_val.to_feather(val_dataframe_path)
+    print("Se creó el archivo:", val_dataframe_path)
 
+    return df_train, df_val, df_test
 
-def create_datasets(
-    df_not_test,
-    df_test,
-    all_years_datasets,
-    image_size,
-    resizing_size,
-    sample=1,
-    nbands=4,
-    tiles=1,
-    stacked_images=[1],
-    savename="",
-    save_examples=True,
-):
-    available_years = list(all_years_datasets.keys())
+def setup_dataloaders(df_train, df_val, df_test, all_years_datasets, params):
+    """
+    Initializes train, val, and test PyTorch dataloaders from pre-split dataframes.
+    """
+    print("--- Initializing PyTorch Datasets ---")
+    print(f"Train: {len(df_train)} | Val: {len(df_val)} | Test: {len(df_test)}")
+
+    # 1. Define Phase-Specific Transforms
+    # Only training data gets random augmentations
+    train_transform = transforms.Compose([
+        transforms.RandomHorizontalFlip(p=0.5),
+        transforms.RandomVerticalFlip(p=0.5),
+        transforms.ToDtype(torch.float32, scale=True)
+    ])
     
-    # --- Configuration ---
-    DEBUG_DIR = PROCESSED_DATA_DIR / "debug_examples"
-    os.makedirs(DEBUG_DIR, exist_ok=True)
-    fname = f"{savename}_example"
-
-    # EPOCHS_PER_CYCLE: How many epochs to reuse the cache before generating new crops
-    # 1 Slow Epoch (Gen) + 9 Fast Epochs (Read) = 10 Total  
-    READ_BATCH_SIZE = 16
-    TRAIN_BATCH_SIZE = 8 #128
-    
-    # Shapes
-    OUTPUT_SHAPE_IMG = (None, resizing_size, resizing_size, nbands * len(stacked_images))
-    OUTPUT_SHAPE_LBL = (None,)
-
-    # --- 1. The Python Data Loader (Slow Logic) ---
-    def get_mini_batch_data(batch_indices, df_subset):
-        indices = batch_indices.numpy()
-        batch_imgs = []
-        batch_lbls = []
-        
-        # Randomly pick a year for this batch to optimize Zarr access
-        
-        total_bands = nbands * len(stacked_images)
-        target_shape = (total_bands, image_size, image_size)
-
-        for i in indices:
-            # ... (Standard extraction logic) ...
-            try:
-                batch_year = random.choice(available_years)
-                primary_dataset = all_years_datasets[batch_year]
-                polygon = df_subset.loc[i]["geometry"]
-                value = df_subset.loc[i]["var"]
-                
-                # Logic to get dataset
-                dataset_name = df_subset.loc[i][f"dataset_{batch_year}"]
-                if not pd.isna(dataset_name):
-                    link_dataset = primary_dataset[dataset_name]
-                else:
-                    link_dataset = None # (Fallback logic omitted for brevity, add back if needed)
-
-                image = np.zeros(shape=(nbands, 0, 0))
-                if link_dataset is not None:
-                    # RANDOM CROP HAPPENS HERE
-                    image, _ = geo_utils.stacked_image_from_census_tract(
-                        dataset=link_dataset,
-                        polygon=polygon,
-                        img_size=image_size,
-                        n_bands=nbands,
-                        stacked_images=stacked_images,
-                    )
-                
-                if image.shape != target_shape:
-                    #  print("Image shape mismatch:", image.shape, "expected:", target_shape)
-                     image = np.zeros(shape=(resizing_size, resizing_size, total_bands))
-
-                else:
-                     image = geo_utils.process_image(image, resizing_size)
-                     # NO AUGMENTATION HERE (We cache the clean image)
-
-                batch_imgs.append(image)
-                batch_lbls.append(value)
-
-            except Exception as e:
-                print(e)
-                # Fail-safe
-                batch_imgs.append(np.zeros((resizing_size, resizing_size, total_bands)))
-                batch_lbls.append(0.0)
-
-        if save_examples and not os.path.exists(DEBUG_DIR / f"{fname}_img.npy"):
-            np.save(DEBUG_DIR / f"{fname}_img.npy", np.stack(batch_imgs).astype(np.uint8))
-            np.save(DEBUG_DIR / f"{fname}_lbl.npy", np.stack(batch_lbls).astype(np.float32))
-
-        return np.stack(batch_imgs).astype(np.uint8), np.stack(batch_lbls).astype(np.float32)
-
-    # --- 2. GPU Augmentation ---
-    data_augmentation = tf.keras.Sequential([
-        tf.keras.layers.RandomFlip("horizontal_and_vertical"),
-        tf.keras.layers.RandomContrast(0.2),
-        tf.keras.layers.RandomRotation(0.25),
+    # Eval transforms ONLY cast to float32 (no random augmentations for val/test)
+    eval_transform = transforms.Compose([
+        transforms.ToDtype(torch.float32, scale=True)
     ])
 
-    def apply_augmentation(img, lbl):
-        return data_augmentation(img, training=True), lbl
-
-    # --- 3. Cache Management Helper ---
-    def clean_cache_file(filepath):
-        """Deletes cache files from previous runs to free space."""
-        # We need this to run as a tf.py_function inside the graph
-        path_str = filepath.numpy().decode('utf-8')
-        if os.path.exists(path_str + ".index"):
-            try:
-                os.remove(path_str + ".index")
-                os.remove(path_str + ".data-00000-of-00001")
-            except: pass
-        return np.int32(0) # Dummy return
-
-    # --- 4. The Cyclic Pipeline Builder ---
-    def build_cyclic_dataset(df_subset, subset_name, is_train=False):
-        # Validation/Test logic remains the same (Static cache)
-        if not is_train:
-            # ... (Keep your existing validation logic) ...
-            pass 
-
-        # --- TRAIN LOGIC: SLIDING WINDOW ---
-        
-        # Configuration
-        ACTIVE_CYCLES = 1          # Number of files active at once (The Window Width)
-        EPOCHS_TO_SURVIVE = 50000      # How long a standard file lives
-        TOTAL_CACHE_SLOTS = 20     # File naming pool
-        
-        def generator_func(cycle_index):
-            # 1. Determine Cache Lifecycle (The Stagger Logic)
-            # If this is one of the very first files (0-4), we give it a shorter life
-            # to ensure they don't all expire at the same time.
-            # File 0 -> Lives 1 epoch  (Dies after Ep 1)
-            # File 1 -> Lives 2 epochs (Dies after Ep 2)
-            # ...
-            # File 5+ -> Lives 5 epochs
-            
-            # We use int64 for comparison to match cycle_index tensor type
-            idx_chk = tf.cast(cycle_index, tf.int64)
-            active_chk = tf.cast(ACTIVE_CYCLES, tf.int64)
-            
-            repeats = tf.cond(
-                idx_chk < active_chk,
-                lambda: idx_chk + 1,        # Warmup phase: Staggered death
-                lambda: tf.cast(EPOCHS_TO_SURVIVE, tf.int64) # Stable phase: Full life
-            )
-
-            # 2. File Naming (Cyclic slots 0-19)
-            file_slot = tf.cast(cycle_index % TOTAL_CACHE_SLOTS, tf.int32)
-            cache_filename = tf.strings.join([
-                str(CACHE_DIR), f"/{savename}_{subset_name}_slot_", tf.strings.as_string(file_slot), ".tfcache"
-            ])
-            
-            # 3. Clean old file
-            _ = tf.py_function(clean_cache_file, [cache_filename], tf.int32)
-            
-            # 4. Generate Data (Slow part, runs once per file lifecycle)
-            # Standardize size to avoid sync issues. 
-            # CACHE_SIZE should be approx (Total_Train_Size / 5).
-            all_indices_ds = tf.data.Dataset.from_tensor_slices(df_subset.index.to_numpy())
-            sampled_indices_ds = all_indices_ds.shuffle(
-                len(df_subset), 
-                seed=tf.cast(cycle_index, tf.int64),
-                reshuffle_each_iteration=False
-            ).take(CACHE_SIZE) 
-            
-            ds = sampled_indices_ds.batch(READ_BATCH_SIZE)
-            ds = ds.map(
-                lambda indices: tf.py_function(
-                    func=lambda x: get_mini_batch_data(x, df_subset.loc[x.numpy()]),
-                    inp=[indices],
-                    Tout=[tf.uint8, tf.float32]
-                ),
-                num_parallel_calls=tf.data.AUTOTUNE
-            )
-            
-            def set_shapes(imgs, lbls):
-                imgs.set_shape(OUTPUT_SHAPE_IMG)
-                lbls.set_shape(OUTPUT_SHAPE_LBL)
-                return imgs, lbls
-            
-            ds = ds.map(set_shapes).unbatch()
-            
-            # 5. Save to Cache
-            ds = ds.cache(tf.strings.as_string(cache_filename))
-            
-            # 6. Repeat based on the Stagger Logic
-            ds = ds.repeat(repeats)
-            
-            return ds
-
-        # --- THE ENGINE ---
-        
-        # We start 5 workers immediately. 
-        # Note: The very first step of training will take time as it generates 5 files.
-        master_ds = tf.data.Dataset.range(100000) \
-            .interleave(
-                generator_func,
-                cycle_length=ACTIVE_CYCLES, # Keep 5 files open
-                block_length=1,             # Take 1 batch from A, 1 from B... (Mix perfectly)
-                num_parallel_calls=tf.data.AUTOTUNE,
-                deterministic=False
-            )
-
-        # 7. Standard Pipeline
-        master_ds = master_ds.shuffle(1000) 
-        master_ds = master_ds.batch(TRAIN_BATCH_SIZE)
-        # master_ds = master_ds.map(apply_augmentation, num_parallel_calls=tf.data.AUTOTUNE)
-        master_ds = master_ds.prefetch(tf.data.AUTOTUNE)
-        
-        return master_ds    
-    # --- Execution ---
+    # 2. Instantiate the Datasets
+    # Each one will pre-fetch its specific subset into RAM via the _prefetch_data() method
+    train_dataset = SatelliteDataset(
+        df=df_train, 
+        all_years_datasets=all_years_datasets, 
+        image_size=params["image_size"], 
+        resizing_size=params["resizing_size"],
+        nbands=params["nbands"],
+        stacked_images=params["stacked_images"],
+        transform=train_transform,
+        mode="train"
+    )
     
-    # Shuffle everything so images are not sequential:
-    df_not_test = df_not_test.sample(frac=1.0, random_state=825).reset_index(drop=True)
-    df_test = df_test.sample(frac=1.0, random_state=825).reset_index(drop=True)
+    val_dataset = SatelliteDataset(
+        df=df_val, 
+        all_years_datasets=all_years_datasets,
+        image_size=params["image_size"], 
+        resizing_size=params["resizing_size"],
+        nbands=params["nbands"],
+        stacked_images=params["stacked_images"],
+        transform=eval_transform,
+        mode="eval"
+    )
     
-    # Generate validation dataset
-    df_val = df_not_test.sample(frac=0.066667, random_state=200)
-    df_train = df_not_test.drop(df_val.index).reset_index(drop=True)
-    df_val = df_val.reset_index(drop=True)
+    test_dataset = SatelliteDataset(
+        df=df_test, 
+        all_years_datasets=all_years_datasets,
+        image_size=params["image_size"], 
+        resizing_size=params["resizing_size"],
+        nbands=params["nbands"],
+        stacked_images=params["stacked_images"],
+        transform=eval_transform,
+        mode="eval"
+    )
 
+    # 3. Wrap them in DataLoaders
+    # Only shuffle the training data via PyTorch's native shuffle flag!
+    batch_size = params.get("batch_size", 32)
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
+    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
     
-    print("\nSetting up Auto-Rotating Cached Pipelines...")
-
-    if sample > 1:
-        # For cache logic, simpler to concat dataframe than repeat dataset
-        df_train = pd.concat([df_train]*sample).reset_index(drop=True)
-
-    train_dataset = build_cyclic_dataset(df_train, "train", is_train=True)
-    val_dataset = build_cyclic_dataset(df_val, "val", is_train=False)
-    test_dataset = build_cyclic_dataset(df_test, "test", is_train=False)
-
-    print("Datasets Ready!")
-    return train_dataset, val_dataset, test_dataset
-
-def get_callbacks(
-    savename,
-    logdir=None,
-) -> List[Union[TensorBoard, EarlyStopping, ModelCheckpoint]]:
-    """Accepts the model name as a string and returns multiple callbacks for training the keras model.
-
-    Parameters
-    ----------
-    model_name : str
-        The name of the model as a string.
-
-    Returns
-    -------
-    List[Union[TensorBoard, EarlyStopping, ModelCheckpoint]]
-        A list of multiple keras callbacks.
-    """
-
-    class CustomLossCallback(tf.keras.callbacks.Callback):
-        def __init__(self, log_dir, savename):
-            super(CustomLossCallback, self).__init__()
-            self.log_dir = log_dir
-            self.savename = savename
-            self.param_log_path = f"{MODELS_DIR}/models_by_epoch/{savename}/{savename}_optimizer_params.csv"
-
-        def on_epoch_end(self, epoch, logs=None):
-            # 1. Save model
-            epoch_dir = f"{MODELS_DIR}/models_by_epoch/{self.savename}"
-            os.makedirs(epoch_dir, exist_ok=True)
-            model_path = f"{epoch_dir}/{self.savename}_{epoch}.keras"
-            self.model.save(model_path, include_optimizer=True)
-
-            # 2. Extract Optimizer Parameters
-            opt = self.model.optimizer
-            
-            # In TF/Keras, some attributes might be tracked as variables or simple floats
-            # This handles both cases safely
-            def get_val(attr):
-                val = getattr(opt, attr, "N/A")
-                if hasattr(val, "numpy"):
-                    return val.numpy()
-                return val
-
-            current_params = {
-                "epoch": epoch,
-                "learning_rate": get_val("learning_rate"),
-                "beta_1": get_val("beta_1"),
-                "beta_2": get_val("beta_2"),
-                "epsilon": get_val("epsilon"),
-                "iterations": get_val("iterations")
-            }
-
-            # 3. Store to CSV
-            df_params = pd.DataFrame([current_params])
-            if not os.path.isfile(self.param_log_path):
-                df_params.to_csv(self.param_log_path, index=False)
-            else:
-                df_params.to_csv(self.param_log_path, mode='a', header=False, index=False)
-
-    tensorboard_callback = TensorBoard(
-        log_dir=logdir, histogram_freq=1, profile_batch=0
-    )
-    # use tensorboard --logdir logs/scalars in your command line to startup tensorboard with the correct logs
-
-    # Create an instance of your custom callback
-    custom_loss_callback = CustomLossCallback(log_dir=logdir, savename=savename)
-
-    early_stopping_callback = EarlyStopping(
-        monitor="val_loss",
-        min_delta=0,  # the training is terminated as soon as the performance measure gets worse from one epoch to the next
-        start_from_epoch=50,
-        patience=50,  # amount of epochs with no improvements until the model stops
-        verbose=2,
-        mode="auto",  # the model is stopped when the quantity monitored has stopped decreasing
-        restore_best_weights=True,  # restore the best model with the lowest validation error
-    )
-    reduce_lr = keras.callbacks.ReduceLROnPlateau(
-        monitor="val_loss", factor=0.3, patience=10, min_lr=0.000001
-    )
-    model_checkpoint_callback = ModelCheckpoint(
-        f"{MODELS_DIR}/{savename}.keras",
-        monitor="loss",
-        verbose=1,
-        save_best_only=True,  # save the best model
-        mode="auto",
-        save_freq="epoch",  # save every epoch
-    )
-    csv_logger = CSVLogger(
-        f"{MODELS_DIR}/models_by_epoch/{savename}/history.csv", append=True
-    )
-
-    return [
-        tensorboard_callback,
-        # reduce_lr,
-        # early_stopping_callback,
-        model_checkpoint_callback,
-        csv_logger,
-        custom_loss_callback,
-    ]
-
-
-def train_model(
-    model_function: Model,
-    lr: float,
-    train_dataset: Iterator,
-    val_dataset: Iterator,
-    loss: str,
-    epochs: int,
-    metrics: List[str],
-    callbacks: List[Union[TensorBoard, EarlyStopping, ModelCheckpoint]],
-    savename: str = "",
-    logdir: str = "",
-    retrain: bool = False,
-):
-    """This function runs a keras model with the Ranger optimizer and multiple callbacks. The model is evaluated within
-    training through the validation generator and afterwards one final time on the test generator.
-
-    Parameters
-    ----------
-    model_function : Model
-        Keras model function like small_cnn()  or adapt_efficient_net().
-    lr : float
-        Learning rate.
-    train_dataset : Iterator
-        tensorflow dataset for the training data.
-    test_dataset : Iterator
-        tesorflow dataset for the test data.
-    loss: str
-        Loss function.
-    metrics: List[str]
-        List of metrics to be used.
-
-    Returns
-    -------
-    History
-        The history of the keras model as a History object. To access it as a Dict, use history.history.
-    """
-
-    def get_last_trained_epoch(savename):
-        model_dir = MODELS_DIR / "models_by_epoch" / f"{savename}"
-        if os.path.exists(model_dir):
-            files = os.listdir(model_dir)
-            epochs = [file.split("_")[-1].replace(".keras", "") for file in files]
-            epochs = [int(epoch) for epoch in epochs if epoch.isdigit()]
-            
-            if epochs:
-                # Return the maximum epoch found
-                return max(epochs)
-            else:
-                print("Model not found, running from beginning")
-                return None
-        else:
-            os.makedirs(model_dir)
-            print("Model not found, running from beginning")
-            return None
-
-    initial_epoch = get_last_trained_epoch(savename)
-    if retrain:
-        initial_epoch = None
-
-    if initial_epoch is None:
-        # constructs the model and compiles it
-        model = model_function
-        # optimizer = tf.keras.optimizers.SGD(learning_rate=lr)
-        # optimizer = tf.keras.optimizers.Adam(learning_rate=lr)
-        optimizer = tf.keras.optimizers.Nadam(learning_rate=lr)
-
-        model.compile(optimizer=optimizer, loss=loss, metrics=metrics, jit_compile=False)
-        initial_epoch = 0
-
-    else:
-        print("Restoring model...")
-        try:
-            model_path = (
-                f"{MODELS_DIR}/models_by_epoch/{savename}/{savename}_{initial_epoch}.keras"
-            )
-            model = keras.models.load_model(model_path)  # load the model from file
-        except:
-            initial_epoch -= 1
-            model_path = (
-                f"{MODELS_DIR}/models_by_epoch/{savename}/{savename}_{initial_epoch}.keras"
-            )
-            model = keras.models.load_model(model_path)  # load the model from file
-        initial_epoch = initial_epoch + 1
-
-    # The number of steps is the number of samples divided by batch size
-    validation_steps = 100 # Use your TRAIN_BATCH_SIZE
-    steps_per_epoch = CACHE_SIZE // 128
-    model.summary()
-
-    history = model.fit(
-        train_dataset,
-        epochs=epochs,
-        steps_per_epoch=steps_per_epoch, # Total train buildings in NYC = 328875 x 
-        initial_epoch=initial_epoch,
-        # validation_data=val_dataset,
-        # validation_steps=validation_steps,
-        callbacks=callbacks,
-    )
-
-    return model, history  # type: ignore
-
-
-def plot_predictions_vs_real(df):
-    """Genera un scatterplot con la comparación entre los valores reales y los predichos.
-
-    Parameters:
-    -----------
-    - df: DataFrame con las columnas 'real' y 'pred'. Se recomienda utilizar el test Dataset para validar
-    la performance del modelo.
-
-    """
-
-    # Resultado general
-    slope, intercept, r, p_value, std_err = scipy.stats.linregress(
-        df["real"], df["pred"]
-    )
-
-    # Gráfico de correlacion
-    sns.set(rc={"figure.figsize": (11.7, 8.27)})
-    g = sns.jointplot(
-        data=df,
-        x="real",
-        y="pred",
-        kind="reg",
-        xlim=(df.real.min(), df.real.max()),
-        ylim=(df.real.min(), df.real.max()),
-        height=10,
-        joint_kws={"line_kws": {"color": "cyan"}},
-        scatter_kws={"s": 2},
-    )
-    g.ax_joint.set_xlabel("Valores Reales", fontweight="bold")
-    g.ax_joint.set_ylabel("Valores Predichos", fontweight="bold")
-
-    # Diagonal
-    x0, x1 = g.ax_joint.get_xlim()
-    y0, y1 = g.ax_joint.get_ylim()
-    lims = [max(x0, y0), min(x1, y1)]
-    g.ax_joint.plot(lims, lims, "-r", color="orange", linewidth=2)
-
-    # Texto con la regresión
-    plt.text(
-        0.1,
-        0.9,
-        f"$y={intercept:.2f}+{slope:.2f}x$; $R^2$={r**2:.2f}",
-        transform=g.ax_joint.transAxes,
-        fontsize=12,
-    )
-
-    return g
-
+    return train_loader, val_loader, test_loader
 
 def validate_parameters(params, default_params):
-
+    
     for key, value in params.items():
         if key not in default_params.keys():
             raise ValueError("Invalid parameter: %s" % key)
@@ -707,6 +380,7 @@ def fill_params_defaults(params):
         "sat_data": "pleiades",
         "years": [2013],
         "extra": "",
+        "batch_size": 32
     }
     validate_parameters(params, default_params)
 
@@ -720,216 +394,45 @@ def fill_params_defaults(params):
 def set_model_and_loss_function(
     model_name: str, kind: str, resizing_size: int, bands: int = 4, weights: str = None
 ):
-        
-    # Diccionario de modelos
-    get_model_from_name = {
-        "small_cnn": custom_models.small_cnn(resizing_size),  # kind=kind),
-        "dinov2_model": custom_models.dinov2_model(
-            resizing_size, bands=3, head="image_only", n_covariates=0, freeze_dino=False,
-        ),
-
-        "mobnet_v3_large": custom_models.mobnet_v3_large(
-            resizing_size, bands=bands, kind=kind,
-        ),
-        "effnet_v2S": custom_models.efficientnet_v2S(
-            resizing_size, bands=bands, kind=kind,
-        ),
-        "effnet_v2M": custom_models.efficientnet_v2M(
-            resizing_size, bands=bands, kind=kind,
-        ),
-        "effnet_v2B1": custom_models.efficientnet_v2B1(
-            resizing_size, bands=bands, kind=kind,
-        ),
-        "spatialecon_cnn": custom_models.spatialecon_cnn(
-            resizing_size,
-            bands=bands,
-        ),
-    }
-
-
+    """
+    Initializes the PyTorch model and appropriate loss function.
+    """
+    print(f"--- Initializing Model: {model_name} ---")
+    
     # Validación de parámetros
     assert kind in ["reg", "cla"], "kind must be either 'reg' or 'cla'"
-    # assert (
-    #     model_name in get_model_from_name.keys()
-    # ), "model_name must be one of the following: " + str(
-    #     list(get_model_from_name.keys())
-    # )
 
-    # Get model
-    model = get_model_from_name[model_name]
+    # 1. Instantiate the model dynamically using our new registry!
+    model = custom_models.get_model(
+        name=model_name, 
+        resizing_size=resizing_size, 
+        bands=bands, 
+        kind=kind
+    )
 
     # Load weights if provided
     if weights is not None and weights not in ["imagenet"]:
-        model.load_weights(weights)
+        # PyTorch uses state_dicts to load weights
+        model.load_state_dict(torch.load(weights))
         print(f"\n--- 🚀 Successfully loaded custom weights from: {weights} ---")
 
-
-    # Set loss and metrics
+    # 2. Set loss functions
+    # Note: PyTorch tracks metrics during the training loop manually, not in model compilation like Keras.
     if kind == "reg":
-        loss = keras.losses.MeanSquaredError()
-        # loss = keras.losses.MeanAbsoluteError()
-        metrics = [
-            # keras.metrics.MeanAbsoluteError(),
-            keras.metrics.R2Score(),
-            # keras.metrics.RootMeanSquaredError(),
-            # keras.metrics.MeanAbsolutePercentageError(),
-        ]
-
+        loss_fn = nn.MSELoss()
+        
     elif kind == "cla":
-        loss = keras.losses.CategoricalCrossentropy()
-        metrics = [
-            keras.metrics.CategoricalAccuracy(),
-            keras.metrics.CategoricalCrossentropy(),
-        ]
+        # CrossEntropyLoss expects raw logits (no softmax in the model output)
+        loss_fn = nn.CrossEntropyLoss()
 
-    return model, loss, metrics
+    # Move model to GPU if available
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model.to(device)
+    print(f"Model loaded and moved to: {device}")
 
-def get_image_wrapper(idx, gdf, datasets, dataset_col, config):
-    """
-    Worker function that fetches one image. 
-    We pass 'idx' and look up the data in the global/passed variables.
-    """
-    # Convert tensor to numpy int
-    idx = int(idx)
-    row = gdf.iloc[idx]
-    
-    # Default placeholder (black image)
-    placeholder = np.zeros((config['resizing_size'], config['resizing_size'], config['nbands']), dtype=np.float32)
-
-    dataset_name = row[dataset_col]
-    if pd.isna(dataset_name) or dataset_name not in datasets:
-        return placeholder
-
-    ds = datasets[dataset_name]
-    geom = row.geometry
-
-    # Handle Point vs Polygon
-    if geom.geom_type != 'Point':
-        point = (geom.centroid.x, geom.centroid.y)
-        polygon = geom
-    else:
-        point = (geom.x, geom.y)
-        polygon = geom.buffer(10)
-
-    try:
-        # Heavy IO operation
-        image, _ = geo_utils.stacked_image_from_census_tract(
-            dataset=ds,
-            polygon=polygon,
-            point=point,
-            img_size=config['image_size'],
-            n_bands=config['nbands'],
-            stacked_images=config['stacked_images'],
-            bounds=True
-        )
-        
-        # Preprocessing
-        processed_img = geo_utils.process_image(
-            image, 
-            resizing_size=config['resizing_size'], 
-            moveaxis=True 
-        )
-        return processed_img.astype(np.float32)
-        
-    except Exception:
-        return placeholder
-
-
-def predict_buildings_income(
-    model, 
-    year=2022, 
-    batch_size=128,  # Increased batch size for GPU efficiency
-    image_size=128, 
-    resizing_size=128, 
-    nbands=4, 
-    stacked_images=[1],
-    output_name="predictions"
-):
-    from tqdm import tqdm 
-
-    # --- 2. Setup Data (Main Thread) ---
-    # 1. Load the Building Data
-    gdf = build_dataset.load_income_dataset()
-
-    print(f"Loading Satellite Imagery for {year}...")
-    datasets, extents = build_dataset.load_satellite_datasets(year=year)
-    
-    print("Mapping buildings to tiles...")
-    gdf = build_dataset.assign_datasets_to_gdf(
-        gdf, extents, year=year, centroid=True, buffer=False
-    )
-
-    dataset_col = f"dataset_{year}"
-    
-    # Configuration dict to pass to workers
-    config = {
-        'image_size': image_size,
-        'resizing_size': resizing_size,
-        'nbands': nbands,
-        'stacked_images': stacked_images
-    }
-
-    # --- 3. Build the TF.Data Pipeline ---
-    print("Building Parallel Pipeline...")
-    
-    # Create a dataset of INDICES (0, 1, 2, ... N)
-    indices_ds = tf.data.Dataset.range(len(gdf))
-
-    def map_func(idx):
-        img = tf.py_function(
-            func=lambda i: get_image_wrapper(i, gdf, datasets, dataset_col, config),
-            inp=[idx],
-            Tout=tf.float32
-        )
-        # Explicitly set shape so TensorFlow knows the dimensions
-        img.set_shape([resizing_size, resizing_size, nbands * len(stacked_images)])
-        return idx, img
-
-    # Apply map and batching
-    dataset = indices_ds.map(map_func, num_parallel_calls=tf.data.AUTOTUNE)
-    dataset = dataset.batch(batch_size).prefetch(tf.data.AUTOTUNE)
-
-    # Define augmentation layer
-    aug_layer = tf.keras.Sequential([
-        tf.keras.layers.RandomFlip("horizontal_and_vertical"),
-        tf.keras.layers.RandomContrast(0.2), # <--- This is likely the key factor
-    ])
-
-
-    # --- Setup Output File ---
-    output_file = RESULTS_DIR / f"{year}_{output_name}.csv"
-    # Create file with headers (overwrites if exists)
-    pd.DataFrame(columns=['index', 'predicted_value']).to_csv(output_file, index=False)
-    print(f"Saving incremental progress to: {output_file}")
-
-    # --- Start Iteration ---
-    print(f"Starting prediction on {len(gdf)} buildings...")
-    total_batches = int(np.ceil(len(gdf) / batch_size))
-
-    # Manually iterate over the dataset
-    for batch_indices, batch_images in tqdm(dataset, total=total_batches, desc="Predicting"):
-        
-        # 1. Predict on the current batch (runs on GPU)
-        # batch_images = aug_layer(batch_images, training=True) # Force the transformation
-        batch_preds = model.predict_on_batch(batch_images)
-        
-        # 2. Convert to numpy and flatten
-        ids = batch_indices.numpy()
-        vals = batch_preds.flatten()
-        
-        # 3. Create a temporary DataFrame
-        batch_df = pd.DataFrame({
-            'index': ids, 
-            'predicted_value': vals
-        })
-        
-        # 4. Append to CSV immediately
-        # mode='a' appends, header=False avoids repeating headers
-        batch_df.to_csv(output_file, mode='a', header=False, index=False)
-
-    print("Prediction complete!")    
-
-    return gdf
+    # We return just model and loss. 
+    # Metrics and Optimizers are instantiated right before the training loop in PyTorch.
+    return model, loss_fn
 
 def generate_parameters_log(params, savename):
 
@@ -942,6 +445,131 @@ def generate_parameters_log(params, savename):
     print(f"Se creó {filename} con los parametros utilizados.")
     return
 
+def train_model(
+    model, 
+    train_loader, 
+    val_loader, 
+    loss_fn, 
+    optimizer, 
+    epochs, 
+    device, 
+    savename
+):
+    print("--- Starting PyTorch Training Loop ---")
+    best_val_loss = float('inf')
+    
+    # Ensure the save directory exists
+    save_dir = MODELS_DIR / "models_by_epoch" / savename
+    os.makedirs(save_dir, exist_ok=True)
+
+    for epoch in range(epochs):
+        # ==========================
+        # 1. TRAINING PHASE
+        # ==========================
+        model.train() # Set model to training mode (enables dropout, batchnorm updates)
+        running_train_loss = 0.0
+        
+        for batch_idx, (images, labels) in enumerate(train_loader):
+            images, labels = images.to(device), labels.to(device)
+            
+            # Zero the gradients
+            optimizer.zero_grad()
+            
+            # Forward pass
+            outputs = model(images)
+            
+            # If your labels are shape (Batch,), and output is (Batch, 1), you might need to squeeze/unsqueeze
+            if outputs.shape != labels.shape:
+                outputs = outputs.view(labels.shape)
+                
+            loss = loss_fn(outputs, labels)
+            
+            # Backward pass & Optimizer step
+            loss.backward()
+            optimizer.step()
+            
+            running_train_loss += loss.item() * images.size(0)
+
+        epoch_train_loss = running_train_loss / len(train_loader.dataset)
+
+        # ==========================
+        # 2. VALIDATION PHASE
+        # ==========================
+        model.eval() # Set model to eval mode (disables dropout)
+        running_val_loss = 0.0
+        
+        # Disable gradient calculation for validation (saves RAM and compute)
+        with torch.no_grad():
+            for images, labels in val_loader:
+                images, labels = images.to(device), labels.to(device)
+                
+                outputs = model(images)
+                if outputs.shape != labels.shape:
+                    outputs = outputs.view(labels.shape)
+                    
+                loss = loss_fn(outputs, labels)
+                running_val_loss += loss.item() * images.size(0)
+
+        epoch_val_loss = running_val_loss / len(val_loader.dataset)
+
+        # ==========================
+        # 3. LOGGING & CHECKPOINTING
+        # ==========================
+        print(f"Epoch [{epoch+1}/{epochs}] | Train Loss: {epoch_train_loss:.4f} | Val Loss: {epoch_val_loss:.4f}")
+        
+        # 🎯 Log metrics directly to W&B cloud!
+        wandb.log({
+            "epoch": epoch + 1,
+            "train_loss": epoch_train_loss,
+            "val_loss": epoch_val_loss,
+            "learning_rate": optimizer.param_groups[0]['lr']
+        })
+
+        # Model Checkpoint logic (Replaces Keras ModelCheckpoint callback)
+        if epoch_val_loss < best_val_loss:
+            print(f"⭐ Val loss improved from {best_val_loss:.4f} to {epoch_val_loss:.4f}. Saving...")
+            best_val_loss = epoch_val_loss
+            
+            model_path = save_dir / f"{savename}_best.pth"
+            torch.save(model.state_dict(), model_path)
+            
+            # Optional: Tell wandb to track this specific file
+            wandb.save(str(model_path))
+
+    print("--- Training Complete ---")
+    return model
+
+def predict_buildings(model, dataloader, device):
+    """
+    Generates predictions for a large dataset using PyTorch batching.
+    Returns a Pandas DataFrame with GEOIDs and their predicted values.
+    """
+    model.eval()
+    all_preds = []
+    all_geoids = []
+    
+    print(f"Starting inference on {len(dataloader.dataset)} items...")
+    
+    # torch.no_grad() is CRITICAL here! It stops PyTorch from storing memory for backpropagation
+    with torch.no_grad():
+        for batch_idx, (batch_images, batch_geoids) in enumerate(dataloader):
+            batch_images = batch_images.to(device)
+            
+            # Get predictions
+            outputs = model(batch_images)
+            
+            # If regression, outputs are shape (Batch, 1). We flatten them to a 1D list.
+            preds = outputs.view(-1).cpu().numpy()
+            
+            all_preds.extend(preds)
+            all_geoids.extend(batch_geoids)
+            
+            # Print progress every 50 batches
+            if batch_idx % 50 == 0:
+                print(f"Predicted batch {batch_idx}/{len(dataloader)}")
+                
+    # Zip the IDs and Predictions back together beautifully
+    return pd.DataFrame({"GEOID": all_geoids, "predicted_value": all_preds})
 
 def run(
     params=None,
@@ -975,6 +603,7 @@ def run(
     sat_data = params["sat_data"]
     years = params["years"]
     extra = params["extra"]
+    batch_size = params["batch_size"]
 
     savename = generate_savename(
         model_name, image_size, learning_rate, stacked_images, years, extra
@@ -983,17 +612,34 @@ def run(
 
     generate_parameters_log(params, savename)
     
-    # print("**"*10)
-    # print("CORRIENDO SOLO CON 2022 PARA TESTEAR. SI TE APARECE ESTO, REVISAR!!!")
-    # print("**"*10)
+    print(f"========== Starting Run for {savename} ==========")
+
     years = [2022]
     all_years_datasets, all_years_extents, df = open_datasets(
         sat_data=sat_data, years=years
     )
+
     if train:
 
-        ## Set Model & loss function
-        model, loss, metrics = set_model_and_loss_function(
+        # ### Create train and test dataframes from ICPAG
+        df_train, df_val, df_test = create_train_test_dataframes(
+            df, savename, small_sample=small_sample
+        )
+
+        #### PyTorch Data Pipeline Setup
+        print("Setting up data generators...")
+        train_loader, val_loader, test_loader = setup_dataloaders(
+                df_train=df_train, 
+                df_val=df_val,
+                df_test=df_test,
+                all_years_datasets=all_years_datasets, 
+                params=params
+            )            
+        print("Data Pipeline Ready!")
+        print(f"Batches per epoch -> Train: {len(train_loader)} | Val: {len(val_loader)} | Test: {len(test_loader)}")
+
+        #### Model Initialization
+        model, loss_fn = set_model_and_loss_function(
             model_name=model_name,
             kind=kind,
             bands=nbands * len(stacked_images),
@@ -1001,87 +647,91 @@ def run(
             weights=weights,
         )
 
-        # ### Create train and test dataframes from ICPAG
-        df_not_test, df_test = create_train_test_dataframes(
-            df, savename, small_sample=small_sample
+        # 1. Setup Device
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+        # 2. Initialize PyTorch Optimizer
+        optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
+
+        # 3. Initialize Weights & Biases
+        wandb.init(
+            project="urban-income-prediction", # Change to your project name
+            name=savename,
+            config=params
         )
 
-        ## Transform dataframes into datagenerators:
-        #    instead of iterating over census tracts (dataframes), we will generate one (or more) images per census tract
-        print("Setting up data generators...")
-        train_dataset, val_dataset, test_dataset = create_datasets(
-            df_not_test=df_not_test,
-            df_test=df_test,
+        # 4. Run PyTorch Model
+        model = train_model(
+            model=model,
+            train_loader=train_loader,
+            val_loader=val_loader,
+            loss_fn=loss_fn,
+            optimizer=optimizer,
+            epochs=n_epochs,
+            device=device,
+            savename=savename
+        )
+        
+        # 5. Finish the wandb run cleanly
+        wandb.finish()
+        print("Fin del entrenamiento")
+    
+    if generate_predictions:
+        print("Generando predicciones...")
+        
+        # 1. Load the Best PyTorch Model
+        model, _ = set_model_and_loss_function(
+            model_name=model_name,
+            kind=kind,
+            bands=nbands * len(stacked_images),
+            resizing_size=resizing_size,
+        )
+        
+        best_model_path = MODELS_DIR / "models_by_epoch" / savename / f"{savename}_best.pth"
+        model.load_state_dict(torch.load(best_model_path))
+        
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        model.to(device)
+
+        # 2. Setup the Evaluaton Transforms
+        eval_transform = transforms.Compose([
+            transforms.ToDtype(torch.float32, scale=True)
+        ])
+        
+        # 3. Setup the Unified Dataset in "predict" mode
+        prediction_dataset = SatelliteDataset(
+            df=df,  
             all_years_datasets=all_years_datasets,
             image_size=image_size,
             resizing_size=resizing_size,
             nbands=nbands,
             stacked_images=stacked_images,
-            tiles=tiles,
-            sample=sample_size,
-            savename=savename,
-            save_examples=True,
+            transform=eval_transform,
+            mode="predict",       # <--- Tells the class to use lazy loading and return GEOIDs
+            fixed_year=2022       # <--- Forces the class to only extract 2022 data
         )
-        # Get tensorboard callbacks and set the custom test loss computation
-        #   at the end of each epoch
-        callbacks = get_callbacks(
-            savename=savename,
-            logdir=log_dir,
-        )
-
-        # Run model
-        model, history = train_model(
-            model_function=model,
-            lr=0.00005,
-            train_dataset=train_dataset,
-            val_dataset=val_dataset,
-            loss=loss,
-            metrics=metrics,
-            callbacks=callbacks,
-            epochs=n_epochs,
-            savename=savename,
-            logdir=log_dir,
-            retrain=retrain,
-        )
-        print("Fin del entrenamiento")
-
-    ## Compute metrics
-    # Genero la test_loss por RC
-    if compute_loss:
-        true_metrics.compute_loss(  # No entra el test_dataset acá pero despues usa el df_test guardado en memoria
-            models_dir=rf"{MODELS_DIR}/models_by_epoch/{savename}",
-            savename=savename,
-            datasets=all_years_datasets,
-            tiles=tiles,
-            size=image_size,
-            resizing_size=resizing_size,
-            n_epochs=n_epochs,
-            n_bands=nbands,
-            stacked_images=stacked_images,
-            generate=True,
-            subset="test",
+        
+        # 4. Wrap in DataLoader (Double batch size since no gradients are stored)
+        prediction_loader = DataLoader(
+            prediction_dataset, 
+            batch_size=params.get("batch_size", 32) * 2, 
+            shuffle=False, 
+            num_workers=0 
         )
 
-    if generate_predictions:
-        print("Generando predicciones...")
-        model = tf.keras.models.load_model(MODELS_DIR / f"{savename}.keras", compile=False)  # Load the best model saved during training
-        df_result = predict_buildings_income(
-            model=model,
-            image_size=image_size, 
-            resizing_size=resizing_size, 
-            nbands=nbands, 
-            stacked_images=stacked_images,
-            year=2022, 
-            output_name=f"testing_predictions_{savename}"
-        )
-        df_result.to_parquet( RESULTS_DIR / "nyc_buildings_with_predictions.parquet")
+        # 5. Generate the Predictions DataFrame
+        df_result = predict_buildings(model, prediction_loader, device)
+        
+        # 6. Save and merge results
+        df_result.to_parquet(RESULTS_DIR / "nyc_buildings_with_predictions.parquet")
 
-        df = pd.read_csv(RESULTS_DIR / f"2022_predictions_{savename}.csv")
         gdf = build_dataset.load_income_dataset()
-        gdf = gdf.join(df, how="inner")
+        df_result.set_index("GEOID", inplace=True) 
+        gdf = gdf.join(df_result, on="GEOID", how="inner")
+        
         gdf.to_parquet(RESULTS_DIR / f"2022_predictions_{savename}.parquet")
 
-        # Fix broken geometries and dissolve by census tract to get tract-level predictions
+        # Fix broken geometries and dissolve by census tract
         gdf['geometry'] = gdf.geometry.buffer(0)
         gdf_by_census_tract = gdf.dissolve(
             "GEOID", 
@@ -1089,33 +739,13 @@ def run(
         )
         gdf_by_census_tract.to_parquet(RESULTS_DIR / f"2022_predictions_by_tract_{savename}.parquet")
 
-        # # Generate gridded predictions & plot examples
-        # for year in [2022]:  # all_years_datasets.keys():
-        #     grid_preds = grid_predictions.generate_grid(
-        #         savename,
-        #         all_years_datasets,
-        #         all_years_extents,
-        #         image_size,
-        #         resizing_size,
-        #         nbands,
-        #         stacked_images,
-        #         year=year,
-        #         generate=True,
-        #     )
-        #     if year==2013:
-        #         grid_preds_2013 =  grid_preds
-        #     grid_predictions.plot_all_examples(
-        #         all_years_datasets, all_years_extents, grid_preds, grid_preds_2013, savename, year
-        #     )
-
-
 if __name__ == "__main__":
 
     variable = "avg_hh_income"
 
     # Selection of parameters
     params = {
-        "model_name": "dinov2_model",
+        "model_name": "small_cnn",
         "kind": "reg",
         "weights": None,
         "image_size": 224,
