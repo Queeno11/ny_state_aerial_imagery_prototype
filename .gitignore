@@ -5,6 +5,7 @@ data/processed/
 # Results and logs (generated)
 results/
 logs/
+wandb/
 
 # Notebooks
 .ipynb_checkpoints/
