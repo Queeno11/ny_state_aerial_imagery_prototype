@@ -1,0 +1,54 @@
+name: torch_geo_env
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.10
+  - pip
+  
+  # === PyTorch Core (CUDA 12.1 to match your previous nvidia-cu12 packages) ===
+  - pytorch
+  - torchvision
+  - torchaudio
+  - pytorch-cuda=12.1
+  
+  # === Geospatial Stack (from your list) ===
+  - geopandas
+  - rasterio
+  - xarray
+  - rioxarray
+  - netcdf4
+  - zarr
+  - shapely
+  - pyproj
+  - fsspec
+  
+  # === Data Science & ML ===
+  - pandas
+  - numpy
+  - scikit-learn
+  - scipy
+  - pyarrow
+  - numba
+  - tqdm
+  
+  # === Visualization ===
+  - matplotlib
+  - seaborn
+  - plotly
+  - folium
+  
+  # === Development & Jupyter ===
+  - ipykernel
+  - jupyterlab
+  - pyyaml
+  - python-dotenv
+  
+  # === Specialized Pip Installs ===
+  - pip:
+    - wandb             # Highly recommended for PyTorch tracking
+    - scikit-image
+    - opencv-python
+    - earthpy

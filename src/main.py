@@ -41,6 +41,7 @@ from torch.utils.data import Dataset, DataLoader
 
 from sklearn.model_selection import train_test_split
 
+os.environ['WANDB_API_KEY'] = os.getenv("WANDB_API_KEY")
 
 # Define a subset of the data that will comfortably fit in RAM cache
 CACHE_SIZE = 800*128 # Around 100k images (128 batch size)
@@ -207,7 +208,7 @@ def create_train_test_dataframes(df, savename, small_sample=False):
     testing.
     """
     if small_sample:
-        df = df.sample(1000, random_state=825).reset_index(drop=True)
+        df = df.sample(100_000, random_state=825).reset_index(drop=True)
 
     ### Split census tracts based on train/test
     #       (the hole census tract must be in the corresponding region)
@@ -754,7 +755,7 @@ if __name__ == "__main__":
         "nbands": 3,
         "stacked_images": [1],
         "sample_size": 1,
-        "small_sample": False,
+        "small_sample": True,
         "n_epochs": 100,
         "learning_rate": 0.001,
         "sat_data": "aerial",

@@ -21,7 +21,7 @@ import scipy
 import random
 import pandas as pd
 import xarray as xr
-import tensorflow as tf
+
 import matplotlib.pyplot as plt
 
 try:
