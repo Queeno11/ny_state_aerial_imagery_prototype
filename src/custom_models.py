@@ -1,4 +1,5 @@
 import importlib.util
+from peft import LoraConfig, get_peft_model
 import timm
 import torch
 import torch.nn as nn
@@ -148,80 +149,22 @@ class ScaleMAE(nn.Module):
             nn.Linear(64, out_features)
         )
 
-        # 3. Apply freezing strategy
-        self._apply_freezing(freeze_strategy)
+        # Set LORA
+        lora_config = LoraConfig(
+            r=16,                     # The rank (8 or 16 is great)
+            lora_alpha=16,           # Scaling factor
+            target_modules=[
+                "qkv",          # The fused attention matrix (no slicing required)
+                "fc1",          # First linear layer of the MLP
+                "fc2"           # Second linear layer of the MLP
+            ],
+            lora_dropout=0.05,
+            bias="none",
+            modules_to_save=["head"],
+        )
+        self.backbone = get_peft_model(self.backbone, lora_config)
+        self.backbone.print_trainable_parameters()
 
-    def _apply_freezing(self, strategy):
-        if strategy == "none":
-            print("🔥 ScaleMAE fully unfrozen — all parameters trainable.")
-            return
-
-        vit = self.backbone.model  # ← the actual VisionTransformer lives here
-
-        # Freeze embedding layers
-        for param in vit.patch_embed.parameters():
-            param.requires_grad = False
-        if hasattr(vit, 'cls_token'):
-            vit.cls_token.requires_grad = False
-        if hasattr(vit, 'pos_embed'):
-            vit.pos_embed.requires_grad = False
-
-        num_blocks = len(vit.blocks)  # 24 for ViT-Large
-
-        if strategy == "partial":
-            blocks_to_freeze = int(num_blocks * 0.75)   # freeze blocks 0–17, train 18–23
-        elif strategy == "linear_probe":
-            blocks_to_freeze = num_blocks               # freeze all, head only
-        else:
-            blocks_to_freeze = 0
-
-        for i in range(blocks_to_freeze):
-            for param in vit.blocks[i].parameters():
-                param.requires_grad = False
-
-        # Also freeze the final LayerNorm if doing linear probe
-        if strategy == "linear_probe":
-            for param in vit.norm.parameters():
-                param.requires_grad = False
-
-        trainable = sum(p.numel() for p in self.backbone.parameters() if p.requires_grad)
-        frozen = sum(p.numel() for p in self.backbone.parameters() if not p.requires_grad)
-        print(f"❄️ ScaleMAE '{strategy}': froze embeddings + {blocks_to_freeze}/{num_blocks} blocks "
-            f"| Trainable: {trainable/1e6:.1f}M | Frozen: {frozen/1e6:.1f}M params")
-    
-    def unfreeze_stage(self, stage: int):
-        """
-        Progressive unfreezing for staged fine-tuning.
-        Stage 0: head only (default at init with linear_probe)
-        Stage 1: unfreeze last 25% of blocks (blocks 18-23 for ViT-L/24)
-        Stage 2: unfreeze next 25% of blocks (blocks 12-17)
-        """
-        vit = self.backbone.model
-        num_blocks = len(vit.blocks)  # 24
-
-        if stage == 1:
-            # Unfreeze last 25% — blocks 18-23
-            unfreeze_from = int(num_blocks * 0.75)  # block 18
-            for i in range(unfreeze_from, num_blocks):
-                for param in vit.blocks[i].parameters():
-                    param.requires_grad = True
-            # Also unfreeze the final LayerNorm — it sits between blocks and head
-            for param in vit.norm.parameters():
-                param.requires_grad = True
-
-        elif stage == 2:
-            # Unfreeze next 25% — blocks 12-17
-            unfreeze_from = int(num_blocks * 0.50)  # block 12
-            unfreeze_to   = int(num_blocks * 0.75)  # block 18
-            for i in range(unfreeze_from, unfreeze_to):
-                for param in vit.blocks[i].parameters():
-                    param.requires_grad = True
-
-        trainable = sum(p.numel() for p in self.parameters() if p.requires_grad)
-        frozen    = sum(p.numel() for p in self.parameters() if not p.requires_grad)
-        tqdm.write(f"🔓 Unfreeze stage {stage} applied | "
-            f"Trainable: {trainable/1e6:.1f}M | Frozen: {frozen/1e6:.1f}M params")
-    
     def forward(self, x):
         # from_pretrained backbone returns patch token sequence (B, N_patches, 1024)
         features = self.backbone(x, patch_size=self.patch_size)

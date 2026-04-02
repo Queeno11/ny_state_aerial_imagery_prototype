@@ -1,4 +1,5 @@
 ##############      Configuración      ##############
+import logging
 import os
 import shutil
 import threading
@@ -47,13 +48,15 @@ from torch.utils.data import Dataset, DataLoader
 
 from sklearn.model_selection import train_test_split
 
+# Set a VRAM hard limit (e.g., 7.5GB to be safe)
+limit_in_bytes = 7.5 * 1024**3 
+torch.cuda.set_per_process_memory_fraction(0.95, device=0)
+
 os.environ['WANDB_API_KEY'] = os.getenv("WANDB_API_KEY")
 os.environ['HF_TOKEN'] = os.getenv("HF_TOKEN")
 
 # Define a subset of the data that will comfortably fit in RAM cache
 CACHE_SIZE = 2048*8 # Around 16000k images (8 batch size)
-UNFREEZE_STAGE1_EPOCH = 5
-UNFREEZE_STAGE2_EPOCH = 80
 
 def generate_savename(
     model_name, image_size, learning_rate, stacked_images, years, extra
@@ -131,7 +134,6 @@ class CyclicCacheManager:
         total_bands = nbands * len(self.params["stacked_images"])
         target_shape = (total_bands, self.params["image_size"], self.params["image_size"])
  
-        image = np.zeros(shape=(nbands, 0, 0))
         try:
             if not pd.isna(dataset_name):
                 link_dataset = primary_dataset.get(dataset_name)
@@ -143,42 +145,47 @@ class CyclicCacheManager:
                         n_bands=nbands,
                         stacked_images=self.params["stacked_images"],
                     )
-        except Exception:
-            pass
- 
-        if image.shape != target_shape:
-            processed_image = np.zeros(
-                shape=(resizing_size, resizing_size, total_bands), dtype=np.uint8
-            )
-        else:
-            processed_image = geo_utils.process_image(image, resizing_size)
- 
-        # Keep as uint8 for disk/RAM efficiency — transform handles float32 later
-        return torch.tensor(processed_image, dtype=torch.uint8).permute(2, 0, 1)
+                    
+                    if image is not None and image.shape == target_shape:
+                        processed_image = geo_utils.process_image(image, resizing_size)
+                        return torch.tensor(processed_image, dtype=torch.uint8).permute(2, 0, 1)
+        except Exception as e:
+            logging.error(f"Failed to extract image for GEOID {row.get('GEOID', 'unknown')}: {e}")
+            
+        # Return None to filter out corrupted data
+        return None
  
     def _worker_generate(self, shard_id, show_progress=False):
         """Runs in background: samples the dataframe and saves a new shard to disk."""
         sampled_df = self.df.sample(self.shard_size, replace=False)
         images, labels = [], []
  
-        # Conditionally wrap the iterator in tqdm
         iterator = sampled_df.iterrows()
         if show_progress:
             iterator = tqdm(iterator, total=sampled_df.shape[0], desc=f"Generating shard {shard_id}")
             
         for _, row in iterator:
-            images.append(self._extract_single_image(row))
+            img = self._extract_single_image(row)
+            if img is None:
+                continue # NATIVELY SKIP TO THE NEXT IMAGE
+                
+            images.append(img)
             labels.append(row["var"])
  
         shard_path = self.cache_dir / f"shard_{shard_id}.pt"
-        torch.save(
-            {
-                "images": torch.stack(images),
-                "labels": torch.tensor(labels, dtype=torch.float32),
-            },
-            shard_path,
-        )
- 
+        if len(images) > 0:
+            torch.save(
+                {
+                    "images": torch.stack(images),
+                    "labels": torch.tensor(labels, dtype=torch.float32),
+                },
+                shard_path,
+            )
+        else:
+            # Fallback if entire shard fails to prevent load crash
+            logging.warning(f"Shard {shard_id} generated 0 valid images.")
+            torch.save({"images": torch.empty(0), "labels": torch.empty(0)}, shard_path) 
+
     def build_initial_cache(self):
         """Synchronously generates the initial num_shards shards. Call once before training."""
         print(f"Building initial {self.num_shards} cache shards...")
@@ -351,7 +358,7 @@ def create_train_test_dataframes(df, savename, small_sample=False):
     testing.
     """
     if small_sample:
-        df = df.sample(1_000, random_state=825).reset_index(drop=True)
+        df = df.sample(100, random_state=825).reset_index(drop=True)
 
     ### Split census tracts based on train/test
     #       (the hole census tract must be in the corresponding region)
@@ -593,38 +600,6 @@ def train_model(
         # ==========================
         # 1. TRAINING PHASE
         # ==========================
-
-        # ── Staged unfreezing ──────────────────────────────────────
-        if epoch == UNFREEZE_STAGE1_EPOCH:
-            tqdm.write(f"\n🔓 Epoch {epoch+1}: Unfreezing stage 1...")
-            model.unfreeze_stage(1)
-            
-            new_lr = learning_rate * 0.1          # 1e-5
-            for pg in optimizer.param_groups:
-                pg['lr'] = new_lr
-            
-            # Reinitialize scheduler from new LR, with remaining epochs as T_max
-            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-                optimizer,
-                T_max=UNFREEZE_STAGE2_EPOCH - UNFREEZE_STAGE1_EPOCH,  # 40 epochs
-                eta_min=1e-7
-            )
-            tqdm.write(f"   LR reset to {new_lr:.2e}, scheduler restarted.")
-
-        if epoch == UNFREEZE_STAGE2_EPOCH:
-            tqdm.write(f"\n🔓 Epoch {epoch+1}: Unfreezing stage 2...")
-            model.unfreeze_stage(2)
-
-            new_lr = learning_rate * 0.01         # 1e-6
-            for pg in optimizer.param_groups:
-                pg['lr'] = new_lr
-
-            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-                optimizer,
-                T_max=epochs - UNFREEZE_STAGE2_EPOCH,  # 50 epochs
-                eta_min=1e-7
-            )
-            tqdm.write(f"   LR reset to {new_lr:.2e}, scheduler restarted.")
         
         # Start training loop
         model.train() # Set model to training mode (enables dropout, batchnorm updates)
@@ -720,8 +695,9 @@ def train_model(
             best_val_loss = epoch_val_loss
             
             model_path = save_dir / f"{savename}_best.pth"
-            torch.save(model.state_dict(), model_path)
-            
+            trainable_weights = {k: v for k, v in model.state_dict().items() if v.requires_grad}
+            torch.save(trainable_weights, model_path)
+                
             # Optional: Tell wandb to track this specific file
             wandb.save(str(model_path))
 
@@ -879,9 +855,9 @@ def run(
         )
 
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
+        optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=0.05)
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            optimizer, T_max=UNFREEZE_STAGE1_EPOCH, eta_min=1e-6
+            optimizer, T_max=n_epochs, eta_min=1e-7
         )
 
         wandb.init(
@@ -978,7 +954,7 @@ if __name__ == "__main__":
         "nbands": 3,
         "stacked_images": [1],
         "sample_size": 1,
-        "batch_size": 16,
+        "batch_size": 8,
         "small_sample": True,
         "n_epochs": 200,
         "learning_rate": 0.0001,
