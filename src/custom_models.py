@@ -112,7 +112,7 @@ def _load_scalemae_backbone(local_dir="./pretrained/scalemae"):
 
 @register_model("scalemae")
 class ScaleMAE(nn.Module):
-    def __init__(self, resizing_size=224, bands=3, kind="reg", freeze_strategy="linear_probe"):
+    def __init__(self, resizing_size=224, bands=3, kind="reg", freeze_strategy="none"):
         super().__init__()
         self.kind = kind
         self.patch_size = 16  # Fixed for ViT-Large/16; passed at runtime to backbone

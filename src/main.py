@@ -5,6 +5,7 @@ import threading
 from xml.parsers.expat import model
 from zipfile import Path
 import pandas as pd
+from peft import LoraConfig, get_peft_model
 import seaborn as sns
 import matplotlib.pyplot as plt
 import numpy as np
@@ -157,7 +158,7 @@ class CyclicCacheManager:
  
     def _worker_generate(self, shard_id, show_progress=False):
         """Runs in background: samples the dataframe and saves a new shard to disk."""
-        sampled_df = self.df.sample(self.shard_size, replace=True)
+        sampled_df = self.df.sample(self.shard_size, replace=False)
         images, labels = [], []
  
         # Conditionally wrap the iterator in tqdm
@@ -367,7 +368,6 @@ def create_train_test_dataframes(df, savename, small_sample=False):
     assert df_test.shape[0] > 0, f"Empty test dataset!"
     df_not_test = df[df["type"] == "train"].copy().reset_index(drop=True)
     assert df_not_test.shape[0] > 0, f"Empty train dataset!"
-
 
     # Shuffle everything so images are not sequential:
     df_test = df_test.sample(frac=1.0, random_state=825).reset_index(drop=True)
@@ -881,8 +881,9 @@ def run(
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            optimizer, T_max=UNFREEZE_STAGE1_EPOCH, eta_min=1e-6
+            optimizer, T_max=n_epochs, eta_min=1e-6
         )
+
         wandb.init(
             project="urban-income-prediction", 
             name=savename, config=params
@@ -977,8 +978,8 @@ if __name__ == "__main__":
         "nbands": 3,
         "stacked_images": [1],
         "sample_size": 1,
-        "batch_size": 8,
-        "small_sample": False,
+        "batch_size": 16,
+        "small_sample": True,
         "n_epochs": 200,
         "learning_rate": 0.0001,
         "sat_data": "aerial",
