@@ -1,12 +1,16 @@
 ##############      Configuración      ##############
 import os
 import shutil
+import threading
 from xml.parsers.expat import model
+from zipfile import Path
 import pandas as pd
 import seaborn as sns
 import matplotlib.pyplot as plt
 import numpy as np
 from typing import List, Dict
+
+from tqdm import tqdm
 from src import grid_predictions
 from src.utils.paths import PROJECT_ROOT, DATA_DIR, EXTERNAL_DATA_DIR, RAW_DATA_DIR, INTERIM_DATA_DIR, PROCESSED_DATA_DIR, CACHE_DIR, RESULTS_DIR, LOGS_DIR, MODELS_DIR, IMAGERY_ROOT
 pd.set_option("display.max_columns", None)
@@ -37,14 +41,18 @@ import wandb
 import torch
 import torch.nn as nn
 import torchvision.transforms.v2 as transforms
+from torch.amp import autocast, GradScaler # Add this to the top of main.py
 from torch.utils.data import Dataset, DataLoader
 
 from sklearn.model_selection import train_test_split
 
 os.environ['WANDB_API_KEY'] = os.getenv("WANDB_API_KEY")
+os.environ['HF_TOKEN'] = os.getenv("HF_TOKEN")
 
 # Define a subset of the data that will comfortably fit in RAM cache
-CACHE_SIZE = 800*128 # Around 100k images (128 batch size)
+CACHE_SIZE = 2048*8 # Around 16000k images (8 batch size)
+UNFREEZE_STAGE1_EPOCH = 5
+UNFREEZE_STAGE2_EPOCH = 80
 
 def generate_savename(
     model_name, image_size, learning_rate, stacked_images, years, extra
@@ -89,55 +97,40 @@ def open_datasets(sat_data="aerial", years=[2013, 2018, 2022]):
 
     return datasets_all_years, extents_all_years, df
 
-
-class SatelliteDataset(Dataset):
-    def __init__(self, df, all_years_datasets, image_size, resizing_size, nbands=4, stacked_images=[1], transform=None, mode="train", fixed_year=None):
-        """
-        Unified PyTorch Dataset for both Training (RAM Prefetch) and Prediction (Lazy Load).
-        
-        Args:
-            mode: "train", "eval", or "predict". 
-                  - "train" and "eval" prefetch to RAM and return (image, label).
-                  - "predict" loads lazily and returns (image, GEOID).
-            fixed_year: Optional. If provided (e.g., for prediction), forces the dataset to only use that year.
-        """
-        self.df = df.reset_index(drop=True)
+class CyclicCacheManager:
+    def __init__(self, df, all_years_datasets, params, cache_dir, num_shards=5, shard_size=20480, single_shard_mode=False, type="train"):
+        self.df = df
         self.all_years_datasets = all_years_datasets
-        self.available_years = list(all_years_datasets.keys())
-        self.image_size = image_size
-        self.resizing_size = resizing_size
-        self.nbands = nbands
-        self.stacked_images = stacked_images
-        self.transform = transform
-        self.mode = mode
-        self.fixed_year = fixed_year
-        
-        self.total_bands = self.nbands * len(self.stacked_images)
-        self.target_shape = (self.total_bands, self.image_size, self.image_size)
-        
-        # If we are training or evaluating, we prefetch the data into RAM
-        if self.mode in ["train", "eval"]:
-            self.cached_images = []
-            self.cached_labels = []
-            print(f"[{self.mode.upper()}] Pre-fetching {len(self.df)} samples into RAM...")
-            self._prefetch_data()
-        elif self.mode == "predict":
-            print(f"[PREDICT] Initialized lazy-loading dataset for {len(self.df)} samples.")
+        self.params = params
+        self.type = type
+        self.cache_dir = cache_dir / f"{self.type}_cache"
+        self.num_shards = num_shards
+        self.shard_size = shard_size
+        self.single_shard_mode = single_shard_mode
 
-    def _extract_image(self, row):
-        """
-        Core geospatial extraction logic. Reused by both prefetching and lazy loading.
-        """
-        polygon = row["geometry"]
-        
-        # Pick the year (fixed for prediction, random for training robustness)
-        batch_year = self.fixed_year if self.fixed_year is not None else random.choice(self.available_years)
-        
+        self.active_shards = []
+        self.next_shard_idx = 0
+        self.bg_thread = None
+        self._is_initialized = False
+ 
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+        for f in self.cache_dir.glob("*.pt"):
+            f.unlink()
+ 
+    def _extract_single_image(self, row):
+        available_years = list(self.all_years_datasets.keys())
+        batch_year = random.choice(available_years)
+ 
         primary_dataset = self.all_years_datasets[batch_year]
         dataset_name = row.get(f"dataset_{batch_year}")
-        
-        image = np.zeros(shape=(self.nbands, 0, 0))
-        
+        polygon = row["geometry"]
+ 
+        nbands = self.params["nbands"]
+        resizing_size = self.params["resizing_size"]
+        total_bands = nbands * len(self.params["stacked_images"])
+        target_shape = (total_bands, self.params["image_size"], self.params["image_size"])
+ 
+        image = np.zeros(shape=(nbands, 0, 0))
         try:
             if not pd.isna(dataset_name):
                 link_dataset = primary_dataset.get(dataset_name)
@@ -145,61 +138,210 @@ class SatelliteDataset(Dataset):
                     image, _ = geo_utils.stacked_image_from_census_tract(
                         dataset=link_dataset,
                         polygon=polygon,
-                        img_size=self.image_size,
-                        n_bands=self.nbands,
-                        stacked_images=self.stacked_images,
+                        img_size=self.params["image_size"],
+                        n_bands=nbands,
+                        stacked_images=self.params["stacked_images"],
                     )
         except Exception:
-            pass # Silent fail handled by shape check below
-
-        # Validate shape and process
-        if image.shape != self.target_shape:
-            processed_image = np.zeros(shape=(self.resizing_size, self.resizing_size, self.total_bands), dtype=np.uint8)
+            pass
+ 
+        if image.shape != target_shape:
+            processed_image = np.zeros(
+                shape=(resizing_size, resizing_size, total_bands), dtype=np.uint8
+            )
         else:
-            processed_image = geo_utils.process_image(image, self.resizing_size)
+            processed_image = geo_utils.process_image(image, resizing_size)
+ 
+        # Keep as uint8 for disk/RAM efficiency — transform handles float32 later
+        return torch.tensor(processed_image, dtype=torch.uint8).permute(2, 0, 1)
+ 
+    def _worker_generate(self, shard_id, show_progress=False):
+        """Runs in background: samples the dataframe and saves a new shard to disk."""
+        sampled_df = self.df.sample(self.shard_size, replace=True)
+        images, labels = [], []
+ 
+        # Conditionally wrap the iterator in tqdm
+        iterator = sampled_df.iterrows()
+        if show_progress:
+            iterator = tqdm(iterator, total=sampled_df.shape[0], desc=f"Generating shard {shard_id}")
+            
+        for _, row in iterator:
+            images.append(self._extract_single_image(row))
+            labels.append(row["var"])
+ 
+        shard_path = self.cache_dir / f"shard_{shard_id}.pt"
+        torch.save(
+            {
+                "images": torch.stack(images),
+                "labels": torch.tensor(labels, dtype=torch.float32),
+            },
+            shard_path,
+        )
+ 
+    def build_initial_cache(self):
+        """Synchronously generates the initial num_shards shards. Call once before training."""
+        print(f"Building initial {self.num_shards} cache shards...")
+        for i in range(self.num_shards):
+            # True: Show progress bar during initial blocking setup
+            self._worker_generate(self.next_shard_idx, show_progress=True) 
+            self.active_shards.append(self.cache_dir / f"shard_{self.next_shard_idx}.pt")
+            self.next_shard_idx += 1
+        self._is_initialized = True
+        print("Initial cache ready.")
+ 
+    def start_background_generation(self):
+        """Kicks off generation of the next shard on a background thread."""
+        if not self._is_initialized:
+            raise RuntimeError("Call build_initial_cache() before starting background generation.")
+        self.bg_thread = threading.Thread(
+            # False: Hide progress bar for background thread
+            target=self._worker_generate, args=(self.next_shard_idx, False), daemon=True 
+        )
+        self.bg_thread.start()
+ 
+    def step(self):
+        """Non-blocking cache rotation."""
+        if not self._is_initialized:
+            raise RuntimeError("Call build_initial_cache() before calling step().")
 
-        # Return as PyTorch (C, H, W) tensor
+        if not self.single_shard_mode:
+            if self.bg_thread is not None and self.bg_thread.is_alive():
+                return False 
+    
+            oldest_shard = self.active_shards.pop(0)
+            oldest_shard.unlink()
+    
+            self.active_shards.append(self.cache_dir / f"shard_{self.next_shard_idx}.pt")
+            self.next_shard_idx += 1
+    
+            self.bg_thread = threading.Thread(
+                # False: Hide progress bar for background thread
+                target=self._worker_generate, args=(self.next_shard_idx, False), daemon=True
+            )
+            self.bg_thread.start()
+            
+            return True 
+        return False
+ 
+
+class CyclicRAMDataset(Dataset):
+    def __init__(self, cache_manager: CyclicCacheManager, transform=None):
+        if not cache_manager._is_initialized:
+            raise RuntimeError(
+                "Call cache_manager.build_initial_cache() before instantiating CyclicRAMDataset."
+            )
+        self.cache_manager = cache_manager
+        self.transform = transform
+        self.images = None
+        self.labels = None
+        self.refresh()
+ 
+    def refresh(self):
+        """Drops the current in-RAM tensors and reloads from the active shards on disk."""
+        if not self.cache_manager.active_shards:
+            raise RuntimeError("No active shards to load. Call build_initial_cache() first.")
+ 
+        img_list, lbl_list = [], []
+        for shard_path in self.cache_manager.active_shards:
+            data = torch.load(shard_path, weights_only=True)
+            img_list.append(data["images"])
+            lbl_list.append(data["labels"])
+ 
+        self.images = torch.cat(img_list)
+        self.labels = torch.cat(lbl_list)
+ 
+    def __len__(self):
+        return len(self.images)
+ 
+    def __getitem__(self, idx):
+        img = self.images[idx]
+        lbl = self.labels[idx]
+ 
+        if self.transform:
+            img = self.transform(img)
+ 
+        return img, lbl
+
+class EvalSatelliteDataset(Dataset):
+    """Static dataset for Validation, Testing, and Prediction."""
+    def __init__(self, df, all_years_datasets, params, transform=None, mode="eval", fixed_year=None):
+        self.df = df.reset_index(drop=True)
+        self.all_years_datasets = all_years_datasets
+        self.params = params
+        self.transform = transform
+        self.mode = mode
+        self.fixed_year = fixed_year
+        self.available_years = list(all_years_datasets.keys())
+        
+        self.total_bands = params["nbands"] * len(params["stacked_images"])
+        self.target_shape = (self.total_bands, params["image_size"], params["image_size"])
+        
+        if self.mode == "eval":
+            print(f"[{self.mode.upper()}] Pre-fetching {len(self.df)} samples into RAM...")
+            self.cached_images = []
+            self.cached_labels = []
+            self._prefetch_data()
+
+    def _extract_image(self, row):
+        batch_year = self.fixed_year if self.fixed_year is not None else random.choice(self.available_years)
+        primary_dataset = self.all_years_datasets[batch_year]
+        dataset_name = row.get(f"dataset_{batch_year}")
+        polygon = row["geometry"]
+        
+        image = np.zeros(shape=(self.params["nbands"], 0, 0))
+        try:
+            if not pd.isna(dataset_name):
+                link_dataset = primary_dataset.get(dataset_name)
+                if link_dataset is not None:
+                    image, _ = geo_utils.stacked_image_from_census_tract(
+                        dataset=link_dataset, polygon=polygon,
+                        img_size=self.params["image_size"], n_bands=self.params["nbands"],
+                        stacked_images=self.params["stacked_images"],
+                    )
+        except Exception:
+            pass
+
+        if image.shape != self.target_shape:
+            processed_image = np.zeros(shape=(self.params["resizing_size"], self.params["resizing_size"], self.total_bands), dtype=np.uint8)
+        else:
+            processed_image = geo_utils.process_image(image, self.params["resizing_size"])
+
         return torch.tensor(processed_image, dtype=torch.uint8).permute(2, 0, 1)
 
     def _prefetch_data(self):
-        """Populates the RAM cache. Only called if mode is 'train' or 'eval'."""
         for idx in range(len(self.df)):
             row = self.df.iloc[idx]
-            
-            # Extract image
-            image_tensor = self._extract_image(row)
-            
-            # Extract label
-            label_tensor = torch.tensor(row["var"], dtype=torch.float32)
-            
-            self.cached_images.append(image_tensor)
-            self.cached_labels.append(label_tensor)
+            self.cached_images.append(self._extract_image(row))
+            self.cached_labels.append(torch.tensor(row["var"], dtype=torch.float32))
 
     def __len__(self):
         return len(self.df)
     
     def __getitem__(self, idx):
-        if self.mode in ["train", "eval"]:
-            # 1. FAST PATH: Return cached image and label
+        if self.mode == "eval":
             img = self.cached_images[idx]
             lbl = self.cached_labels[idx]
-            
             if self.transform:
                 img = self.transform(img)
-                
             return img, lbl
-            
+
+        elif self.mode == "lazy_eval":
+            # Lazy load path for Validation/Testing (Saves RAM and startup time)
+            row = self.df.iloc[idx]
+            img = self._extract_image(row)
+            lbl = torch.tensor(row["var"], dtype=torch.float32)
+            if self.transform:
+                img = self.transform(img)
+            return img, lbl
+        
         elif self.mode == "predict":
-            # 2. LAZY PATH: Extract image on the fly and return GEOID
             row = self.df.iloc[idx]
             img = self._extract_image(row)
             geoid = row["GEOID"]
-            
             if self.transform:
                 img = self.transform(img)
-                
             return img, geoid
-        
+                                
 def create_train_test_dataframes(df, savename, small_sample=False):
     """Create train and test dataframes with the links and xr.datasets to use for training and testing
 
@@ -208,7 +350,7 @@ def create_train_test_dataframes(df, savename, small_sample=False):
     testing.
     """
     if small_sample:
-        df = df.sample(100_000, random_state=825).reset_index(drop=True)
+        df = df.sample(1_000, random_state=825).reset_index(drop=True)
 
     ### Split census tracts based on train/test
     #       (the hole census tract must be in the corresponding region)
@@ -232,7 +374,7 @@ def create_train_test_dataframes(df, savename, small_sample=False):
     df_not_test = df_not_test.sample(frac=1.0, random_state=825).reset_index(drop=True)
     
     # Generate validation dataset
-    df_val = df_not_test.sample(frac=0.066667, random_state=200).reset_index(drop=True)
+    df_val = df_not_test.sample(frac=0.06667, random_state=200).reset_index(drop=True)
     df_train = df_not_test.drop(df_val.index).reset_index(drop=True)
 
     test_dataframe_path = PROCESSED_DATA_DIR / "test_datasets" / f"{savename}_test_dataframe.feather"
@@ -249,67 +391,43 @@ def create_train_test_dataframes(df, savename, small_sample=False):
 
     return df_train, df_val, df_test
 
-def setup_dataloaders(df_train, df_val, df_test, all_years_datasets, params):
-    """
-    Initializes train, val, and test PyTorch dataloaders from pre-split dataframes.
-    """
+def setup_dataloaders(df_train, df_val, df_test, all_years_datasets, params, train_cache_manager=None, val_cache_manager=None):
     print("--- Initializing PyTorch Datasets ---")
-    print(f"Train: {len(df_train)} | Val: {len(df_val)} | Test: {len(df_test)}")
+    print(f"Train: Cyclical Cache | Val: {len(df_val)} | Test: {len(df_test)}")
 
-    # 1. Define Phase-Specific Transforms
-    # Only training data gets random augmentations
+    test_loader = None # TODO
+
     train_transform = transforms.Compose([
         transforms.RandomHorizontalFlip(p=0.5),
         transforms.RandomVerticalFlip(p=0.5),
         transforms.ToDtype(torch.float32, scale=True)
     ])
     
-    # Eval transforms ONLY cast to float32 (no random augmentations for val/test)
     eval_transform = transforms.Compose([
         transforms.ToDtype(torch.float32, scale=True)
     ])
 
-    # 2. Instantiate the Datasets
-    # Each one will pre-fetch its specific subset into RAM via the _prefetch_data() method
-    train_dataset = SatelliteDataset(
-        df=df_train, 
-        all_years_datasets=all_years_datasets, 
-        image_size=params["image_size"], 
-        resizing_size=params["resizing_size"],
-        nbands=params["nbands"],
-        stacked_images=params["stacked_images"],
-        transform=train_transform,
-        mode="train"
+    train_dataset = CyclicRAMDataset(
+        cache_manager=train_cache_manager,
+        transform=train_transform
     )
-    
-    val_dataset = SatelliteDataset(
-        df=df_val, 
-        all_years_datasets=all_years_datasets,
-        image_size=params["image_size"], 
-        resizing_size=params["resizing_size"],
-        nbands=params["nbands"],
-        stacked_images=params["stacked_images"],
-        transform=eval_transform,
-        mode="eval"
-    )
-    
-    test_dataset = SatelliteDataset(
-        df=df_test, 
-        all_years_datasets=all_years_datasets,
-        image_size=params["image_size"], 
-        resizing_size=params["resizing_size"],
-        nbands=params["nbands"],
-        stacked_images=params["stacked_images"],
-        transform=eval_transform,
-        mode="eval"
+        
+    val_dataset = CyclicRAMDataset(
+        cache_manager=val_cache_manager,
+        transform=eval_transform # No random augmentations
     )
 
-    # 3. Wrap them in DataLoaders
-    # Only shuffle the training data via PyTorch's native shuffle flag!
+    
+    # test_dataset = EvalSatelliteDataset(
+    #     df=df_test, all_years_datasets=all_years_datasets,
+    #     params=params, transform=eval_transform, mode="lazy_eval"
+    # )
+
     batch_size = params.get("batch_size", 32)
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
-    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
+    # Since all data is fully loaded in RAM, num_workers=0 is perfectly fast!
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=0)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size*4, shuffle=False, num_workers=0)
+    # test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=0)
     
     return train_loader, val_loader, test_loader
 
@@ -451,10 +569,13 @@ def train_model(
     train_loader, 
     val_loader, 
     loss_fn, 
+    learning_rate,
     optimizer, 
+    scheduler,
     epochs, 
     device, 
-    savename
+    savename,
+    cache_manager
 ):
     print("--- Starting PyTorch Training Loop ---")
     best_val_loss = float('inf')
@@ -463,60 +584,127 @@ def train_model(
     save_dir = MODELS_DIR / "models_by_epoch" / savename
     os.makedirs(save_dir, exist_ok=True)
 
+    # Initialize Mixed Precision Scaler
+    scaler = GradScaler()
+    accumulation_steps = 4  # Accumulate gradients (e.g., batch_size 8 * 4 steps = effective batch size 32)
+
     for epoch in range(epochs):
+               
         # ==========================
         # 1. TRAINING PHASE
         # ==========================
+
+        # ── Staged unfreezing ──────────────────────────────────────
+        if epoch == UNFREEZE_STAGE1_EPOCH:
+            tqdm.write(f"\n🔓 Epoch {epoch+1}: Unfreezing stage 1...")
+            model.unfreeze_stage(1)
+            
+            new_lr = learning_rate * 0.1          # 1e-5
+            for pg in optimizer.param_groups:
+                pg['lr'] = new_lr
+            
+            # Reinitialize scheduler from new LR, with remaining epochs as T_max
+            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                optimizer,
+                T_max=UNFREEZE_STAGE2_EPOCH - UNFREEZE_STAGE1_EPOCH,  # 40 epochs
+                eta_min=1e-7
+            )
+            tqdm.write(f"   LR reset to {new_lr:.2e}, scheduler restarted.")
+
+        if epoch == UNFREEZE_STAGE2_EPOCH:
+            tqdm.write(f"\n🔓 Epoch {epoch+1}: Unfreezing stage 2...")
+            model.unfreeze_stage(2)
+
+            new_lr = learning_rate * 0.01         # 1e-6
+            for pg in optimizer.param_groups:
+                pg['lr'] = new_lr
+
+            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                optimizer,
+                T_max=epochs - UNFREEZE_STAGE2_EPOCH,  # 50 epochs
+                eta_min=1e-7
+            )
+            tqdm.write(f"   LR reset to {new_lr:.2e}, scheduler restarted.")
+        
+        # Start training loop
         model.train() # Set model to training mode (enables dropout, batchnorm updates)
         running_train_loss = 0.0
         
-        for batch_idx, (images, labels) in enumerate(train_loader):
+        # Zero the gradients
+        optimizer.zero_grad()
+        
+        train_bar = tqdm(
+            enumerate(train_loader), 
+            total=len(train_loader),
+            desc=f"Epoch [{epoch+1}/{epochs}] Train",
+            leave=False   # clears the bar when done, keeping output clean
+        )
+
+        for batch_idx, (images, labels) in train_bar:
             images, labels = images.to(device), labels.to(device)
             
-            # Zero the gradients
-            optimizer.zero_grad()
-            
-            # Forward pass
-            outputs = model(images)
-            
-            # If your labels are shape (Batch,), and output is (Batch, 1), you might need to squeeze/unsqueeze
-            if outputs.shape != labels.shape:
-                outputs = outputs.view(labels.shape)
+            # Run forward pass in Mixed Precision (FP16)
+            with autocast(device_type='cuda'):
+                outputs = model(images)
+                if outputs.shape != labels.shape:
+                    outputs = outputs.view(labels.shape)
                 
-            loss = loss_fn(outputs, labels)
+                loss = loss_fn(outputs, labels)
+
+                # Scale loss to account for accumulation
+                loss = loss / accumulation_steps 
             
-            # Backward pass & Optimizer step
-            loss.backward()
-            optimizer.step()
+            # Backward pass with scaler
+            scaler.scale(loss).backward()
             
-            running_train_loss += loss.item() * images.size(0)
+            # Only step the optimizer every `accumulation_steps`
+            if (batch_idx + 1) % accumulation_steps == 0 or (batch_idx + 1) == len(train_loader):
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad()
+            
+            # De-scale loss for logging
+            step_loss = loss.item() * accumulation_steps
+            running_train_loss += (step_loss) * images.size(0)
+            samples_seen = (batch_idx + 1) * images.size(0)
+            running_avg = running_train_loss / samples_seen
+
+            # Live loss update in the bar
+            train_bar.set_postfix(
+                step=f"{step_loss:.4f}",       # current batch loss (keras-style: loss per step)
+                avg=f"{running_avg:.4f}"       # running epoch average (keras-style: epoch progress)
+            )
 
         epoch_train_loss = running_train_loss / len(train_loader.dataset)
+        
+        # Always step scheduler at end of epoch
+        scheduler.step()        
 
         # ==========================
         # 2. VALIDATION PHASE
         # ==========================
         model.eval() # Set model to eval mode (disables dropout)
         running_val_loss = 0.0
-        
+        val_bar = tqdm(val_loader, desc=f"Epoch [{epoch+1}/{epochs}] Val", leave=False)
+
         # Disable gradient calculation for validation (saves RAM and compute)
         with torch.no_grad():
-            for images, labels in val_loader:
+            for images, labels in val_bar:
                 images, labels = images.to(device), labels.to(device)
-                
-                outputs = model(images)
-                if outputs.shape != labels.shape:
-                    outputs = outputs.view(labels.shape)
-                    
-                loss = loss_fn(outputs, labels)
+                with autocast(device_type='cuda'):
+                    outputs = model(images)
+                    if outputs.shape != labels.shape:
+                        outputs = outputs.view(labels.shape)
+                    loss = loss_fn(outputs, labels)
                 running_val_loss += loss.item() * images.size(0)
+                val_bar.set_postfix(loss=f"{loss.item():.4f}")
 
         epoch_val_loss = running_val_loss / len(val_loader.dataset)
 
         # ==========================
         # 3. LOGGING & CHECKPOINTING
         # ==========================
-        print(f"Epoch [{epoch+1}/{epochs}] | Train Loss: {epoch_train_loss:.4f} | Val Loss: {epoch_val_loss:.4f}")
+        tqdm.write(f"Epoch [{epoch+1}/{epochs}] | Train Loss: {epoch_train_loss:.4f} | Val Loss: {epoch_val_loss:.4f}")
         
         # 🎯 Log metrics directly to W&B cloud!
         wandb.log({
@@ -528,7 +716,7 @@ def train_model(
 
         # Model Checkpoint logic (Replaces Keras ModelCheckpoint callback)
         if epoch_val_loss < best_val_loss:
-            print(f"⭐ Val loss improved from {best_val_loss:.4f} to {epoch_val_loss:.4f}. Saving...")
+            tqdm.write(f"⭐ Val loss improved from {best_val_loss:.4f} to {epoch_val_loss:.4f}. Saving...")
             best_val_loss = epoch_val_loss
             
             model_path = save_dir / f"{savename}_best.pth"
@@ -536,6 +724,18 @@ def train_model(
             
             # Optional: Tell wandb to track this specific file
             wandb.save(str(model_path))
+
+        # ==========================
+        # 4. ROTATE CACHE FOR NEXT EPOCH
+        # ==========================
+        cache_updated = cache_manager.step()             
+        if cache_updated:
+            tqdm.write("🔄 New background shard ready! Loading updated data into RAM...")
+            train_loader.dataset.refresh()   
+        else:
+            # The GPU is faster than the CPU. Re-use current RAM data.
+            pass
+        
 
     print("--- Training Complete ---")
     return model
@@ -622,58 +822,80 @@ def run(
 
     if train:
 
-        # ### Create train and test dataframes from ICPAG
         df_train, df_val, df_test = create_train_test_dataframes(
             df, savename, small_sample=small_sample
         )
 
-        #### PyTorch Data Pipeline Setup
+        #### 1. Setup Cyclic Cache Manager
+        print("Building Initial Cache...")
+        if small_sample:
+            num_shards = 1
+            current_shard_size = len(df_train) # E.g., ~150 images per shard
+        else:
+            num_shards = 5
+            current_shard_size = CACHE_SIZE // 5             # E.g., 20,480 images per shard
+
+        print("\n[TRAIN] Building cyclic training cache...")
+        train_cache_manager = CyclicCacheManager(
+            df=df_train,
+            all_years_datasets=all_years_datasets,
+            params=params,
+            cache_dir=CACHE_DIR,
+            single_shard_mode=small_sample, # If small_sample is True, keep only one shard to speed up testing
+            num_shards=num_shards,
+            shard_size=current_shard_size, 
+            type="train"
+        )
+        train_cache_manager.build_initial_cache()
+        train_cache_manager.start_background_generation() # Starts generating shard 6 for Epoch 1
+
+        print("\n[VAL] Building static validation cache...")
+        val_cache_manager = CyclicCacheManager(
+            df=df_val, # Or full df_val
+            all_years_datasets=all_years_datasets,
+            params=params,
+            cache_dir=CACHE_DIR,
+            num_shards=1,               # Only build one shard
+            shard_size=len(df_val),     # Make it big enough for the whole val set
+            single_shard_mode=True,     # IMPORTANT: This disables rotation
+            type="val"
+        )
+        val_cache_manager.build_initial_cache() # This will build and show a progress bar
+
+        #### 2. PyTorch Data Pipeline Setup
         print("Setting up data generators...")
         train_loader, val_loader, test_loader = setup_dataloaders(
-                df_train=df_train, 
-                df_val=df_val,
-                df_test=df_test,
-                all_years_datasets=all_years_datasets, 
-                params=params
-            )            
+            df_train=df_train, df_val=df_val, df_test=df_test,
+            all_years_datasets=all_years_datasets, params=params,
+            train_cache_manager=train_cache_manager, val_cache_manager=val_cache_manager
+        )            
         print("Data Pipeline Ready!")
-        print(f"Batches per epoch -> Train: {len(train_loader)} | Val: {len(val_loader)} | Test: {len(test_loader)}")
 
-        #### Model Initialization
+        #### 3. Model Initialization
         model, loss_fn = set_model_and_loss_function(
-            model_name=model_name,
-            kind=kind,
+            model_name=model_name, kind=kind,
             bands=nbands * len(stacked_images),
-            resizing_size=resizing_size,
-            weights=weights,
+            resizing_size=resizing_size, weights=weights,
         )
 
-        # 1. Setup Device
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-        # 2. Initialize PyTorch Optimizer
         optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
-
-        # 3. Initialize Weights & Biases
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=UNFREEZE_STAGE1_EPOCH, eta_min=1e-6
+        )
         wandb.init(
-            project="urban-income-prediction", # Change to your project name
-            name=savename,
-            config=params
+            project="urban-income-prediction", 
+            name=savename, config=params
         )
 
-        # 4. Run PyTorch Model
+        #### 4. Run PyTorch Model
         model = train_model(
-            model=model,
-            train_loader=train_loader,
-            val_loader=val_loader,
-            loss_fn=loss_fn,
-            optimizer=optimizer,
-            epochs=n_epochs,
-            device=device,
-            savename=savename
+            model=model, train_loader=train_loader, val_loader=val_loader,
+            loss_fn=loss_fn, learning_rate=learning_rate, optimizer=optimizer, scheduler=scheduler, 
+            epochs=n_epochs, device=device, savename=savename,
+            cache_manager=train_cache_manager
         )
         
-        # 5. Finish the wandb run cleanly
         wandb.finish()
         print("Fin del entrenamiento")
     
@@ -746,7 +968,7 @@ if __name__ == "__main__":
 
     # Selection of parameters
     params = {
-        "model_name": "small_cnn",
+        "model_name": "scalemae",
         "kind": "reg",
         "weights": None,
         "image_size": 224,
@@ -755,9 +977,10 @@ if __name__ == "__main__":
         "nbands": 3,
         "stacked_images": [1],
         "sample_size": 1,
-        "small_sample": True,
-        "n_epochs": 100,
-        "learning_rate": 0.001,
+        "batch_size": 8,
+        "small_sample": False,
+        "n_epochs": 200,
+        "learning_rate": 0.0001,
         "sat_data": "aerial",
         "years": [2022], # Only the data inside WSL! all data is: [2010, 2012, 2014, 2016, 2018, 2020, 2022, 2024],
         "extra": "",  # Extra info to add to the savename (e.g. for ablation studies)

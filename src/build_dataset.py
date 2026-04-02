@@ -258,9 +258,9 @@ def split_train_test(gdf, buffer=500):
 
     print(
         "",
-        f"Size of test dataset: {test_size/total_size*100:.2f}% ({test_size} features)",
-        f"Size of train dataset: {train_size/total_size*100:.2f}% ({train_size} features)",
-        f"Deleted images due to train/test overlapping: {invalid_size/total_size*100:.2f}% ({invalid_size} features)",
+        f"Size of test dataset: {test_size/total_size*100:.2f}% ({test_size} rows)",
+        f"Size of train dataset: {train_size/total_size*100:.2f}% ({train_size} rows)",
+        f"Deleted images due to train/test overlapping: {invalid_size/total_size*100:.2f}% ({invalid_size} rows)",
         sep="\n",
     )
 
