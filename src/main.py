@@ -881,7 +881,7 @@ def run(
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            optimizer, T_max=n_epochs, eta_min=1e-6
+            optimizer, T_max=UNFREEZE_STAGE1_EPOCH, eta_min=1e-6
         )
 
         wandb.init(
