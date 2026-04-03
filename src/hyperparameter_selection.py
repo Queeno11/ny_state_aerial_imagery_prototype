@@ -5,7 +5,7 @@ import seaborn as sns
 import matplotlib.pyplot as plt
 import numpy as np
 from typing import List, Dict
-from src import custom_models
+from src import custom_models_tf
 from src.utils.paths import PROJECT_ROOT, DATA_DIR, EXTERNAL_DATA_DIR, RAW_DATA_DIR, INTERIM_DATA_DIR, PROCESSED_DATA_DIR, RESULTS_DIR, LOGS_DIR, IMAGERY_ROOT, MODELS_DIR
 pd.set_option("display.max_columns", None)
 
@@ -21,7 +21,7 @@ import scipy
 import random
 import pandas as pd
 import xarray as xr
-import tensorflow as tf
+
 import matplotlib.pyplot as plt
 
 try:

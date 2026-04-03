@@ -25,21 +25,6 @@ import geopandas as gpd
 from typing import Iterator, List, Union, Tuple, Any
 from datetime import datetime
 
-import tensorflow as tf
-from tensorflow import keras
-import tensorflow_datasets as tfds
-
-from tensorflow.keras import layers, models, Model
-from tensorflow.keras.callbacks import (
-    TensorBoard,
-    EarlyStopping,
-    ModelCheckpoint,
-)
-from tensorflow.keras.models import Sequential
-from tensorflow.keras import backend as K
-import cv2
-import skimage
-
 # the next 3 lines of code are for my machine and setup due to https://github.com/tensorflow/tensorflow/issues/43174
 try:
     physical_devices = tf.config.list_physical_devices("GPU")
@@ -1055,7 +1040,7 @@ if __name__ == "__main__":
         model_name=model,
         pred_variable=variable,
         kind=kind,
-        small_sample=False,
+        small_sample=True,
         weights=None,
         image_size=image_size,
         sample_size=sample_size,
@@ -1066,5 +1051,5 @@ if __name__ == "__main__":
         n_epochs=99,
         initial_epoch=initial_epoch,
         # model_path=f"{path_repo}/data/data_out/models_by_epoch/{model}_size{image_size}_tiles{tiles}_sample{sample_size}{extra}/{model}_size{image_size}_tiles{tiles}_sample{sample_size}{extra}_{initial_epoch}",
-        extra="_nostack",
+        extra="",
     )
