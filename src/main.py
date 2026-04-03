@@ -1,4 +1,5 @@
 ##############      Configuración      ##############
+import gc
 import logging
 import os
 import shutil
@@ -40,8 +41,10 @@ from typing import Iterator, List, Union, Tuple, Any
 from datetime import datetime
 
 import wandb
+import time
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torchvision.transforms.v2 as transforms
 from torch.amp import autocast, GradScaler # Add this to the top of main.py
 from torch.utils.data import Dataset, DataLoader
@@ -149,19 +152,23 @@ class CyclicCacheManager:
             int(p.stem.split("_")[1]) for p in existing_shards
         ) + 1
  
-    def _extract_single_image(self, row):
+    def _extract_raw_image(self, row):
+        """
+        Extract a raw (C, H, W) numpy array at the full image_size, WITHOUT resizing.
+        Resize is deferred so the entire shard can be resized in one batched call.
+        Returns the numpy array, or None if extraction fails.
+        """
         available_years = list(self.all_years_datasets.keys())
         batch_year = random.choice(available_years)
- 
+
         primary_dataset = self.all_years_datasets[batch_year]
         dataset_name = row.get(f"dataset_{batch_year}")
         polygon = row["geometry"]
- 
+
         nbands = self.params["nbands"]
-        resizing_size = self.params["resizing_size"]
         total_bands = nbands * len(self.params["stacked_images"])
         target_shape = (total_bands, self.params["image_size"], self.params["image_size"])
- 
+
         try:
             if not pd.isna(dataset_name):
                 link_dataset = primary_dataset.get(dataset_name)
@@ -173,49 +180,117 @@ class CyclicCacheManager:
                         n_bands=nbands,
                         stacked_images=self.params["stacked_images"],
                     )
-                    
                     if image is not None and image.shape == target_shape:
-                        processed_image = geo_utils.process_image(image, resizing_size)
-                        if processed_image.max() == 0:
-                            return None
-                        return torch.tensor(processed_image, dtype=torch.uint8).permute(2, 0, 1)
-                    
+                        return image  # raw (C, H, W) numpy — no resize yet
         except Exception as e:
             logging.error(f"Failed to extract image for GEOID {row.get('GEOID', 'unknown')}: {e}")
-            
-        # Return None to filter out corrupted data
+
         return None
- 
+
+    def _batch_resize_and_convert(self, raw_images):
+        """
+        Resize a list of raw (C, H, W) numpy arrays to (C, resizing_size, resizing_size)
+        in a SINGLE vectorised call via torch.nn.functional.interpolate on CPU.
+
+        Why this is faster than calling geo_utils.process_image N times in a loop:
+        - Skimage/PIL resize launches a separate C routine per image; Python loop overhead
+          multiplies with N (here N ~ 3,000+).
+        - F.interpolate operates on the entire (N, C, H, W) tensor at once using PyTorch's
+          optimised BLAS/OpenMP kernels — one C call for the whole shard.
+        - Eliminating the HWC ↔ CHW transpose that process_image performs also saves
+          memory bandwidth.
+
+        Returns a list of (C, resizing_size, resizing_size) uint8 tensors, matching the
+        format previously produced by process_image + permute.
+        """
+        resizing_size = self.params["resizing_size"]
+
+        # Stack into (N, C, H, W) float32 — interpolate requires floating-point input
+        batch = torch.stack([
+            torch.from_numpy(img.astype(np.float32)) for img in raw_images
+        ])  # (N, C, image_size, image_size)
+
+        # Single batched bilinear downsample — all images in one call
+        # antialias=True avoids high-frequency aliasing when downsampling by 3x (672 → 224)
+        resized = F.interpolate(
+            batch,
+            size=(resizing_size, resizing_size),
+            mode="bilinear",
+            align_corners=False,
+            antialias=True,
+        )  # (N, C, resizing_size, resizing_size)
+
+        # Clamp + cast to uint8 — same in-memory format as the previous pipeline
+        resized = resized.clamp(0, 255).to(torch.uint8)
+
+        return list(resized)  # list of (C, resizing_size, resizing_size) uint8 tensors
+
     def _worker_generate(self, shard_id, show_progress=False):
-        """Runs in background: samples the dataframe and saves a new shard to disk."""
+        """
+        Runs in background: samples the dataframe and saves a new shard to disk.
+        Processes images in chunks to prevent massive RAM leaks.
+        """
         sampled_df = self.df.sample(self.shard_size, replace=False)
-        images, labels = [], []
- 
+        
+        valid_images = []
+        valid_labels = []
+        
+        # Buffers for chunked processing
+        raw_chunk = []
+        label_chunk = []
+        CHUNK_SIZE = 128  # Process 128 images at a time to keep RAM usage low
+
         iterator = sampled_df.iterrows()
         if show_progress:
             iterator = tqdm(iterator, total=sampled_df.shape[0], desc=f"Generating shard {shard_id}")
-            
+
         for _, row in iterator:
-            img = self._extract_single_image(row)
-            if img is None:
-                continue # NATIVELY SKIP TO THE NEXT IMAGE
+            raw_img = self._extract_raw_image(row)
+            if raw_img is None:
+                continue
                 
-            images.append(img)
-            labels.append(row["var"])
- 
+            raw_chunk.append(raw_img)
+            label_chunk.append(row["var"])
+
+            # Whenever our chunk reaches the limit, resize and clean up RAM!
+            if len(raw_chunk) >= CHUNK_SIZE:
+                # Resize the chunk
+                resized_tensors = self._batch_resize_and_convert(raw_chunk)
+                
+                # Filter black images and store the small uint8 tensors
+                for tensor, label in zip(resized_tensors, label_chunk):
+                    if tensor.max() > 0:
+                        valid_images.append(tensor)
+                        valid_labels.append(label)
+                
+                # IMPORTANT: Free the massive raw images from memory!
+                raw_chunk.clear()
+                label_chunk.clear()
+
+        # Process any remaining images in the final partial chunk
+        if len(raw_chunk) > 0:
+            resized_tensors = self._batch_resize_and_convert(raw_chunk)
+            for tensor, label in zip(resized_tensors, label_chunk):
+                if tensor.max() > 0:
+                    valid_images.append(tensor)
+                    valid_labels.append(label)
+            
+            raw_chunk.clear()
+            label_chunk.clear()
+
+        # Save the shard to SSD
         shard_path = self.cache_dir / f"shard_{shard_id}.pt"
-        if len(images) > 0:
+        if len(valid_images) > 0:
             torch.save(
                 {
-                    "images": torch.stack(images),
-                    "labels": torch.tensor(labels, dtype=torch.float32),
+                    "images": torch.stack(valid_images),
+                    "labels": torch.tensor(valid_labels, dtype=torch.float32),
                 },
                 shard_path,
             )
         else:
-            # Fallback if entire shard fails to prevent load crash
-            logging.warning(f"Shard {shard_id} generated 0 valid images.")
-            torch.save({"images": torch.empty(0), "labels": torch.empty(0)}, shard_path) 
+            logging.warning(f"Shard {shard_id}: all extracted images were black/invalid.")
+            torch.save({"images": torch.empty(0), "labels": torch.empty(0)}, shard_path)
 
     def build_initial_cache(self):
         """Synchronously generates the initial num_shards shards. Call once before training."""
@@ -657,10 +732,13 @@ def train_model(
             leave=False   # clears the bar when done, keeping output clean
         )
 
+        t_batch_start = time.perf_counter()  # start timer before first batch
         for batch_idx, (images, labels) in train_bar:
+            t_data_end = time.perf_counter()  # data is ready; measure load time
             images, labels = images.to(device), labels.to(device)
             
             # Run forward pass in Mixed Precision (FP16)
+            t_forward_start = time.perf_counter()
             with autocast(device_type='cuda'):
                 outputs = model(images)
                 if outputs.shape != labels.shape:
@@ -688,6 +766,24 @@ def train_model(
                 scaler.step(optimizer)
                 scaler.update()
                 optimizer.zero_grad()
+
+            # Sync GPU before stopping the timer so we measure real GPU time, not just kernel launch
+            torch.cuda.synchronize()
+            t_forward_end = time.perf_counter()
+
+            # ── Per-step W&B perf metrics (logged every 50 steps to reduce overhead) ──
+            if batch_idx % 50 == 0:
+                data_ms   = (t_data_end   - t_batch_start) * 1000
+                forward_ms = (t_forward_end - t_forward_start) * 1000
+                total_ms   = data_ms + forward_ms
+                wandb.log({
+                    "perf/data_load_ms":   data_ms,
+                    "perf/forward_ms":     forward_ms,
+                    # Fraction of wall-time the GPU is actually computing (higher = better)
+                    "perf/gpu_util_ratio": forward_ms / total_ms if total_ms > 0 else 0,
+                    "perf/samples_per_sec": images.size(0) / (total_ms / 1000) if total_ms > 0 else 0,
+                })
+            t_batch_start = time.perf_counter()  # reset for next batch's data-load window
             
             # De-scale loss for logging
             step_loss = loss.item() * accumulation_steps
@@ -936,6 +1032,10 @@ def run(
             all_years_datasets=all_years_datasets, params=params,
             train_cache_manager=train_cache_manager, val_cache_manager=val_cache_manager
         )            
+
+        del df, df_test, all_years_extents
+        gc.collect() # Force Python to free up memory from large objects we no longer need
+        
         print("Data Pipeline Ready!")
 
         #### 3. Model Initialization
@@ -1074,4 +1174,4 @@ if __name__ == "__main__":
     }
 
     # Run full pipeline
-    run(params, train=True, retrain=True, compute_loss=False, generate_predictions=False)
+    run(params, train=True, retrain=False, compute_loss=False, generate_predictions=False)
