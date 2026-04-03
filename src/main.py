@@ -102,7 +102,18 @@ def open_datasets(sat_data="aerial", years=[2013, 2018, 2022]):
     return datasets_all_years, extents_all_years, df
 
 class CyclicCacheManager:
-    def __init__(self, df, all_years_datasets, params, cache_dir, num_shards=5, shard_size=20480, single_shard_mode=False, type="train"):
+    def __init__(
+        self,
+        df,
+        all_years_datasets,
+        params,
+        cache_dir,
+        num_shards=5,
+        shard_size=20480,
+        single_shard_mode=False,
+        type="train",
+        clear_cache=False,
+    ):
         self.df = df
         self.all_years_datasets = all_years_datasets
         self.params = params
@@ -111,6 +122,7 @@ class CyclicCacheManager:
         self.num_shards = num_shards
         self.shard_size = shard_size
         self.single_shard_mode = single_shard_mode
+        self.clear_cache = clear_cache
 
         self.active_shards = []
         self.next_shard_idx = 0
@@ -118,8 +130,24 @@ class CyclicCacheManager:
         self._is_initialized = False
  
         self.cache_dir.mkdir(parents=True, exist_ok=True)
-        for f in self.cache_dir.glob("*.pt"):
-            f.unlink()
+        if self.clear_cache:
+            for f in self.cache_dir.glob("*.pt"):
+                f.unlink()
+        else:
+            self._load_existing_shards()
+
+    def _load_existing_shards(self):
+        existing_shards = sorted(
+            self.cache_dir.glob("shard_*.pt"),
+            key=lambda p: int(p.stem.split("_")[1]),
+        )
+        if not existing_shards:
+            return
+
+        self.active_shards = existing_shards
+        self.next_shard_idx = max(
+            int(p.stem.split("_")[1]) for p in existing_shards
+        ) + 1
  
     def _extract_single_image(self, row):
         available_years = list(self.all_years_datasets.keys())
@@ -148,7 +176,10 @@ class CyclicCacheManager:
                     
                     if image is not None and image.shape == target_shape:
                         processed_image = geo_utils.process_image(image, resizing_size)
+                        if processed_image.max() == 0:
+                            return None
                         return torch.tensor(processed_image, dtype=torch.uint8).permute(2, 0, 1)
+                    
         except Exception as e:
             logging.error(f"Failed to extract image for GEOID {row.get('GEOID', 'unknown')}: {e}")
             
@@ -188,6 +219,13 @@ class CyclicCacheManager:
 
     def build_initial_cache(self):
         """Synchronously generates the initial num_shards shards. Call once before training."""
+        if self.active_shards and not self.clear_cache:
+            print(
+                f"Using existing {len(self.active_shards)} pre-built cache shard(s) in {self.cache_dir}"
+            )
+            self._is_initialized = True
+            return
+
         print(f"Building initial {self.num_shards} cache shards...")
         for i in range(self.num_shards):
             # True: Show progress bar during initial blocking setup
@@ -358,7 +396,7 @@ def create_train_test_dataframes(df, savename, small_sample=False):
     testing.
     """
     if small_sample:
-        df = df.sample(100, random_state=825).reset_index(drop=True)
+        df = df.sample(1000, random_state=825).reset_index(drop=True)
 
     ### Split census tracts based on train/test
     #       (the hole census tract must be in the corresponding region)
@@ -381,7 +419,7 @@ def create_train_test_dataframes(df, savename, small_sample=False):
     df_not_test = df_not_test.sample(frac=1.0, random_state=825).reset_index(drop=True)
     
     # Generate validation dataset
-    df_val = df_not_test.sample(frac=0.06667, random_state=200).reset_index(drop=True)
+    df_val = df_not_test.sample(frac=0.03333, random_state=200).reset_index(drop=True)
     df_train = df_not_test.drop(df_val.index).reset_index(drop=True)
 
     test_dataframe_path = PROCESSED_DATA_DIR / "test_datasets" / f"{savename}_test_dataframe.feather"
@@ -433,7 +471,7 @@ def setup_dataloaders(df_train, df_val, df_test, all_years_datasets, params, tra
     batch_size = params.get("batch_size", 32)
     # Since all data is fully loaded in RAM, num_workers=0 is perfectly fast!
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=0)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size*4, shuffle=False, num_workers=0)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size*32, shuffle=False, num_workers=0)
     # test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=0)
     
     return train_loader, val_loader, test_loader
@@ -572,20 +610,24 @@ def generate_parameters_log(params, savename):
     return
 
 def train_model(
-    model, 
-    train_loader, 
-    val_loader, 
-    loss_fn, 
+    model,
+    train_loader,
+    val_loader,
+    loss_fn,
     learning_rate,
-    optimizer, 
+    optimizer,
     scheduler,
-    epochs, 
-    device, 
+    epochs,
+    device,
     savename,
-    cache_manager
+    cache_manager,
+    start_epoch=0,
+    initial_best_val_loss=None,
 ):
     print("--- Starting PyTorch Training Loop ---")
-    best_val_loss = float('inf')
+    best_val_loss = (
+        initial_best_val_loss if initial_best_val_loss is not None else float('inf')
+    )
     
     # Ensure the save directory exists
     save_dir = MODELS_DIR / "models_by_epoch" / savename
@@ -595,7 +637,7 @@ def train_model(
     scaler = GradScaler()
     accumulation_steps = 4  # Accumulate gradients (e.g., batch_size 8 * 4 steps = effective batch size 32)
 
-    for epoch in range(epochs):
+    for epoch in range(start_epoch, epochs):
                
         # ==========================
         # 1. TRAINING PHASE
@@ -623,6 +665,15 @@ def train_model(
                 outputs = model(images)
                 if outputs.shape != labels.shape:
                     outputs = outputs.view(labels.shape)
+                
+                if outputs.shape != labels.shape:
+                    raise ValueError(
+                        f"\n[BROADCASTING BUG CAUGHT]\n"
+                        f"Output shape: {outputs.shape} | Target shape: {labels.shape}\n"
+                        f"Because these don't match EXACTLY, PyTorch is comparing every prediction to every label in the batch. "
+                        f"This forces the model to predict the average, flatlining the loss. "
+                        f"Fix: Add 'outputs = outputs.squeeze()' before your loss function."
+                    )
                 
                 loss = loss_fn(outputs, labels)
 
@@ -653,7 +704,8 @@ def train_model(
         epoch_train_loss = running_train_loss / len(train_loader.dataset)
         
         # Always step scheduler at end of epoch
-        scheduler.step()        
+        if scheduler:
+            scheduler.step()
 
         # ==========================
         # 2. VALIDATION PHASE
@@ -666,6 +718,14 @@ def train_model(
         with torch.no_grad():
             for images, labels in val_bar:
                 images, labels = images.to(device), labels.to(device)
+                if images.dtype != torch.float32 or images.max() > 10.0:
+                    raise RuntimeError(
+                        f"\n[NORMALIZATION BUG CAUGHT]\n"
+                        f"Image dtype: {images.dtype} | Max pixel value: {images.max().item()}\n"
+                        f"ScaleMAE requires float32 tensors with standard ImageNet normalization. "
+                        f"If the model receives raw 0-255 uint8 arrays, its attention layers will output pure noise and refuse to learn."
+                    )
+                
                 with autocast(device_type='cuda'):
                     outputs = model(images)
                     if outputs.shape != labels.shape:
@@ -704,17 +764,27 @@ def train_model(
         # ==========================
         # 4. ROTATE CACHE FOR NEXT EPOCH
         # ==========================
-        cache_updated = cache_manager.step()             
+        cache_updated = cache_manager.step()
         if cache_updated:
             tqdm.write("🔄 New background shard ready! Loading updated data into RAM...")
-            train_loader.dataset.refresh()   
+            train_loader.dataset.refresh()
         else:
             # The GPU is faster than the CPU. Re-use current RAM data.
             pass
-        
 
-    print("--- Training Complete ---")
+        # Save checkpoint after each epoch
+        checkpoint = {
+            "epoch": epoch + 1,
+            "model_state_dict": model.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "scheduler_state_dict": scheduler.state_dict() if scheduler is not None else None,
+            "best_val_loss": best_val_loss,
+        }
+        torch.save(checkpoint, save_dir / f"{savename}_last.pth")
+
+    # Return model for caller chaining (especially if we loaded/checkpointed externally)
     return model
+
 
 def predict_buildings(model, dataloader, device):
     """
@@ -802,7 +872,26 @@ def run(
             df, savename, small_sample=small_sample
         )
 
-        #### 1. Setup Cyclic Cache Manager
+        #### 1. Setup resume logic for model/cache
+        checkpoint_dir = MODELS_DIR / "models_by_epoch" / savename
+        best_checkpoint_path = checkpoint_dir / f"{savename}_best.pth"
+        last_checkpoint_path = checkpoint_dir / f"{savename}_last.pth"
+
+        resume_cache = False
+        resume_model_checkpoint = None
+
+        if not retrain and checkpoint_dir.exists():
+            if last_checkpoint_path.exists():
+                resume_model_checkpoint = last_checkpoint_path
+                resume_cache = True
+                print(f"🟢 Resuming from checkpoint: {last_checkpoint_path}")
+            elif best_checkpoint_path.exists():
+                resume_model_checkpoint = best_checkpoint_path
+                resume_cache = True
+                print(f"🟡 Found best weights only: {best_checkpoint_path} (resume with no optimizer state)")
+        else:
+            print(checkpoint_dir, " does not exist. Starting fresh training run.")
+
         print("Building Initial Cache...")
         if small_sample:
             num_shards = 1
@@ -819,8 +908,9 @@ def run(
             cache_dir=CACHE_DIR,
             single_shard_mode=small_sample, # If small_sample is True, keep only one shard to speed up testing
             num_shards=num_shards,
-            shard_size=current_shard_size, 
-            type="train"
+            shard_size=current_shard_size,
+            type="train",
+            clear_cache=not resume_cache,
         )
         train_cache_manager.build_initial_cache()
         train_cache_manager.start_background_generation() # Starts generating shard 6 for Epoch 1
@@ -834,7 +924,8 @@ def run(
             num_shards=1,               # Only build one shard
             shard_size=len(df_val),     # Make it big enough for the whole val set
             single_shard_mode=True,     # IMPORTANT: This disables rotation
-            type="val"
+            type="val",
+            clear_cache=not resume_cache,
         )
         val_cache_manager.build_initial_cache() # This will build and show a progress bar
 
@@ -860,6 +951,23 @@ def run(
             optimizer, T_max=n_epochs, eta_min=1e-7
         )
 
+        # If we found a saved checkpoint from a previous run, resume from it
+        start_epoch = 0
+        initial_best_val_loss = None
+        if not retrain and resume_model_checkpoint is not None and resume_model_checkpoint.exists():
+            print(f"➡️ Resuming model/optimizer from checkpoint: {resume_model_checkpoint}")
+            checkpoint = torch.load(resume_model_checkpoint, map_location=device)
+            
+            # Restore all states
+            model.load_state_dict(checkpoint["model_state_dict"])
+            optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+            if scheduler and checkpoint.get("scheduler_state_dict"):
+                scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+                
+            start_epoch = checkpoint["epoch"]
+            initial_best_val_loss = checkpoint.get("best_val_loss")
+            print(f"✅ Resumed at epoch {start_epoch+1} with best_val_loss={initial_best_val_loss}...")
+
         wandb.init(
             project="urban-income-prediction", 
             name=savename, config=params
@@ -870,7 +978,9 @@ def run(
             model=model, train_loader=train_loader, val_loader=val_loader,
             loss_fn=loss_fn, learning_rate=learning_rate, optimizer=optimizer, scheduler=scheduler, 
             epochs=n_epochs, device=device, savename=savename,
-            cache_manager=train_cache_manager
+            cache_manager=train_cache_manager,
+            start_epoch=start_epoch,
+            initial_best_val_loss=initial_best_val_loss,
         )
         
         wandb.finish()
@@ -948,16 +1058,16 @@ if __name__ == "__main__":
         "model_name": "scalemae",
         "kind": "reg",
         "weights": None,
-        "image_size": 224,
+        "image_size": 224*3,
         "resizing_size": 224,
         "tiles": 1,
         "nbands": 3,
         "stacked_images": [1],
         "sample_size": 1,
-        "batch_size": 8,
-        "small_sample": True,
+        "batch_size": 16,
+        "small_sample": False,
         "n_epochs": 200,
-        "learning_rate": 0.0001,
+        "learning_rate": 0.0003,
         "sat_data": "aerial",
         "years": [2022], # Only the data inside WSL! all data is: [2010, 2012, 2014, 2016, 2018, 2020, 2022, 2024],
         "extra": "",  # Extra info to add to the savename (e.g. for ablation studies)
