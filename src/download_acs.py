@@ -72,9 +72,9 @@ except ImportError:
 # ══════════════════════════════════════════════════════════════════════════════
 # ① USER CONFIGURATION  ←  all tuneable knobs live here
 # ══════════════════════════════════════════════════════════════════════════════
-API_KEY     = os.environ.get("CENSUS_API_KEY", "364fb9378fe05cc52fda7a590e1cf616cf18e9b6")
+API_KEY     = os.environ.get("CENSUS_API_KEY")
 STATE       = "36"           # FIPS — 36 = New York
-START_YEAR  = 2013           # first ACS 5-yr release
+START_YEAR  = 2009           # first ACS 5-yr release
 END_YEAR    = 2024           # inclusive; update as new vintages drop
 MAX_VARS    = 45             # variables per API call (Census hard-cap ~50)
 RETRY_MAX   = 1              # max retries on transient HTTP errors
@@ -185,7 +185,8 @@ def fetch_chunk_with_retry(
     params = {
         "get": "NAME," + ",".join(var_codes),
         "for": "tract:*",
-        "in":  f"state:{STATE} county:*",
+        # Only 2009 requires the list-based 'in' parameter formatting
+        "in":  [f"state:{STATE}", "county:*"] if year == 2009 else f"state:{STATE} county:*",
         "key": API_KEY,
     }
     sleep = RETRY_SLEEP
@@ -224,7 +225,7 @@ def _safe_fetch_chunk(
         print("ok")
         return df
     except ValueError:
-        print("400 — probing individually …")
+        print("400 — Testing individual variables query …")
         good: list[str] = []
         bad:  list[str] = []
         for code in chunk:
@@ -249,7 +250,11 @@ def fetch_all_for_year(year: int) -> pd.DataFrame:
     Pull every variable for *year* in MAX_VARS-sized chunks and merge into
     one wide DataFrame with numeric dtypes; Census sentinels become NaN.
     """
-    base_url = f"https://api.census.gov/data/{year}/acs/acs5"
+    if year <= 2009:
+        # The API endpoint structure changed after 2009; older vintages use a different URL pattern
+        base_url = f"https://api.census.gov/data/{year}/acs5"
+    else:
+        base_url = f"https://api.census.gov/data/{year}/acs/acs5"
     codes    = list(RAW_VARS.keys())
     chunks   = list(chunked(codes, MAX_VARS))
     frames:  list[pd.DataFrame] = []
@@ -293,18 +298,30 @@ def fetch_geometries(year: int) -> gpd.GeoDataFrame:
     """Fetch Census tract geometries for a specific year using pygris."""
     print(f"  |   Fetching TIGER geometries for {year} ... ", end="", flush=True)
     
-    # pygris handles the API/FTP routing under the hood
-    geo_df = tracts(state=STATE, year=year, cb=True, cache=True)
+    try:
+        # Attempt to get the Cartographic Boundary file (water clipped out)
+        geo_df = tracts(state=STATE, year=year, cb=True, cache=True)
+    except Exception as e:
+        # Fallback: If the cb=True file is missing (2009, 2011) or the cache is corrupted (2012), 
+        # fallback to the raw TIGER/Line boundaries (cb=False)
+        print(f"\n  |   cb=True failed (likely missing for {year}), falling back to cb=False ... ", end="", flush=True)
+        geo_df = tracts(state=STATE, year=year, cb=False, cache=True)
     
     # Census shapefiles change their ID column names (e.g., GEOID, GEOID10, GEOID20)
     # We find whatever column starts with "GEOID" and standardize it to "geoid"
-    id_col = next((col for col in geo_df.columns if col.startswith("GEOID")), None)
-    if not id_col:
-        raise ValueError(f"Could not locate a GEOID column in the {year} spatial data.")
+    id_col = next((col for col in geo_df.columns if col.replace("_", "").startswith("GEOID")), None) 
 
-    # Clear IDS (from 2023 they have a "1400000US" prefix which we don't need) and ensure it's a string
-    geo_df[id_col] = geo_df[id_col].str.replace(r"1400000US", "")
+    # Fallback for older formats where it might be named CTIDFP00
+    if not id_col:
+        if "CTIDFP00" in geo_df.columns:
+            id_col = "CTIDFP00"
+        else:
+            raise ValueError(f"Could not locate a GEOID column in the {year} spatial data. Available: {list(geo_df.columns)}")
     
+    
+    # Clear IDS (in 2010-2023 they have a "1400000US", and in 2009 they have a "14000US" 
+    #   prefix which we don't need)
+    geo_df[id_col] = geo_df[id_col].astype(str).str.replace(r"^14000(00)?US", "", regex=True)
     print("ok")
     return geo_df[[id_col, "geometry"]].rename(columns={id_col: "geoid"})
 
