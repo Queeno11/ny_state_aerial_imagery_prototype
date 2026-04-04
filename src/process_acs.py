@@ -178,7 +178,6 @@ def process_panel(years: list[int], base_year: int, boundaries_path):
         
     final_gdf['Valid_Structural_Change'] = any_significant & ~is_yo_yo
     
-    # 7. Computing Inverse-Variance Weighted Mean for stable tracts
     # 7. Construct Final Training Labels
     print("Assigning training labels (True Z-scores for all tracts)...")
     for year in years:
