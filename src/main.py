@@ -76,65 +76,39 @@ def generate_savename(
     return savename
 
 
-def open_datasets(sat_data="aerial", train_years=[2013, 2018, 2022], test_years=[2024]):
+def open_datasets(sat_data="aerial", years=[2013, 2018, 2022]):
 
-    ### Open temporal and spatial data separately (Normalized Relational Approach)
-    print("Reading datasets...")
-    years = train_years + test_years
-    df, gdf_shapes = build_dataset.load_income_dataset()
+    ### Open dataframe with files and labels
+    print("Reading dataset...")
+    df = build_dataset.load_income_dataset()
 
-    # Ensure the long format has columns for dataset names for each year
-    for year in years:
-        if f"dataset_{year}" not in df.columns:
-            df[f"dataset_{year}"] = np.nan
-
+    year_cols = []
     datasets_all_years = {}
     extents_all_years = {}
-    
     for year in years:
         if sat_data == "aerial":
-            sat_imgs_datasets, extents = build_dataset.load_satellite_datasets(year=year)
+            sat_imgs_datasets, extents = build_dataset.load_satellite_datasets(
+                year=year
+            )
         elif sat_data == "landsat":
             raise NotImplementedError("Landsat support not implemented yet.")
+            sat_imgs_datasets, extents = build_dataset.load_landsat_datasets()
 
-        # 1. SPATIAL STEP: Figure out which GEOID goes with which image for this specific year
-        print(f"Mapping {year} images to spatial geometries...")
-        spatial_mapping = build_dataset.get_spatial_image_mapping(
-            gdf_shapes, extents, year=year, verbose=True
-        )
-
-        # 2. TEMPORAL STEP: Apply this spatial mapping ONLY to the rows in `df` representing this year
-        # This fills in the dataset_YEAR column based on spatial intersection
-        year_mask = df["year"] == year
-        df.loc[year_mask, f"dataset_{year}"] = df.loc[year_mask, "id_building"].map(spatial_mapping)
-
-        # Store the heavy xarray datasets in memory dictionaries
+        df = build_dataset.assign_datasets_to_gdf(df, extents, year=year, verbose=True)
         datasets_all_years[year] = sat_imgs_datasets
         extents_all_years[year] = extents
+        year_cols += [f"dataset_{year}"]
 
-    # 3. Clean up: Drop any building-year combinations that didn't have a matching image
-    # Check if ANY year's dataset column has a valid mapping for this row
-    has_dataset = False
-    for year in years:
-        has_dataset = has_dataset | df[f"dataset_{year}"].notna()
-    
-    initial_rows = len(df)
-    df = df[has_dataset].reset_index(drop=True)
-    
-    print(f"Dropped {initial_rows - len(df)} missing temporal observations (no satellite imagery).")
-    print(f"Remaining valid building-years: {len(df)}")
+    df = df[df[year_cols].notna().any(axis=1)]
     print("Datasets loaded!")
 
-    # Return: datasets, extents, temporal data, spatial data
-    # The spatial data stays on disk until needed (lazy join during eval/predictions)
-    return datasets_all_years, extents_all_years, df, gdf_shapes
+    return datasets_all_years, extents_all_years, df
 
 class CyclicCacheManager:
     def __init__(
         self,
         df,
-        xr_datasets,
-        gdf_shapes,
+        all_years_datasets,
         params,
         cache_dir,
         num_shards=5,
@@ -144,8 +118,7 @@ class CyclicCacheManager:
         clear_cache=False,
     ):
         self.df = df
-        self.xr_datasets = xr_datasets
-        self.gdf_shapes = gdf_shapes  # Spatial data for lazy geometry lookups
+        self.all_years_datasets = all_years_datasets
         self.params = params
         self.type = type
         self.cache_dir = cache_dir / f"{self.type}_cache"
@@ -184,20 +157,13 @@ class CyclicCacheManager:
         Extract a raw (C, H, W) numpy array at the full image_size, WITHOUT resizing.
         Resize is deferred so the entire shard can be resized in one batched call.
         Returns the numpy array, or None if extraction fails.
-        
-        Note: Geometries are fetched lazily on-demand from gdf_shapes to avoid RAM overhead.
         """
-        available_years = list(self.xr_datasets.keys())
+        available_years = list(self.all_years_datasets.keys())
         batch_year = random.choice(available_years)
 
-        primary_dataset = self.xr_datasets[batch_year]
+        primary_dataset = self.all_years_datasets[batch_year]
         dataset_name = row.get(f"dataset_{batch_year}")
-        
-        # Lazy-load geometry only for this specific building
-        id_building = row.get("id_building")
-        if id_building is None or id_building not in self.gdf_shapes.index:
-            return None
-        polygon = self.gdf_shapes.loc[id_building, "geometry"]  # always a single Shapely polygon
+        polygon = row["geometry"]
 
         nbands = self.params["nbands"]
         total_bands = nbands * len(self.params["stacked_images"])
@@ -418,16 +384,15 @@ class CyclicRAMDataset(Dataset):
         return img, lbl
 
 class EvalSatelliteDataset(Dataset):
-    """Static dataset for Validation, Testing, and Prediction with lazy geometry loading."""
-    def __init__(self, df, xr_datasets, gdf_shapes, params, transform=None, mode="eval", fixed_year=None):
+    """Static dataset for Validation, Testing, and Prediction."""
+    def __init__(self, df, all_years_datasets, params, transform=None, mode="eval", fixed_year=None):
         self.df = df.reset_index(drop=True)
-        self.xr_datasets = xr_datasets
-        self.gdf_shapes = gdf_shapes  # Spatial data for lazy geometry lookups
+        self.all_years_datasets = all_years_datasets
         self.params = params
         self.transform = transform
         self.mode = mode
         self.fixed_year = fixed_year
-        self.available_years = list(self.xr_datasets.keys())
+        self.available_years = list(all_years_datasets.keys())
         
         self.total_bands = params["nbands"] * len(params["stacked_images"])
         self.target_shape = (self.total_bands, params["image_size"], params["image_size"])
@@ -440,29 +405,22 @@ class EvalSatelliteDataset(Dataset):
 
     def _extract_image(self, row):
         batch_year = self.fixed_year if self.fixed_year is not None else random.choice(self.available_years)
-        primary_dataset = self.xr_datasets[batch_year]
+        primary_dataset = self.all_years_datasets[batch_year]
         dataset_name = row.get(f"dataset_{batch_year}")
+        polygon = row["geometry"]
         
-        # Lazy-load geometry only for this specific building
-        geoid = row.get("GEOID")
-        if geoid is None or geoid not in self.gdf_shapes.index:
-            # Return blank image if geometry not found
-            image = np.zeros(shape=(self.params["nbands"], 0, 0))
-        else:
-            polygon = self.gdf_shapes.loc[geoid, "geometry"]
-            
-            image = np.zeros(shape=(self.params["nbands"], 0, 0))
-            try:
-                if not pd.isna(dataset_name):
-                    link_dataset = primary_dataset.get(dataset_name)
-                    if link_dataset is not None:
-                        image, _ = geo_utils.stacked_image_from_census_tract(
-                            dataset=link_dataset, polygon=polygon,
-                            img_size=self.params["image_size"], n_bands=self.params["nbands"],
-                            stacked_images=self.params["stacked_images"],
-                        )
-            except Exception:
-                pass
+        image = np.zeros(shape=(self.params["nbands"], 0, 0))
+        try:
+            if not pd.isna(dataset_name):
+                link_dataset = primary_dataset.get(dataset_name)
+                if link_dataset is not None:
+                    image, _ = geo_utils.stacked_image_from_census_tract(
+                        dataset=link_dataset, polygon=polygon,
+                        img_size=self.params["image_size"], n_bands=self.params["nbands"],
+                        stacked_images=self.params["stacked_images"],
+                    )
+        except Exception:
+            pass
 
         if image.shape != self.target_shape:
             processed_image = np.zeros(shape=(self.params["resizing_size"], self.params["resizing_size"], self.total_bands), dtype=np.uint8)
@@ -505,7 +463,7 @@ class EvalSatelliteDataset(Dataset):
                 img = self.transform(img)
             return img, geoid
                                 
-def create_train_test_dataframes(df, savename, train_years, test_years, small_sample=False):
+def create_train_test_dataframes(df, savename, small_sample=False):
     """Create train and test dataframes with the links and xr.datasets to use for training and testing
 
     Load the ICPAG dataset and assign the links to the corresponding xr.dataset, then split the census tracts
@@ -516,13 +474,10 @@ def create_train_test_dataframes(df, savename, train_years, test_years, small_sa
         df = df.sample(1000, random_state=825).reset_index(drop=True)
 
     ### Split census tracts based on train/test
-    #       (the temporal data will be split; geometry is stored separately)
-    df = build_dataset.split_train_test(df, train_years=train_years, test_years=test_years, buffer=500)
-    
-    # Keep only temporal columns (GEOID, var, type, year) and dataset columns
-    # Geometry is NOT included - it stays in gdf_shapes and will be lazy-loaded when needed
+    #       (the hole census tract must be in the corresponding region)
+    df = build_dataset.split_train_test(df)
     df = df[
-        ["id_building_year", "id_building", "GEOID", "var", "type", "year"]
+        ["GEOID", "var", "type", "geometry"]
         + [col for col in df.columns if "dataset" in col]
     ]
 
@@ -556,7 +511,7 @@ def create_train_test_dataframes(df, savename, train_years, test_years, small_sa
 
     return df_train, df_val, df_test
 
-def setup_dataloaders(df_train, df_val, df_test, params, train_cache_manager=None, val_cache_manager=None):
+def setup_dataloaders(df_train, df_val, df_test, all_years_datasets, params, train_cache_manager=None, val_cache_manager=None):
     print("--- Initializing PyTorch Datasets ---")
     print(f"Train: Cyclical Cache | Val: {len(df_val)} | Test: {len(df_test)}")
 
@@ -584,7 +539,7 @@ def setup_dataloaders(df_train, df_val, df_test, params, train_cache_manager=Non
 
     
     # test_dataset = EvalSatelliteDataset(
-    #     df=df_test, xr_datasets=xr_datasets,
+    #     df=df_test, all_years_datasets=all_years_datasets,
     #     params=params, transform=eval_transform, mode="lazy_eval"
     # )
 
@@ -662,8 +617,7 @@ def fill_params_defaults(params):
         "n_epochs": 100,
         "learning_rate": 0.0001,
         "sat_data": "pleiades",
-        "train_years": [2013],
-        "test_years": [2022],
+        "years": [2013],
         "extra": "",
         "batch_size": 32
     }
@@ -897,7 +851,8 @@ def train_model(
             best_val_loss = epoch_val_loss
             
             model_path = save_dir / f"{savename}_best.pth"
-            torch.save(model.state_dict(), model_path)
+            trainable_weights = {k: v for k, v in model.state_dict().items() if v.requires_grad}
+            torch.save(trainable_weights, model_path)
                 
             # Optional: Tell wandb to track this specific file
             wandb.save(str(model_path))
@@ -934,13 +889,13 @@ def predict_buildings(model, dataloader, device):
     """
     model.eval()
     all_preds = []
-    all_buildings_ids = []
+    all_geoids = []
     
     print(f"Starting inference on {len(dataloader.dataset)} items...")
     
     # torch.no_grad() is CRITICAL here! It stops PyTorch from storing memory for backpropagation
     with torch.no_grad():
-        for batch_idx, (batch_images, batch_buildings_ids) in enumerate(dataloader):
+        for batch_idx, (batch_images, batch_geoids) in enumerate(dataloader):
             batch_images = batch_images.to(device)
             
             # Get predictions
@@ -950,14 +905,14 @@ def predict_buildings(model, dataloader, device):
             preds = outputs.view(-1).cpu().numpy()
             
             all_preds.extend(preds)
-            all_buildings_ids.extend(batch_buildings_ids)
+            all_geoids.extend(batch_geoids)
             
             # Print progress every 50 batches
             if batch_idx % 50 == 0:
                 print(f"Predicted batch {batch_idx}/{len(dataloader)}")
                 
     # Zip the IDs and Predictions back together beautifully
-    return pd.DataFrame({"id_building": all_buildings_ids, "predicted_value": all_preds})
+    return pd.DataFrame({"GEOID": all_geoids, "predicted_value": all_preds})
 
 def run(
     params=None,
@@ -989,12 +944,10 @@ def run(
     n_epochs = params["n_epochs"]
     learning_rate = params["learning_rate"]
     sat_data = params["sat_data"]
-    train_years = params["train_years"]
-    test_years = params["test_years"]  # Default to training years if not specified
+    years = params["years"]
     extra = params["extra"]
     batch_size = params["batch_size"]
 
-    years = train_years + test_years
     savename = generate_savename(
         model_name, image_size, learning_rate, stacked_images, years, extra
     )
@@ -1003,16 +956,16 @@ def run(
     generate_parameters_log(params, savename)
     
     print(f"========== Starting Run for {savename} ==========")
-    all_years_datasets, all_years_extents, df, gdf_shapes = open_datasets(
-        sat_data=sat_data,
-        train_years=train_years,
-        test_years=test_years,
+
+    years = [2022]
+    all_years_datasets, all_years_extents, df = open_datasets(
+        sat_data=sat_data, years=years
     )
 
     if train:
 
         df_train, df_val, df_test = create_train_test_dataframes(
-            df, savename, small_sample=small_sample, train_years=train_years, test_years=test_years
+            df, savename, small_sample=small_sample
         )
 
         #### 1. Setup resume logic for model/cache
@@ -1046,8 +999,7 @@ def run(
         print("\n[TRAIN] Building cyclic training cache...")
         train_cache_manager = CyclicCacheManager(
             df=df_train,
-            xr_datasets=all_years_datasets,
-            gdf_shapes=gdf_shapes,
+            all_years_datasets=all_years_datasets,
             params=params,
             cache_dir=CACHE_DIR,
             single_shard_mode=small_sample, # If small_sample is True, keep only one shard to speed up testing
@@ -1062,8 +1014,7 @@ def run(
         print("\n[VAL] Building static validation cache...")
         val_cache_manager = CyclicCacheManager(
             df=df_val, # Or full df_val
-            xr_datasets=all_years_datasets,
-            gdf_shapes=gdf_shapes,
+            all_years_datasets=all_years_datasets,
             params=params,
             cache_dir=CACHE_DIR,
             num_shards=1,               # Only build one shard
@@ -1077,12 +1028,9 @@ def run(
         #### 2. PyTorch Data Pipeline Setup
         print("Setting up data generators...")
         train_loader, val_loader, test_loader = setup_dataloaders(
-            df_train=df_train, 
-            df_val=df_val, 
-            df_test=df_test,
-            params=params,
-            train_cache_manager=train_cache_manager, 
-            val_cache_manager=val_cache_manager
+            df_train=df_train, df_val=df_val, df_test=df_test,
+            all_years_datasets=all_years_datasets, params=params,
+            train_cache_manager=train_cache_manager, val_cache_manager=val_cache_manager
         )            
 
         del df, df_test, all_years_extents
@@ -1141,14 +1089,6 @@ def run(
     if generate_predictions:
         print("Generando predicciones...")
         
-        # Ensure we have the datasets loaded if not already in memory
-        if 'all_years_datasets' not in locals():
-            all_years_datasets, all_years_extents, df, gdf_shapes = open_datasets(
-                sat_data=sat_data,
-                train_years=train_years,
-                test_years=test_years,
-            )
-        
         # 1. Load the Best PyTorch Model
         model, _ = set_model_and_loss_function(
             model_name=model_name,
@@ -1158,9 +1098,7 @@ def run(
         )
         
         best_model_path = MODELS_DIR / "models_by_epoch" / savename / f"{savename}_best.pth"
-        if not best_model_path.exists():
-            raise FileNotFoundError(f"Model checkpoint not found at {best_model_path}. Train the model first.")
-        model.load_state_dict(torch.load(best_model_path, map_location=torch.device('cpu')))
+        model.load_state_dict(torch.load(best_model_path))
         
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         model.to(device)
@@ -1171,14 +1109,16 @@ def run(
         ])
         
         # 3. Setup the Unified Dataset in "predict" mode
-        prediction_dataset = EvalSatelliteDataset(
+        prediction_dataset = SatelliteDataset(
             df=df,  
-            xr_datasets=all_years_datasets,
-            gdf_shapes=gdf_shapes,
-            params=params,
+            all_years_datasets=all_years_datasets,
+            image_size=image_size,
+            resizing_size=resizing_size,
+            nbands=nbands,
+            stacked_images=stacked_images,
             transform=eval_transform,
             mode="predict",       # <--- Tells the class to use lazy loading and return GEOIDs
-            fixed_year=test_years[0] if test_years else 2022  # <--- Forces the class to only extract test year data
+            fixed_year=2022       # <--- Forces the class to only extract 2022 data
         )
         
         # 4. Wrap in DataLoader (Double batch size since no gradients are stored)
@@ -1195,8 +1135,7 @@ def run(
         # 6. Save and merge results
         df_result.to_parquet(RESULTS_DIR / "nyc_buildings_with_predictions.parquet")
 
-        # Load the income dataset (returns tuple: df, gdf_shapes)
-        df_income, gdf = build_dataset.load_income_dataset()
+        gdf = build_dataset.load_income_dataset()
         df_result.set_index("GEOID", inplace=True) 
         gdf = gdf.join(df_result, on="GEOID", how="inner")
         
@@ -1230,8 +1169,7 @@ if __name__ == "__main__":
         "n_epochs": 200,
         "learning_rate": 0.0003,
         "sat_data": "aerial",
-        "train_years": [2010, 2012, 2014, 2018, 2020, 2022, 2024], # Only the data inside WSL! all data is: [2010, 2012, 2014, 2016, 2018, 2020, 2022, 2024],
-        "test_years": [2016],
+        "years": [2022], # Only the data inside WSL! all data is: [2010, 2012, 2014, 2016, 2018, 2020, 2022, 2024],
         "extra": "",  # Extra info to add to the savename (e.g. for ablation studies)
     }
 
