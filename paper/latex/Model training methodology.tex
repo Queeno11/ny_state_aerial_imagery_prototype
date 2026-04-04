@@ -36,7 +36,6 @@ We utilize a stochastic weighting strategy via batch composition. Each training 
     \item \textbf{Changing Temporal Pairs (10\%):} Pairs of the \textit{same} tract across time $(X_{i,t_a}^\tau, X_{i,t_b}^\tau)$ where valid structural change occurred ($I_i^{valid} = 1$).
 \end{itemize}
 
-The network calculates three distinct loss penalties corresponding to the batch composition.
 \subsection{Unified Pairwise Difference Regression Loss}
 To ensure out-of-sample generalization by structurally discarding spatial cardinality, we frame the objective as a continuous relative difference problem \cite{parikh2011relative}. We train the network to minimize the pairwise squared error between predicted and true relative score differences \cite{daudt2018fully, chen2021remote, burges2005learning}. This unifies the cross-sectional ranking and temporal change objectives under a single differentiable loss function that is translation-invariant by construction.
 
@@ -48,7 +47,7 @@ For any pair of observations $u$ and $v$ drawn from our stochastically composed 
 This single formulation gracefully handles all three pair types in our stochastic batch composition natively:
 \begin{itemize}
     \item \textbf{Spatial Pairs:} The target is $L_i - L_j$. The model learns to reproduce the full continuous magnitude of cross-sectional wealth differences rather than just their directional ranking, effectively discarding absolute topological anchors while capturing nuanced relative hierarchies.
-    \item \textbf{Stable Temporal Pairs:} The target is $L_{i,t_b} - L_{i,t_a}$, which, due to natural spatial economic filtering, is typically a small, non-zero drift. Rather than forcing mathematically identical outputs, the pairwise loss handles this honestly by supervising the model to predict a difference exactly proportional to the true ACS drift.
+    \item \textbf{Stable Temporal Pairs:} The target is explicitly forced to $0$. Because a deterministic CNN must output identical scalars for identical physical inputs, supervising on the noisy, non-zero ACS economic drift would induce gradient gridlock. By setting the target difference to zero, the pairwise formulation elegantly simplifies into a Siamese robustness penalty $(R_{i,t_b} - R_{i,t_a})^2$, forcing the model to strictly ignore transient survey noise.
     \item \textbf{Changing Temporal Pairs:} The target is the intertemporal difference $L_{i,t_b} - L_{i,t_a}$. Because MSE penalizes missed magnitudes quadratically, it provides a strong, natural gradient signal proportional to the severity of the structural change, removing the need for an engineered dynamic margin.
 \end{itemize}
 
