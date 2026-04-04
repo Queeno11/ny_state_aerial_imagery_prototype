@@ -9,6 +9,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 from typing import List, Dict
 from src.utils.paths import PROJECT_ROOT, DATA_DIR, EXTERNAL_DATA_DIR, RAW_DATA_DIR, INTERIM_DATA_DIR, PROCESSED_DATA_DIR, RESULTS_DIR, LOGS_DIR, IMAGERY_ROOT
+import warnings
 
 pd.set_option("display.max_columns", None)
 
@@ -97,11 +98,31 @@ def load_satellite_datasets(year=2014, stretch=False, engine="zarr"):
 
 
 def load_income_dataset(variable="avg_hh_inc", trim=False, log=True):
-    """Open income dataset and merge with ELL estimation (small area estimates)."""
+    """
+    Load and normalize income dataset. Returns split temporal and spatial data.
+    
+    Temporal data (Long Format):
+    - GEOID, var (normalized income), type (train/val/test - added later)
+    
+    Spatial data (Cross-Sectional):
+    - GEOID, geometry
+    
+    This split allows efficient caching: geometries stay on disk until needed,
+    temporal data is lightweight and filters quickly.
+    
+    Returns:
+    --------
+    df_temporal : pd.DataFrame with columns [GEOID, var]
+    gdf_spatial : gpd.GeoDataFrame with columns [GEOID, geometry]
+    """
 
     # Open SAE dataset
+    print("Loading income dataset...")
     gdf = gpd.read_parquet(PROCESSED_DATA_DIR / "nyc_buildings_with_sae.parquet")
-    gdf["building_id"] = gdf.index
+    
+    # id_building is the original unique index of the buildings GeoDataFrame
+    gdf["id_building"] = gdf.index
+    gdf["id_building_year"] = gdf["id_building"].astype(str) + "_" + gdf["year"].astype(str)
 
     # FIXME: Probably it's a good idea to reproject all the zarr so I can scale this to anywhere...
     gdf = gdf.to_crs("EPSG:6539")
@@ -131,91 +152,160 @@ def load_income_dataset(variable="avg_hh_inc", trim=False, log=True):
         PROCESSED_DATA_DIR / f"scalars_{variable}_trim{trim}_{date}.csv"
     )
 
+    # ======== SPLIT INTO TEMPORAL AND SPATIAL DATA ========
+    
+    # 1. TEMPORAL DATA (Long Format): [GEOID, var] - lightweight, fast to filter
+    df_temporal = gdf[["id_building_year", "id_building", "GEOID", "year", "var"]].copy()
+    
+    # 2. SPATIAL DATA (Cross-Sectional): [GEOID, geometry] - indexed by GEOID for fast joins
+    gdf_spatial = gdf[["id_building", "geometry"]].drop_duplicates("id_building").copy()
+    gdf_spatial = gdf_spatial.set_index("id_building")
+    
+    # Save both to Parquet
+    temporal_path = PROCESSED_DATA_DIR / f"temporal_data_{variable}_trim{trim}_{date}.parquet"
+    spatial_path = PROCESSED_DATA_DIR / f"geometries_{variable}_trim{trim}_{date}.parquet"
+    
+    df_temporal.to_parquet(temporal_path)
+    gdf_spatial.to_parquet(spatial_path)
+    
+    print(f"Saved temporal data: {temporal_path}")
+    print(f"Saved spatial data: {spatial_path}")
+    
+    # Also keep the old combined format for backward compatibility
     gdf.to_parquet(PROCESSED_DATA_DIR / f"gdf_{variable}_trim{trim}_{date}.parquet")
     
+    return df_temporal, gdf_spatial
+
+
+def load_temporal_data(variable="avg_hh_inc", trim=False, log=True):
+    """
+    Load only the temporal (non-spatial) data.
+    Returns: pd.DataFrame with [GEOID, var]
+    """
+    date_pattern = "*"  # Find the most recent file
+    files = list(PROCESSED_DATA_DIR.glob(f"temporal_data_{variable}_trim{trim}_{date_pattern}.parquet"))
+    
+    if not files:
+        raise FileNotFoundError(f"No temporal data files found for variable={variable}, trim={trim}")
+    
+    # Load the most recent file
+    latest_file = sorted(files)[-1]
+    print(f"Loading temporal data from: {latest_file}")
+    return pd.read_parquet(latest_file)
+
+
+def load_geometries(variable="avg_hh_inc", trim=False, log=True):
+    """
+    Load only the spatial (geometry) data.
+    Returns: gpd.GeoDataFrame with [GEOID, geometry] (indexed by GEOID)
+    """
+    date_pattern = "*"  # Find the most recent file
+    files = list(PROCESSED_DATA_DIR.glob(f"geometries_{variable}_trim{trim}_{date_pattern}.parquet"))
+    
+    if not files:
+        raise FileNotFoundError(f"No geometry files found for variable={variable}, trim={trim}")
+    
+    # Load the most recent file
+    latest_file = sorted(files)[-1]
+    print(f"Loading geometries from: {latest_file}")
+    return gpd.read_parquet(latest_file)
+
+
+def lazy_join_geometries(df_temporal, gdf_spatial, id_column="id_building"):
+    """
+    Perform a lazy join of temporal data with spatial geometries.
+    Only called when geometries are actually needed (e.g., during validation or final output).
+    
+    Parameters:
+    -----------
+    df_temporal : pd.DataFrame with GEOID column
+    gdf_spatial : gpd.GeoDataFrame indexed by GEOID
+    id_column : str, name of the GEOID column in df_temporal
+    
+    Returns:
+    --------
+    gdf : gpd.GeoDataFrame with both temporal and spatial data
+    """
+    gdf = gpd.GeoDataFrame(
+        df_temporal.set_index(id_column),
+        geometry=gdf_spatial.loc[df_temporal[id_column], "geometry"].values,
+        crs=gdf_spatial.crs
+    )
     return gdf
 
 
-def assign_datasets_to_gdf(
-    gdf,
+def get_spatial_image_mapping(
+    gdf_shapes,
     extents,
-    year=2013,
+    year,
     centroid=False,
     buffer=True,
     select="first_match",
     verbose=True,
 ):
-    """Assign each geometry a dataset if the census tract falls within the extent of the dataset (images)
-
+    """
+    Spatially intersects geometries with image extents for a specific year.
+    Returns a mapping dictionary: GEOID -> dataset_name (for a single year).
+    
+    This is designed to be called once per year, then the results are merged into
+    the temporal DataFrame as a new column f"dataset_{year}".
+    
     Parameters:
     -----------
-    gdf: geopandas.GeoDataFrame, shapefile with the census tracts
-    extents: dict, dictionary with the extents of the satellite datasets
-    year: int, year of the satellite images
-    centroid: bool, if True, the centroid of the census tract is used to assign the dataset
-    select: str, method to select the dataset. Options are "first_match" or "all_matches"
+    gdf_shapes : gpd.GeoDataFrame with [GEOID, geometry]
+    extents : dict mapping dataset_name -> bounding box polygon
+    year : int, the year being processed
+    centroid : bool, use centroids instead of full geometry
+    buffer : bool, buffer geometries before intersection
+    select : str, "first_match" or "all_matches"
+    verbose : bool, print statistics
+    
+    Returns:
+    --------
+    pd.Series indexed by GEOID with dataset_name values (or NaN if no match)
     """
     import warnings
-    def get_matching_names(row):
-        # Create a list of all the names where the row has a True
-        return [name for name in extents.keys() if row[name] is True]
-
-    def keep_only_one_capture(file_list):
-        # Extract the identifier from the first element
-        if len(file_list)>0:
-            capture_id = file_list[0].split("_")[1]
-            # Filter the list to keep only the values that match the identifier
-            file_list = [f for f in file_list if capture_id in f]
-        return file_list
-
     warnings.filterwarnings("ignore")
 
-    if centroid:
-        gdf["geometry"] = gdf.centroid
+    # Work on a lightweight copy so we don't pollute the master geometries
+    temp_gdf = gdf_shapes.reset_index()[["id_building", "geometry"]].copy()
+    temp_gdf["dataset"] = np.nan
 
-    if year is None:
-        colname = "dataset"
-    else:
-        colname = f"dataset_{year}"
+    if centroid:
+        temp_gdf["geometry"] = temp_gdf.centroid
+
+    temp_gdf["dataset"] = np.nan
 
     if select == "first_match":
         for name, bbox in extents.items():
             if buffer:
-                gdf.loc[gdf.buffer(0.004).within(bbox), colname] = name
+                temp_gdf.loc[temp_gdf.buffer(0.004).within(bbox), "dataset"] = name
             else:
-                gdf.loc[gdf.within(bbox), colname] = name
+                temp_gdf.loc[temp_gdf.within(bbox), "dataset"] = name
 
     elif select == "all_matches":
+        def get_matching_names(row):
+            return [name for name in extents.keys() if row[name] is True]
+
         for name, bbox in extents.items():
-            print(name)
             if buffer:
-                gdf[name] = gdf.buffer(0.004).intersects(bbox)
+                temp_gdf[name] = temp_gdf.buffer(0.004).intersects(bbox)
             else:
-                gdf[name] = gdf.intersects(bbox)
-    
+                temp_gdf[name] = temp_gdf.intersects(bbox)
 
-
-        gdf[colname] = gdf.apply(get_matching_names, axis=1)
-        # gdf[colname] = gdf[colname].apply(keep_only_one_capture)
-        # Replace empty lists with NaN
-        gdf[colname] = gdf[colname].apply(lambda x: x if len(x) > 0 else np.nan)
-        gdf = gdf.drop(columns=list(extents.keys()))
-
-    nan_links = gdf[colname].isna().sum()
-    # gdf = gdf[gdf[colname].notna()]
+        temp_gdf["dataset"] = temp_gdf.apply(get_matching_names, axis=1)
+        temp_gdf["dataset"] = temp_gdf["dataset"].apply(lambda x: x if len(x) > 0 else np.nan)
+        temp_gdf = temp_gdf.drop(columns=list(extents.keys()))
 
     if verbose:
-        print(
-            f"Links without images ({year}):", nan_links, "out of", len(gdf) + nan_links
-        )
-        print(f"Remaining links for train/test ({year}):", len(gdf))
-        gdf.plot()
-        plt.savefig(rf"{PROCESSED_DATA_DIR}/links_with_images.png")
+        nan_links = temp_gdf["dataset"].isna().sum()
+        total_links = len(temp_gdf)
+        print(f"[{year}] Geometries without images: {nan_links} out of {total_links}")
 
     warnings.filterwarnings("default")
 
-    return gdf
-
+    # Return a Series indexed by GEOID (for easy merging into temporal data)
+    return temp_gdf.set_index("id_building")["dataset"]
 
 
 def get_test_area_from_file(filename = "Test_NYC_Area.parquet"):
@@ -223,48 +313,99 @@ def get_test_area_from_file(filename = "Test_NYC_Area.parquet"):
     test_polygon = test.dissolve().geometry.iloc[0]
     return test_polygon
 
-def split_train_test(gdf, buffer=500):
+def split_train_test(df_temporal, train_years, test_years, gdf_spatial=None, buffer=500):
     """
-    Splits the GeoDataFrame into 'train' and 'test' based on a test_polygon.
+    Splits the temporal DataFrame into 'train' and 'test' based on spatial and temporal criteria.
+    
+    The temporal data must have been previously merged with spatial data and a 'year' column
+    added via get_spatial_image_mapping().
     
     Logic:
-    - TEST:  Geometry is strictly INSIDE the test_polygon.
-    - TRAIN: Geometry is strictly OUTSIDE the (test_polygon + buffer).
+    - TEST:  year is in test_years OR geometry is strictly INSIDE the test_polygon.
+    - TRAIN: year is in train_years AND geometry is strictly OUTSIDE the (test_polygon + buffer).
     - DROP:  Geometry overlaps the border or falls within the buffer zone.
+    
+    Parameters:
+    -----------
+    df_temporal : pd.DataFrame with columns [GEOID, var, year, dataset_year]
+    train_years : list of years for training
+    test_years : list of years for testing
+    gdf_spatial : gpd.GeoDataFrame (optional), indexed by GEOID. If provided, used for spatial filtering.
+    buffer : int, buffer distance in meters for the exclusion zone
+    
+    Returns:
+    --------
+    df_temporal : pd.DataFrame with added 'type' column [train/test/None]
     """
     
     test_polygon = get_test_area_from_file()
-
+    
     # Initialize column with NaNs
-    gdf["type"] = "Unassigned"
-
-    # 1. Identify TEST rows
-    # "within" checks if the feature is fully contained inside the test polygon
-    test_mask = gdf.geometry.within(test_polygon)
-    gdf.loc[test_mask, "type"] = "test"
-
-    # 2. Identify TRAIN rows
-    # We buffer the test polygon to create the "exclusion zone"
-    # "disjoint" checks if the feature has absolutely no overlap with the buffered zone
-    exclusion_zone = test_polygon.buffer(buffer)
-    train_mask = gdf.geometry.disjoint(exclusion_zone)
-    gdf.loc[train_mask, "type"] = "train"
-
-    # 3. Calculate and Print Stats
-    test_size = gdf[gdf["type"] == "test"].shape[0]
-    train_size = gdf[gdf["type"] == "train"].shape[0]
-    invalid_size = gdf[gdf["type"].isna()].shape[0]
-    total_size = gdf.shape[0]
+    df_temporal["type"] = np.nan
+    
+    # ====== TEMPORAL FILTERING ======
+    # 3- Include all rows from test_years in the test set 
+    test_year_mask = df_temporal["year"].isin(test_years)
+    df_temporal.loc[test_year_mask, "type"] = "test"
+    
+    train_year_mask = df_temporal["year"].isin(train_years)
+    
+    # ====== SPATIAL FILTERING (only if gdf_spatial provided) ======
+    if gdf_spatial is not None:
+        # For each GEOID, check if it falls in test area or buffer zone
+        # We can group by GEOID since spatial properties are constant per building
+        
+        geoid_spatial_type = {}
+        for geoid in df_temporal["id_building"].unique():
+            if geoid not in gdf_spatial.index:
+                geoid_spatial_type[geoid] = None  # Drop if no geometry
+                continue
+            
+            geometry = gdf_spatial.loc[geoid, "geometry"]
+            
+            # CHECK TEST: Must be strictly inside the test polygon
+            if geometry.within(test_polygon):
+                geoid_spatial_type[geoid] = "test_spatial"
+            
+            # CHECK TRAIN: Must be strictly outside the (test polygon + buffer)
+            elif geometry.disjoint(test_polygon.buffer(buffer)):
+                geoid_spatial_type[geoid] = "train_spatial"
+            
+            else:
+                # Falls in buffer zone - will be dropped
+                geoid_spatial_type[geoid] = None
+        
+        # Apply spatial type to all rows with that GEOID
+        for geoid, spatial_type in geoid_spatial_type.items():
+            geoid_mask = df_temporal["id_building"] == geoid
+            
+            if spatial_type == "test_spatial":
+                df_temporal.loc[geoid_mask, "type"] = "test"
+            elif spatial_type == "train_spatial" and train_year_mask[geoid_mask].any():
+                # Only mark as train if it also has a training year
+                df_temporal.loc[geoid_mask & train_year_mask, "type"] = "train"
+            else:
+                # Mark for deletion (buffer zone)
+                df_temporal.loc[geoid_mask, "type"] = np.nan
+    else:
+        # No spatial filtering - just use temporal split
+        df_temporal.loc[train_year_mask, "type"] = "train"
+    
+    # ====== CALCULATE STATS ======
+    test_size = df_temporal[df_temporal["type"] == "test"].shape[0]
+    train_size = df_temporal[df_temporal["type"] == "train"].shape[0]
+    invalid_size = df_temporal[df_temporal["type"].isna()].shape[0]
+    total_size = df_temporal.shape[0]
 
     print(
         "\n",
         f"Size of test dataset: {test_size/total_size*100:.2f}% ({test_size} rows)",
-        f"Size of train+val datasets: {train_size/total_size*100:.2f}% ({train_size} rows)",
-        f"Deleted images due to train/test overlapping: {invalid_size/total_size*100:.2f}% ({invalid_size} rows)",
+        f"Size of train dataset: {train_size/total_size*100:.2f}% ({train_size} rows)",
+        f"Deleted rows due to train/test overlapping: {invalid_size/total_size*100:.2f}% ({invalid_size} rows)",
         sep="\n",
     )
 
-    return gdf
+    return df_temporal
 
 from shapely.geometry import box
 
@@ -799,16 +940,3 @@ def generate_matrix_of_datasets(datasets):
         if len(rows_ds) > 0:
             matrix += [rows_ds]
     return matrix
-
-# Add this function to main.py or geo_utils.py
-def get_gpu_augmentation_layer():
-    return tf.keras.Sequential([
-        # Random Flips (replaces np.flip)
-        tf.keras.layers.RandomFlip("horizontal_and_vertical"),
-        
-        # Random Contrast (replaces skimage gamma/contrast)
-        tf.keras.layers.RandomContrast(0.2),
-        
-        # Random Brightness (replaces percentile scaling somewhat)
-        tf.keras.layers.RandomBrightness(0.2),
-    ])
