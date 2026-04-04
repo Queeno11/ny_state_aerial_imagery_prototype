@@ -209,16 +209,33 @@ def process_panel(years: list[int], base_year: int, boundaries_path):
     final_gdf.to_feather(output_name)
     print(f"Panel dataset successfully created and saved to {output_name}!")
 
-    # 10. Print Correlations
+    # 10. Print Statistics
     score_cols = [f'Rel_Score_{y}' for y in years] + ['Weighted_Stable_Score']
     r2_valid = final_gdf[final_gdf['Valid_Structural_Change'] == True][score_cols].corr() ** 2 
+    r2_unchanged = final_gdf[final_gdf['Valid_Structural_Change'] == False][score_cols].corr() ** 2
     r2_all = final_gdf[score_cols].corr() ** 2 
     
     print("\nR-squared of Relative Scores across years for VALID structural change tracts:")
     print(r2_valid)
+    print("\nR-squared of Relative Scores across years for unchanged/invalid change tracts:")
+    print(r2_unchanged)
     print("\nR-squared of Relative Scores across years for ALL tracts:")
     print(r2_all)
     
+    # Average change magnitude for valid structural change tracts vs unchanged tracts
+    avg_change_valid = final_gdf[final_gdf['Valid_Structural_Change'] == True][[f'diff_{y1}_{y2}' for y1, y2 in consecutive_pairs]].abs().mean()
+    avg_change_unchanged = final_gdf[final_gdf['Valid_Structural_Change'] == False][[f'diff_{y1}_{y2}' for y1, y2 in consecutive_pairs]].abs().mean()
+    avg_change_valid_full_period = final_gdf[final_gdf['Valid_Structural_Change'] == True][f'diff_{start_year}_{end_year}'].abs().mean()
+    avg_change_unchanged_full_period = final_gdf[final_gdf['Valid_Structural_Change'] == False][f'diff_{start_year}_{end_year}'].abs().mean()
+    
+    print("\nAverage absolute change magnitude for VALID structural change tracts (by period):")
+    print(avg_change_valid)
+    print("\nAverage absolute change magnitude for UNCHANGED/invalid change tracts (by period):")
+    print(avg_change_unchanged)
+    print(f"\nAverage absolute change magnitude for VALID structural change tracts (full period {start_year} to {end_year}): {avg_change_valid_full_period}")
+    print(f"Average absolute change magnitude for UNCHANGED/invalid change tracts (full period {start_year} to {end_year}): {avg_change_unchanged_full_period}")
+
+
     return final_gdf
     
 if __name__ == "__main__":
