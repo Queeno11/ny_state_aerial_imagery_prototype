@@ -32,7 +32,7 @@ We utilize a stochastic weighting strategy via batch composition. Each training 
 
 \begin{itemize}
     \item \textbf{Spatial Pairs (80\%):} Pairs of distinct tracts drawn from the same city and year $(X_{i,t}^\tau, X_{j,t}^\tau)$. To prevent the network from overfitting to visual noise within dense middle-income clusters, we employ a **Curriculum Learning strategy via Threshold Annealing**. At the start of training, the Minimum Resolution Threshold ($\epsilon$) is set to a high value (e.g., $2.0\sigma$), admitting only pairs with unambiguous macro-structural differences. As training progresses, this threshold is gradually annealed following an exponential decay schedule. This allows the model to first establish a robust feature backbone on clear signals before fine-tuning on more nuanced distinctions. The threshold anneals to a final, non-zero boundary ($\epsilon_{final}$) determined by the average measurement error of the underlying ACS data, ensuring the model is never forced to learn from statistically insignificant spatial variations.
-    \item \textbf{Stable Temporal Pairs (10\%):} Pairs of the \textit{same} tract across time $(X_{i,t_a}^\tau, X_{i,t_b}^\tau)$ where the econometrically cleared Macro Gate indicates no structural change ($I_i^{valid} = 0$).
+    \item \textbf{Stable Temporal Pairs (10\%):} Pairs of the \textit{same} tract across time $(X_{i,t_a}^\tau, X_{i,t_b}^\tau)$ where the econometrically cleared Macro Gate indicates no structural change ($I_i^{valid} = 0$). Crucially, for these pairs, the network ignores the natural temporal drift in their relative cross-sectional Z-scores (economic filtering) and exclusively penalizes divergence in their latent physical embeddings.
     \item \textbf{Changing Temporal Pairs (10\%):} Pairs of the \textit{same} tract across time $(X_{i,t_a}^\tau, X_{i,t_b}^\tau)$ where valid structural change occurred ($I_i^{valid} = 1$).
 \end{itemize}
 
@@ -40,13 +40,13 @@ We utilize a stochastic weighting strategy via batch composition. Each training 
 The network calculates three distinct loss penalties corresponding to the batch composition.
 
 \vspace{0.5em}
-\noindent\textbf{1. Supervised Spatial Ranking Objective:} Applied to the 80\% spatial pairs (denoted by the set $\mathbb{P}$) to evaluate cross-sectional ordinal accuracy. Let $y_{ij} = \text{sign}(L_i - L_j)$ denote the true econometric relationship between the tracts based on the ACS labels. We employ a Margin Ranking Loss with margin $m_{spatial}$:
+\noindent\textbf{1. Supervised Spatial Ranking Objective:} Applied to the 80\% spatial pairs (denoted by the set $\mathbb{P}$) to evaluate cross-sectional ordinal accuracy. Let $y_{ij} = \text{sign}(L_i - L_j)$ denote the true econometric relationship between the tracts based on the year-specific ACS labels. We employ a Margin Ranking Loss with margin $m_{spatial}$:
 \begin{equation}
 \mathcal{L}_{rank}(\theta, \phi) = \frac{1}{|\mathbb{P}|} \sum_{(i,j) \in \mathbb{P}} \max \left(0, -y_{ij} \left( \hat{R}_{i} - \hat{R}_{j} \right) + m_{spatial} \right)
 \end{equation}
 
 \vspace{0.5em}
-\noindent\textbf{2. Siamese Robustness Regularization:} Applied only to the 10\% stable temporal pairs (denoted by the set $\mathbb{S}$). We minimize the Euclidean distance between their latent embeddings, forcing the network to ignore spurious dataset updates and transient noise:
+\noindent\textbf{2. Siamese Robustness Regularization:} Applied only to the 10\% stable temporal pairs (denoted by the set $\mathbb{S}$). Because these tracts experienced no statistically significant physical change, we minimize the Euclidean distance between their latent embeddings. This forces the network to ignore spurious optical noise and macroeconomic label drift, effectively locking the structural representation:
 \begin{equation}
 \mathcal{L}_{robust}(\theta) = \frac{1}{|\mathbb{S}|} \sum_{(i, t_a, t_b) \in \mathbb{S}} \left\| f_\theta(X_{i, t_a}^\tau) - f_\theta(X_{i, t_b}^\tau) \right\|_2^2
 \end{equation}

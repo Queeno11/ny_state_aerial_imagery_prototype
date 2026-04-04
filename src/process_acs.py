@@ -179,38 +179,23 @@ def process_panel(years: list[int], base_year: int, boundaries_path):
     final_gdf['Valid_Structural_Change'] = any_significant & ~is_yo_yo
     
     # 7. Computing Inverse-Variance Weighted Mean for stable tracts
-    print("Computing Inverse-Variance Weighted Mean for stable tracts...")
-    eps = 1e-9 
-    sum_w = pd.Series(0.0, index=final_gdf.index)
-    weighted_sum = pd.Series(0.0, index=final_gdf.index)
-
+    # 7. Construct Final Training Labels
+    print("Assigning training labels (True Z-scores for all tracts)...")
     for year in years:
-        w_y = 1 / (final_gdf[f'Rel_SE_{year}']**2 + eps)
-        sum_w = sum_w.add(w_y, fill_value=0)
-        weighted_sum = weighted_sum.add(w_y * final_gdf[f'Rel_Score_{year}'], fill_value=0)
-        
-    final_gdf['Weighted_Stable_Score'] = weighted_sum / sum_w
-
-    # 8. Construct Final Training Labels
-    for year in years:
-        final_gdf[f'Training_Label_{year}'] = np.where(
-            final_gdf['Valid_Structural_Change'] == True,
-            final_gdf[f'Rel_Score_{year}'],      
-            final_gdf['Weighted_Stable_Score']   
-        )
+        final_gdf[f'Training_Label_{year}'] = final_gdf[f'Rel_Score_{year}']
         
     print("Training labels successfully assigned!")
     print(f"Filtered out {is_yo_yo.sum()} tracts due to reversing transient shocks (Yo-Yo effect).")
     print(f"Final count of tracts with valid structural change: {final_gdf['Valid_Structural_Change'].sum()} out of {len(final_gdf)} total tracts.")
 
-    # 9. Save out the panel dataset dynamically named
+    # 8. Save out the panel dataset dynamically named
     years_str = "_".join(map(str, years))
     output_name = PROCESSED_DATA_DIR / f"ny_tracts_panel_{years_str}.feather"
     final_gdf.to_feather(output_name)
     print(f"Panel dataset successfully created and saved to {output_name}!")
 
-    # 10. Print Statistics
-    score_cols = [f'Rel_Score_{y}' for y in years] + ['Weighted_Stable_Score']
+    # 9. Print Statistics
+    score_cols = [f'Rel_Score_{y}' for y in years]
     r2_valid = final_gdf[final_gdf['Valid_Structural_Change'] == True][score_cols].corr() ** 2 
     r2_unchanged = final_gdf[final_gdf['Valid_Structural_Change'] == False][score_cols].corr() ** 2
     r2_all = final_gdf[score_cols].corr() ** 2 
