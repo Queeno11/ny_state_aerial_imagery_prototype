@@ -36,57 +36,31 @@ We utilize a stochastic weighting strategy via batch composition. Each training 
     \item \textbf{Changing Temporal Pairs (10\%):} Pairs of the \textit{same} tract across time $(X_{i,t_a}^\tau, X_{i,t_b}^\tau)$ where valid structural change occurred ($I_i^{valid} = 1$).
 \end{itemize}
 
-\subsection{The Tripartite Loss Function}
 The network calculates three distinct loss penalties corresponding to the batch composition.
+\subsection{Unified Pairwise Difference Regression Loss}
+To ensure out-of-sample generalization by structurally discarding spatial cardinality, we frame the objective as a continuous relative difference problem \cite{parikh2011relative}. We train the network to minimize the pairwise squared error between predicted and true relative score differences \cite{daudt2018fully, chen2021remote, burges2005learning}. This unifies the cross-sectional ranking and temporal change objectives under a single differentiable loss function that is translation-invariant by construction.
 
-\vspace{0.5em}
-\noindent\textbf{1. Supervised Spatial Ranking Objective:} Applied to the 80\% spatial pairs (denoted by the set $\mathbb{P}$) to evaluate cross-sectional ordinal accuracy. Let $y_{ij} = \text{sign}(L_i - L_j)$ denote the true econometric relationship between the tracts based on the year-specific ACS labels. We employ a Margin Ranking Loss with margin $m_{spatial}$:
+For any pair of observations $u$ and $v$ drawn from our stochastically composed batch $\mathbb{B}$, let $\hat{R}_u$ and $\hat{R}_v$ be their predicted scalar scores, and $L_u$ and $L_v$ be their true year-specific ACS econometric labels. The unified pairwise loss is defined as:
 \begin{equation}
-\mathcal{L}_{rank}(\theta, \phi) = \frac{1}{|\mathbb{P}|} \sum_{(i,j) \in \mathbb{P}} \max \left(0, -y_{ij} \left( \hat{R}_{i} - \hat{R}_{j} \right) + m_{spatial} \right)
+\mathcal{L}_{pair}(\theta, \phi) = \frac{1}{|\mathbb{B}|} \sum_{(u, v) \in \mathbb{B}} \left[ \left(\hat{R}_{u} - \hat{R}_{v}\right) - \left(L_{u} - L_{v}\right) \right]^2
 \end{equation}
 
-\vspace{0.5em}
-\noindent\textbf{2. Siamese Robustness Regularization:} Applied only to the 10\% stable temporal pairs (denoted by the set $\mathbb{S}$). Because these tracts experienced no statistically significant physical change, we minimize the Euclidean distance between their latent embeddings. This forces the network to ignore spurious optical noise and macroeconomic label drift, effectively locking the structural representation:
-\begin{equation}
-\mathcal{L}_{robust}(\theta) = \frac{1}{|\mathbb{S}|} \sum_{(i, t_a, t_b) \in \mathbb{S}} \left\| f_\theta(X_{i, t_a}^\tau) - f_\theta(X_{i, t_b}^\tau) \right\|_2^2
-\end{equation}
+This single formulation gracefully handles all three pair types in our stochastic batch composition natively:
+\begin{itemize}
+    \item \textbf{Spatial Pairs:} The target is $L_i - L_j$. The model learns to reproduce the full continuous magnitude of cross-sectional wealth differences rather than just their directional ranking, effectively discarding absolute topological anchors while capturing nuanced relative hierarchies.
+    \item \textbf{Stable Temporal Pairs:} The target is $L_{i,t_b} - L_{i,t_a}$, which, due to natural spatial economic filtering, is typically a small, non-zero drift. Rather than forcing mathematically identical outputs, the pairwise loss handles this honestly by supervising the model to predict a difference exactly proportional to the true ACS drift.
+    \item \textbf{Changing Temporal Pairs:} The target is the intertemporal difference $L_{i,t_b} - L_{i,t_a}$. Because MSE penalizes missed magnitudes quadratically, it provides a strong, natural gradient signal proportional to the severity of the structural change, removing the need for an engineered dynamic margin.
+\end{itemize}
 
-\vspace{0.5em}
-\noindent\textbf{3. Temporal Dynamic Margin Loss:} Applied only to the 10\% changing temporal pairs (denoted by the set $\mathbb{C}$). To prevent a ``lazy gradient'' where the network learns just enough to satisfy a standard ranking margin, we introduce a \textit{dynamic margin} proportional to the absolute magnitude of true econometric change: $m_{dynamic} = \alpha \left| L_{i,t_b} - L_{i,t_a} \right|$. 
-
-Let $y_{temp} = \text{sign}(L_{i,t_b} - L_{i,t_a})$ represent the direction of gentrification or decay. The dynamic ranking loss ensures the temporal embeddings are pushed apart in proportion to the severity of the structural change:
-\begin{equation}
-\mathcal{L}_{delta}(\theta, \phi) = \frac{1}{|\mathbb{C}|} \sum_{(i, t_a, t_b) \in \mathbb{C}} \max \left(0, -y_{temp} \left( \hat{R}_{i,t_b} - \hat{R}_{i,t_a} \right) + \alpha \left| L_{i,t_b} - L_{i,t_a} \right| \right)
-\end{equation}
-
-\begin{quote}
-Step 2 — Equalize effective gradient contribution, not sample counts
-The right target is not equal counts of each pair type but equal gradient variance across the three loss components. In practice, this means you want each loss term in the total:
-Ltotal=Lrank+λ1Lrobust+λ2Ldelta\mathcal{L}_{total} = \mathcal{L}_{rank} + \lambda_1 \mathcal{L}_{robust} + \lambda_2 \mathcal{L}_{delta}Ltotal​=Lrank​+λ1​Lrobust​+λ2​Ldelta​
-to produce gradients of roughly comparable L2 norm when evaluated on a representative minibatch. You can measure this empirically in the first few epochs by logging ||∇_θ L_rank||, ||∇_θ L_robust||, and ||∇_θ L_delta|| separately. Set the batch split and λ values so that these three norms are within a factor of 2–3 of each other. If you find that the spatial gradient norm is 50× larger than the delta gradient norm, the temporal signal is simply never updating the shared weights meaningfully.
-Step 3 — A specific principled recommendation
-A clean methodology you can defend in a paper is the following two-parameter design:
-First, fix the ratio of stable to changing temporal pairs at 1:1 — because your Siamese robustness regularizer and your temporal delta loss are complementary and should be learned jointly. Do not let one dominate the other.
-Second, choose the proportion of temporal pairs in the batch by solving for the point where the temporal gradient norm equals the spatial gradient norm after λ-rescaling. In practice, before you have gradient measurements, a reasonable starting point is 60/20/20 rather than 80/10/10. This doubles the temporal exposure and is justified by the fact that temporal generalization is the harder and more novel learning task.
-Then, once training begins, use a gradient norm logging callback after every 100 steps to measure whether the 60/20/20 split is actually producing balanced gradients, and report this in the paper as evidence that the composition is principled rather than arbitrary. The specific split becomes a footnote; the gradient balance measurement becomes the methodological claim.
-Step 4 — Consider a curriculum
-A further refinement, which you can implement and report as a sensitivity check rather than the main method, is a curriculum schedule on the batch composition. In early epochs, let the network learn the spatial ordinal ranking task first — run something like 90/5/5 for the first 20\% of training until the spatial ranking loss plateaus. Then shift to 60/20/20 for the remainder, when the backbone has already learned a meaningful feature space and the temporal pairs can productively update it. This is motivated by the intuition that you cannot learn gentrification signal until you first have a coherent notion of relative wealth, and it mirrors curriculum learning practices in contrastive learning more broadly.
-\end{quote}
-
-\subsection{Joint Loss and Hyperparameter Rescaling}
-The network is trained end-to-end to minimize the total expected loss:
-\begin{equation}
-\mathcal{L}_{total} = \mathcal{L}_{rank}(\theta, \phi) + \lambda_1 \mathcal{L}_{robust}(\theta) + \lambda_2 \mathcal{L}_{delta}(\theta, \phi)
-\end{equation}
-
-While the 80/10/10 batch composition dictates the frequency of the gradient updates, we utilize \textbf{rescaling hyperparameters $\lambda_1$ and $\lambda_2$} to balance the magnitudes of the distinct loss spaces. These act as signal boosters, ensuring the relatively quiet temporal gradients (regularization and dynamic delta mapping) provide a sufficient push to update the network alongside the dominant spatial ranking gradients.
+% NOTE: If empirical testing reveals that intertemporal consistency remains an issue (i.e., if the network learns wildly divergent visual embeddings for stable tracts that merely happen to regress to similar scalars), we can optionally reintroduce a Siamese Robustness Penalty. This regularization term, \mathcal{L}_{robust}(\theta) = \| f_\theta(X_{i, t_a}^\tau) - f_\theta(X_{i, t_b}^\tau) \|_2^2, applied exclusively to stable pairs, minimizes the Euclidean distance between their latent representations to strictly lock the embedding space against spurious optical noise.
 
 \subsection*{Summary of Core Architectural Hyperparameters}
 \begin{itemize}
     \item \textbf{$\tau$ (Spillover Threshold):} Determines the spatial context window (in meters) beyond the tract boundary to capture localized externalities.
     \item \textbf{Batch Split $(\rho_{spatial}, \rho_{stable}, \rho_{change})$:} Set to (0.8, 0.1, 0.1) to define the stochastic probability of drawing a cross-sectional comparison versus temporal regularization pairs.
-    \item \textbf{$\alpha$ (Dynamic Temporal Scale):} Maps the true magnitude of econometric change into a target mathematical margin space for the changing temporal pairs.
-    \item \textbf{$\lambda_1, \lambda_2$ (Loss Weights):} Rescales the gradients of the Siamese robustness penalty and the temporal dynamic margin relative to the spatial ordinal ranker.
 \end{itemize}
 
+
 \end{document}
+
+
