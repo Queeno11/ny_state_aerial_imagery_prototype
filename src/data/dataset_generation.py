@@ -82,7 +82,7 @@ def load_building_data():
     return buildings_nyc
 
 
-def build_training_datasets(buildings_nyc, panel_gdf, panel_years, tau_meters=50):
+def build_panel_datasets(buildings_nyc, panel_gdf, panel_years, tau_meters=50):
     """
     Produces two artifacts for the Zero-Join DataLoader:
 
@@ -101,6 +101,17 @@ def build_training_datasets(buildings_nyc, panel_gdf, panel_years, tau_meters=50
         r"ny_state_aerial_imagery_prototype/data/processed/"
     )
     METRIC_CRS = "EPSG:6539"
+
+    temporal_data_path = OUTPUT_DIR / f"temporal_data_t{tau_meters}_years{panel_years.min()}-{panel_years.max()}.parquet"
+    geometries_path = OUTPUT_DIR / f"building_geometries_years{panel_years.min()}-{panel_years.max()}.parquet"
+
+    # Check if output files already exist to avoid redundant processing
+    if temporal_data_path.exists() and geometries_path.exists():
+        print(f"Output files already exist at:\n  {temporal_data_path}\n  {geometries_path}")
+        print("Loading existing datasets...")
+        temporal_data_flat = pd.read_parquet(temporal_data_path)
+        geometries_df = pd.read_parquet(geometries_path, index_col="DOITT_ID")
+        return temporal_data_flat, geometries_df
 
     # ------------------------------------------------------------------ #
     # 1. CRS alignment                                                   #
@@ -209,10 +220,10 @@ def build_training_datasets(buildings_nyc, panel_gdf, panel_years, tau_meters=50
     # ------------------------------------------------------------------ #
     print("7. Saving to Parquet...")
     temporal_data_flat.to_parquet(
-        OUTPUT_DIR / "temporal_data.parquet", index=False
+        temporal_data_path, index=False
     )
     geometries_df.to_parquet(
-        OUTPUT_DIR / "geometries.parquet", index=True   # index = DOITT_ID
+        geometries_path, index=True  # Keep DOITT_ID as index for geometries
     )
 
     print(
@@ -266,7 +277,7 @@ if __name__ == "__main__":
     buildings_nyc = load_building_data()
     acs_panel = process_acs_panel()
 
-    temporal_df, geoms_df = build_training_datasets(
+    temporal_df, geoms_df = build_panel_datasets(
         buildings_nyc=buildings_nyc,
         panel_gdf=acs_panel,
         panel_years=PANEL_YEARS,
