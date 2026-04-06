@@ -1,7 +1,9 @@
+import math
 import pandas as pd
 import geopandas as gpd
 import numpy as np
 from pathlib import Path
+from pyproj import CRS
 
 def get_closest_acs_year(year, acs_years=[2009, 2014, 2019, 2024]):
     """
@@ -12,6 +14,7 @@ def get_closest_acs_year(year, acs_years=[2009, 2014, 2019, 2024]):
     return closest_year
 
 def process_acs_panel():
+    print("Loading and processing ACS panel data...")
     panel_path = Path(
         r"/mnt/c/Working Papers/NY State Aerial Imagery Prototype/"
         r"ny_state_aerial_imagery_prototype/data/processed/"
@@ -22,6 +25,8 @@ def process_acs_panel():
 
 
 def load_building_data():
+    print("Loading building footprint data from GeoJSON files...")
+
     BUILDINGS_DATASET_DIR = Path(
         r"/mnt/e/Datasets/Building Footprints/NYC Building Footprints"
     )
@@ -95,7 +100,7 @@ def build_training_datasets(buildings_nyc, panel_gdf, panel_years, tau_meters=50
         r"/mnt/c/Working Papers/NY State Aerial Imagery Prototype/"
         r"ny_state_aerial_imagery_prototype/data/processed/"
     )
-    METRIC_CRS = "EPSG:3857"
+    METRIC_CRS = "EPSG:6539"
 
     # ------------------------------------------------------------------ #
     # 1. CRS alignment                                                   #
@@ -122,8 +127,12 @@ def build_training_datasets(buildings_nyc, panel_gdf, panel_years, tau_meters=50
     # ------------------------------------------------------------------ #
     # 3. Apply tau buffer and extract bounding boxes                      #
     # ------------------------------------------------------------------ #
-    print(f"3. Applying Context Spillover (tau = {tau_meters}m) and Extracting BBoxes...")
-    buffered_geoms = buildings_mapped.geometry.buffer(tau_meters)
+    print(f"3. Applying Context Spillover (tau = {tau_meters}m) and Extracting BBoxes (assuming zarr has 0.5 EPSG:6539 units per pixel)...")
+    
+    meters_per_crs_unit = projected_units_to_meters(1.0, 6539)    
+    tau_crs_units = tau_meters / meters_per_crs_unit
+    buffered_geoms = buildings_mapped.centroid.buffer(tau_crs_units)
+
     bounds = buffered_geoms.bounds
     buildings_mapped["bbox_minx"] = bounds["minx"]
     buildings_mapped["bbox_miny"] = bounds["miny"]
@@ -215,13 +224,44 @@ def build_training_datasets(buildings_nyc, panel_gdf, panel_years, tau_meters=50
     )
     return temporal_data_flat, geometries_df
 
+def projected_units_to_meters(value: float, epsg_code: int) -> float:
+    """
+    Converts a value from the native units of a projected CRS into meters.
+    
+    Args:
+        value (float): The distance in the native CRS units (e.g., 0.5)
+        epsg_code (int): The EPSG code of the projected coordinate system
+        
+    Returns:
+        float: The exact equivalent distance in meters.
+    """
+    crs = CRS.from_epsg(epsg_code)
+    
+    # 1. Safety check: ensure the CRS is projected (linear), not geographic (angular/degrees)
+    if crs.is_geographic:
+        raise ValueError(
+            f"EPSG:{epsg_code} is a geographic CRS ({crs.name}). "
+            "Its units are degrees, which do not have a constant meter length. "
+            "Please provide a Projected CRS."
+        )
+        
+    # 2. Fetch the exact conversion factor to meters for this specific CRS
+    # axis_info[0] looks at the first spatial axis (usually Easting/X)
+    conversion_factor = crs.axis_info[0].unit_conversion_factor
+    unit_name = crs.axis_info[0].unit_name
+    
+    print(f"EPSG:{epsg_code} native unit is '{unit_name}'.")
+    print(f"Conversion factor to meters: 1 {unit_name} = {conversion_factor} meters.")
+    
+    # 3. Calculate and return
+    return value * conversion_factor
 
 # --------------------------------------------------------------------------- #
 # Execution                                                                   #
 # --------------------------------------------------------------------------- #
 if __name__ == "__main__":
     PANEL_YEARS = [2008, 2010, 2012, 2014, 2016, 2018, 2020, 2022, 2024]
-    TAU_METERS = 50
+    TAU_METERS = 100  # 100m spillover buffer around each building's bounding box
 
     buildings_nyc = load_building_data()
     acs_panel = process_acs_panel()
