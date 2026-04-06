@@ -20,8 +20,8 @@ def process_acs_panel():
         r"ny_state_aerial_imagery_prototype/data/processed/"
         r"ny_tracts_panel_2009_2014_2019_2024.feather"
     )
-    panel_gdf = gpd.read_feather(panel_path)
-    return panel_gdf
+    panel_tract_gdf = gpd.read_feather(panel_path)
+    return panel_tract_gdf
 
 
 def load_building_data():
@@ -82,7 +82,7 @@ def load_building_data():
     return buildings_nyc
 
 
-def build_panel_datasets(buildings_nyc, panel_gdf, panel_years, tau_meters=50):
+def build_panel_datasets(panel_years, tau_meters=50):
     """
     Produces two artifacts for the Zero-Join DataLoader:
 
@@ -113,21 +113,24 @@ def build_panel_datasets(buildings_nyc, panel_gdf, panel_years, tau_meters=50):
         geometries_df = pd.read_parquet(geometries_path, index_col="DOITT_ID")
         return temporal_data_flat, geometries_df
 
+    buildings_nyc = load_building_data()
+    panel_tract_gdf = process_acs_panel()
+
     # ------------------------------------------------------------------ #
     # 1. CRS alignment                                                   #
     # ------------------------------------------------------------------ #
     print("1. Preparing Spatial Data and CRS...")
     if buildings_nyc.crs != METRIC_CRS:
         buildings_nyc = buildings_nyc.to_crs(METRIC_CRS)
-    if panel_gdf.crs != METRIC_CRS:
-        panel_gdf = panel_gdf.to_crs(METRIC_CRS)
+    if panel_tract_gdf.crs != METRIC_CRS:
+        panel_tract_gdf = panel_tract_gdf.to_crs(METRIC_CRS)
 
     # ------------------------------------------------------------------ #
     # 2. Assign buildings to 2024 census tracts                          #
     # ------------------------------------------------------------------ #
     print("2. Assigning Buildings to 2024 Census Tracts...")
     tracts_2024 = (
-        panel_gdf[["geoid_2024", "geometry"]]
+        panel_tract_gdf[["geoid_2024", "geometry"]]
         .rename(columns={"geoid_2024": "GEOID"})
     )
     buildings_mapped = gpd.sjoin(
@@ -173,7 +176,7 @@ def build_panel_datasets(buildings_nyc, panel_gdf, panel_years, tau_meters=50):
 
         # Merge ACS labels for this specific year
         tract_labels = (
-            panel_gdf[["geoid_2024", "Valid_Structural_Change", f"Rel_Score_{acs_year}"]]
+            panel_tract_gdf[["geoid_2024", "Valid_Structural_Change", f"Rel_Score_{acs_year}"]]
             .copy()
             .rename(columns={
                 "geoid_2024": "GEOID",
@@ -274,12 +277,8 @@ if __name__ == "__main__":
     PANEL_YEARS = [2008, 2010, 2012, 2014, 2016, 2018, 2020, 2022, 2024]
     TAU_METERS = 100  # 100m spillover buffer around each building's bounding box
 
-    buildings_nyc = load_building_data()
-    acs_panel = process_acs_panel()
 
     temporal_df, geoms_df = build_panel_datasets(
-        buildings_nyc=buildings_nyc,
-        panel_gdf=acs_panel,
         panel_years=PANEL_YEARS,
         tau_meters=TAU_METERS,
     )
