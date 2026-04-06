@@ -83,23 +83,16 @@ def open_datasets(sat_data="aerial", years=[2013, 2018, 2022], tau_meters=100):
     df = build_dataset.load_income_dataset(years, tau_meters=tau_meters)
 
     year_cols = []
-    datasets_all_years = {}
-    extents_all_years = {}
-    for year in years:
-        if sat_data == "aerial":
-            sat_imgs_datasets, extents = build_dataset.load_satellite_datasets(
-                year=year
-            )
-        elif sat_data == "landsat":
-            raise NotImplementedError("Landsat support not implemented yet.")
-            sat_imgs_datasets, extents = build_dataset.load_landsat_datasets()
+    if sat_data == "aerial":
+        datasets_all_years, extents_all_years = build_dataset.load_satellite_datasets(
+            years=years
+        )
+    elif sat_data == "landsat":
+        raise NotImplementedError("Landsat support not implemented yet.")
+        sat_imgs_datasets, extents = build_dataset.load_landsat_datasets()
 
-        df = build_dataset.assign_datasets_to_gdf(df, extents, year=year, verbose=True, save_plot=True)
-        datasets_all_years[year] = sat_imgs_datasets
-        extents_all_years[year] = extents
-        year_cols += [f"dataset_{year}"]
+    df = build_dataset.assign_datasets_to_gdf(df, extents_all_years, year=years, verbose=True, save_plot=True)
 
-    df = df[df[year_cols].notna().any(axis=1)]
     print("Datasets loaded!")
 
     return datasets_all_years, extents_all_years, df
@@ -475,7 +468,7 @@ def create_train_test_dataframes(df, savename, small_sample=False):
 
     ### Split census tracts based on train/test
     #       (the hole census tract must be in the corresponding region)
-    df = build_dataset.split_train_test(df)
+    train_df, test_df, val_df = build_dataset.split_train_test(df)
     df = df[
         ["GEOID", "var", "type", "geometry"]
         + [col for col in df.columns if "dataset" in col]
@@ -948,7 +941,7 @@ def run(
     extra = params["extra"]
     batch_size = params["batch_size"]
     tau_meters = params.get("tau_meters", 100)
-    
+
     savename = generate_savename(
         model_name, image_size, learning_rate, stacked_images, years, extra
     )

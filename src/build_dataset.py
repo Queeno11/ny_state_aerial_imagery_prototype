@@ -23,35 +23,40 @@ import pandas as pd
 import src.geo_utils as geo_utils
 
 
-def load_satellite_datasets(year=2014, stretch=False, engine="zarr"):
+def load_satellite_datasets(years,stretch=False, engine="zarr"):
     """Load satellite datasets and get their extents"""
+    datasets = {}
+    extents = {}
+    for year in years:
+        if engine=="zarr":
+            file = f"nyc_{year}.zarr"
+            dataset_path = IMAGERY_ROOT
+            files = [file]
 
-    if engine=="zarr":
-        file = f"nyc_{year}.zarr"
-        dataset_path = IMAGERY_ROOT
-        files = [file]
+        elif engine=="tif":
+            dataset_path = IMAGERY_ROOT / year
+            files = os.listdir(dataset_path)
+            files = [f for f in files if f.endswith(".tif")]
+            assert all([os.path.isfile(dataset_path / f) for f in files])
 
-    elif engine=="tif":
-        dataset_path = IMAGERY_ROOT / year
-        files = os.listdir(dataset_path)
-        files = [f for f in files if f.endswith(".tif")]
-        assert all([os.path.isfile(dataset_path / f) for f in files])
+        else:
+            raise ValueError(f"Unknown engine: {engine}. Valid engines are: zarr, tif")
 
-    else:
-        raise ValueError(f"Unknown engine: {engine}. Valid engines are: zarr, tif")
+        print(f"Loading {len(files)} files from {dataset_path}...")
+        if not os.path.exists(dataset_path):
+            raise ValueError(f"Year {year} images not found: {dataset_path} does exist! Check they are stored in WSL!")
+        datasets_year = {
+            f: (filter_black_pixels(xr.open_dataset(dataset_path / f, engine=engine,  mask_and_scale=False)))
+            for f in files
+        }
 
-    print(f"Loading {len(files)} files from {dataset_path}...")
-    if not os.path.exists(dataset_path):
-        raise ValueError(f"Year {year} images not found: {dataset_path} does exist! Check they are stored in WSL!")
-    datasets = {
-        f: (filter_black_pixels(xr.open_dataset(dataset_path / f, engine=engine,  mask_and_scale=False)))
-        for f in files
-    }
+        if stretch:
+            datasets_year = {(name if year in name else f"{name}_{year}"): stretch_dataset(ds) for name, ds in datasets_year.items()}
 
-    if stretch:
-        datasets = {name: stretch_dataset(ds) for name, ds in datasets.items()}
+        extents_year = {name: geo_utils.get_dataset_extent(ds) for name, ds in datasets_year.items()}
 
-    extents = {name: geo_utils.get_dataset_extent(ds) for name, ds in datasets.items()}
+        datasets.update(datasets_year)
+        extents.update(extents_year)
 
     return datasets, extents
 
@@ -397,7 +402,7 @@ def projected_units_to_meters(value: float, epsg_code: int) -> float:
 def assign_datasets_to_gdf(
     df,
     extents,
-    year=2013,
+    years,
     verbose=True,
     save_plot=True,
 ):
@@ -407,7 +412,7 @@ def assign_datasets_to_gdf(
     -----------
     df: pandas.DataFrame, must have columns "centroid_x" and "centroid_y" with the coordinates of the centroid of the census tract
     extents: dict, dictionary with the extents of the satellite datasets
-    year: int, year of the satellite images
+    years: list, years of the satellite images
     centroid: bool, if True, the centroid of the census tract is used to assign the dataset
     select: str, method to select the dataset. Options are "first_match" or "all_matches"
     """
@@ -417,29 +422,27 @@ def assign_datasets_to_gdf(
     if "centroid_x" not in df.columns or "centroid_y" not in df.columns:
         raise ValueError("DataFrame must have 'centroid_x' and 'centroid_y' columns with the coordinates of the centroid of the census tract")  
 
-    if year is None:
-        colname = "dataset"
-    else:
-        colname = f"dataset_{year}"
-
-    for name, bbox in extents.items():
-        xmin, ymin, xmax, ymax = bbox
-        inside_bbox = (
-            (df["centroid_x"] >= xmin) &
-            (df["centroid_x"] <= xmax) &
-            (df["centroid_y"] >= ymin) &
-            (df["centroid_y"] <= ymax)
-        )
-        df.loc[inside_bbox, colname] = name
+    colname = "dataset"
+    for year in years:
+        inside_year = df["year"] == year
+        for name, bbox in extents.items():
+            xmin, ymin, xmax, ymax = bbox
+            inside_bbox = (
+                (df["centroid_x"] >= xmin) &
+                (df["centroid_x"] <= xmax) &
+                (df["centroid_y"] >= ymin) &
+                (df["centroid_y"] <= ymax)
+            )
+            df.loc[inside_bbox & inside_year, colname] = name
 
     nan_links = df[colname].isna().sum()
     df = df[df[colname].notna()]
 
     if verbose:
         print(
-            f"Links without images ({year}):", nan_links, "out of", len(df) + nan_links
+            f"Buildings without images):", nan_links, "out of", len(df) + nan_links
         )
-        print(f"Remaining links for train/test ({year}):", len(df))
+        print(f"Buildings for datasets (train/test/val):", len(df))
     if save_plot:
         gdf = gpd.GeoDataFrame(
             df,
@@ -574,6 +577,15 @@ def split_train_test(
     print(f"Assigned to Train Set (strictly outside patches + buffer): {len(train_df):,}")
     print(f"Dropped (spatial moat/buffer zone): {len(df) - len(test_df) - len(train_df):,}")
 
+    # Keep only relevant columns for the DataLoader
+    relevant_columns = [
+        "DOITT_ID", "GEOID", "year",
+        "Rel_Score", "Valid_Structural_Change", "score_bin",
+    ]
+    train_df = train_df[relevant_columns]
+    test_df = test_df[relevant_columns]
+    val_df = val_df[relevant_columns] if val_df is not None else None
+    
     return train_df, test_df, val_df
     
 from shapely.geometry import box
