@@ -9,6 +9,8 @@ import matplotlib.pyplot as plt
 import numpy as np
 from typing import List, Dict
 from src.utils.paths import PROJECT_ROOT, DATA_DIR, EXTERNAL_DATA_DIR, RAW_DATA_DIR, INTERIM_DATA_DIR, PROCESSED_DATA_DIR, RESULTS_DIR, LOGS_DIR, IMAGERY_ROOT
+from pathlib import Path
+from pyproj import CRS
 
 pd.set_option("display.max_columns", None)
 
@@ -96,176 +98,484 @@ def load_satellite_datasets(year=2014, stretch=False, engine="zarr"):
 #     return datasets, extents
 
 
-def load_income_dataset(variable="avg_hh_inc", trim=False, log=True):
-    """Open income dataset and merge with ELL estimation (small area estimates)."""
+def get_closest_acs_year(year, acs_years=[2009, 2014, 2019, 2024]):
+    """
+    Given a year and a list of panel years, return the closest panel year.
+    This is used to match each building-year pair with the appropriate ACS labels.
+    """
+    closest_year = min(acs_years, key=lambda y: abs(y - year))
+    return closest_year
 
-    # Open SAE dataset
-    gdf = gpd.read_parquet(PROCESSED_DATA_DIR / "nyc_buildings_with_sae.parquet")
-    gdf["building_id"] = gdf.index
+def process_acs_panel():
+    print("Loading and processing ACS panel data...")
+    panel_path = Path(
+        r"/mnt/c/Working Papers/NY State Aerial Imagery Prototype/"
+        r"ny_state_aerial_imagery_prototype/data/processed/"
+        r"ny_tracts_panel_2009_2014_2019_2024.feather"
+    )
+    panel_tract_gdf = gpd.read_feather(panel_path)
+    return panel_tract_gdf
 
-    # FIXME: Probably it's a good idea to reproject all the zarr so I can scale this to anywhere...
-    gdf = gdf.to_crs("EPSG:6539")
-    gdf = gdf[gdf[variable]>0]  # Remove ct with no income data 
 
-    # FIXME: I forgot to add Bronx for some reason... Should add it later
-    gdf = gdf[gdf[variable]>0]
+def load_building_data():
+    print("Loading building footprint data from GeoJSON files...")
 
-    if trim:
-        # Should not be needed with these models
-        gdf = gdf[gdf["Area"] <= 200000]  # Remove ct that are too big
-    gdf = gdf.reset_index(drop=True)
-
-    # Normalize ELL estimation:
-    # FIXME: I should do this normalization based on census tract estimates, not buildings...
-    if log:
-        gdf[variable + "_log"] = gdf[variable].apply(lambda x: np.log(x))
-        variable = variable + "_log"
-
-    var_mean = gdf[variable].mean()
-    var_std = gdf[variable].std()
-    gdf["var"] = (gdf[variable] - var_mean) / var_std
-
-    date = pd.Timestamp.now().strftime("%Y%m%d")
-    data_dict = {"mean": var_mean, "std": var_std}
-    pd.DataFrame().from_dict(data_dict, orient="index", columns=[variable]).to_csv(
-        PROCESSED_DATA_DIR / f"scalars_{variable}_trim{trim}_{date}.csv"
+    BUILDINGS_DATASET_DIR = Path(
+        r"/mnt/e/Datasets/Building Footprints/NYC Building Footprints"
+    )
+    buildings_now = gpd.read_file(
+        BUILDINGS_DATASET_DIR / "BUILDING_view_8608618849432433473.geojson"
+    )
+    building_historical = gpd.read_file(
+        BUILDINGS_DATASET_DIR / "BUILDING_HISTORIC_view_4222244593352533104.geojson"
     )
 
-    gdf.to_parquet(PROCESSED_DATA_DIR / f"gdf_{variable}_trim{trim}_{date}.parquet")
-    
-    return gdf
+    # Keep only buildings demolished after the start of our panel
+    building_historical = building_historical[
+        building_historical["DEMOLITION_YEAR"] > 2009
+    ]
+    buildings_nyc = pd.concat([buildings_now, building_historical])
 
+    # Log problematic duplicate IDs for inspection
+    problematic_ids = buildings_nyc[
+        buildings_nyc.duplicated(subset=["DOITT_ID"], keep=False)
+    ]
+    problematic_ids.to_parquet(
+        r"/mnt/c/Working Papers/NY State Aerial Imagery Prototype/"
+        r"ny_state_aerial_imagery_prototype/data/processed/"
+        r"problematic_building_ids.parquet"
+    )
+
+    # Drop sentinel DOITT_ID = 0 (unusable, not a real building)
+    buildings_nyc = buildings_nyc[buildings_nyc["DOITT_ID"] != 0]
+
+    # For duplicated IDs, keep the record with the most recent demolition year
+    buildings_nyc = (
+        buildings_nyc
+        .sort_values("DEMOLITION_YEAR", ascending=False)
+        .drop_duplicates(subset=["DOITT_ID"], keep="first")
+    )
+
+    buildings_nyc = buildings_nyc[
+        ["OBJECTID", "DOITT_ID", "CONSTRUCTION_YEAR", "DEMOLITION_YEAR", "geometry"]
+    ]
+    # Fill missing years with sentinel values:
+    #   CONSTRUCTION_YEAR = 0  → building always existed before the panel
+    #   DEMOLITION_YEAR   = 2999 → building still standing
+    # Existence filter: CONSTRUCTION_YEAR <= year < DEMOLITION_YEAR
+    buildings_nyc["CONSTRUCTION_YEAR"] = buildings_nyc["CONSTRUCTION_YEAR"].fillna(0)
+    buildings_nyc["DEMOLITION_YEAR"] = buildings_nyc["DEMOLITION_YEAR"].fillna(2999)
+    buildings_nyc = buildings_nyc.set_index("DOITT_ID")
+
+    output_path = (
+        r"/mnt/c/Working Papers/NY State Aerial Imagery Prototype/"
+        r"ny_state_aerial_imagery_prototype/data/processed/buildings_nyc.parquet"
+    )
+    buildings_nyc.to_parquet(output_path)
+    return buildings_nyc
+
+
+def load_income_dataset(panel_years, tau_meters=50):
+    """
+    Produces two artifacts for the Zero-Join DataLoader:
+
+      1. temporal_data.parquet  — flat table: one row per (building, year).
+                                  Contains bbox coordinates, ACS labels, and
+                                  stratification bins. No geometry column.
+                                  This is the hot path the DataLoader reads.
+
+      2. geometries.parquet     — geometry lookup: one row per building,
+                                  indexed by DOITT_ID. Only used offline for
+                                  visualisation and debugging; the DataLoader
+                                  never touches this file at training time.
+    """
+    OUTPUT_DIR = Path(
+        r"/mnt/c/Working Papers/NY State Aerial Imagery Prototype/"
+        r"ny_state_aerial_imagery_prototype/data/processed/"
+    )
+    METRIC_CRS = "EPSG:6539"
+
+    temporal_data_path = OUTPUT_DIR / f"temporal_data_t{tau_meters}_years{panel_years.min()}-{panel_years.max()}.parquet"
+    geometries_path = OUTPUT_DIR / f"building_geometries_years{panel_years.min()}-{panel_years.max()}.parquet"
+
+    # Check if output files already exist to avoid redundant processing
+    if temporal_data_path.exists() and geometries_path.exists():
+        print(f"Output files already exist at:\n  {temporal_data_path}\n  {geometries_path}")
+        print("Loading existing datasets...")
+        temporal_data_flat = pd.read_parquet(temporal_data_path)
+        geometries_df = pd.read_parquet(geometries_path, index_col="DOITT_ID")
+        return temporal_data_flat, geometries_df
+
+    buildings_nyc = load_building_data()
+    panel_tract_gdf = process_acs_panel()
+
+    # ------------------------------------------------------------------ #
+    # 1. CRS alignment                                                   #
+    # ------------------------------------------------------------------ #
+    print("1. Preparing Spatial Data and CRS...")
+    if buildings_nyc.crs != METRIC_CRS:
+        buildings_nyc = buildings_nyc.to_crs(METRIC_CRS)
+    if panel_tract_gdf.crs != METRIC_CRS:
+        panel_tract_gdf = panel_tract_gdf.to_crs(METRIC_CRS)
+
+    # ------------------------------------------------------------------ #
+    # 2. Assign buildings to 2024 census tracts                          #
+    # ------------------------------------------------------------------ #
+    print("2. Assigning Buildings to 2024 Census Tracts...")
+    tracts_2024 = (
+        panel_tract_gdf[["geoid_2024", "geometry"]]
+        .rename(columns={"geoid_2024": "GEOID"})
+    )
+    buildings_mapped = gpd.sjoin(
+        buildings_nyc, tracts_2024, how="inner", predicate="intersects"
+    )
+    buildings_mapped = buildings_mapped.drop(columns=["index_right"])
+
+    # ------------------------------------------------------------------ #
+    # 3. Apply tau buffer and extract bounding boxes                      #
+    # ------------------------------------------------------------------ #
+    print(f"3. Applying Context Spillover (tau = {tau_meters}m) and Extracting BBoxes (assuming zarr has 0.5 EPSG:6539 units per pixel)...")
+    
+    meters_per_crs_unit = projected_units_to_meters(1.0, 6539)    
+    tau_crs_units = tau_meters / meters_per_crs_unit
+    buffered_geoms = buildings_mapped.centroid.buffer(tau_crs_units)
+
+    bounds = buffered_geoms.bounds
+    buildings_mapped["bbox_minx"] = bounds["minx"]
+    buildings_mapped["bbox_miny"] = bounds["miny"]
+    buildings_mapped["bbox_maxx"] = bounds["maxx"]
+    buildings_mapped["bbox_maxy"] = bounds["maxy"]
+
+    # --- Artifact 1: geometry lookup (indexed by DOITT_ID) ---
+    geometries_df = buildings_mapped[["geometry"]].copy()  # index = DOITT_ID
+
+    # [FIX HERE] Now safe to drop geometry AND reset index so DOITT_ID becomes a regular column.
+    # This prevents DOITT_ID from being lost during pd.concat later.
+    buildings_mapped = buildings_mapped.drop(columns=["geometry"]).reset_index()
+
+    # ------------------------------------------------------------------ #
+    # 4. Unroll to (building, year) pairs                                 #
+    # ------------------------------------------------------------------ #
+    print("4. Unrolling Temporal Building-Year Pairs...")
+    temporal_rows = []
+    for year in panel_years:
+        existed_mask = (
+            (buildings_mapped["CONSTRUCTION_YEAR"] <= year) &
+            (buildings_mapped["DEMOLITION_YEAR"] > year)
+        )
+        bldgs_year = buildings_mapped[existed_mask].copy()
+        bldgs_year["year"] = year
+        acs_year = get_closest_acs_year(year)
+
+        # Merge ACS labels for this specific year
+        tract_labels = (
+            panel_tract_gdf[["geoid_2024", "Valid_Structural_Change", f"Rel_Score_{acs_year}"]]
+            .copy()
+            .rename(columns={
+                "geoid_2024": "GEOID",
+                f"Rel_Score_{acs_year}": "Rel_Score",
+            })
+        )
+        bldgs_year = bldgs_year.merge(tract_labels, on="GEOID", how="inner")
+        temporal_rows.append(bldgs_year)
+
+    temporal_df = pd.concat(temporal_rows, ignore_index=True)
+
+    # ------------------------------------------------------------------ #
+    # 5. Stratified score bins — computed WITHIN each year               #
+    # ------------------------------------------------------------------ #
+    print("5. Calculating Year-Stratified Score Bins...")
+    temporal_df["score_bin"] = (
+        temporal_df
+        .groupby("year")["Rel_Score"]
+        .transform(
+            lambda x: pd.qcut(x, q=10, labels=False, duplicates="drop")
+        )
+    )
+
+    # ------------------------------------------------------------------ #
+    # 6. Build the flat temporal table (DataLoader hot path)             #
+    # ------------------------------------------------------------------ #
+    print("6. Building Flat Temporal Table...")
+    # Because we called .reset_index() earlier, DOITT_ID is now safely a column.
+    hot_path_columns = [
+        "DOITT_ID", "GEOID", "year",
+        "bbox_minx", "bbox_miny", "bbox_maxx", "bbox_maxy",
+        "Rel_Score", "Valid_Structural_Change", "score_bin",
+    ]
+    missing = [c for c in hot_path_columns if c not in temporal_df.columns]
+    if missing:
+        raise KeyError(
+            f"Expected columns missing from temporal_df: {missing}\n"
+            f"Available columns: {list(temporal_df.columns)}"
+        )
+    temporal_data_flat = temporal_df[hot_path_columns].copy()
+    
+    # ------------------------------------------------------------------ #
+    # 7. Save                                                             #
+    # ------------------------------------------------------------------ #
+    print("7. Saving to Parquet...")
+    temporal_data_flat.to_parquet(
+        temporal_data_path, index=False
+    )
+    geometries_df.to_parquet(
+        geometries_path, index=True  # Keep DOITT_ID as index for geometries
+    )
+
+    print(
+        f"\nDone!\n"
+        f"  temporal_data.parquet : {len(temporal_data_flat):,} rows "
+        f"({temporal_data_flat['year'].nunique()} years × buildings)\n"
+        f"  geometries.parquet    : {len(geometries_df):,} unique buildings\n"
+        f"  Score bins computed within each of: {sorted(temporal_df['year'].unique())}"
+    )
+    return temporal_data_flat
+
+def projected_units_to_meters(value: float, epsg_code: int) -> float:
+    """
+    Converts a value from the native units of a projected CRS into meters.
+    
+    Args:
+        value (float): The distance in the native CRS units (e.g., 0.5)
+        epsg_code (int): The EPSG code of the projected coordinate system
+        
+    Returns:
+        float: The exact equivalent distance in meters.
+    """
+    crs = CRS.from_epsg(epsg_code)
+    
+    # 1. Safety check: ensure the CRS is projected (linear), not geographic (angular/degrees)
+    if crs.is_geographic:
+        raise ValueError(
+            f"EPSG:{epsg_code} is a geographic CRS ({crs.name}). "
+            "Its units are degrees, which do not have a constant meter length. "
+            "Please provide a Projected CRS."
+        )
+        
+    # 2. Fetch the exact conversion factor to meters for this specific CRS
+    # axis_info[0] looks at the first spatial axis (usually Easting/X)
+    conversion_factor = crs.axis_info[0].unit_conversion_factor
+    unit_name = crs.axis_info[0].unit_name
+    
+    print(f"EPSG:{epsg_code} native unit is '{unit_name}'.")
+    print(f"Conversion factor to meters: 1 {unit_name} = {conversion_factor} meters.")
+    
+    # 3. Calculate and return
+    return value * conversion_factor
+def projected_units_to_meters(value: float, epsg_code: int) -> float:
+    """
+    Converts a value from the native units of a projected CRS into meters.
+    
+    Args:
+        value (float): The distance in the native CRS units (e.g., 0.5)
+        epsg_code (int): The EPSG code of the projected coordinate system
+        
+    Returns:
+        float: The exact equivalent distance in meters.
+    """
+    crs = CRS.from_epsg(epsg_code)
+    
+    # 1. Safety check: ensure the CRS is projected (linear), not geographic (angular/degrees)
+    if crs.is_geographic:
+        raise ValueError(
+            f"EPSG:{epsg_code} is a geographic CRS ({crs.name}). "
+            "Its units are degrees, which do not have a constant meter length. "
+            "Please provide a Projected CRS."
+        )
+        
+    # 2. Fetch the exact conversion factor to meters for this specific CRS
+    # axis_info[0] looks at the first spatial axis (usually Easting/X)
+    conversion_factor = crs.axis_info[0].unit_conversion_factor
+    unit_name = crs.axis_info[0].unit_name
+    
+    print(f"EPSG:{epsg_code} native unit is '{unit_name}'.")
+    print(f"Conversion factor to meters: 1 {unit_name} = {conversion_factor} meters.")
+    
+    # 3. Calculate and return
+    return value * conversion_factor
 
 def assign_datasets_to_gdf(
-    gdf,
+    df,
     extents,
     year=2013,
-    centroid=False,
-    buffer=True,
-    select="first_match",
     verbose=True,
+    save_plot=True,
 ):
     """Assign each geometry a dataset if the census tract falls within the extent of the dataset (images)
 
     Parameters:
     -----------
-    gdf: geopandas.GeoDataFrame, shapefile with the census tracts
+    df: pandas.DataFrame, must have columns "centroid_x" and "centroid_y" with the coordinates of the centroid of the census tract
     extents: dict, dictionary with the extents of the satellite datasets
     year: int, year of the satellite images
     centroid: bool, if True, the centroid of the census tract is used to assign the dataset
     select: str, method to select the dataset. Options are "first_match" or "all_matches"
     """
     import warnings
-    def get_matching_names(row):
-        # Create a list of all the names where the row has a True
-        return [name for name in extents.keys() if row[name] is True]
-
-    def keep_only_one_capture(file_list):
-        # Extract the identifier from the first element
-        if len(file_list)>0:
-            capture_id = file_list[0].split("_")[1]
-            # Filter the list to keep only the values that match the identifier
-            file_list = [f for f in file_list if capture_id in f]
-        return file_list
-
     warnings.filterwarnings("ignore")
 
-    if centroid:
-        gdf["geometry"] = gdf.centroid
+    if "centroid_x" not in df.columns or "centroid_y" not in df.columns:
+        raise ValueError("DataFrame must have 'centroid_x' and 'centroid_y' columns with the coordinates of the centroid of the census tract")  
 
     if year is None:
         colname = "dataset"
     else:
         colname = f"dataset_{year}"
 
-    if select == "first_match":
-        for name, bbox in extents.items():
-            if buffer:
-                gdf.loc[gdf.buffer(0.004).within(bbox), colname] = name
-            else:
-                gdf.loc[gdf.within(bbox), colname] = name
+    for name, bbox in extents.items():
+        xmin, ymin, xmax, ymax = bbox
+        inside_bbox = (
+            (df["centroid_x"] >= xmin) &
+            (df["centroid_x"] <= xmax) &
+            (df["centroid_y"] >= ymin) &
+            (df["centroid_y"] <= ymax)
+        )
+        df.loc[inside_bbox, colname] = name
 
-    elif select == "all_matches":
-        for name, bbox in extents.items():
-            print(name)
-            if buffer:
-                gdf[name] = gdf.buffer(0.004).intersects(bbox)
-            else:
-                gdf[name] = gdf.intersects(bbox)
-    
-
-
-        gdf[colname] = gdf.apply(get_matching_names, axis=1)
-        # gdf[colname] = gdf[colname].apply(keep_only_one_capture)
-        # Replace empty lists with NaN
-        gdf[colname] = gdf[colname].apply(lambda x: x if len(x) > 0 else np.nan)
-        gdf = gdf.drop(columns=list(extents.keys()))
-
-    nan_links = gdf[colname].isna().sum()
-    # gdf = gdf[gdf[colname].notna()]
+    nan_links = df[colname].isna().sum()
+    df = df[df[colname].notna()]
 
     if verbose:
         print(
-            f"Links without images ({year}):", nan_links, "out of", len(gdf) + nan_links
+            f"Links without images ({year}):", nan_links, "out of", len(df) + nan_links
         )
-        print(f"Remaining links for train/test ({year}):", len(gdf))
+        print(f"Remaining links for train/test ({year}):", len(df))
+    if save_plot:
+        gdf = gpd.GeoDataFrame(
+            df,
+            geometry=gpd.points_from_xy(df["centroid_x"], df["centroid_y"]),
+            crs="EPSG:6539",
+        )
         gdf.plot()
         plt.savefig(rf"{PROCESSED_DATA_DIR}/links_with_images.png")
 
     warnings.filterwarnings("default")
 
-    return gdf
+    return df
 
 
 
-def get_test_area_from_file(filename = "Test_NYC_Area.parquet"):
+def get_test_area_from_file(filename="Test_NYC_Area.parquet"):
+    """
+    Reads the test patches and extracts their exact bounding box coordinates.
+    Since the patches are rectangular, their bounds perfectly represent their area.
+    """
     test = gpd.read_parquet(RAW_DATA_DIR / filename)
-    test_polygon = test.dissolve().geometry.iloc[0]
-    return test_polygon
-
-def split_train_test(gdf, buffer=500):
-    """
-    Splits the GeoDataFrame into 'train' and 'test' based on a test_polygon.
     
-    Logic:
-    - TEST:  Geometry is strictly INSIDE the test_polygon.
-    - TRAIN: Geometry is strictly OUTSIDE the (test_polygon + buffer).
-    - DROP:  Geometry overlaps the border or falls within the buffer zone.
-    """
+    # .bounds returns a DataFrame with columns: ['minx', 'miny', 'maxx', 'maxy']
+    # One row for each rectangular test patch.
+    test_bounds_df = test.geometry.bounds
     
-    test_polygon = get_test_area_from_file()
+    return test_bounds_df
 
-    # Initialize column with NaNs
-    gdf["type"] = "Unassigned"
+def split_train_test(
+    df: pd.DataFrame, 
+    test_bounds_df: pd.DataFrame, 
+    val_bounds_df: pd.DataFrame = None,
+    test_years: List[int] = None,
+    test_column: str = "None",
+    spillover_buffer: float = 0.0
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Splits a flat dataset into train and test sets using pure numerical bounding box comparisons
+    against multiple test patches.
+    
+    Args:
+        df: Pandas DataFrame containing the building bbox coordinates.
+        test_bounds_df: DataFrame of test patch boundaries (minx, miny, maxx, maxy).
+        val_bounds_df: Optional DataFrame of validation patch boundaries (minx, miny, maxx, maxy).
+        test_years: Optional list of years to assign to the test set (if doing a temporal split in addition to spatial).
+        test_column: Optional boolean column name in df to use for another splitting (e.g., df["Boston"]==True). If provided, 
+                this column will be used to assign rows to the test set regardless of spatial location.
+        spillover_buffer: Distance to expand the train building bboxes to prevent spatial leakage.
+                          
+    Returns:
+        train_df, test_df
+    """
 
-    # 1. Identify TEST rows
-    # "within" checks if the feature is fully contained inside the test polygon
-    test_mask = gdf.geometry.within(test_polygon)
-    gdf.loc[test_mask, "type"] = "test"
+    ##### SPATIAL SPLIT LOGIC #####
 
-    # 2. Identify TRAIN rows
-    # We buffer the test polygon to create the "exclusion zone"
-    # "disjoint" checks if the feature has absolutely no overlap with the buffered zone
-    exclusion_zone = test_polygon.buffer(buffer)
-    train_mask = gdf.geometry.disjoint(exclusion_zone)
-    gdf.loc[train_mask, "type"] = "train"
+    # Initialize boolean masks
+    # Test mask starts completely False. Train mask starts completely True.
+    spatial_test_mask = pd.Series(False, index=df.index)
+    spatial_val_mask = pd.Series(False, index=df.index)
+    train_mask = pd.Series(True, index=df.index)
+    
+    # Iterate through each rectangular test patch
+    for subset in ["Test", "Validation"]:
+        mask = spatial_test_mask if subset == "Test" else spatial_val_mask
+        bounds_df = test_bounds_df if subset == "Test" else val_bounds_df
 
-    # 3. Calculate and Print Stats
-    test_size = gdf[gdf["type"] == "test"].shape[0]
-    train_size = gdf[gdf["type"] == "train"].shape[0]
-    invalid_size = gdf[gdf["type"].isna()].shape[0]
-    total_size = gdf.shape[0]
+        for _, test_patch in bounds_df.iterrows():
+            t_minx = test_patch['minx']
+            t_miny = test_patch['miny']
+            t_maxx = test_patch['maxx']
+            t_maxy = test_patch['maxy']
+            
+            # ----------------------------------------------------
+            # TEST SET: Does the building fall entirely inside THIS patch?
+            # ----------------------------------------------------
+            inside_this_patch = (
+                (df['bbox_minx'] >= t_minx) &
+                (df['bbox_maxx'] <= t_maxx) &
+                (df['bbox_miny'] >= t_miny) &
+                (df['bbox_maxy'] <= t_maxy)
+            )
+            # Add to the global test mask (Logical OR)
+            mask = mask | inside_this_patch
+            
+            # ----------------------------------------------------
+            # TRAIN SET: Is the building completely outside THIS patch (with buffer)?
+            # ----------------------------------------------------
+            completely_outside_this_patch = (
+                ((df['bbox_minx'] - spillover_buffer) > t_maxx) |
+                ((df['bbox_maxx'] + spillover_buffer) < t_minx) |
+                ((df['bbox_miny'] - spillover_buffer) > t_maxy) |
+                ((df['bbox_maxy'] + spillover_buffer) < t_miny)
+            )
+            # If it intersects THIS patch, we must REMOVE it from the train set (Logical AND)
+            train_mask = train_mask & completely_outside_this_patch            
 
-    print(
-        "\n",
-        f"Size of test dataset: {test_size/total_size*100:.2f}% ({test_size} rows)",
-        f"Size of train+val datasets: {train_size/total_size*100:.2f}% ({train_size} rows)",
-        f"Deleted images due to train/test overlapping: {invalid_size/total_size*100:.2f}% ({invalid_size} rows)",
-        sep="\n",
-    )
+        if subset == "Test":
+            spatial_test_mask = mask
+        else:
+            spatial_val_mask = mask    
+    
+    ##### TIME SPLIT LOGIC #####
+    time_mask = pd.Series(False, index=df.index)
+    for test_year in test_years:
+        time_mask = time_mask & (df["year"] == test_year)
 
-    return gdf
+    ##### OTHER SPLIT LOGIC (e.g., by city) #####
+    other_mask = pd.Series(False, index=df.index)
+    if test_column in df.columns:
+        other_mask = df[test_column] == True  # Example: assign all Boston rows to test set
 
+    ##### FINAL COMBINATION LOGIC #####
+    # A row is in the test set if it meets ANY of the test criteria (spatial OR temporal OR other)
+    final_test_mask = spatial_test_mask | time_mask | other_mask
+    final_val_mask = spatial_val_mask  # Validation set is purely spatial in this example
+    final_train_mask = ~final_test_mask & ~final_val_mask  # Train set is everything that is NOT in test or val
+
+    # Create the final DataFrames
+    test_df = df[final_test_mask].copy()
+    val_df = df[final_val_mask].copy() if val_bounds_df is not None else None
+    train_df = df[final_train_mask].copy()
+
+    # Logging
+    print(f"Total buildings evaluated: {len(df):,}")
+    print(f"Assigned to Test Set (strictly inside patches): {len(test_df):,}")
+    print(f"     - of which assigned by spatial split: {spatial_test_mask.sum():,}")
+    print(f"     - of which assigned by temporal split: {time_mask.sum():,}")
+    print(f"     - of which assigned by other split ({test_column}): {other_mask.sum():,}")
+    print(f"     - Overlaps between criteria: {spatial_test_mask.sum() + time_mask.sum() + other_mask.sum():,}")
+    if val_bounds_df is not None:
+        print(f"Assigned to Validation Set (strictly inside val patches): {len(val_df):,}")
+    print(f"Assigned to Train Set (strictly outside patches + buffer): {len(train_df):,}")
+    print(f"Dropped (spatial moat/buffer zone): {len(df) - len(test_df) - len(train_df):,}")
+
+    return train_df, test_df, val_df
+    
 from shapely.geometry import box
 
 def assert_train_test_datapoint(bounds, test_polygon, wanted_type="train", buffer=500):

@@ -76,11 +76,11 @@ def generate_savename(
     return savename
 
 
-def open_datasets(sat_data="aerial", years=[2013, 2018, 2022]):
+def open_datasets(sat_data="aerial", years=[2013, 2018, 2022], tau_meters=100):
 
     ### Open dataframe with files and labels
     print("Reading dataset...")
-    df = build_dataset.load_income_dataset()
+    df = build_dataset.load_income_dataset(years, tau_meters=tau_meters)
 
     year_cols = []
     datasets_all_years = {}
@@ -94,7 +94,7 @@ def open_datasets(sat_data="aerial", years=[2013, 2018, 2022]):
             raise NotImplementedError("Landsat support not implemented yet.")
             sat_imgs_datasets, extents = build_dataset.load_landsat_datasets()
 
-        df = build_dataset.assign_datasets_to_gdf(df, extents, year=year, verbose=True)
+        df = build_dataset.assign_datasets_to_gdf(df, extents, year=year, verbose=True, save_plot=True)
         datasets_all_years[year] = sat_imgs_datasets
         extents_all_years[year] = extents
         year_cols += [f"dataset_{year}"]
@@ -947,7 +947,8 @@ def run(
     years = params["years"]
     extra = params["extra"]
     batch_size = params["batch_size"]
-
+    tau_meters = params.get("tau_meters", 100)
+    
     savename = generate_savename(
         model_name, image_size, learning_rate, stacked_images, years, extra
     )
@@ -959,7 +960,7 @@ def run(
 
     years = [2022]
     all_years_datasets, all_years_extents, df = open_datasets(
-        sat_data=sat_data, years=years
+        sat_data=sat_data, years=years, tau_meters=tau_meters
     )
 
     if train:

@@ -82,7 +82,7 @@ def load_building_data():
     return buildings_nyc
 
 
-def build_panel_datasets(panel_years, tau_meters=50):
+def load_income_dataset(panel_years, tau_meters=50):
     """
     Produces two artifacts for the Zero-Join DataLoader:
 
@@ -152,7 +152,9 @@ def build_panel_datasets(panel_years, tau_meters=50):
     buildings_mapped["bbox_miny"] = bounds["miny"]
     buildings_mapped["bbox_maxx"] = bounds["maxx"]
     buildings_mapped["bbox_maxy"] = bounds["maxy"]
-
+    buildings_mapped["centroid_x"] = buildings_mapped.centroid.x
+    buildings_mapped["centroid_y"] = buildings_mapped.centroid.y
+    
     # --- Artifact 1: geometry lookup (indexed by DOITT_ID) ---
     geometries_df = buildings_mapped[["geometry"]].copy()  # index = DOITT_ID
 
@@ -236,7 +238,7 @@ def build_panel_datasets(panel_years, tau_meters=50):
         f"  geometries.parquet    : {len(geometries_df):,} unique buildings\n"
         f"  Score bins computed within each of: {sorted(temporal_df['year'].unique())}"
     )
-    return temporal_data_flat, geometries_df
+    return temporal_data_flat
 
 def projected_units_to_meters(value: float, epsg_code: int) -> float:
     """
@@ -277,8 +279,7 @@ if __name__ == "__main__":
     PANEL_YEARS = [2008, 2010, 2012, 2014, 2016, 2018, 2020, 2022, 2024]
     TAU_METERS = 100  # 100m spillover buffer around each building's bounding box
 
-
-    temporal_df, geoms_df = build_panel_datasets(
+    temporal_df = load_income_dataset(
         panel_years=PANEL_YEARS,
         tau_meters=TAU_METERS,
     )
