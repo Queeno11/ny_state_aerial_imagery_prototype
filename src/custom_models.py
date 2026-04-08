@@ -35,7 +35,7 @@ def get_model(name, **kwargs):
 # ==========================================
 @register_model("small_cnn")
 class SmallCNN(nn.Module):
-    def __init__(self, resizing_size, bands=4, kind="reg"):
+    def __init__(self, image_size, bands=4, kind="reg"):
         """
         A minimal CNN to test the PyTorch transition.
         """
@@ -51,7 +51,7 @@ class SmallCNN(nn.Module):
         
         # Calculate the size of the tensor after 2 max-pooling layers (halved twice)
         # e.g., 224 -> 112 -> 56
-        flattened_dim = resizing_size // 4
+        flattened_dim = image_size // 4
         linear_input_size = 32 * flattened_dim * flattened_dim
         
         # Fully Connected Block
@@ -113,7 +113,7 @@ def _load_scalemae_backbone(local_dir="./pretrained/scalemae"):
 
 @register_model("scalemae")
 class ScaleMAE(nn.Module):
-    def __init__(self, resizing_size=224, bands=3, kind="reg", freeze_strategy="none"):
+    def __init__(self, image_size=224, bands=3, kind="reg", freeze_strategy="none"):
         super().__init__()
         self.kind = kind
         self.patch_size = 16  # Fixed for ViT-Large/16; passed at runtime to backbone

@@ -143,7 +143,7 @@ def load_income_dataset(panel_years, tau_meters=50):
     # ------------------------------------------------------------------ #
     print(f"3. Applying Context Spillover (tau = {tau_meters}m) and Extracting BBoxes (assuming zarr has 0.5 EPSG:6539 units per pixel)...")
     
-    meters_per_crs_unit = projected_units_to_meters(1.0, 6539)    
+    meters_per_crs_unit = geo_utils.projected_units_to_meters(1.0, 6539)    
     tau_crs_units = tau_meters / meters_per_crs_unit
     buffered_geoms = buildings_mapped.centroid.buffer(tau_crs_units)
 
