@@ -382,7 +382,10 @@ def assign_datasets_to_gdf(
     for year in years:
         inside_year = df["year"] == year
         for name, bbox in extents.items():
-            xmin, ymin, xmax, ymax = bbox.bounds  
+            if str(year) not in name:   # ← skip datasets that don't belong to this year
+                continue
+
+            xmin, ymin, xmax, ymax = bbox.bounds
             inside_bbox = (
                 (df["centroid_x"] >= xmin) &
                 (df["centroid_x"] <= xmax) &
@@ -390,14 +393,12 @@ def assign_datasets_to_gdf(
                 (df["centroid_y"] <= ymax)
             )
             inside_dataset = inside_bbox & inside_year
-            
-            if not inside_dataset.any():   # ← skip zarr I/O entirely
+
+            if not inside_dataset.any():
                 continue
 
-            # Add column
             df.loc[inside_dataset, colname] = name
-            
-            # Compute dataset indexes for the buildings based on the CRS bbox. _extract_raw_image calls these values
+
             x_values = datasets[name].x.values
             y_values = datasets[name].y.values
             boxes = df.loc[inside_dataset, ["bbox_minx", "bbox_miny", "bbox_maxx", "bbox_maxy"]].values
