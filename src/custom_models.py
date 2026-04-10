@@ -113,9 +113,10 @@ def _load_scalemae_backbone(local_dir="./pretrained/scalemae"):
 
 @register_model("scalemae")
 class ScaleMAE(nn.Module):
-    def __init__(self, image_size=224, bands=3, kind="reg", freeze_strategy="none"):
+    def __init__(self, image_size=224, bands=3, kind="reg", freeze_strategy="none", meta_dim=0):
         super().__init__()
         self.kind = kind
+        self.meta_dim = meta_dim
         self.patch_size = 16  # Fixed for ViT-Large/16; passed at runtime to backbone
 
         # 1. Load backbone with pretrained weights from HuggingFace
@@ -139,8 +140,10 @@ class ScaleMAE(nn.Module):
         embed_dim = 1024
         out_features = 1 if kind == "reg" else 2
 
+        fuse_dim = embed_dim + meta_dim
+
         self.head = nn.Sequential(
-            nn.Linear(embed_dim, 256),
+            nn.Linear(fuse_dim, 256),
             nn.GELU(),                  # GELU matches ViT internals (was ReLU before — fixed)
             nn.LayerNorm(256),
             nn.Dropout(0.3),
@@ -165,11 +168,17 @@ class ScaleMAE(nn.Module):
         self.backbone = get_peft_model(self.backbone, lora_config)
         self.backbone.print_trainable_parameters()
 
-    def forward(self, x):
+    def forward(self, x, metadata=None):
         # from_pretrained backbone returns patch token sequence (B, N_patches, 1024)
         features = self.backbone(x, patch_size=self.patch_size)
 
         # Mean-pool patch tokens for spatially distributed wealth signal
         pooled = features.mean(dim=1)   # (B, 1024)
+        
+        # Late fusion of covariates
+        if metadata is not None and self.meta_dim > 0:
+            # Ensure metadata matches the meta_dim we initialized with
+            pooled = torch.cat([pooled, metadata], dim=1)
+            
         return self.head(pooled)
 

@@ -47,7 +47,7 @@ os.environ['WANDB_API_KEY'] = os.getenv("WANDB_API_KEY")
 os.environ['HF_TOKEN'] = os.getenv("HF_TOKEN")
 
 # Define a subset of the data that will comfortably fit in RAM cache
-CACHE_SIZE = 2048*8 # Around 16000k images (8 batch size)
+CACHE_SIZE = 2048*4 # Around 8000k images (4 batch size)
 
 def generate_savename(
     model_name, image_size, learning_rate, years, extra
@@ -76,7 +76,7 @@ def open_datasets(sat_data="aerial", years=[2013, 2018, 2022], tau_meters=100):
         raise NotImplementedError("Landsat support not implemented yet.")
         sat_imgs_datasets, extents = build_dataset.load_landsat_datasets()
 
-    df = build_dataset.assign_datasets_to_gdf(df, datasets_all_years, extents_all_years, years=years, verbose=True, save_plot=True)
+    df = build_dataset.assign_datasets_to_gdf(df, datasets_all_years, extents_all_years, years=years, verbose=True, save_plot=False)
 
     print("Datasets loaded!")
 
@@ -113,6 +113,7 @@ class CyclicCacheManager:
         self.active_shards = []
         self.next_shard_idx = 0
         self.bg_thread = None
+        self._pending_k = 0
         self._is_initialized = False
  
         self.cache_dir.mkdir(parents=True, exist_ok=True)
@@ -202,12 +203,24 @@ class CyclicCacheManager:
         return list(resized)  # list of (C, image_size, image_size) uint8 tensors
 
     def _worker_generate(self, shard_id, show_progress=False):
-        sampled_df = self.df.sample(self.shard_size, replace=False)
+        # FIX: Sequential chunking for Validation/Test, Random sampling for Train
+        if self.type.startswith("val") or self.type.startswith("test"):
+            start_idx = shard_id * self.shard_size
+            end_idx = min(start_idx + self.shard_size, len(self.df))
+            sampled_df = self.df.iloc[start_idx:end_idx]
+            
+            # If we've exhausted the dataframe, stop generating
+            if sampled_df.empty:
+                return
+        else:
+            sampled_df = self.df.sample(self.shard_size, replace=False)
 
         valid_images = []
         valid_labels = []
+        valid_metas = []
         raw_chunk = []
         label_chunk = []
+        meta_chunk = []
         CHUNK_SIZE = 8
         MAX_EXTRACT_WORKERS = 8  # tune to your disk/CPU
 
@@ -218,8 +231,9 @@ class CyclicCacheManager:
             label = row["Rel_Score"]
             # ⚠️ CRITICAL: Skip if label is NaN
             if pd.isna(label):
-                return None, None
-            return self._extract_raw_image(row, n_bands=self.params["nbands"]), label
+                return None, None, None
+            dist_to_center = row.get("dist_to_center", 0.0) # default to 0 if not present
+            return self._extract_raw_image(row, n_bands=self.params["nbands"]), label, dist_to_center
 
         with ThreadPoolExecutor(max_workers=MAX_EXTRACT_WORKERS) as pool:
             futures = [pool.submit(_extract, item) for item in rows]
@@ -228,33 +242,38 @@ class CyclicCacheManager:
                 iterator = tqdm(iterator, total=len(futures), desc=f"Generating shard {shard_id}")
 
             for future in iterator:
-                raw_img, label = future.result()
+                raw_img, label, meta = future.result()
                 if raw_img is None or label is None:
                     continue
 
                 raw_chunk.append(raw_img)
                 label_chunk.append(label)
+                meta_chunk.append(meta)
 
                 if len(raw_chunk) >= CHUNK_SIZE:
                     resized_tensors = self._batch_resize_and_convert(raw_chunk)
-                    for tensor, lbl in zip(resized_tensors, label_chunk):
+                    for tensor, lbl, mt in zip(resized_tensors, label_chunk, meta_chunk):
                         if tensor.max() > 0:
                             valid_images.append(tensor)
                             valid_labels.append(lbl)
+                            valid_metas.append(mt)
                     raw_chunk.clear()
                     label_chunk.clear()
+                    meta_chunk.clear()
 
         if raw_chunk:
             resized_tensors = self._batch_resize_and_convert(raw_chunk)
-            for tensor, lbl in zip(resized_tensors, label_chunk):
+            for tensor, lbl, mt in zip(resized_tensors, label_chunk, meta_chunk):
                 if tensor.max() > 0:
                     valid_images.append(tensor)
                     valid_labels.append(lbl)
+                    valid_metas.append(mt)
 
         shard_path = self.cache_dir / f"shard_{shard_id}.pt"
         if valid_images:
             labels_tensor = torch.tensor(valid_labels, dtype=torch.float32)
-            
+            metas_tensor = torch.tensor(valid_metas, dtype=torch.float32).unsqueeze(1) # shape (N, 1)
+
             # 🔍 Safety check: verify no NaNs in labels
             if torch.isnan(labels_tensor).any():
                 nan_count = torch.isnan(labels_tensor).sum().item()
@@ -264,13 +283,14 @@ class CyclicCacheManager:
                 images_tensor = torch.stack(valid_images)
                 images_tensor = images_tensor[valid_mask]
                 labels_tensor = labels_tensor[valid_mask]
+                metas_tensor = metas_tensor[valid_mask]
             else:
                 images_tensor = torch.stack(valid_images)
-            
-            torch.save({"images": images_tensor, "labels": labels_tensor}, shard_path)
+
+            torch.save({"images": images_tensor, "labels": labels_tensor, "metas": metas_tensor}, shard_path)
         else:
             logging.warning(f"Shard {shard_id}: all extracted images were black/invalid.")
-            torch.save({"images": torch.empty(0), "labels": torch.empty(0)}, shard_path)
+            torch.save({"images": torch.empty(0), "labels": torch.empty(0), "metas": torch.empty(0)}, shard_path)
 
     def build_initial_cache(self):
         """Synchronously generates the initial num_shards shards. Call once before training."""
@@ -290,35 +310,56 @@ class CyclicCacheManager:
         self._is_initialized = True
         print("Initial cache ready.")
  
-    def start_background_generation(self):
-        """Kicks off generation of the next shard on a background thread."""
+    def _worker_generate_k(self, start_idx, k, show_progress=False):
+        """Generates k consecutive shards sequentially in a background thread."""
+        for i in range(k):
+            self._worker_generate(start_idx + i, show_progress)
+ 
+    def start_background_generation(self, k=2):
+        """Kicks off generation of the next k shards on a background thread before training begins."""
         if not self._is_initialized:
             raise RuntimeError("Call build_initial_cache() before starting background generation.")
         self.bg_thread = threading.Thread(
-            # False: Hide progress bar for background thread
-            target=self._worker_generate, args=(self.next_shard_idx, False), daemon=True 
+            target=self._worker_generate_k, args=(self.next_shard_idx, k, False), daemon=True
         )
+        self._pending_k = k
         self.bg_thread.start()
- 
-    def step(self):
-        """Non-blocking cache rotation."""
+
+    def step(self, k=2):
+        """Non-blocking cache rotation. Background generates next k shards, then swaps them safely on completion."""
         if not self._is_initialized:
             raise RuntimeError("Call build_initial_cache() before calling step().")
 
-        if not self.single_shard_mode:
-            if self.bg_thread is not None and self.bg_thread.is_alive():
-                return False 
-    
-            oldest_shard = self.active_shards.pop(0)
-            oldest_shard.unlink()
-    
-            self.active_shards.append(self.cache_dir / f"shard_{self.next_shard_idx}.pt")
-            self.next_shard_idx += 1
-    
+        if self.single_shard_mode:
+            return False 
+
+        if self.bg_thread is None:
+            # Kick off the very first background generation
             self.bg_thread = threading.Thread(
-                # False: Hide progress bar for background thread
-                target=self._worker_generate, args=(self.next_shard_idx, False), daemon=True
+                target=self._worker_generate_k, args=(self.next_shard_idx, k, False), daemon=True
             )
+            self._pending_k = k
+            self.bg_thread.start()
+            return False
+            
+        else:
+            if self.bg_thread.is_alive():
+                return False  # Still generating in background
+                
+            # Background thread FINISHED: Swap the shards securely!
+            for _ in range(self._pending_k):
+                oldest_shard = self.active_shards.pop(0)
+                try: oldest_shard.unlink() 
+                except FileNotFoundError: pass
+        
+                self.active_shards.append(self.cache_dir / f"shard_{self.next_shard_idx}.pt")
+                self.next_shard_idx += 1
+    
+            # Immediately kick off the next batch cycle
+            self.bg_thread = threading.Thread(
+                target=self._worker_generate_k, args=(self.next_shard_idx, k, False), daemon=True
+            )
+            self._pending_k = k
             self.bg_thread.start()
             
             return True 
@@ -363,143 +404,61 @@ class CyclicRAMDataset(Dataset):
  
         return img, lbl
 
-class EvalSatelliteDataset(Dataset):
-    """Static dataset for Validation, Testing, and Prediction."""
-    def __init__(self, df, all_years_datasets, params, transform=None, mode="eval", fixed_year=None):
-        self.df = df.reset_index(drop=True)
-        self.all_years_datasets = all_years_datasets
-        self.params = params
-        self.transform = transform
-        self.mode = mode
-        self.fixed_year = fixed_year
-        self.available_years = list(all_years_datasets.keys())
-        
-        self.total_bands = params["nbands"] * 1  # stacked_images hardcoded to [1]
-        self.target_shape = (self.total_bands, params["image_size"], params["image_size"])
-        
-        if self.mode == "eval":
-            print(f"[{self.mode.upper()}] Pre-fetching {len(self.df)} samples into RAM...")
-            self.cached_images = []
-            self.cached_labels = []
-            self._prefetch_data()
 
-    def _extract_image(self, row):
-        batch_year = self.fixed_year if self.fixed_year is not None else random.choice(self.available_years)
-        primary_dataset = self.all_years_datasets[batch_year]
-        dataset_name = row.get(f"dataset_{batch_year}")
-        polygon = row["geometry"]
-        
-        image = np.zeros(shape=(self.params["nbands"], 0, 0))
-        try:
-            if not pd.isna(dataset_name):
-                link_dataset = primary_dataset.get(dataset_name)
-                if link_dataset is not None:
-                    image, _ = geo_utils.stacked_image_from_census_tract(
-                        dataset=link_dataset, polygon=polygon,
-                        img_size=self.params["image_size"], n_bands=self.params["nbands"],
-                        stacked_images=[1],  # hardcoded
-                    )
-        except Exception:
-            pass
-
-        if image.shape != self.target_shape:
-            processed_image = np.zeros(shape=(self.params["image_size"], self.params["image_size"], self.total_bands), dtype=np.uint8)
-        else:
-            processed_image = geo_utils.process_image(image, self.params["image_size"])
-
-        return torch.tensor(processed_image, dtype=torch.uint8).permute(2, 0, 1)
-
-    def _prefetch_data(self):
-        for idx in range(len(self.df)):
-            row = self.df.iloc[idx]
-            self.cached_images.append(self._extract_image(row))
-            self.cached_labels.append(torch.tensor(row["Rel_Score"], dtype=torch.float32))
-
-    def __len__(self):
-        return len(self.df)
-    
-    def __getitem__(self, idx):
-        if self.mode == "eval":
-            img = self.cached_images[idx]
-            lbl = self.cached_labels[idx]
-            if self.transform:
-                img = self.transform(img)
-            return img, lbl
-
-        elif self.mode == "lazy_eval":
-            # Lazy load path for Validation/Testing (Saves RAM and startup time)
-            row = self.df.iloc[idx]
-            img = self._extract_image(row)
-            lbl = torch.tensor(row["Rel_Score"], dtype=torch.float32)
-            if self.transform:
-                img = self.transform(img)
-            return img, lbl
-        
-        elif self.mode == "predict":
-            row = self.df.iloc[idx]
-            img = self._extract_image(row)
-            geoid = row["GEOID"]
-            if self.transform:
-                img = self.transform(img)
-            return img, geoid
-                                
-def create_train_test_dataframes(df, savename, test_years=[], test_column=None, small_sample=False):
-    """Create train and test dataframes with the IDs and xr.datasets names to use for training and testing
-
-    Split the census tracts into train and test. The train and test dataframes contain the links and xr.datasets to use for training and
-    testing.
+class StaticShardedDataset(Dataset):
     """
-    if small_sample:
-        df = df.sample(1000, random_state=825).reset_index(drop=True)
-
-    ### Split census tracts based on train/test
-    #       (the hole census tract must be in the corresponding region)
-    test_bounds = build_dataset.get_test_area_from_file(filename="Test_NYC_Area.parquet")
-    # val_bounds = build_dataset.get_test_area_from_file(filename="Test_NYC_Area.parquet")
-
-    # jitter buffer = 5 meters, to prevent all the images being generated at the exact center of the buildings...
-    meters_jitter = 10
-    meters_per_crs_unit = geo_utils.projected_units_to_meters(1.0, epsg_code=6539)
-    jitter_in_projected_units = meters_jitter / meters_per_crs_unit
-    jitter_buffer = jitter_in_projected_units / 2 # The zarr pixel dimension is 0.5 EPSG 6539, s
-    train_mask, test_mask, val_mask = build_dataset.split_train_test(df, test_bounds_df=test_bounds, val_bounds_df=None, test_years=test_years, test_column=test_column, jitter_buffer=jitter_buffer)
-
-    # Keep only relevant columns for the DataLoader
-    relevant_columns = [
-        "DOITT_ID", "GEOID", "year",
-        "Rel_Score", "Valid_Structural_Change", "score_bin",
-        "dataset", "bbox_minx", "bbox_miny", "bbox_maxx", "bbox_maxy",
-        "row_start", "row_stop", "col_start", "col_stop",
-    ]
-    df = df[relevant_columns]
-
-    # Split dataframes and shuffle them
-    df_train = df[train_mask].copy().reset_index(drop=True).sample(frac=1, random_state=825, replace=False)  # Shuffle train set
-    df_test = df[test_mask].copy()
-    df_val = df[val_mask].copy()
-    
-    assert df_test.shape[0] > 0, f"Empty test dataset!"
-    assert df_train.shape[0] > 0, f"Empty train dataset!"
-
-    ### Train/Test
-
-    test_dataframe_path = PROCESSED_DATA_DIR / "test_datasets" / f"{savename}_test_dataframe.feather"
-    df_test.to_feather(test_dataframe_path)
-    print("Se creó el archivo:", test_dataframe_path)
-
-    train_dataframe_path = PROCESSED_DATA_DIR / "train_datasets" / f"{savename}_train_dataframe.feather"
-    df_train.to_feather(train_dataframe_path)
-    print("Se creó el archivo:", train_dataframe_path)
-
-    val_dataframe_path = PROCESSED_DATA_DIR / "val_datasets" / f"{savename}_val_dataframe.feather"
-    df_val.to_feather(val_dataframe_path)
-    print("Se creó el archivo:", val_dataframe_path)
-
-    return df_train, df_val, df_test
-
-def setup_dataloaders(df_train, df_val, df_test, all_years_datasets, params, train_cache_manager=None, val_cache_manager=None):
+    Evaluates cleanly across many pre-computed shards.
+    Only keeps one shard in RAM at a time to prevent OOM when the validation set is massive.
+    """
+    def __init__(self, active_shards, transform=None):
+        if not active_shards:
+            raise RuntimeError("No active shards to load.")
+        self.shard_paths = active_shards
+        self.transform = transform
+        self.current_shard_idx = -1
+        self.images = None
+        self.labels = None
+        
+        print(f"Loading metadata for {len(self.shard_paths)} shards to establish dataset sizes...")
+        self.shard_lengths = []
+        for p in self.shard_paths:
+            data = torch.load(p, weights_only=True)
+            self.shard_lengths.append(len(data["images"]))
+            
+        self.total_length = sum(self.shard_lengths)
+        print(f"Discovered {self.total_length} total validation items across shards.")
+        
+        # To make DataLoader indexing completely seamless
+        self.idx_mapping = []
+        for shard_idx, length in enumerate(self.shard_lengths):
+            for i in range(length):
+                self.idx_mapping.append((shard_idx, i))
+    def _load_shard(self, shard_idx):
+        if self.current_shard_idx == shard_idx:
+            return
+        # Drops the old tensor, loads the new one
+        data = torch.load(self.shard_paths[shard_idx], weights_only=True)
+        self.images = data["images"]
+        self.labels = data["labels"]
+        self.current_shard_idx = shard_idx
+    def __len__(self):
+        return self.total_length
+    def __getitem__(self, idx):
+        shard_idx, item_idx = self.idx_mapping[idx]
+        self._load_shard(shard_idx)
+        
+        img = self.images[item_idx]
+        lbl = self.labels[item_idx]
+        
+        if self.transform:
+            img = self.transform(img)
+            
+        return img, lbl
+                                        
+def setup_dataloaders(df_train, dfs_val_dict, df_test, all_years_datasets, params, train_cache_manager=None, val_cache_manager=None):
     print("--- Initializing PyTorch Datasets ---")
-    print(f"Train: Cyclical Cache | Val: {len(df_val)} | Test: {len(df_test)}")
+    string_val_lengths = "| ".join([f"{name}: {len(df)}" for name, df in dfs_val_dict.items()])
+    print(f"Train: Cyclical Cache | {string_val_lengths} | Test: {len(df_test)}")
 
     batch_size = params.get("batch_size", 32)
 
@@ -522,14 +481,15 @@ def setup_dataloaders(df_train, df_val, df_test, all_years_datasets, params, tra
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=0)
     
     # VAL
-    if df_val.shape[0] > 0:
-        val_dataset = CyclicRAMDataset(
-            cache_manager=val_cache_manager,
-            transform=eval_transform # No random augmentations
-        )
-        val_loader = DataLoader(val_dataset, batch_size=batch_size*32, shuffle=False, num_workers=0)
-    else:
-        val_loader = None
+    val_loaders = {}
+    if val_cache_manager is not None:
+        for name, df_val in dfs_val_dict.items():
+            if name in val_cache_manager and val_cache_manager[name] is not None:
+                val_dataset = StaticShardedDataset(
+                    active_shards=val_cache_manager[name].active_shards,
+                    transform=eval_transform # No random augmentations
+                )
+                val_loaders[name] = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=0)
 
     # TEST
 
@@ -540,7 +500,7 @@ def setup_dataloaders(df_train, df_val, df_test, all_years_datasets, params, tra
     test_loader = None # TODO
     # test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=0)
    
-    return train_loader, val_loader, test_loader
+    return train_loader, val_loaders, test_loader
 
 def validate_parameters(params, default_params):
     
@@ -609,12 +569,17 @@ def fill_params_defaults(params):
         "test_years": [],
         "test_column": None,
         "extra": "",
+        "tau_meters": 100,
     }
     validate_parameters(params, default_params)
 
     # Merge default and provided hyperparameters (keep from params)
     updated_params = {**default_params, **params}
-    print(updated_params)
+    print("-" * 40)
+    print("Runtime Parameters:")
+    for k, v in updated_params.items():
+        print(f"  {k}: {v}")
+    print("-" * 40)
 
     return updated_params
 
@@ -670,15 +635,14 @@ def generate_parameters_log(params, savename):
     with open(filename, "w") as file:
         json.dump(params, file)
 
-    print(f"Se creó {filename} con los parametros utilizados.")
+    print(f"Created parameters log at: {filename}")
     return
 
 def train_model(
     model,
     train_loader,
-    val_loader,
+    val_loaders,
     loss_fn,
-    learning_rate,
     optimizer,
     scheduler,
     epochs,
@@ -687,6 +651,7 @@ def train_model(
     cache_manager,
     start_epoch=0,
     initial_best_val_loss=None,
+    val_cache_managers=None,
 ):
     print("--- Starting PyTorch Training Loop ---")
     best_val_loss = (
@@ -699,7 +664,7 @@ def train_model(
 
     # Initialize Mixed Precision Scaler
     scaler = GradScaler()
-    accumulation_steps = 4  # Accumulate gradients (e.g., batch_size 8 * 4 steps = effective batch size 32)
+    accumulation_steps = 8  # Accumulate gradients (e.g., batch_size 8 * 4 steps = effective batch size 32)
 
     for epoch in range(start_epoch, epochs):
                
@@ -795,40 +760,46 @@ def train_model(
         # ==========================
         # 2. VALIDATION PHASE
         # ==========================
-        if val_loader is not None:
-            model.eval() # Set model to eval mode (disables dropout)
-            running_val_loss = 0.0
-            val_bar = tqdm(val_loader, desc=f"Epoch [{epoch+1}/{epochs}] Val", leave=False)
+        val_losses = {}
+        if len(val_loaders.values())>0:
+            for val_name, val_loader in val_loaders.items():
+                model.eval() # Set model to eval mode (disables dropout)
+                running_val_loss = 0.0
+                val_bar = tqdm(val_loader, desc=f"Epoch [{epoch+1}/{epochs}] {val_name}", leave=False)
 
-            # Disable gradient calculation for validation (saves RAM and compute)
-            with torch.no_grad():
-                for images, labels in val_bar:
-                    images, labels = images.to(device), labels.to(device)
-                    if images.dtype != torch.float32 or images.max() > 10.0:
-                        raise RuntimeError(
-                            f"\n[NORMALIZATION BUG CAUGHT]\n"
-                            f"Image dtype: {images.dtype} | Max pixel value: {images.max().item()}\n"
-                            f"ScaleMAE requires float32 tensors with standard ImageNet normalization. "
-                            f"If the model receives raw 0-255 uint8 arrays, its attention layers will output pure noise and refuse to learn."
-                        )
-                    
-                    with autocast(device_type='cuda'):
-                        outputs = model(images)
-                        if outputs.shape != labels.shape:
-                            outputs = outputs.view(labels.shape)
-                        loss = loss_fn(outputs, labels)
-                    running_val_loss += loss.item() * images.size(0)
-                    val_bar.set_postfix(loss=f"{loss.item():.4f}")
+                # Disable gradient calculation for validation (saves RAM and compute)
+                with torch.no_grad():
+                    for images, labels in val_bar:
+                        images, labels = images.to(device), labels.to(device)
+                        if images.dtype != torch.float32 or images.max() > 10.0:
+                            raise RuntimeError(
+                                f"\n[NORMALIZATION BUG CAUGHT]\n"
+                                f"Image dtype: {images.dtype} | Max pixel value: {images.max().item()}\n"
+                                f"ScaleMAE requires float32 tensors with standard ImageNet normalization. "
+                                f"If the model receives raw 0-255 uint8 arrays, its attention layers will output pure noise and refuse to learn."
+                            )
+                        
+                        with autocast(device_type='cuda'):
+                            outputs = model(images)
+                            if outputs.shape != labels.shape:
+                                outputs = outputs.view(labels.shape)
+                            loss = loss_fn(outputs, labels)
+                        running_val_loss += loss.item() * images.size(0)
+                        val_bar.set_postfix(loss=f"{loss.item():.4f}")
 
-            epoch_val_loss = running_val_loss / len(val_loader.dataset)
-        
+                val_losses[val_name] = running_val_loss / len(val_loader.dataset)
+            
+            # Use mean validation loss for early stopping / best model checkpointing
+            epoch_val_loss = sum(val_losses.values()) / len(val_losses)
         else:
             epoch_val_loss = float('nan')  # No validation data
 
         # ==========================
         # 3. LOGGING & CHECKPOINTING
         # ==========================
-        tqdm.write(f"Epoch [{epoch+1}/{epochs}] | Train Loss: {epoch_train_loss:.4f} | Val Loss: {epoch_val_loss:.4f}")
+        val_losses_str = " | ".join([f"{k} Loss: {v:.4f}" for k, v in val_losses.items()])
+        val_display = val_losses_str if val_losses_str else f"Val Loss: {epoch_val_loss:.4f}"
+        tqdm.write(f"Epoch [{epoch+1}/{epochs}] | Train Loss: {epoch_train_loss:.4f} | {val_display}")
         
         # 🎯 Log metrics directly to W&B cloud!
         log_dict = {
@@ -836,8 +807,9 @@ def train_model(
             "train_loss": epoch_train_loss,
             "learning_rate": optimizer.param_groups[0]['lr']
         }
-        if val_loader is not None:
-            log_dict["val_loss"] = epoch_val_loss
+        if len(val_loaders.values())>0:
+            for val_name, val_loader in val_loaders.items():
+                log_dict[f"{val_name}"] = val_losses[val_name]
 
         wandb.log(log_dict)
 
@@ -847,22 +819,33 @@ def train_model(
             best_val_loss = epoch_val_loss
             
             model_path = save_dir / f"{savename}_best.pth"
-            trainable_weights = {k: v for k, v in model.state_dict().items() if v.requires_grad}
-            torch.save(trainable_weights, model_path)
-                
-            # Optional: Tell wandb to track this specific file
+            # Save LoRA adapter + regression head separately.
+            # state_dict() tensors are always detached — requires_grad is never set on them,
+            # so a filter like `if v.requires_grad` produces an empty dict.
+            lora_dir = save_dir / f"{savename}_best_lora"
+            model.backbone.save_pretrained(lora_dir)         # saves adapter_config.json + adapter_model.safetensors
+            torch.save(model.head.state_dict(), model_path)  # saves the regression head weights
+
+            # Tell wandb to track these files
             wandb.save(str(model_path))
+            wandb.save(str(lora_dir / "adapter_model.safetensors"))
 
         # ==========================
         # 4. ROTATE CACHE FOR NEXT EPOCH
         # ==========================
-        cache_updated = cache_manager.step()
-        if cache_updated:
-            tqdm.write("🔄 New background shard ready! Loading updated data into RAM...")
-            train_loader.dataset.refresh()
-        else:
-            # The GPU is faster than the CPU. Re-use current RAM data.
-            pass
+        if cache_manager:
+            cache_updated = cache_manager.step()
+            if cache_updated:
+                tqdm.write("🔄 New train background shard ready! Loading updated data into RAM...")
+                train_loader.dataset.refresh()
+
+        if val_cache_managers:
+            for val_name, v_manager in val_cache_managers.items():
+                if v_manager is not None:
+                    v_updated = v_manager.step()
+                    if v_updated and val_name in val_loaders:
+                        tqdm.write(f"🔄 New validation background shard ready for {val_name}! Loading updated data...")
+                        val_loaders[val_name].dataset.refresh()
 
         # Save checkpoint after each epoch
         checkpoint = {
@@ -942,6 +925,7 @@ def run(
     extra = params["extra"]
     batch_size = params["batch_size"]
     tau_meters = params.get("tau_meters", 100)
+    max_jitter = params.get("max_jitter", 10)
 
     savename = generate_savename(
         model_name, image_size, learning_rate, years, extra
@@ -950,7 +934,9 @@ def run(
 
     generate_parameters_log(params, savename)
     
-    print(f"========== Starting Run for {savename} ==========")
+    print("\n" + "="*80)
+    print(f"🚀 STARTING RUN: {savename}")
+    print("="*80 + "\n")
 
     all_years_datasets, all_years_extents, df = open_datasets(
         sat_data=sat_data, years=years, tau_meters=tau_meters
@@ -958,9 +944,11 @@ def run(
 
     if train:
 
-        df_train, df_val, df_test = create_train_test_dataframes(
-            df, savename, test_years=test_years, test_column=test_column, small_sample=small_sample
+        df_train, df_vals_dict, df_test = build_dataset.create_train_test_dataframes(
+            df, savename, test_years=test_years, test_column=test_column, small_sample=small_sample, max_jitter=max_jitter
         )
+        del df  # Free up memory, we won't need the full dataframe anymore
+        gc.collect()
 
         #### 1. Setup resume logic for model/cache
         checkpoint_dir = MODELS_DIR / "models_by_epoch" / savename
@@ -980,7 +968,7 @@ def run(
                 resume_cache = True
                 print(f"🟡 Found best weights only: {best_checkpoint_path} (resume with no optimizer state)")
         else:
-            print(checkpoint_dir, " does not exist. Starting fresh training run.")
+            print(f"{checkpoint_dir} does not exist. Starting fresh training run.")
 
         print("Building Initial Cache...")
         if small_sample:
@@ -988,7 +976,7 @@ def run(
             current_shard_size = len(df_train) # E.g., ~150 images per shard
         else:
             num_shards = 10
-            current_shard_size = CACHE_SIZE // 10             # E.g., 20,480 images per shard
+            current_shard_size = CACHE_SIZE // 10 # E.g., 20,480 images per shard
 
         print("\n[TRAIN] Building cyclic training cache...")
         train_cache_manager = CyclicCacheManager(
@@ -1001,38 +989,46 @@ def run(
             shard_size=current_shard_size,
             type="train",
             clear_cache=not resume_cache,
+            max_jitter=max_jitter,
         )
         train_cache_manager.build_initial_cache()
-        train_cache_manager.start_background_generation() # Starts generating shard 6 for Epoch 1
 
         print("\n[VAL] Building static validation cache...")
-        if df_val.shape[0] > 0:
-            val_cache_manager = CyclicCacheManager(
-                df=df_val, # Or full df_val
-                all_years_datasets=all_years_datasets,
-                params=params,
-                cache_dir=CACHE_DIR,
-                num_shards=1,               # Only build one shard
-                shard_size=len(df_val),     # Make it big enough for the whole val set
-                single_shard_mode=True,     # IMPORTANT: This disables rotation
-                type="val",
-                clear_cache=not resume_cache,
-            )
-            val_cache_manager.build_initial_cache() # This will build and show a progress bar
-        else:
-            val_cache_manager = None
-
+        vals_cache_manager_dict = {}
+        for val_name, df_val in df_vals_dict.items():
+            if df_val.shape[0] > 0:
+                # Take up to 5 buildings per shard for validation to keep RAM usage low, since we load the whole shard at once during validation
+                df_val = df_val.groupby(['GEOID', 'year'], group_keys=False).apply(lambda x: x.sample(n=min(len(x), 10)), include_groups=False)
+                val_num_shards = max(1, (len(df_val) + current_shard_size - 1) // current_shard_size)
+                val_cache_manager = CyclicCacheManager(
+                    df=df_val, # Or full df_val
+                    all_years_datasets=all_years_datasets,
+                    params=params,
+                    cache_dir=CACHE_DIR,
+                    num_shards=val_num_shards,  # Build multiple shards to cover the whole val set
+                    shard_size=current_shard_size,  # Smaller shard size avoids RAM explosion during generation
+                    single_shard_mode=True,     # IMPORTANT: This disables active rotation / generation
+                    type=val_name,
+                    clear_cache=not resume_cache,
+                )
+                val_cache_manager.build_initial_cache() # This will build and show a progress bar
+                vals_cache_manager_dict[val_name] = val_cache_manager
+            else:
+                val_cache_manager = None
+       
         #### 2. PyTorch Data Pipeline Setup
         print("Setting up data generators...")
-        train_loader, val_loader, test_loader = setup_dataloaders(
-            df_train=df_train, df_val=df_val, df_test=df_test,
+        train_loader, val_loaders, test_loader = setup_dataloaders(
+            df_train=df_train, dfs_val_dict=df_vals_dict, df_test=df_test,
             all_years_datasets=all_years_datasets, params=params,
-            train_cache_manager=train_cache_manager, val_cache_manager=val_cache_manager
+            train_cache_manager=train_cache_manager, val_cache_manager=vals_cache_manager_dict
         )            
 
-        del df, df_test, all_years_extents
+        del df_train, df_test, df_val, all_years_extents
         gc.collect() # Force Python to free up memory from large objects we no longer need
         
+        train_cache_manager.start_background_generation() # Starts generating shard 6 for Epoch 1
+
         print("Data Pipeline Ready!")
 
         #### 3. Model Initialization
@@ -1058,13 +1054,25 @@ def run(
             checkpoint = torch.load(resume_model_checkpoint, map_location=device)
             
             # Restore all states
-            model.load_state_dict(checkpoint["model_state_dict"])
-            optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-            if scheduler and checkpoint.get("scheduler_state_dict"):
-                scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
-                
-            start_epoch = checkpoint["epoch"]
-            initial_best_val_loss = checkpoint.get("best_val_loss")
+            if "model_state_dict" in checkpoint:
+                # Full training checkpoint (_last.pth): restore model + optimizer + scheduler
+                model.load_state_dict(checkpoint["model_state_dict"])
+                if "optimizer_state_dict" in checkpoint:
+                    optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+                if scheduler and checkpoint.get("scheduler_state_dict"):
+                    scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+                start_epoch = checkpoint.get("epoch", 0)
+                initial_best_val_loss = checkpoint.get("best_val_loss")
+            else:
+                # Best-model checkpoint (_best.pth): head weights only; load LoRA adapter separately
+                model.head.load_state_dict(checkpoint)
+                lora_dir = resume_model_checkpoint.parent / f"{resume_model_checkpoint.stem}_lora"
+                if lora_dir.exists():
+                    from peft import PeftModel
+                    model.backbone = PeftModel.from_pretrained(model.backbone.base_model.model, lora_dir)
+                    print(f"✅ LoRA adapter loaded from {lora_dir}")
+                start_epoch = 0
+                initial_best_val_loss = None
             print(f"✅ Resumed at epoch {start_epoch+1} with best_val_loss={initial_best_val_loss}...")
 
         wandb.init(
@@ -1074,12 +1082,13 @@ def run(
 
         #### 4. Run PyTorch Model
         model = train_model(
-            model=model, train_loader=train_loader, val_loader=val_loader,
-            loss_fn=loss_fn, learning_rate=learning_rate, optimizer=optimizer, scheduler=scheduler, 
+            model=model, train_loader=train_loader, val_loaders=val_loaders,
+            loss_fn=loss_fn, optimizer=optimizer, scheduler=scheduler, 
             epochs=n_epochs, device=device, savename=savename,
             cache_manager=train_cache_manager,
             start_epoch=start_epoch,
             initial_best_val_loss=initial_best_val_loss,
+            val_cache_managers=vals_cache_manager_dict
         )
         
         wandb.finish()
@@ -1159,14 +1168,14 @@ if __name__ == "__main__":
         "nbands": 3,
         "batch_size": 16,
         "small_sample": False,
-        "n_epochs": 200,
+        "n_epochs": 100,
         "learning_rate": 0.0003,
         "sat_data": "aerial",
-        "years": [2010, 2012, 2014, 2016, 2018, 2020, 2022, 2024], # Only the data inside WSL! all data is: [2010, 2012, 2014, 2016, 2018, 2020, 2022, 2024],
-        "test_years": [2016],
+        "years": [2022], # Only the data inside WSL! all data is: [2010, 2012, 2014, 2016, 2018, 2020, 2022, 2024],
+        "test_years": [],
         "test_column": None,
         "extra": "",  # Extra info to add to the savename (e.g. for ablation studies)
     }
 
     # Run full pipeline
-    run(params, train=True, retrain=False, compute_loss=False, generate_predictions=False)
+    run(params, train=True, retrain=True, compute_loss=False, generate_predictions=False)

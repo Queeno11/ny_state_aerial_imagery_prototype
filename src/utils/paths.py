@@ -15,6 +15,8 @@ PROCESSED_DATA_DIR = DATA_DIR / "processed"
 
 # Results
 RESULTS_DIR = PROJECT_ROOT / "results"
+FIGURES_DIR = RESULTS_DIR / "figures"
+TABLES_DIR = RESULTS_DIR / "tables"
 
 # Logs and Cache
 LOGS_DIR = PROJECT_ROOT / "logs"

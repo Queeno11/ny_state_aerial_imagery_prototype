@@ -1,6 +1,7 @@
 ##############      Configuración      ##############
 from ast import Return
 import os
+import math
 import pickle
 from tokenize import String
 import pandas as pd
@@ -8,7 +9,9 @@ import geopandas as gpd
 import matplotlib.pyplot as plt
 import numpy as np
 from typing import List, Dict
-from src.utils.paths import PROJECT_ROOT, DATA_DIR, EXTERNAL_DATA_DIR, RAW_DATA_DIR, INTERIM_DATA_DIR, PROCESSED_DATA_DIR, RESULTS_DIR, LOGS_DIR, IMAGERY_ROOT
+
+import shapely
+from src.utils.paths import FIGURES_DIR, PROJECT_ROOT, DATA_DIR, EXTERNAL_DATA_DIR, RAW_DATA_DIR, INTERIM_DATA_DIR, PROCESSED_DATA_DIR, RESULTS_DIR, LOGS_DIR, IMAGERY_ROOT
 from pathlib import Path
 from shapely.geometry import box
 
@@ -119,7 +122,7 @@ def process_acs_panel():
         r"ny_state_aerial_imagery_prototype/data/processed/"
         r"ny_tracts_panel_2009_2014_2019_2024.feather"
     )
-    panel_tract_gdf = gpd.read_feather(panel_path)
+    panel_tract_gdf = gpd.read_feather(panel_path).to_crs(epsg=6539)
     return panel_tract_gdf
 
 
@@ -206,8 +209,8 @@ def load_income_dataset(panel_years, tau_meters=50):
 
     # Check if output files already exist to avoid redundant processing
     if temporal_data_path.exists() and geometries_path.exists():
-        print(f"Output files already exist at:\n  {temporal_data_path}\n  {geometries_path}")
-        print("Loading existing datasets...")
+        print(f"Preprocessed datasets already exist.\n  Temporal data: {temporal_data_path}\n  Geometries: {geometries_path}")
+        print("Loading existing temporal dataset...")
         temporal_data_flat = pd.read_parquet(temporal_data_path)
         return temporal_data_flat
 
@@ -236,6 +239,11 @@ def load_income_dataset(panel_years, tau_meters=50):
     )
     buildings_mapped = buildings_mapped.drop(columns=["index_right"])
 
+    ## Add distance to NYC economic center in meters as variable (used for training)
+    #   NYSE is used as the economic center (40.70687862946312, -74.01126682079922)
+    nyc_economic_center = gpd.GeoSeries.from_wkt(["POINT (-74.011267 40.706879)"], crs="EPSG:4326").to_crs(buildings_mapped.crs).iloc[0]
+    buildings_mapped["dist_to_center"] = buildings_mapped.distance(nyc_economic_center).apply(lambda x: geo_utils.projected_units_to_meters(x, epsg_code=6539))
+
     # ------------------------------------------------------------------ #
     # 3. Apply tau buffer and extract bounding boxes                      #
     # ------------------------------------------------------------------ #
@@ -253,11 +261,9 @@ def load_income_dataset(panel_years, tau_meters=50):
     buildings_mapped["centroid_x"] = buildings_mapped.centroid.x
     buildings_mapped["centroid_y"] = buildings_mapped.centroid.y
 
-    # --- Artifact 1: geometry lookup (indexed by DOITT_ID) ---
-    geometries_df = buildings_mapped[["geometry"]].copy()  # index = DOITT_ID
+    geometries_df = buildings_mapped[["geometry"]].copy()  # index = DOITT_ID + year
 
-    # [FIX HERE] Now safe to drop geometry AND reset index so DOITT_ID becomes a regular column.
-    # This prevents DOITT_ID from being lost during pd.concat later.
+    # Now it's safe to drop geometry AND reset index so DOITT_ID becomes a regular column.
     buildings_mapped = buildings_mapped.drop(columns=["geometry"]).reset_index()
 
     # ------------------------------------------------------------------ #
@@ -323,7 +329,7 @@ def load_income_dataset(panel_years, tau_meters=50):
         "DOITT_ID", "GEOID", "year",
         "bbox_minx", "bbox_miny", "bbox_maxx", "bbox_maxy",
         "centroid_x", "centroid_y",
-        "Rel_Score", "Valid_Structural_Change", "score_bin",
+        "Rel_Score", "Valid_Structural_Change", "score_bin", "dist_to_center"
     ]
     missing = [c for c in relevant_columns if c not in temporal_df.columns]
     if missing:
@@ -409,17 +415,15 @@ def assign_datasets_to_gdf(
     df = df[df[colname].notna()]
 
     if verbose:
-        print(
-            f"Buildings without images):", nan_links, "out of", len(df) + nan_links
-        )
-        print(f"Buildings for datasets (train/test/val):", len(df))
+        print(f"Buildings without images: {nan_links} out of {len(df) + nan_links}")
+        print(f"Buildings for datasets (train/test/val): {len(df)}")
     if save_plot:
         gdf = gpd.GeoDataFrame(
             df,
             geometry=gpd.points_from_xy(df["centroid_x"], df["centroid_y"]),
             crs="EPSG:6539",
         )
-        gdf.plot()
+        gdf.plot(markersize=1, figsize=(10, 10), alpha=0.5)
         plt.savefig(rf"{PROCESSED_DATA_DIR}/links_with_images.png")
 
     warnings.filterwarnings("default")
@@ -441,10 +445,124 @@ def get_test_area_from_file(filename="Test_NYC_Area.parquet"):
     
     return test_bounds_df
 
-def split_train_test(
+
+
+def create_stratified_tract_holdout(gdf, cluster_radius, stratify_cols, eval_fraction=0.05, exclude_mask=None):
+    """
+    Creates a holdout set by growing contiguous clusters of tracts.
+    Uses a spatial exclude_mask to ensure clusters do not cross into restricted territories.
+    """
+    captured_geoids = set()
+    holdout_indices = []
+
+    # Drop any tracts that fall into the restricted exclusion zone
+    if exclude_mask is not None:
+        available_gdf = gdf[~exclude_mask].copy()
+    else:
+        available_gdf = gdf.copy()
+        
+    groups = available_gdf.groupby(stratify_cols, dropna=False)
+    
+    print(f"Stratifying across {len(groups)} unique groups...")
+
+    for name, group in groups:
+        unique_group_geoids = set(group['GEOID'].unique())
+        target_count = math.ceil(len(unique_group_geoids) * eval_fraction)
+        
+        if target_count == 0: continue
+            
+        group_captured = len(unique_group_geoids.intersection(captured_geoids))
+        
+        while group_captured < target_count:
+            # 1. Sample a random seed tract from this group
+            areas = group.geometry.area
+            if areas.sum() == 0: break
+            
+            # np.random.choice uses the global numpy random seed
+            seed_idx = np.random.choice(group.index, p=areas / areas.sum())
+            seed_geom = group.loc[seed_idx].geometry
+            
+            # 2. Capture all tracts within the radius to form a contiguous cluster
+            cluster_mask = available_gdf.geometry.intersects(seed_geom.buffer(cluster_radius))
+            cluster_tracts = available_gdf[cluster_mask]
+            
+            if cluster_tracts.empty: continue
+            
+            # 3. Update tracking variables
+            current_geoids = set(cluster_tracts['GEOID'].unique())
+            captured_geoids.update(current_geoids)
+            holdout_indices.extend(cluster_tracts.index.tolist())
+            
+            group_captured = len(unique_group_geoids.intersection(captured_geoids))
+            
+    print(f"Success! Captured {len(captured_geoids)} GEOIDs for this split.")
+    
+    # SORT the list so that Python's hash randomization doesn't alter the output row order
+    deterministic_indices = sorted(list(set(holdout_indices)))
+    return gdf.loc[deterministic_indices].copy()
+
+def assign_tracts_train_val_test(gdf, test_tracts, val_tracts, dead_zone_buffer):
+    """
+    Assigns the final splits and calculates the exact dead zone needed to prevent spatial leakage.
+    """
+    gdf['type'] = 'train' # Default to train
+    
+    # 1. Combine all holdout tracts to calculate a unified dead zone
+    holdouts = pd.concat([test_tracts, val_tracts])
+    
+    # 2. Buffer the exact, irregular boundaries of the holdout tracts by tau
+    dead_zone_geom = holdouts.geometry.union_all().buffer(dead_zone_buffer)
+    
+    # 3. Find any tract that touches this buffer
+    in_dead_zone = gdf.geometry.intersects(dead_zone_geom)
+    
+    # 4. Apply assignment hierarchy (Holdouts override Dead Zone override Train)
+    gdf.loc[in_dead_zone, 'type'] = 'dead_zone'
+    
+    if not val_tracts.empty:
+        gdf.loc[gdf.index.isin(val_tracts.index), 'type'] = 'val'
+    if not test_tracts.empty:
+        gdf.loc[gdf.index.isin(test_tracts.index), 'type'] = 'test'
+        
+    return gdf, gpd.GeoDataFrame(geometry=[dead_zone_geom], crs=gdf.crs)
+
+def plot_tracts_splits(gdf, dead_zone_gdf):
+    ax = gdf.plot(figsize=(20, 20), color='whitesmoke', edgecolor='lightgray')
+    
+    if not dead_zone_gdf.empty:
+        dead_zone_gdf.plot(ax=ax, color="gray", alpha=0.5)
+    
+    train_gdf = gdf[gdf["type"] == "train"]
+    val_gdf = gdf[gdf["type"] == "val"]
+    test_gdf = gdf[gdf["type"] == "test"]
+    dead_gdf = gdf[gdf["type"] == "dead_zone"]
+
+    if not train_gdf.empty: train_gdf.plot(ax=ax, color="green")
+    if not val_gdf.empty: val_gdf.plot(ax=ax, color="blue")
+    if not test_gdf.empty: test_gdf.plot(ax=ax, color="orange")
+    if not dead_gdf.empty: dead_gdf.plot(ax=ax, color="red")
+    
+    import matplotlib.patches as mpatches
+    legend_handles = [
+        mpatches.Patch(color='gray', alpha=0.5, label='Dead Zone (Buffer)'),
+        mpatches.Patch(color='green', label='Train'),
+        mpatches.Patch(color='blue', label='Validation'),
+        mpatches.Patch(color='orange', label='Test'),
+        mpatches.Patch(color='red', label='Dead Zone (Discarded Tracts)')
+    ]
+    ax.legend(handles=legend_handles)
+    
+    plt.title("Tract-Centric Train/Val/Test Split with Dead Zones")
+    plt.savefig(FIGURES_DIR / "tract_splits_with_dead_zone.png")
+
+    print("\n--- Tract Assignments ---")
+    print(gdf['type'].value_counts().to_string())
+    print("-" * 25)
+
+def assign_buildings_train_test_val(
     df: pd.DataFrame, 
-    test_bounds_df: pd.DataFrame, 
-    val_bounds_df: pd.DataFrame = None,
+    val_polygon: shapely.geometry.Polygon = None,
+    test_polygon: shapely.geometry.Polygon = None,
     test_years: List[int] = None,
     test_column: str = "None",
     jitter_buffer: float = 0.0
@@ -455,8 +573,8 @@ def split_train_test(
     
     Args:
         df: Pandas DataFrame containing the building bbox coordinates.
-        test_bounds_df: DataFrame of test patch boundaries (minx, miny, maxx, maxy).
-        val_bounds_df: Optional DataFrame of validation patch boundaries (minx, miny, maxx, maxy).
+        test_polygon: Optional shapely (Multi)Polygon representing the test area.
+        val_polygon: Optional shapely (Multi)Polygon representing the validation area.
         test_years: Optional list of years to assign to the test set (if doing a temporal split in addition to spatial).
         test_column: Optional boolean column name in df to use for another splitting (e.g., df["Boston"]==True). If provided, 
             this column will be used to assign rows to the test set regardless of spatial location.
@@ -472,85 +590,144 @@ def split_train_test(
          - val_mask: True for rows assigned to the validation set (if val_bounds_df provided; otherwise all False)
     """
 
+    print("\nAssigning buildings to train/test/val splits...")
+
+    if test_years is None:
+        test_years = []
+
+    ###############################
     ##### SPATIAL SPLIT LOGIC #####
+    ###############################
 
-    # Initialize boolean masks
-    # Test mask starts completely False. Train mask starts completely True.
-    spatial_test_mask = pd.Series(False, index=df.index)
-    spatial_val_mask = pd.Series(False, index=df.index)
-    train_mask = pd.Series(True, index=df.index)
+    # Pre-extract building arrays with Jitter Buffer applied to BBOX
+    jitter_buffer_crs = geo_utils.meters_to_projected_units(jitter_buffer, epsg_code=6539)
+    b_minx = df['bbox_minx'].values - jitter_buffer_crs
+    b_miny = df['bbox_miny'].values - jitter_buffer_crs
+    b_maxx = df['bbox_maxx'].values + jitter_buffer_crs
+    b_maxy = df['bbox_maxy'].values + jitter_buffer_crs
+    bboxes = gpd.GeoSeries(
+        shapely.box(b_minx, b_miny, b_maxx, b_maxy), 
+        crs="EPSG:6539",
+        index=df.index
+    )
     
-    # Iterate through each rectangular test patch
-    for subset in ["Test", "Validation"]:
-        mask = spatial_test_mask if subset == "Test" else spatial_val_mask
-        bounds_df = test_bounds_df if subset == "Test" else val_bounds_df
-        if subset == "Validation" and bounds_df is None:
-            continue  # Skip if no validation bounds provided
-        
-        for _, test_patch in bounds_df.iterrows():
-            t_minx = test_patch['minx']
-            t_miny = test_patch['miny']
-            t_maxx = test_patch['maxx']
-            t_maxy = test_patch['maxy']
-            
-            # ----------------------------------------------------
-            # TEST SET: Does the building fall entirely inside THIS patch?
-            # ----------------------------------------------------
-            inside_this_patch = (
-                (df['bbox_minx'] >= t_minx) &
-                (df['bbox_maxx'] <= t_maxx) &
-                (df['bbox_miny'] >= t_miny) &
-                (df['bbox_maxy'] <= t_maxy)
-            )
-            # Add to the global test mask (Logical OR)
-            mask = mask | inside_this_patch
-            
-            # ----------------------------------------------------
-            # TRAIN SET: Is the building completely outside THIS patch (with buffer)?
-            # ----------------------------------------------------
-            completely_outside_this_patch = (
-                ((df['bbox_minx'] - jitter_buffer) > t_maxx) |
-                ((df['bbox_maxx'] + jitter_buffer) < t_minx) |
-                ((df['bbox_miny'] - jitter_buffer) > t_maxy) |
-                ((df['bbox_maxy'] + jitter_buffer) < t_miny)
-            )
-            # If it intersects THIS patch, we must REMOVE it from the train set (Logical AND)
-            train_mask = train_mask & completely_outside_this_patch            
+    # Generate centroid arrays for point-in-polygon checks
+    centroids = gpd.GeoSeries(
+        gpd.points_from_xy(df['centroid_x'], df['centroid_y']), 
+        crs="EPSG:6539", 
+        index=df.index
+    )
 
-        if subset == "Test":
-            spatial_test_mask = mask
-        else:
-            spatial_val_mask = mask    
+    # Initialize boolean masks as NumPy arrays (default False)
+    spatial_test_mask = np.zeros(len(df), dtype=bool)
+    spatial_val_mask = np.zeros(len(df), dtype=bool)
+    train_drop_mask = np.zeros(len(df), dtype=bool) 
     
-    ##### TIME SPLIT LOGIC #####
-    time_mask = pd.Series(False, index=df.index)
+
+    ## Assigment logic:
+    # - If a building falls entirely inside ANY test/val patch, assign it to that set
+    # - If a building's BBOX expanded by jitter_buffer intersects ANY test/val patch, drop it from train
+    
+    # Assign to test/val based on centroids first (strict point-in-polygon)
+    if test_polygon is not None:
+        spatial_test_mask = centroids.within(test_polygon)
+    if val_polygon is not None:
+        spatial_val_mask = centroids.within(val_polygon)
+    
+    # Remove any building that whose image intersects with test/val from the train drop mask consideration
+    if test_polygon is not None:
+        train_drop_mask |= bboxes.intersects(test_polygon)
+    if val_polygon is not None:
+        train_drop_mask |= bboxes.intersects(val_polygon)
+
+    ###############################    
+    #####   TIME SPLIT LOGIC  #####
+    ###############################
+
+    time_mask_np = np.zeros(len(df), dtype=bool)
+    time_mask_val_np = np.zeros(len(df), dtype=bool)
     for test_year in test_years:
-        time_mask = time_mask & (df["year"] == test_year)
+        time_mask_np |= (df["year"].values == test_year)
+        time_mask_val_np |= (df["year"].values == test_year)  # If you want val to also include these years, otherwise keep as False 
 
-    ##### OTHER SPLIT LOGIC (e.g., by city) #####
-    other_mask = pd.Series(False, index=df.index)
+    ###############################
+    #####  OTHER SPLIT LOGIC  #####
+    ###############################
+
+    other_mask_np = np.zeros(len(df), dtype=bool)
     if test_column in df.columns:
-        other_mask = df[test_column] == True  # Example: assign all Boston rows to test set
+        other_mask_np = (df[test_column].values == True)
 
+    ###################################
     ##### FINAL COMBINATION LOGIC #####
-    # A row is in the test set if it meets ANY of the test criteria (spatial OR temporal OR other)
-    final_test_mask = spatial_test_mask | time_mask | other_mask
-    final_val_mask = spatial_val_mask  # Validation set is purely spatial in this example
-    final_train_mask = ~final_test_mask & ~final_val_mask  # Train set is everything that is NOT in test or val
+    ###################################
+    # 1. val_time captures the val tracts at the year of test
+    final_val_time_mask_np = time_mask_val_np & spatial_val_mask
+
+    # 2. val_spatial captures all other val tracts NOT in the year of test
+    final_val_spatial_mask_np = spatial_val_mask & ~time_mask_val_np
+    
+    # 3. test captures the whole test year (and other test patches), but removes those val tracts
+    final_test_mask_np = (spatial_test_mask | time_mask_np | other_mask_np) & ~spatial_val_mask
+
+    # Train set is everything NOT inside test, val, or the dropped expansion zones
+    final_train_mask_np = (~train_drop_mask) & (~final_test_mask_np) & (~final_val_spatial_mask_np) & (~final_val_time_mask_np)
+
+
+    # Convert back to Pandas Series with original index
+    final_train_mask = pd.Series(final_train_mask_np, index=df.index)
+    final_test_mask = pd.Series(final_test_mask_np, index=df.index)
+    final_val_spatial_mask = pd.Series(final_val_spatial_mask_np, index=df.index)
+    final_val_time_mask = pd.Series(final_val_time_mask_np, index=df.index)
+    total_val_mask = final_val_spatial_mask | final_val_time_mask
+
+    # Create dict of masks
+    final_val_masks = {
+        "val_spatial": final_val_spatial_mask,
+    }
+    if test_years:  # Only add temporal val key if test_years were provided; avoids IndexError
+        final_val_masks[f"val_{test_years[0]}"] = final_val_time_mask
+    
+    # Compute logs
+    overlaps = (spatial_test_mask & time_mask_np).sum() + (spatial_test_mask & other_mask_np).sum() + (time_mask_np & other_mask_np).sum()
+    dropped = len(df) - final_test_mask.sum() - final_val_spatial_mask.sum() - final_val_time_mask.sum() - final_train_mask.sum()
+
+    assert not (final_test_mask & total_val_mask).any(), "Error: Some buildings are assigned to both test and val sets!"
+    assert not (final_test_mask & final_train_mask).any(), "Error: Some buildings are assigned to both test and train sets!"
+    assert not (total_val_mask & final_train_mask).any(), "Error: Some buildings are assigned to both val and train sets!"
+    assert not (final_val_time_mask & final_val_spatial_mask).any(), "Error: Some buildings are assigned to both val by time criteria and val by spatial criteria!"
+    
+    df.loc[final_train_mask, "type"] = "train"
+    df.loc[final_test_mask, "type"] = "test"
+    df.loc[final_val_spatial_mask, "type"] = "val_spatial"
+    df.loc[final_val_time_mask, "type"] = "val_time"
+
+    train_tracts = df[final_train_mask].drop_duplicates("GEOID").shape[0]
+    test_tracts = df[final_test_mask].drop_duplicates("GEOID").shape[0]
+    val_tracts = df[total_val_mask].drop_duplicates("GEOID").shape[0]
 
     # Logging
+    print("\n--- Final Dataset Assignment ---")
     print(f"Total buildings evaluated: {len(df):,}")
-    print(f"Assigned to Test Set (strictly inside patches): {final_test_mask.sum():,}")
+    print(f"Assigned to Test Set (strictly inside patches/criteria): {final_test_mask.sum():,} ({test_tracts} tracts)")
     print(f"     - of which assigned by spatial split: {spatial_test_mask.sum():,}")
-    print(f"     - of which assigned by temporal split: {time_mask.sum():,}")
-    print(f"     - of which assigned by other split ({test_column}): {other_mask.sum():,}")
-    print(f"     - Overlaps between criteria: {spatial_test_mask.sum() + time_mask.sum() + other_mask.sum():,}")
-    print(f"Assigned to Validation Set (strictly inside val patches): {final_val_mask.sum():,}")
-    print(f"Assigned to Train Set (strictly outside patches + buffer): {final_train_mask.sum():,}")
-    print(f"Dropped (spatial moat/buffer zone): {len(df) - final_test_mask.sum() - final_val_mask.sum() - final_train_mask.sum():,}")
-
-    return final_train_mask, final_test_mask, final_val_mask
-    
+    print(f"     - of which assigned by temporal split: {time_mask_np.sum():,}")
+    print(f"     - of which assigned by other split ({test_column}): {other_mask_np.sum():,}")
+    print(f"     - Overlaps between criteria: {overlaps:,}")
+    print(f"Assigned to Validation Set: {total_val_mask.sum():,} ({val_tracts} tracts)")
+    print(f"     - of which assigned by spatial split: {final_val_spatial_mask.sum():,}")
+    print(f"     - of which assigned by temporal split: {final_val_time_mask.sum():,}")
+    print(f"Assigned to Train Set: {final_train_mask.sum():,} ({train_tracts} tracts)")
+    print(f"Dropped (spatial moat/buffer zone): {dropped:,}")
+    print("-" * 30)
+    # Export gdf with bboxes and assigned datasets for visualization and debugging
+    gdf = gpd.GeoDataFrame(
+        df,
+        geometry=bboxes, # Use the jitter-buffered bboxes for visualization to see the actual exclusion zones
+        crs="EPSG:6539",
+    )
+    gdf[["DOITT_ID", "year", "type", "geometry"]].to_feather(PROCESSED_DATA_DIR / "building_splits.feather")
+    return final_train_mask, final_test_mask, final_val_masks    
 
 def assert_train_test_datapoint(bounds, test_polygon, wanted_type="train", buffer=500):
     """
@@ -1084,15 +1261,100 @@ def generate_matrix_of_datasets(datasets):
             matrix += [rows_ds]
     return matrix
 
-# Add this function to main.py or geo_utils.py
-def get_gpu_augmentation_layer():
-    return tf.keras.Sequential([
-        # Random Flips (replaces np.flip)
-        tf.keras.layers.RandomFlip("horizontal_and_vertical"),
-        
-        # Random Contrast (replaces skimage gamma/contrast)
-        tf.keras.layers.RandomContrast(0.2),
-        
-        # Random Brightness (replaces percentile scaling somewhat)
-        tf.keras.layers.RandomBrightness(0.2),
-    ])
+def create_train_test_dataframes(buildings_df, savename, test_years=[], test_column=None, small_sample=False, max_jitter=10):
+    """Create train and test dataframes with the IDs and xr.datasets names to use for training and testing
+
+    Split the census tracts into train and test. The train and test dataframes contain the links and xr.datasets to use for training and
+    testing.
+    """
+    if small_sample:
+        buildings_df = buildings_df.sample(1000, random_state=825).reset_index(drop=True)
+
+    tract_panel = process_acs_panel()
+    tract_panel["income_quintile"] = pd.qcut(tract_panel["Rel_Score_2024"], q=5, labels=False)
+    tract_panel = tract_panel.rename(columns={"geoid_2024": "GEOID"})
+    tract_panel = tract_panel.dropna(subset=["income_quintile"]).reset_index(drop=True)
+
+    ###### Split census tracts 
+    cluster_radius = geo_utils.meters_to_projected_units(300, epsg_code=6539) 
+    dead_zone_buffer = geo_utils.meters_to_projected_units(100, epsg_code=6539) # Your tau parameter
+
+    # 1. Generate TEST Holdout (5%)
+
+    test_tracts = create_stratified_tract_holdout(
+        tract_panel, 
+        cluster_radius=cluster_radius, 
+        stratify_cols=["income_quintile"], 
+        eval_fraction=0.06
+    )
+
+    # 2. CREATE A STRICT QUARANTINE ZONE AROUND THE TEST SET
+    test_restricted_geom = test_tracts.geometry.union_all().buffer(dead_zone_buffer)
+    invalid_val_candidates_mask = tract_panel.geometry.intersects(test_restricted_geom)
+
+    # 3. Generate VALIDATION Holdout (5%) 
+    val_tracts = create_stratified_tract_holdout(
+        tract_panel, 
+        cluster_radius=cluster_radius, 
+        stratify_cols=["income_quintile"], 
+        eval_fraction=0.06, 
+        exclude_mask=invalid_val_candidates_mask
+    )
+
+    # 4. Assign labels and compute the final combined dead zones for the Train set
+    assigned_tracts, dead_zone_geom_gdf = assign_tracts_train_val_test(
+        tract_panel, 
+        test_tracts, 
+        val_tracts, 
+        dead_zone_buffer
+    )
+
+    # --- Plot and Verify ---
+    plot_tracts_splits(tract_panel, dead_zone_geom_gdf)
+    assigned_tracts[["GEOID", "geometry", "type"]].to_feather(PROCESSED_DATA_DIR / "tract_splits.feather", index=False)
+    print(f"Created file: {PROCESSED_DATA_DIR / 'tract_splits.feather'}")
+
+    ###### Split Buildings
+    val_area = assigned_tracts[assigned_tracts["type"] == "val"].union_all()
+    test_area = assigned_tracts[assigned_tracts["type"] == "test"].union_all()
+    # val_bounds = get_test_area_from_file(filename="Test_NYC_Area.parquet")
+
+    train_mask, test_mask, val_masks_dict = assign_buildings_train_test_val(buildings_df, val_area, test_area, test_years=test_years, test_column=test_column, jitter_buffer=max_jitter)
+
+    # Keep only relevant columns for the DataLoader
+    relevant_columns = [
+        "DOITT_ID", "GEOID", "year",
+        "Rel_Score", "Valid_Structural_Change", "score_bin",
+        "dataset", "bbox_minx", "bbox_miny", "bbox_maxx", "bbox_maxy",
+        "row_start", "row_stop", "col_start", "col_stop", "dist_to_center"
+    ]
+    buildings_df = buildings_df[relevant_columns]
+
+    # Split dataframes and shuffle them
+    df_train = buildings_df[train_mask].copy().reset_index(drop=True).sample(frac=1, random_state=825, replace=False)  # Shuffle train set
+    df_test = buildings_df[test_mask].copy()
+    df_vals_dict = {}
+    for val_name, val_mask in val_masks_dict.items():
+        df_vals_dict[val_name] = buildings_df[val_mask].copy()
+        assert df_vals_dict[val_name].shape[0] > 0, f"Empty val dataset for {val_name}!"
+    
+    assert df_test.shape[0] > 0, f"Empty test dataset!"
+    assert df_train.shape[0] > 0, f"Empty train dataset!"
+
+    ### Train/Test
+
+    test_dataframe_path = PROCESSED_DATA_DIR / "test_datasets" / f"{savename}_test_dataframe.feather"
+    df_test.to_feather(test_dataframe_path)
+    print(f"Created test dataset: {test_dataframe_path}")
+
+    train_dataframe_path = PROCESSED_DATA_DIR / "train_datasets" / f"{savename}_train_dataframe.feather"
+    df_train.to_feather(train_dataframe_path)
+    print(f"Created train dataset: {train_dataframe_path}")
+
+    val_dataframe_path = PROCESSED_DATA_DIR / "val_datasets"
+    for val_name, df_val_year in df_vals_dict.items():
+        df_val_year.to_feather(val_dataframe_path / f"{savename}_{val_name}_val_dataframe.feather")
+        print(f"Created val dataset: {val_dataframe_path}")
+
+    return df_train, df_vals_dict, df_test
+
