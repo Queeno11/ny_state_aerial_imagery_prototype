@@ -638,6 +638,42 @@ def generate_parameters_log(params, savename):
     print(f"Created parameters log at: {filename}")
     return
 
+def check_feature_importance(model):
+    """
+    Extracts and logs the relative weight of the image features vs. metadata features
+    from the final fusion layer.
+    """
+    # Look for the fusion layer (final_head) which might be nested in ScaleMAE
+    fusion_layer = None
+    if hasattr(model, "final_head"):
+        fusion_layer = model.final_head
+    elif hasattr(model, "head") and hasattr(model.head, "final_head"):
+        fusion_layer = model.head.final_head
+
+    if not hasattr(model, "meta_dim") or model.meta_dim == 0 or fusion_layer is None:
+        return
+
+    # Get absolute weights from the final linear layer (squeeze to 1D)
+    weights = fusion_layer.weight.data.abs().squeeze()
+    
+    # Slice weights based on meta_dim
+    image_weights = weights[:-model.meta_dim]
+    meta_weights = weights[-model.meta_dim:]
+    
+    image_avg_strength = image_weights.mean().item()
+    commute_strength = meta_weights.mean().item()
+    ratio = commute_strength / image_avg_strength if image_avg_strength > 0 else 0
+    
+    print(f"\n[Feature Weights] Commute: {commute_strength:.4f} | Avg Image: {image_avg_strength:.4f} | Ratio: {ratio:.2f}x")
+    
+    # Log to W&B if a run is active
+    if wandb.run is not None:
+        wandb.log({
+            "weights/commute_strength": commute_strength,
+            "weights/image_avg_strength": image_avg_strength,
+            "weights/commute_to_image_ratio": ratio
+        }, commit=False) # commit=False ties it to the next step log
+
 def train_model(
     model,
     train_loader,
@@ -829,6 +865,10 @@ def train_model(
             # Tell wandb to track these files
             wandb.save(str(model_path))
             wandb.save(str(lora_dir / "adapter_model.safetensors"))
+
+            # Report feature importance for the best model
+            check_feature_importance(model)
+
 
         # ==========================
         # 4. ROTATE CACHE FOR NEXT EPOCH
