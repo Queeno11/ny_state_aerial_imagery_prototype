@@ -136,56 +136,46 @@ class CyclicCacheManager:
             int(p.stem.split("_")[1]) for p in existing_shards
         ) + 1
  
-    def _extract_raw_image(self, row, n_bands=None):
+    def _extract_raw_image(self, row, n_bands=None, pad=0):
         dataset_name = row.get("dataset")
         zarr_array = self.all_years_datasets[dataset_name]["value"]  # raw zarr array
 
-        # Apply jitter in pixel space — much cheaper than CRS perturbation
-        jitter_row = np.random.randint(-self.max_jitter_pixels, self.max_jitter_pixels)
-        jitter_col = np.random.randint(-self.max_jitter_pixels, self.max_jitter_pixels)
-        row_start = max(0, int(row["row_start"]) + jitter_row)
-        row_stop  = row_start + self.image_size
-        col_start = max(0, int(row["col_start"]) + jitter_col)
-        col_stop  = col_start + self.image_size
+        # Expand the extraction window by `pad` zarr pixels on each side (for RandomCrop jitter)
+        tile_size = self.image_size + 2 * pad
+        row_start = max(0, int(row["row_start"]) - pad)
+        row_stop  = row_start + tile_size
+        col_start = max(0, int(row["col_start"]) - pad)
+        col_stop  = col_start + tile_size
         
         try:
             tile = zarr_array[:n_bands, row_start:row_stop, col_start:col_stop]
             if (
                 tile.shape[0] == self.nbands and
-                tile.shape[1] == self.image_size and
-                tile.shape[2] == self.image_size
+                tile.shape[1] == tile_size and
+                tile.shape[2] == tile_size
             ):                
                 return tile.to_numpy()  # Convert from zarr array to numpy array for processing
             else:
-                raise ValueError(f"Extracted tile has invalid shape: {tile.shape}. Expected ({self.nbands}, {self.image_size}, {self.image_size}).")
+                raise ValueError(f"Extracted tile has invalid shape: {tile.shape}. Expected ({self.nbands}, {tile_size}, {tile_size}).")
             
         except Exception as e:
             logging.error(f"Failed for DOITT_ID {row.get('DOITT_ID', '?')}: {e}")
 
         return None
 
-    def _batch_resize_and_convert(self, raw_images):
+    def _batch_resize_and_convert(self, raw_images, target_size=None):
         """
-        Resize a list of raw (C, H, W) numpy arrays to (C, image_size, image_size)
+        Resize a list of raw (C, H, W) numpy arrays to (C, target_size, target_size)
         in a SINGLE vectorised call via torch.nn.functional.interpolate on CPU.
-
-        Why this is faster than calling geo_utils.process_image N times in a loop:
-        - Skimage/PIL resize launches a separate C routine per image; Python loop overhead
-          multiplies with N (here N ~ 3,000+).
-        - F.interpolate operates on the entire (N, C, H, W) tensor at once using PyTorch's
-          optimised BLAS/OpenMP kernels — one C call for the whole shard.
-        - Eliminating the HWC ↔ CHW transpose that process_image performs also saves
-          memory bandwidth.
-
-        Returns a list of (C, image_size, image_size) uint8 tensors, matching the
-        format previously produced by process_image + permute.
+        target_size defaults to params["image_size"]; pass a larger value for padded
+        training tiles that will later be RandomCropped to image_size.
         """
-        image_size = self.params["image_size"]
+        image_size = target_size or self.params["image_size"]
 
         # Stack into (N, C, H, W) float32 — interpolate requires floating-point input
         batch = torch.stack([
             torch.from_numpy(img.astype(np.float32)) for img in raw_images
-        ])  # (N, C, image_size, image_size)
+        ])  # (N, C, H, W)
 
         # Single batched bilinear downsample — all images in one call
         # antialias=True avoids high-frequency aliasing when downsampling by 3x (672 → 224)
@@ -195,15 +185,15 @@ class CyclicCacheManager:
             mode="bilinear",
             align_corners=False,
             antialias=True,
-        )  # (N, C, image_size, image_size)
+        )
 
         # Clamp + cast to uint8 — same in-memory format as the previous pipeline
         resized = resized.clamp(0, 255).to(torch.uint8)
 
-        return list(resized)  # list of (C, image_size, image_size) uint8 tensors
+        return list(resized)  # list of (C, target_size, target_size) uint8 tensors
 
     def _worker_generate(self, shard_id, show_progress=False):
-        # FIX: Sequential chunking for Validation/Test, Random sampling for Train
+        # Sequential chunking for Validation/Test, Random sampling for Train
         if self.type.startswith("val") or self.type.startswith("test"):
             start_idx = shard_id * self.shard_size
             end_idx = min(start_idx + self.shard_size, len(self.df))
@@ -214,6 +204,16 @@ class CyclicCacheManager:
                 return
         else:
             sampled_df = self.df.sample(self.shard_size, replace=False)
+
+        # For training shards, extract a padded tile so RandomCrop can apply true per-batch jitter.
+        # Val/test shards use no padding (exact bbox, no augmentation).
+        is_train = self.type == "train"
+        jitter_pad = self.max_jitter_pixels if is_train else 0  # zarr pixels of border
+        # Compute the model-resolution padded size: preserve the same scale ratio as the base crop
+        model_padded_size = (
+            round(self.params["image_size"] * (self.image_size + 2 * jitter_pad) / self.image_size)
+            if is_train else self.params["image_size"]
+        )
 
         valid_images = []
         valid_labels = []
@@ -233,7 +233,7 @@ class CyclicCacheManager:
             if pd.isna(label):
                 return None, None, None
             dist_to_center = row.get("dist_to_center", 0.0) # default to 0 if not present
-            return self._extract_raw_image(row, n_bands=self.params["nbands"]), label, dist_to_center
+            return self._extract_raw_image(row, n_bands=self.params["nbands"], pad=jitter_pad), label, dist_to_center
 
         with ThreadPoolExecutor(max_workers=MAX_EXTRACT_WORKERS) as pool:
             futures = [pool.submit(_extract, item) for item in rows]
@@ -251,7 +251,7 @@ class CyclicCacheManager:
                 meta_chunk.append(meta)
 
                 if len(raw_chunk) >= CHUNK_SIZE:
-                    resized_tensors = self._batch_resize_and_convert(raw_chunk)
+                    resized_tensors = self._batch_resize_and_convert(raw_chunk, target_size=model_padded_size)
                     for tensor, lbl, mt in zip(resized_tensors, label_chunk, meta_chunk):
                         if tensor.max() > 0:
                             valid_images.append(tensor)
@@ -262,7 +262,7 @@ class CyclicCacheManager:
                     meta_chunk.clear()
 
         if raw_chunk:
-            resized_tensors = self._batch_resize_and_convert(raw_chunk)
+            resized_tensors = self._batch_resize_and_convert(raw_chunk, target_size=model_padded_size)
             for tensor, lbl, mt in zip(resized_tensors, label_chunk, meta_chunk):
                 if tensor.max() > 0:
                     valid_images.append(tensor)
@@ -376,6 +376,7 @@ class CyclicRAMDataset(Dataset):
         self.transform = transform
         self.images = None
         self.labels = None
+        self.metas = None
         self.refresh()
  
     def refresh(self):
@@ -383,14 +384,20 @@ class CyclicRAMDataset(Dataset):
         if not self.cache_manager.active_shards:
             raise RuntimeError("No active shards to load. Call build_initial_cache() first.")
  
-        img_list, lbl_list = [], []
+        img_list, lbl_list, meta_list = [], [], []
         for shard_path in self.cache_manager.active_shards:
             data = torch.load(shard_path, weights_only=True)
             img_list.append(data["images"])
             lbl_list.append(data["labels"])
+            if "metas" in data:
+                meta_list.append(data["metas"])
  
         self.images = torch.cat(img_list)
         self.labels = torch.cat(lbl_list)
+        if meta_list:
+            self.metas = torch.cat(meta_list)
+        else:
+            self.metas = torch.empty((len(self.labels), 0))
  
     def __len__(self):
         return len(self.images)
@@ -398,11 +405,12 @@ class CyclicRAMDataset(Dataset):
     def __getitem__(self, idx):
         img = self.images[idx]
         lbl = self.labels[idx]
+        meta = self.metas[idx] if self.metas is not None else None
  
         if self.transform:
             img = self.transform(img)
  
-        return img, lbl
+        return img, lbl, meta
 
 
 class StaticShardedDataset(Dataset):
@@ -418,6 +426,7 @@ class StaticShardedDataset(Dataset):
         self.current_shard_idx = -1
         self.images = None
         self.labels = None
+        self.metas = None
         
         print(f"Loading metadata for {len(self.shard_paths)} shards to establish dataset sizes...")
         self.shard_lengths = []
@@ -440,6 +449,7 @@ class StaticShardedDataset(Dataset):
         data = torch.load(self.shard_paths[shard_idx], weights_only=True)
         self.images = data["images"]
         self.labels = data["labels"]
+        self.metas = data.get("metas")
         self.current_shard_idx = shard_idx
     def __len__(self):
         return self.total_length
@@ -449,11 +459,12 @@ class StaticShardedDataset(Dataset):
         
         img = self.images[item_idx]
         lbl = self.labels[item_idx]
+        meta = self.metas[item_idx] if self.metas is not None else None
         
         if self.transform:
             img = self.transform(img)
             
-        return img, lbl
+        return img, lbl, meta
                                         
 def setup_dataloaders(df_train, dfs_val_dict, df_test, all_years_datasets, params, train_cache_manager=None, val_cache_manager=None):
     print("--- Initializing PyTorch Datasets ---")
@@ -464,7 +475,9 @@ def setup_dataloaders(df_train, dfs_val_dict, df_test, all_years_datasets, param
 
 
     # TRAIN
+    image_size = params.get("image_size", 224)
     train_transform = transforms.Compose([
+        transforms.RandomCrop(image_size),   # Realizes per-batch spatial jitter from the padded shard tiles
         transforms.RandomHorizontalFlip(p=0.5),
         transforms.RandomVerticalFlip(p=0.5),
         transforms.ToDtype(torch.float32, scale=True)
@@ -585,7 +598,7 @@ def fill_params_defaults(params):
 
 
 def set_model_and_loss_function(
-    model_name: str, kind: str, image_size: int, bands: int = 4, weights: str = None
+    model_name: str, kind: str, image_size: int, bands: int = 4, weights: str = None, meta_dim: int = 0
 ):
     """
     Initializes the PyTorch model and appropriate loss function.
@@ -600,7 +613,8 @@ def set_model_and_loss_function(
         name=model_name, 
         image_size=image_size, 
         bands=bands, 
-        kind=kind
+        kind=kind,
+        meta_dim=meta_dim
     )
 
     # Load weights if provided
@@ -723,14 +737,14 @@ def train_model(
         )
 
         t_batch_start = time.perf_counter()  # start timer before first batch
-        for batch_idx, (images, labels) in train_bar:
+        for batch_idx, (images, labels, metas) in train_bar:
             t_data_end = time.perf_counter()  # data is ready; measure load time
-            images, labels = images.to(device), labels.to(device)
+            images, labels, metas = images.to(device), labels.to(device), metas.to(device)
             
             # Run forward pass in Mixed Precision (FP16)
             t_forward_start = time.perf_counter()
             with autocast(device_type='cuda'):
-                outputs = model(images)
+                outputs = model(images, metadata=metas)
                 if outputs.shape != labels.shape:
                     outputs = outputs.view(labels.shape)
                 
@@ -805,8 +819,8 @@ def train_model(
 
                 # Disable gradient calculation for validation (saves RAM and compute)
                 with torch.no_grad():
-                    for images, labels in val_bar:
-                        images, labels = images.to(device), labels.to(device)
+                    for images, labels, metas in val_bar:
+                        images, labels, metas = images.to(device), labels.to(device), metas.to(device)
                         if images.dtype != torch.float32 or images.max() > 10.0:
                             raise RuntimeError(
                                 f"\n[NORMALIZATION BUG CAUGHT]\n"
@@ -816,7 +830,7 @@ def train_model(
                             )
                         
                         with autocast(device_type='cuda'):
-                            outputs = model(images)
+                            outputs = model(images, metadata=metas)
                             if outputs.shape != labels.shape:
                                 outputs = outputs.view(labels.shape)
                             loss = loss_fn(outputs, labels)
@@ -914,17 +928,18 @@ def predict_buildings(model, dataloader, device):
     
     # torch.no_grad() is CRITICAL here! It stops PyTorch from storing memory for backpropagation
     with torch.no_grad():
-        for batch_idx, (batch_images, batch_geoids) in enumerate(dataloader):
+        for batch_idx, (batch_images, batch_labels, batch_metas) in enumerate(dataloader):
             batch_images = batch_images.to(device)
+            batch_metas = batch_metas.to(device)
             
             # Get predictions
-            outputs = model(batch_images)
+            outputs = model(batch_images, metadata=batch_metas)
             
             # If regression, outputs are shape (Batch, 1). We flatten them to a 1D list.
             preds = outputs.view(-1).cpu().numpy()
             
             all_preds.extend(preds)
-            all_geoids.extend(batch_geoids)
+            all_geoids.extend(batch_labels)
             
             # Print progress every 50 batches
             if batch_idx % 50 == 0:
@@ -1038,7 +1053,7 @@ def run(
         for val_name, df_val in df_vals_dict.items():
             if df_val.shape[0] > 0:
                 # Take up to 5 buildings per shard for validation to keep RAM usage low, since we load the whole shard at once during validation
-                df_val = df_val.groupby(['GEOID', 'year'], group_keys=False).apply(lambda x: x.sample(n=min(len(x), 10)), include_groups=False)
+                df_val = df_val.groupby(['GEOID', 'year'], group_keys=False).apply(lambda x: x.sample(n=min(len(x), 20)), include_groups=False)
                 val_num_shards = max(1, (len(df_val) + current_shard_size - 1) // current_shard_size)
                 val_cache_manager = CyclicCacheManager(
                     df=df_val, # Or full df_val
@@ -1072,10 +1087,10 @@ def run(
         print("Data Pipeline Ready!")
 
         #### 3. Model Initialization
+        # meta_dim=1 for the 'dist_to_center' covariate
         model, loss_fn = set_model_and_loss_function(
             model_name=model_name, 
             kind=kind,
-            bands=nbands,  # stacked_images hardcoded to [1]
             bands=nbands, 
             image_size=image_size, 
             weights=weights,
