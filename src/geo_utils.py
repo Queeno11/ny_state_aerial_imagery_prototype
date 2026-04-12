@@ -7,7 +7,7 @@ import skimage
 from skimage import color
 from shapely import Point
 import src.build_dataset as build_dataset
-
+from pyproj import CRS
 
 def get_dataset_extent(ds, image_size=None):
     """Return a polygon with the extent of the dataset
@@ -135,8 +135,133 @@ def filter_datasets_by_idx_and_buffer(
 
     return filtered
 
+def projected_units_to_meters(value: float, epsg_code: int) -> float:
+    """
+    Converts a value from the native units of a projected CRS into meters.
+    
+    Args:
+        value (float): The distance in the native CRS units (e.g., 0.5)
+        epsg_code (int): The EPSG code of the projected coordinate system
+        
+    Returns:
+        float: The exact equivalent distance in meters.
+    """
+    crs = CRS.from_epsg(epsg_code)
+    
+    # 1. Safety check: ensure the CRS is projected (linear), not geographic (angular/degrees)
+    if crs.is_geographic:
+        raise ValueError(
+            f"EPSG:{epsg_code} is a geographic CRS ({crs.name}). "
+            "Its units are degrees, which do not have a constant meter length. "
+            "Please provide a Projected CRS."
+        )
+        
+    # 2. Fetch the exact conversion factor to meters for this specific CRS
+    # axis_info[0] looks at the first spatial axis (usually Easting/X)
+    conversion_factor = crs.axis_info[0].unit_conversion_factor
+    unit_name = crs.axis_info[0].unit_name
+    
+    # print(f"EPSG:{epsg_code} native unit is '{unit_name}'.")
+    # print(f"Conversion factor to meters: 1 {unit_name} = {conversion_factor} meters.")
+    
+    # 3. Calculate and return
+    return value * conversion_factor
+
+from pyproj import CRS
+
+def meters_to_projected_units(value_in_meters: float, epsg_code: int) -> float:
+    """
+    Converts a distance value from meters into the native units of a projected CRS.
+    
+    Args:
+        value_in_meters (float): The distance in meters (e.g., 10.0)
+        epsg_code (int): The EPSG code of the projected coordinate system
+        
+    Returns:
+        float: The exact equivalent distance in the CRS's native units.
+    """
+    crs = CRS.from_epsg(epsg_code)
+    
+    # 1. Safety check: ensure the CRS is projected (linear), not geographic (angular/degrees)
+    if crs.is_geographic:
+        raise ValueError(
+            f"EPSG:{epsg_code} is a geographic CRS ({crs.name}). "
+            "Its units are degrees, which cannot be uniformly converted from a flat meter distance. "
+            "Please provide a Projected CRS."
+        )
+        
+    # 2. Fetch the exact conversion factor for this specific CRS
+    # The conversion factor tells us how many meters are in 1 native unit.
+    conversion_factor = crs.axis_info[0].unit_conversion_factor
+    # unit_name = crs.axis_info[0].unit_name
+    
+    # 3. Calculate and return
+    # Meters / (Meters per Native Unit) = Native Units
+    return value_in_meters / conversion_factor
+
+def meters_to_pixels(meters: float, crs_units_per_pixel: float = 0.5, epsg_code: int = 6539) -> int:
+    """
+    Convert a real-world distance in meters to a pixel count.
+
+    Default resolution is 0.5 US Survey Feet/pixel (EPSG:6539),
+    matching the NYC aerial zarr files.
+    """
+    meters_per_crs_unit = projected_units_to_meters(1.0, epsg_code=epsg_code)
+    meters_per_pixel = crs_units_per_pixel * meters_per_crs_unit
+    return int(round(meters / meters_per_pixel))
+
+def precompute_all_indices(x_values, y_values, bboxes):
+    """
+    Vectorized: converts all CRS bboxes → pixel index tuples in one shot.
+    bboxes: np.ndarray of shape (N, 4) → [xmin, ymin, xmax, ymax]
+    """
+    xmins, ymins, xmaxs, ymaxs = bboxes[:,0], bboxes[:,1], bboxes[:,2], bboxes[:,3]
+
+    # x is ascending
+    col_starts = np.searchsorted(x_values, xmins, side="left")   # include xmin
+    col_stops  = np.searchsorted(x_values, xmaxs, side="right")  # include xmax
+
+    # y is descending — negate to use searchsorted
+    neg_y = -y_values
+    row_starts = np.searchsorted(neg_y, -ymaxs, side="left")   # ymax → top row (small idx)
+    row_stops  = np.searchsorted(neg_y, -ymins, side="right")  # ymin → bottom row (large idx)
+
+    # Raise warnings if more than 1% of images are not "near-squared" (i.e., more than one pixel difference between width and height)
+    widths = col_stops - col_starts
+    width_99_5 = np.quantile(widths, 0.995)
+    width_00_5 = np.quantile(widths, 0.005)
+    if width_99_5 - width_00_5 > 1:
+        raise ValueError(f"More than 1% of image widths vary by more than 1 pixel (min: {width_00_5}, max: {width_99_5}). Check the bboxes and dataset coordinates for consistency.")
+
+    heights = row_stops - row_starts
+    height_99_5 = np.quantile(heights, 0.995)
+    height_00_5 = np.quantile(heights, 0.005)
+    if height_99_5 - height_00_5 > 1:
+        raise ValueError(f"More than 1% of image heights vary by more than 1 pixel (min: {height_00_5}, max: {height_99_5}). Check the bboxes and dataset coordinates for consistency.")
+
+    if height_00_5 != width_00_5 or height_99_5 != width_99_5:
+        raise ValueError(f"Image min heights and widths do not match (width min/max: {width_00_5}/{width_99_5}, height min/max: {height_00_5}/{height_99_5}). Check the bboxes and dataset coordinates for consistency. Probably a CRS issue...")
+    
+    return np.array([row_starts, row_stops, col_starts, col_stops]).T
 
 def image_from_point(dataset, point, img_size=128):
+
+    # Find the rearest raster of this random point
+    idx_x, idx_y = find_index_of_point_in_dataset(dataset, point)
+    image = filter_datasets_by_idx_and_buffer(dataset, idx_x, idx_y, img_size)
+
+    if image is None:
+        return np.zeros(shape=(1, 1, 1))
+
+    image = image.value
+
+    if image.chunks is not None:
+        # If the image is not computed, compute it
+        image = image.compute()
+
+    return image
+
+def generate_image_from_bbox(dataset, bbox, n_bands=4, min_img_size=244):
 
     # Find the rearest raster of this random point
     idx_x, idx_y = find_index_of_point_in_dataset(dataset, point)
@@ -299,6 +424,39 @@ def stacked_image_from_census_tract(
             if bounds:
                 return image, bounds
             return image
+
+    # Get total bounds
+    image = np.concatenate(images_to_stack, axis=0)  # Concat over bands
+    assert image.shape == (total_bands, img_size, img_size)
+    if bounds:
+        bounds = get_image_bounds(image_da)  # The last image has to be the bigger
+        return image, bounds
+
+    return image
+
+def generate_image_from_bbox(dataset, bbox, n_bands=4, min_img_size=244):
+
+    try:
+        if type(dataset) == list:
+            image_ds = dataset[np.random.randint(0, len(dataset))]
+        else:
+            image_ds = dataset
+
+        image_da = image_from_bbox(image_ds, point, image_size)
+        image = image_da.to_numpy()[:n_bands, :, :]
+        assert image.shape == (n_bands, img_size, img_size)
+
+        image = np.nan_to_num(image)
+        image = image.astype(np.uint8)
+        images_to_stack += [image]
+
+    except Exception as e:
+        print(e)
+
+        image = np.zeros(shape=(n_bands, 1, 1))
+        if bounds:
+            return image, bounds
+        return image
 
     # Get total bounds
     image = np.concatenate(images_to_stack, axis=0)  # Concat over bands

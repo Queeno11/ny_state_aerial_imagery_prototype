@@ -20,8 +20,8 @@ def process_acs_panel():
         r"ny_state_aerial_imagery_prototype/data/processed/"
         r"ny_tracts_panel_2009_2014_2019_2024.feather"
     )
-    panel_gdf = gpd.read_feather(panel_path)
-    return panel_gdf
+    panel_tract_gdf = gpd.read_feather(panel_path)
+    return panel_tract_gdf
 
 
 def load_building_data():
@@ -82,7 +82,7 @@ def load_building_data():
     return buildings_nyc
 
 
-def build_training_datasets(buildings_nyc, panel_gdf, panel_years, tau_meters=50):
+def load_income_dataset(panel_years, tau_meters=50):
     """
     Produces two artifacts for the Zero-Join DataLoader:
 
@@ -102,21 +102,35 @@ def build_training_datasets(buildings_nyc, panel_gdf, panel_years, tau_meters=50
     )
     METRIC_CRS = "EPSG:6539"
 
+    temporal_data_path = OUTPUT_DIR / f"temporal_data_t{tau_meters}_years{panel_years.min()}-{panel_years.max()}.parquet"
+    geometries_path = OUTPUT_DIR / f"building_geometries_years{panel_years.min()}-{panel_years.max()}.parquet"
+
+    # Check if output files already exist to avoid redundant processing
+    if temporal_data_path.exists() and geometries_path.exists():
+        print(f"Output files already exist at:\n  {temporal_data_path}\n  {geometries_path}")
+        print("Loading existing datasets...")
+        temporal_data_flat = pd.read_parquet(temporal_data_path)
+        geometries_df = pd.read_parquet(geometries_path, index_col="DOITT_ID")
+        return temporal_data_flat, geometries_df
+
+    buildings_nyc = load_building_data()
+    panel_tract_gdf = process_acs_panel()
+
     # ------------------------------------------------------------------ #
     # 1. CRS alignment                                                   #
     # ------------------------------------------------------------------ #
     print("1. Preparing Spatial Data and CRS...")
     if buildings_nyc.crs != METRIC_CRS:
         buildings_nyc = buildings_nyc.to_crs(METRIC_CRS)
-    if panel_gdf.crs != METRIC_CRS:
-        panel_gdf = panel_gdf.to_crs(METRIC_CRS)
+    if panel_tract_gdf.crs != METRIC_CRS:
+        panel_tract_gdf = panel_tract_gdf.to_crs(METRIC_CRS)
 
     # ------------------------------------------------------------------ #
     # 2. Assign buildings to 2024 census tracts                          #
     # ------------------------------------------------------------------ #
     print("2. Assigning Buildings to 2024 Census Tracts...")
     tracts_2024 = (
-        panel_gdf[["geoid_2024", "geometry"]]
+        panel_tract_gdf[["geoid_2024", "geometry"]]
         .rename(columns={"geoid_2024": "GEOID"})
     )
     buildings_mapped = gpd.sjoin(
@@ -129,7 +143,7 @@ def build_training_datasets(buildings_nyc, panel_gdf, panel_years, tau_meters=50
     # ------------------------------------------------------------------ #
     print(f"3. Applying Context Spillover (tau = {tau_meters}m) and Extracting BBoxes (assuming zarr has 0.5 EPSG:6539 units per pixel)...")
     
-    meters_per_crs_unit = projected_units_to_meters(1.0, 6539)    
+    meters_per_crs_unit = geo_utils.projected_units_to_meters(1.0, 6539)    
     tau_crs_units = tau_meters / meters_per_crs_unit
     buffered_geoms = buildings_mapped.centroid.buffer(tau_crs_units)
 
@@ -138,7 +152,9 @@ def build_training_datasets(buildings_nyc, panel_gdf, panel_years, tau_meters=50
     buildings_mapped["bbox_miny"] = bounds["miny"]
     buildings_mapped["bbox_maxx"] = bounds["maxx"]
     buildings_mapped["bbox_maxy"] = bounds["maxy"]
-
+    buildings_mapped["centroid_x"] = buildings_mapped.centroid.x
+    buildings_mapped["centroid_y"] = buildings_mapped.centroid.y
+    
     # --- Artifact 1: geometry lookup (indexed by DOITT_ID) ---
     geometries_df = buildings_mapped[["geometry"]].copy()  # index = DOITT_ID
 
@@ -162,7 +178,7 @@ def build_training_datasets(buildings_nyc, panel_gdf, panel_years, tau_meters=50
 
         # Merge ACS labels for this specific year
         tract_labels = (
-            panel_gdf[["geoid_2024", "Valid_Structural_Change", f"Rel_Score_{acs_year}"]]
+            panel_tract_gdf[["geoid_2024", "Valid_Structural_Change", f"Rel_Score_{acs_year}"]]
             .copy()
             .rename(columns={
                 "geoid_2024": "GEOID",
@@ -209,10 +225,10 @@ def build_training_datasets(buildings_nyc, panel_gdf, panel_years, tau_meters=50
     # ------------------------------------------------------------------ #
     print("7. Saving to Parquet...")
     temporal_data_flat.to_parquet(
-        OUTPUT_DIR / "temporal_data.parquet", index=False
+        temporal_data_path, index=False
     )
     geometries_df.to_parquet(
-        OUTPUT_DIR / "geometries.parquet", index=True   # index = DOITT_ID
+        geometries_path, index=True  # Keep DOITT_ID as index for geometries
     )
 
     print(
@@ -222,7 +238,7 @@ def build_training_datasets(buildings_nyc, panel_gdf, panel_years, tau_meters=50
         f"  geometries.parquet    : {len(geometries_df):,} unique buildings\n"
         f"  Score bins computed within each of: {sorted(temporal_df['year'].unique())}"
     )
-    return temporal_data_flat, geometries_df
+    return temporal_data_flat
 
 def projected_units_to_meters(value: float, epsg_code: int) -> float:
     """
@@ -263,12 +279,7 @@ if __name__ == "__main__":
     PANEL_YEARS = [2008, 2010, 2012, 2014, 2016, 2018, 2020, 2022, 2024]
     TAU_METERS = 100  # 100m spillover buffer around each building's bounding box
 
-    buildings_nyc = load_building_data()
-    acs_panel = process_acs_panel()
-
-    temporal_df, geoms_df = build_training_datasets(
-        buildings_nyc=buildings_nyc,
-        panel_gdf=acs_panel,
+    temporal_df = load_income_dataset(
         panel_years=PANEL_YEARS,
         tau_meters=TAU_METERS,
     )

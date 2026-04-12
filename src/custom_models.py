@@ -35,7 +35,7 @@ def get_model(name, **kwargs):
 # ==========================================
 @register_model("small_cnn")
 class SmallCNN(nn.Module):
-    def __init__(self, resizing_size, bands=4, kind="reg"):
+    def __init__(self, image_size, bands=4, kind="reg"):
         """
         A minimal CNN to test the PyTorch transition.
         """
@@ -51,7 +51,7 @@ class SmallCNN(nn.Module):
         
         # Calculate the size of the tensor after 2 max-pooling layers (halved twice)
         # e.g., 224 -> 112 -> 56
-        flattened_dim = resizing_size // 4
+        flattened_dim = image_size // 4
         linear_input_size = 32 * flattened_dim * flattened_dim
         
         # Fully Connected Block
@@ -111,11 +111,41 @@ def _load_scalemae_backbone(local_dir="./pretrained/scalemae"):
     return backbone
 
 
+class LateFusionHead(nn.Module):
+    def __init__(self, embed_dim, meta_dim, out_features):
+        super().__init__()
+        self.meta_dim = meta_dim
+        # 1. Compress the image features first
+        self.image_compressor = nn.Sequential(
+            nn.Linear(embed_dim, 64),
+            nn.GELU(),
+            nn.LayerNorm(64),
+            nn.Dropout(0.4)
+        )
+        # 2. Fuse with metadata, then map straight to output
+        fuse_dim = 64 + meta_dim
+        self.final_head = nn.Linear(fuse_dim, out_features)
+
+    def forward(self, pooled, metadata=None):
+        # Compress image features to a smaller bottleneck
+        compressed_img = self.image_compressor(pooled)
+        
+        # Late fusion of covariates
+        if metadata is not None and self.meta_dim > 0:
+            fused = torch.cat([compressed_img, metadata], dim=1)
+        else:
+            fused = compressed_img
+            
+        return self.final_head(fused)
+
+
+
 @register_model("scalemae")
 class ScaleMAE(nn.Module):
-    def __init__(self, resizing_size=224, bands=3, kind="reg", freeze_strategy="none"):
+    def __init__(self, image_size=224, bands=3, kind="reg", freeze_strategy="none", meta_dim=0):
         super().__init__()
         self.kind = kind
+        self.meta_dim = meta_dim
         self.patch_size = 16  # Fixed for ViT-Large/16; passed at runtime to backbone
 
         # 1. Load backbone with pretrained weights from HuggingFace
@@ -139,15 +169,7 @@ class ScaleMAE(nn.Module):
         embed_dim = 1024
         out_features = 1 if kind == "reg" else 2
 
-        self.head = nn.Sequential(
-            nn.Linear(embed_dim, 256),
-            nn.GELU(),                  # GELU matches ViT internals (was ReLU before — fixed)
-            nn.LayerNorm(256),
-            nn.Dropout(0.3),
-            nn.Linear(256, 64),
-            nn.GELU(),
-            nn.Linear(64, out_features)
-        )
+        self.head = LateFusionHead(embed_dim, meta_dim, out_features)
 
         # Set LORA
         lora_config = LoraConfig(
@@ -160,16 +182,20 @@ class ScaleMAE(nn.Module):
             ],
             lora_dropout=0.05,
             bias="none",
-            modules_to_save=["head"],
+            # Note: modules_to_save=["head"] is intentionally omitted.
+            # self.head is a sibling of self.backbone (not a child), so PEFT cannot
+            # find it when wrapping backbone. The head is saved/loaded explicitly via
+            # torch.save(model.head.state_dict()) in train_model().
         )
         self.backbone = get_peft_model(self.backbone, lora_config)
         self.backbone.print_trainable_parameters()
 
-    def forward(self, x):
+    def forward(self, x, metadata=None):
         # from_pretrained backbone returns patch token sequence (B, N_patches, 1024)
         features = self.backbone(x, patch_size=self.patch_size)
 
         # Mean-pool patch tokens for spatially distributed wealth signal
         pooled = features.mean(dim=1)   # (B, 1024)
-        return self.head(pooled)
+        
+        return self.head(pooled, metadata=metadata)
 
