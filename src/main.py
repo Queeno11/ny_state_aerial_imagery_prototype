@@ -1076,8 +1076,10 @@ def run(
             model_name=model_name, 
             kind=kind,
             bands=nbands,  # stacked_images hardcoded to [1]
+            bands=nbands, 
             image_size=image_size, 
             weights=weights,
+            meta_dim=1 
         )
 
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -1091,7 +1093,7 @@ def run(
         initial_best_val_loss = None
         if not retrain and resume_model_checkpoint is not None and resume_model_checkpoint.exists():
             print(f"➡️ Resuming model/optimizer from checkpoint: {resume_model_checkpoint}")
-            checkpoint = torch.load(resume_model_checkpoint, map_location=device)
+            checkpoint = torch.load(resume_model_checkpoint, map_location=device, weights_only=True)
             
             # Restore all states
             if "model_state_dict" in checkpoint:
@@ -1141,12 +1143,21 @@ def run(
         model, _ = set_model_and_loss_function(
             model_name=model_name,
             kind=kind,
-            bands=nbands * 1,  # stacked_images hardcoded to [1]
+            bands=nbands, 
             image_size=image_size,
+            meta_dim=1 # Set back to 1 for dist_to_center
         )
         
         best_model_path = MODELS_DIR / "models_by_epoch" / savename / f"{savename}_best.pth"
-        model.load_state_dict(torch.load(best_model_path))
+        
+        # Best-model loading: Load head + Load LoRA separately
+        model.head.load_state_dict(torch.load(best_model_path, weights_only=True))
+        lora_dir = best_model_path.parent / f"{best_model_path.stem}_lora"
+        if lora_dir.exists():
+            from peft import PeftModel
+            # Wrap the base model (unwrapped backbone) with the best lora adapter
+            model.backbone = PeftModel.from_pretrained(model.backbone.base_model.model, lora_dir)
+            print(f"✅ Best LoRA adapter loaded from {lora_dir}")
         
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         model.to(device)
@@ -1209,7 +1220,7 @@ if __name__ == "__main__":
         "batch_size": 16,
         "small_sample": False,
         "n_epochs": 100,
-        "learning_rate": 0.0003,
+        "learning_rate": 0.0001,
         "sat_data": "aerial",
         "years": [2022], # Only the data inside WSL! all data is: [2010, 2012, 2014, 2016, 2018, 2020, 2022, 2024],
         "test_years": [],
