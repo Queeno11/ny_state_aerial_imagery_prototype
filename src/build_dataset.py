@@ -239,10 +239,10 @@ def load_income_dataset(panel_years, tau_meters=50):
     )
     buildings_mapped = buildings_mapped.drop(columns=["index_right"])
 
-    ## Add distance to NYC economic center in meters as variable (used for training)
+    ## Add distance to NYC economic center in kilometers as variable (used for training)
     #   NYSE is used as the economic center (40.70687862946312, -74.01126682079922)
     nyc_economic_center = gpd.GeoSeries.from_wkt(["POINT (-74.011267 40.706879)"], crs="EPSG:4326").to_crs(buildings_mapped.crs).iloc[0]
-    buildings_mapped["dist_to_center"] = buildings_mapped.distance(nyc_economic_center).apply(lambda x: geo_utils.projected_units_to_meters(x, epsg_code=6539))
+    buildings_mapped["dist_to_center"] = buildings_mapped.distance(nyc_economic_center).apply(lambda x: geo_utils.projected_units_to_meters(x, epsg_code=6539)) / 1000
 
     # ------------------------------------------------------------------ #
     # 3. Apply tau buffer and extract bounding boxes                      #
