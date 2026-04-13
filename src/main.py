@@ -46,7 +46,7 @@ os.environ['WANDB_API_KEY'] = os.getenv("WANDB_API_KEY")
 os.environ['HF_TOKEN'] = os.getenv("HF_TOKEN")
 
 # Define a subset of the data that will comfortably fit in RAM cache
-CACHE_SIZE = 2048*4*5 # Around 8000k images (4 batch size)
+CACHE_SIZE = 2048*4 # Around 8000k images (4 batch size)
 
 def generate_savename(
     model_name, image_size, learning_rate, years, extra
@@ -376,6 +376,11 @@ class CyclicRAMDataset(Dataset):
         if not self.cache_manager.active_shards:
             raise RuntimeError("No active shards to load. Call build_initial_cache() first.")
  
+        self.images = None
+        self.labels = None
+        self.metas = None
+        gc.collect()
+
         img_list, lbl_list, meta_list = [], [], []
         doitt_ids, geoids, years, types = [], [], [], []
         for shard_path in self.cache_manager.active_shards:
@@ -918,11 +923,12 @@ def train_model(
         # 4. ROTATE CACHE FOR NEXT EPOCH
         # ==========================
         if cache_manager:
-            cache_updated = cache_manager.step(k=10)
+            k = 3
+            cache_updated = cache_manager.step(k=k)
             if cache_updated:
-                if cache_manager._pending_k / cache_manager.k < 0.2:
+                if cache_manager._pending_k != k:
                     # The cache is falling behind the GPU! Report it so I can increase k
-                    tqdm.write(f"⚠️ The cache is falling behind the GPU! {cache_manager._pending_k} new train background shard(s) ready, but {cache_manager._pending_k / cache_manager.k * 100}% of the cache is stale. Consider increasing k.")
+                    tqdm.write(f"⚠️ The cache is falling behind the GPU! {cache_manager._pending_k} new train background shard(s) ready, but {cache_manager._pending_k / k * 100}% of the cache is stale. Consider increasing k.")
                 else:
                     tqdm.write(f"🔄 {cache_manager._pending_k} new train background shard(s) ready! Loading updated data into RAM...")
                     train_loader.dataset.refresh()
@@ -1087,8 +1093,8 @@ def run(
             num_shards = 1
             current_shard_size = len(df_train) # E.g., ~150 images per shard
         else:
-            num_shards = 50
-            current_shard_size = CACHE_SIZE // 50 # E.g., 20,480 images per shard
+            num_shards = 10
+            current_shard_size = CACHE_SIZE // 10 # E.g., 20,480 images per shard
 
         print("\n[TRAIN] Building cyclic training cache...")
         train_cache_manager = CyclicCacheManager(
