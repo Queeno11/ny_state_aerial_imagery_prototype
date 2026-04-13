@@ -199,6 +199,30 @@ def meters_to_projected_units(value_in_meters: float, epsg_code: int) -> float:
     # Meters / (Meters per Native Unit) = Native Units
     return value_in_meters / conversion_factor
 
+def calculate_exact_tau(tau_meters: float, image_size: int, crs_units_per_pixel: float = 0.5, epsg_code: int = 6539) -> tuple[float, int]:
+    """
+    Given an approximate tau_meters and target image_size, finds the integer sub-sampling step N
+    that creates a raw pixel width closest to what tau_meters would give.
+    Returns the EXACT tau_meters that precisely maps to N * image_size pixels,
+    along with the step N.
+    """
+    meters_per_crs_unit = projected_units_to_meters(1.0, epsg_code=epsg_code)
+    meters_per_pixel = crs_units_per_pixel * meters_per_crs_unit
+    
+    # Raw pixels needed to cover 2 * tau_meters
+    raw_pixels = (2 * tau_meters) / meters_per_pixel
+    
+    # Find the closest sub-sampling step N
+    N = max(1, int(round(raw_pixels / image_size)))
+    
+    # Calculate exact raw pixels required
+    exact_raw_pixels = N * image_size
+    
+    # Refine tau_meters
+    exact_tau_meters = (exact_raw_pixels * meters_per_pixel) / 2.0
+    
+    return exact_tau_meters, N
+
 def meters_to_pixels(meters: float, crs_units_per_pixel: float = 0.5, epsg_code: int = 6539) -> int:
     """
     Convert a real-world distance in meters to a pixel count.

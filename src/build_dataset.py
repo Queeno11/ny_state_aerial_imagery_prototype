@@ -26,6 +26,28 @@ import pandas as pd
 import src.geo_utils as geo_utils
 
 
+def open_datasets(sat_data="aerial", years=[2013, 2018, 2022], tau_meters=100):
+
+    ### Open dataframe with files and labels
+    print("Reading dataset...")
+    df = load_income_dataset(years, tau_meters=tau_meters)
+
+    year_cols = []
+    if sat_data == "aerial":
+        datasets_all_years, extents_all_years = load_satellite_datasets(
+            years=years
+        )
+    elif sat_data == "landsat":
+        raise NotImplementedError("Landsat support not implemented yet.")
+        sat_imgs_datasets, extents = load_landsat_datasets()
+
+    df = assign_datasets_to_gdf(df, datasets_all_years, extents_all_years, years=years, verbose=True, save_plot=False)
+
+    print("Datasets loaded!")
+
+    return datasets_all_years, extents_all_years, df
+
+
 def load_satellite_datasets(years,stretch=False, engine="zarr"):
     """Load satellite datasets and get their extents"""
     datasets = {}
@@ -64,7 +86,18 @@ def load_satellite_datasets(years,stretch=False, engine="zarr"):
 
     return datasets, extents
 
+def generate_datasets(savename, sat_data, years, test_years, test_column, small_sample=False, max_jitter=0, tau_meters=100):
+    
+    all_years_datasets, all_years_extents, df = open_datasets(
+        sat_data=sat_data, years=years, tau_meters=tau_meters
+    )
 
+    df_train, df_vals_dict, df_test, df_dead_zone = create_train_test_dataframes(
+        df, savename, test_years=test_years, test_column=test_column, small_sample=small_sample, max_jitter=max_jitter
+    )
+
+    return all_years_datasets, all_years_extents, df_train, df_vals_dict, df_test, df_dead_zone
+    
 # def load_landsat_datasets(stretch=False):
 #     """Load satellite datasets and get their extents"""
 
@@ -681,6 +714,9 @@ def assign_buildings_train_test_val(
     final_val_time_mask = pd.Series(final_val_time_mask_np, index=df.index)
     total_val_mask = final_val_spatial_mask | final_val_time_mask
 
+    final_dead_zone_mask_np = (~final_test_mask_np) & (~final_val_spatial_mask_np) & (~final_val_time_mask_np)
+    final_dead_zone_mask = pd.Series(final_dead_zone_mask_np, index=df.index)
+
     # Create dict of masks
     final_val_masks = {
         "val_spatial": final_val_spatial_mask,
@@ -701,6 +737,7 @@ def assign_buildings_train_test_val(
     df.loc[final_test_mask, "type"] = "test"
     df.loc[final_val_spatial_mask, "type"] = "val_spatial"
     df.loc[final_val_time_mask, "type"] = "val_time"
+    df.loc[final_dead_zone_mask, "type"] = "dead_zone"
 
     train_tracts = df[final_train_mask].drop_duplicates("GEOID").shape[0]
     test_tracts = df[final_test_mask].drop_duplicates("GEOID").shape[0]
@@ -727,7 +764,7 @@ def assign_buildings_train_test_val(
         crs="EPSG:6539",
     )
     gdf[["DOITT_ID", "year", "type", "geometry"]].to_feather(PROCESSED_DATA_DIR / "building_splits.feather")
-    return final_train_mask, final_test_mask, final_val_masks    
+    return final_train_mask, final_test_mask, final_val_masks, final_dead_zone_mask    
 
 def assert_train_test_datapoint(bounds, test_polygon, wanted_type="train", buffer=500):
     """
@@ -1319,11 +1356,11 @@ def create_train_test_dataframes(buildings_df, savename, test_years=[], test_col
     test_area = assigned_tracts[assigned_tracts["type"] == "test"].union_all()
     # val_bounds = get_test_area_from_file(filename="Test_NYC_Area.parquet")
 
-    train_mask, test_mask, val_masks_dict = assign_buildings_train_test_val(buildings_df, val_area, test_area, test_years=test_years, test_column=test_column, jitter_buffer=max_jitter)
+    train_mask, test_mask, val_masks_dict, dead_zone_mask = assign_buildings_train_test_val(buildings_df, val_area, test_area, test_years=test_years, test_column=test_column, jitter_buffer=max_jitter)
 
     # Keep only relevant columns for the DataLoader
     relevant_columns = [
-        "DOITT_ID", "GEOID", "year",
+        "DOITT_ID", "GEOID", "year", "type",
         "Rel_Score", "Valid_Structural_Change", "score_bin",
         "dataset", "bbox_minx", "bbox_miny", "bbox_maxx", "bbox_maxy",
         "row_start", "row_stop", "col_start", "col_stop", "dist_to_center"
@@ -1333,6 +1370,7 @@ def create_train_test_dataframes(buildings_df, savename, test_years=[], test_col
     # Split dataframes and shuffle them
     df_train = buildings_df[train_mask].copy().reset_index(drop=True).sample(frac=1, random_state=825, replace=False)  # Shuffle train set
     df_test = buildings_df[test_mask].copy()
+    df_dead_zone = buildings_df[dead_zone_mask].copy()
     df_vals_dict = {}
     for val_name, val_mask in val_masks_dict.items():
         df_vals_dict[val_name] = buildings_df[val_mask].copy()
@@ -1356,5 +1394,8 @@ def create_train_test_dataframes(buildings_df, savename, test_years=[], test_col
         df_val_year.to_feather(val_dataframe_path / f"{savename}_{val_name}_val_dataframe.feather")
         print(f"Created val dataset: {val_dataframe_path}")
 
-    return df_train, df_vals_dict, df_test
+    dead_zone_dataframe_path = PROCESSED_DATA_DIR / "train_datasets" / f"{savename}_dead_zone_dataframe.feather"
+    df_dead_zone.reset_index(drop=True).to_feather(dead_zone_dataframe_path)
+
+    return df_train, df_vals_dict, df_test, df_dead_zone
 
