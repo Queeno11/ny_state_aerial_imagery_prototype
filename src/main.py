@@ -11,7 +11,6 @@ import random
 import logging
 import warnings
 import threading
-import queue
 import xarray as xr
 import pandas as pd
 import seaborn as sns
@@ -93,9 +92,6 @@ class CyclicCacheManager:
         self.bg_thread = None
         self._pending_k = 0
         self._is_initialized = False
-        self._gen_queue = queue.Queue()     # Sequential generation queue
-        self._ready_queue = queue.Queue()   # Completed shards ready for swap
-        self._worker_running = False
  
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         if self.clear_cache:
@@ -255,25 +251,21 @@ class CyclicCacheManager:
             metas_tensor = torch.tensor(valid_metas, dtype=torch.float32).unsqueeze(1) # shape (N, 1)
 
             # 🔍 Safety check: verify no NaNs in labels
-            valid_mask = ~torch.isnan(labels_tensor)
-            if not valid_mask.all():
-                nan_count = (~valid_mask).sum().item()
+            if torch.isnan(labels_tensor).any():
+                nan_count = torch.isnan(labels_tensor).sum().item()
                 logging.error(f"⚠️ ALERT: Shard {shard_id} contains {nan_count} NaN labels! Filtering them out.")
-
-            # Stack images directly into one tensor, then immediately free the list to avoid double-peak
-            images_tensor = torch.stack(valid_images)
-            valid_images.clear()
-
-            images_tensor = images_tensor[valid_mask]
-            labels_tensor = labels_tensor[valid_mask]
-            metas_tensor = metas_tensor[valid_mask]
-
-            # Apply NaN mask to the metadata rows too
-            if not valid_mask.all():
-                valid_rows = [valid_rows[i] for i, keep in enumerate(valid_mask.tolist()) if keep]
+                # Filter out NaN labels and corresponding images
+                valid_mask = ~torch.isnan(labels_tensor)
+                images_tensor = torch.stack(valid_images)
+                images_tensor = images_tensor[valid_mask]
+                labels_tensor = labels_tensor[valid_mask]
+                metas_tensor = metas_tensor[valid_mask]
+                
+                valid_rows = [valid_rows[i] for i, mask_val in enumerate(valid_mask.tolist()) if mask_val]
+            else:
+                images_tensor = torch.stack(valid_images)
 
             valid_df = pd.DataFrame(valid_rows)
-            valid_rows.clear()
             doitt_ids = valid_df["DOITT_ID"].tolist() if not valid_df.empty else []
             geoids = valid_df["GEOID"].tolist() if not valid_df.empty else []
             years = valid_df["year"].tolist() if not valid_df.empty else []
@@ -310,74 +302,60 @@ class CyclicCacheManager:
         self._is_initialized = True
         print("Initial cache ready.")
  
-    def _bg_worker_loop(self):
-        """Persistent background worker: pulls shard IDs from _gen_queue one at a time,
-        generates each shard sequentially, and posts completed shard paths to _ready_queue.
-        This guarantees at most ONE shard is being generated at any moment."""
-        while True:
-            shard_id = self._gen_queue.get()  # blocks until work is available
-            if shard_id is None:              # poison pill → shut down
-                self._gen_queue.task_done()
-                break
-            self._worker_generate(shard_id, show_progress=False)
-            shard_path = self.cache_dir / f"shard_{shard_id}.pt"
-            self._ready_queue.put(shard_path)
-            self._gen_queue.task_done()
-
-    def _ensure_worker(self):
-        """Lazily starts the persistent background worker thread."""
-        if not self._worker_running:
-            self.bg_thread = threading.Thread(
-                target=self._bg_worker_loop, daemon=True
-            )
-            self._worker_running = True
-            self.bg_thread.start()
-
+    def _worker_generate_k(self, start_idx, k, show_progress=False):
+        """Generates k consecutive shards sequentially in a background thread."""
+        for i in range(k):
+            self._worker_generate(start_idx + i, show_progress)
+ 
     def start_background_generation(self, k=2):
-        """Enqueues k shards for sequential background generation before training begins."""
+        """Kicks off generation of the next k shards on a background thread before training begins."""
         if not self._is_initialized:
             raise RuntimeError("Call build_initial_cache() before starting background generation.")
-        self._ensure_worker()
-        for _ in range(k):
-            self._gen_queue.put(self.next_shard_idx)
-            self.next_shard_idx += 1
+        self.bg_thread = threading.Thread(
+            target=self._worker_generate_k, args=(self.next_shard_idx, k, False), daemon=True
+        )
+        self._pending_k = k
+        self.bg_thread.start()
 
     def step(self, k=2):
-        """Non-blocking cache rotation.  Drains all completed shards from the ready queue,
-        swaps each one in (removing the oldest active shard), then enqueues k new shards
-        for sequential generation.  Returns True if at least one swap occurred."""
+        """Non-blocking cache rotation. Background generates next k shards, then swaps them safely on completion."""
         if not self._is_initialized:
             raise RuntimeError("Call build_initial_cache() before calling step().")
 
         if self.single_shard_mode:
+            return False 
+
+        if self.bg_thread is None:
+            # Kick off the very first background generation
+            self.bg_thread = threading.Thread(
+                target=self._worker_generate_k, args=(self.next_shard_idx, k, False), daemon=True
+            )
+            self._pending_k = k
+            self.bg_thread.start()
             return False
-
-        self._ensure_worker()
-
-        # Drain every shard that the background worker has finished
-        swapped = 0
-        while not self._ready_queue.empty():
-            try:
-                new_shard_path = self._ready_queue.get_nowait()
-            except queue.Empty:
-                break
-            # Remove the oldest active shard to keep total count constant
-            if self.active_shards:
-                oldest = self.active_shards.pop(0)
-                try:
-                    oldest.unlink()
-                except FileNotFoundError:
-                    pass
-            self.active_shards.append(new_shard_path)
-            swapped += 1
-
-        # Enqueue the next k shards for sequential background generation
-        for _ in range(k):
-            self._gen_queue.put(self.next_shard_idx)
-            self.next_shard_idx += 1
-
-        self._pending_k = swapped  # record how many were swapped for logging
-        return swapped > 0
+            
+        else:
+            if self.bg_thread.is_alive():
+                return False  # Still generating in background
+                
+            # Background thread FINISHED: Swap the shards securely!
+            for _ in range(self._pending_k):
+                oldest_shard = self.active_shards.pop(0)
+                try: oldest_shard.unlink() 
+                except FileNotFoundError: pass
+        
+                self.active_shards.append(self.cache_dir / f"shard_{self.next_shard_idx}.pt")
+                self.next_shard_idx += 1
+    
+            # Immediately kick off the next batch cycle
+            self.bg_thread = threading.Thread(
+                target=self._worker_generate_k, args=(self.next_shard_idx, k, False), daemon=True
+            )
+            self._pending_k = k
+            self.bg_thread.start()
+            
+            return True 
+        return False
  
 
 class CyclicRAMDataset(Dataset):
@@ -940,11 +918,14 @@ def train_model(
         # 4. ROTATE CACHE FOR NEXT EPOCH
         # ==========================
         if cache_manager:
-            cache_updated = cache_manager.step(k=1)
+            cache_updated = cache_manager.step(k=10)
             if cache_updated:
-                n_swapped = cache_manager._pending_k
-                tqdm.write(f"🔄 {n_swapped} new train shard(s) swapped in! Loading updated data into RAM...")
-                train_loader.dataset.refresh()
+                if cache_manager._pending_k / cache_manager.k < 0.2:
+                    # The cache is falling behind the GPU! Report it so I can increase k
+                    tqdm.write(f"⚠️ The cache is falling behind the GPU! {cache_manager._pending_k} new train background shard(s) ready, but {cache_manager._pending_k / cache_manager.k * 100}% of the cache is stale. Consider increasing k.")
+                else:
+                    tqdm.write(f"🔄 {cache_manager._pending_k} new train background shard(s) ready! Loading updated data into RAM...")
+                    train_loader.dataset.refresh()
 
         if val_cache_managers:
             for val_name, v_manager in val_cache_managers.items():
@@ -1107,7 +1088,7 @@ def run(
             current_shard_size = len(df_train) # E.g., ~150 images per shard
         else:
             num_shards = 50
-            current_shard_size = CACHE_SIZE // num_shards # ~820 images per shard, 5 shards built upfront, rest generated lazily in background
+            current_shard_size = CACHE_SIZE // 50 # E.g., 20,480 images per shard
 
         print("\n[TRAIN] Building cyclic training cache...")
         train_cache_manager = CyclicCacheManager(
@@ -1158,7 +1139,7 @@ def run(
         del df_train, df_test, df_val, all_years_extents
         gc.collect() # Force Python to free up memory from large objects we no longer need
         
-        train_cache_manager.start_background_generation(k=1)  # Pre-warms queue with 1 shard; step(k=1) keeps it rolling
+        train_cache_manager.start_background_generation() # Starts generating shard 6 for Epoch 1
 
         print("Data Pipeline Ready!")
 
@@ -1417,4 +1398,4 @@ if __name__ == "__main__":
     }
 
     # Run full pipeline
-    run(params, train=True, retrain=False, compute_loss=False, generate_predictions=True)
+    run(params, train=True, retrain=True, compute_loss=False, generate_predictions=True)
