@@ -1223,8 +1223,8 @@ def run(
 
         # Combine all dataframes
         val_dfs = list(df_vals_dict.values())
-        # df_all = pd.concat([df_train, df_test, df_dead_zone] + val_dfs, ignore_index=True)
-        df_all = pd.concat(val_dfs, ignore_index=True)
+        df_all = pd.concat([df_train, df_test, df_dead_zone] + val_dfs, ignore_index=True)
+        # df_all = pd.concat(val_dfs, ignore_index=True)
         del df_train, df_test, df_dead_zone, val_dfs, df_vals_dict
         gc.collect()
 
@@ -1404,4 +1404,4 @@ if __name__ == "__main__":
     }
 
     # Run full pipeline
-    run(params, train=True, retrain=True, compute_loss=False, generate_predictions=True)
+    run(params, train=False, retrain=False, compute_loss=False, generate_predictions=True)
