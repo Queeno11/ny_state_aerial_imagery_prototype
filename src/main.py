@@ -14,6 +14,7 @@ import threading
 import xarray as xr
 import pandas as pd
 import seaborn as sns
+import geopandas as gpd
 from datetime import datetime
 import matplotlib.pyplot as plt
 import numpy as np
@@ -1414,34 +1415,29 @@ def run(
                 eval_transform=eval_transform
             )
             
-            output_path = RESULTS_DIR / f"{year}_predictions_{savename}.csv"
-            df_result = predict_buildings(model, prediction_loader, device, output_path, verbose=True)
+            output_path = RESULTS_DIR / f"{savename}/{year}_predictions.csv"
+            predict_buildings(model, prediction_loader, device, output_path, verbose=True)
+            df_result = pd.read_csv(output_path)
 
             if len(df_result) == 0:
                 print(f"No valid predictions generated for year {year}.")
                 continue
 
-            # Save CSV as backup
-            csv_dir = RESULTS_DIR / f"{year}_predictions_{savename}.csv"
-            df_result.to_csv(csv_dir, index=False)
-                      
-            # 6. Save flat table results
-            df_result.to_parquet(RESULTS_DIR / f"{year}_buildings_with_predictions_{savename}.parquet")
+            # Save georeferenced predictions
+            gdf = gpd.read_parquet(PROCESSED_DATA_DIR / f"building_geometries_years{min(years)}-{max(years)}.parquet")
+            df_result = df_result.set_index("DOITT_ID")
+            gdf = gdf.join(df_result, how="inner")
+            gdf.to_parquet(RESULTS_DIR / f"{savename}/predictions_{year}.parquet")
 
             # Dissolve by census tract
             df_result_tracts = df_result.groupby("GEOID").agg({
                 "Rel_Score": "mean",
-                "predicted_value": "mean"
+                "predicted_value": ["mean", "std"]
             }).reset_index()
+            df_result_tracts.columns = ["GEOID", "Rel_Score", "predicted_value", "predicted_value_std"]
 
-            df_result_tracts.to_parquet(RESULTS_DIR / f"{year}_predictions_by_tract_{savename}.parquet")
-
-            # # Load tract geometry from build_dataset process_acs_panel
-            # gdf_tracts_base = build_dataset.process_acs_panel()[["geoid_2024", "geometry"]].rename(columns={"geoid_2024": "GEOID"})
-            
-            # gdf_tracts = gdf_tracts_base.merge(df_result_tracts, on="GEOID", how="inner")
-            # gdf_tracts.to_parquet(RESULTS_DIR / f"{year}_predictions_by_tract_{savename}.parquet")
-            
+            df_result_tracts.to_parquet(RESULTS_DIR / f"{savename}/predictions_by_tract_{year}.parquet")
+           
             print(f"Finished evaluating {len(df_result)} valid buildings for year {year} at {RESULTS_DIR}")
 
 if __name__ == "__main__":
