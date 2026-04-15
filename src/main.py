@@ -871,6 +871,8 @@ def train_model(
                             loss = loss_fn(outputs, labels)
                         running_val_loss += loss.item() * images.size(0)
                         val_bar.set_postfix(loss=f"{loss.item():.4f}")
+                
+                tqdm.write(f"{val_name} loss:{running_val_loss / len(val_loader.dataset):.4f}.")
 
                 val_losses[val_name] = running_val_loss / len(val_loader.dataset)
             
@@ -954,55 +956,181 @@ def train_model(
     # Return model for caller chaining (especially if we loaded/checkpointed externally)
     return model
 
+import queue
+import threading
+import pandas as pd
 
-def predict_buildings(model, dataloader, device, verbose=True):
+class FastPredictLoader:
+    def __init__(self, df, all_years_datasets, params, batch_size, eval_transform):
+        self.df = df
+        self.all_years_datasets = all_years_datasets
+        self.params = params
+        self.batch_size = batch_size
+        self.eval_transform = eval_transform
+        
+        self.image_size = int((self.df["row_stop"] - self.df["row_start"]).min())
+        self.nbands = params["nbands"]
+        self.step = params["subsample_step"]
+        
+        # Fake dataset to satisfy print statements in predict_buildings
+        class FakeDataset:
+            def __init__(self, length):
+                self.length = length
+            def __len__(self):
+                return self.length
+        self.dataset = FakeDataset(len(self.df))
+        
+        self.queue = queue.Queue(maxsize=10) # 10 batches buffered ahead keeping GPU fed
+        self.thread = threading.Thread(target=self._worker)
+        self.thread.daemon = True
+        self.thread.start()
+
+    def _extract_raw_image(self, row):
+        dataset_name = row.get("dataset")
+        zarr_array = self.all_years_datasets[dataset_name]["value"]
+        
+        row_start = int(row["row_start"])
+        row_stop  = row_start + self.image_size
+        col_start = int(row["col_start"])
+        col_stop  = col_start + self.image_size
+        
+        try:
+            tile = zarr_array[:self.nbands, row_start:row_stop, col_start:col_stop]
+            if tile.shape[0] == self.nbands and tile.shape[1] == self.image_size and tile.shape[2] == self.image_size:
+                return tile.to_numpy()
+        except:
+            pass
+        return None
+
+    def _worker(self):
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        import torch
+
+        def _extract(item):
+            _, row = item
+            label = row["Rel_Score"]
+            dist_to_center = row.get("dist_to_center", 0.0)
+            return self._extract_raw_image(row), label, dist_to_center, row
+
+        raw_chunk, label_chunk, meta_chunk, row_chunk = [], [], [], []
+        rows = list(self.df.iterrows())
+        MAX_EXTRACT_WORKERS = 18
+
+        # KEY FIX: Only allow this many images to be in-flight at once.
+        # Without this, pool.map() submits ALL rows as futures simultaneously,
+        # storing every extracted numpy tile in memory before any are consumed.
+        MAX_IN_FLIGHT = self.batch_size * 4  # e.g., 4 batches worth (~1GB for 224px tiles)
+
+        with ThreadPoolExecutor(max_workers=MAX_EXTRACT_WORKERS) as pool:
+            i = 0
+            while i < len(rows):
+                # Submit only a bounded window of futures at a time
+                chunk_end = min(i + MAX_IN_FLIGHT, len(rows))
+                futures = {pool.submit(_extract, rows[j]): j for j in range(i, chunk_end)}
+                i = chunk_end
+
+                for future in as_completed(futures):
+                    raw_img, label, meta, row = future.result()
+
+                    if raw_img is None or pd.isna(label):
+                        continue
+
+                    raw_chunk.append(raw_img)
+                    label_chunk.append(label)
+                    meta_chunk.append(meta)
+                    row_chunk.append(row)
+
+                    if len(raw_chunk) >= self.batch_size:
+                        batch = torch.stack([torch.from_numpy(img) for img in raw_chunk])
+                        batch = batch[:, :, ::self.step, ::self.step]
+
+                        labels_tensor = torch.tensor(label_chunk, dtype=torch.float32)
+                        metas_tensor = torch.tensor(meta_chunk, dtype=torch.float32).unsqueeze(1)
+                        doitt_ids = torch.tensor([r.get("DOITT_ID", 0) for r in row_chunk])
+                        geoids = [str(r.get("GEOID", "")) for r in row_chunk]
+                        years_t = torch.tensor([r.get("year", 0) for r in row_chunk])
+                        types = [str(r.get("type", "")) for r in row_chunk]
+
+                        # queue.put() blocks here if GPU is slow — this is your backpressure valve
+                        self.queue.put((
+                            self.eval_transform(batch), labels_tensor, metas_tensor,
+                            doitt_ids, geoids, years_t, types
+                        ))
+
+                        raw_chunk.clear(); label_chunk.clear()
+                        meta_chunk.clear(); row_chunk.clear()
+
+        # Flush the last partial batch
+        if raw_chunk:
+            batch = torch.stack([torch.from_numpy(img) for img in raw_chunk])
+            batch = batch[:, :, ::self.step, ::self.step]
+
+            labels_tensor = torch.tensor(label_chunk, dtype=torch.float32)
+            metas_tensor = torch.tensor(meta_chunk, dtype=torch.float32).unsqueeze(1)
+            doitt_ids = torch.tensor([r.get("DOITT_ID", 0) for r in row_chunk])
+            geoids = [str(r.get("GEOID", "")) for r in row_chunk]
+            years_t = torch.tensor([r.get("year", 0) for r in row_chunk])
+            types = [str(r.get("type", "")) for r in row_chunk]
+
+            self.queue.put((
+                self.eval_transform(batch), labels_tensor, metas_tensor,
+                doitt_ids, geoids, years_t, types
+            ))
+
+        self.queue.put(None)
+
+    def __iter__(self):
+        return self
+    
+    def __next__(self):
+        batch = self.queue.get()
+        if batch is None:
+            raise StopIteration
+        return batch
+        
+    def __len__(self):
+        return max(1, len(self.df) // self.batch_size)
+
+
+def predict_buildings(model, dataloader, device, output_path, verbose=True):
     """
-    Generates predictions for a large dataset using PyTorch batching.
-    Returns a Pandas DataFrame with GEOIDs and their predicted values.
+    Streams predictions directly to CSV in chunks — no full-dataset RAM accumulation.
     """
     model.eval()
-    all_preds = []
-    all_labels = []
-    all_doitt_ids = []
-    all_geoids = []
-    all_years = []
-    all_types = []
-    
+    first_write = True
+
     if verbose:
         print(f"Starting inference on {len(dataloader.dataset)} items...")
-    
-    # torch.no_grad() is CRITICAL here! It stops PyTorch from storing memory for backpropagation
+
     with torch.no_grad():
-        for batch_idx, (batch_images, batch_labels, batch_metas, batch_doitt_ids, batch_geoids, batch_years, batch_types) in enumerate(dataloader):
+        iterator = enumerate(dataloader)
+        if verbose:
+            iterator = tqdm(iterator, total=len(dataloader), desc="Predicting Batches")
+
+        for batch_idx, (batch_images, batch_labels, batch_metas, batch_doitt_ids, batch_geoids, batch_years, batch_types) in iterator:
             batch_images = batch_images.to(device)
             batch_metas = batch_metas.to(device)
-            
-            # Get predictions
-            outputs = model(batch_images, metadata=batch_metas)
-            
-            # If regression, outputs are shape (Batch, 1). We flatten them to a 1D list.
-            preds = outputs.view(-1)
-            
-            all_preds.extend(preds.cpu().numpy())
-            all_labels.extend(batch_labels.cpu().numpy())
-            all_doitt_ids.extend(batch_doitt_ids.cpu().numpy())
-            all_geoids.extend(batch_geoids)
-            all_years.extend(batch_years.cpu().numpy())
-            all_types.extend(batch_types)
-            
-            # Print progress every 50 batches
-            if verbose and batch_idx % 50 == 0:
-                print(f"Predicted batch {batch_idx}/{len(dataloader)}")
-                
-    # Zip the IDs and Predictions back together beautifully
-    return pd.DataFrame({
-        "Rel_Score": all_labels, 
-        "predicted_value": all_preds,
-        "DOITT_ID": all_doitt_ids,
-        "GEOID": all_geoids,
-        "year": all_years,
-        "type": all_types
-    })
+
+            with autocast(device_type='cuda'):
+                outputs = model(batch_images, metadata=batch_metas)
+
+            preds = outputs.view(-1).cpu().numpy()
+
+            chunk_df = pd.DataFrame({
+                "Rel_Score":       batch_labels.cpu().numpy(),
+                "predicted_value": preds,
+                "DOITT_ID":        batch_doitt_ids.cpu().numpy(),
+                "GEOID":           batch_geoids,
+                "year":            batch_years.cpu().numpy(),
+                "type":            batch_types,
+            })
+
+            # Write header only on first chunk, then append
+            chunk_df.to_csv(output_path, mode='a', header=first_write, index=False)
+            first_write = False
+
+    if verbose:
+        print(f"Predictions saved to {output_path}")
 
 def run(
     params=None,
@@ -1116,7 +1244,7 @@ def run(
         for val_name, df_val in df_vals_dict.items():
             if df_val.shape[0] > 0:
                 # Take up to 5 buildings per shard for validation to keep RAM usage low, since we load the whole shard at once during validation
-                df_val = df_val.groupby(['GEOID', 'year'], group_keys=False)[df_val.columns].apply(lambda x: x.sample(n=min(len(x), 20)))
+                df_val = df_val.groupby(['GEOID', 'year'], group_keys=False)[df_val.columns].apply(lambda x: x.sample(n=min(len(x), 2)))
                 val_num_shards = max(1, (len(df_val) + current_shard_size - 1) // current_shard_size)
                 val_cache_manager = CyclicCacheManager(
                     df=df_val, # Or full df_val
@@ -1223,8 +1351,8 @@ def run(
 
         # Combine all dataframes
         val_dfs = list(df_vals_dict.values())
-        # df_all = pd.concat([df_train, df_test, df_dead_zone] + val_dfs, ignore_index=True)
-        df_all = pd.concat(val_dfs, ignore_index=True)
+        df_all = pd.concat([df_train, df_test, df_dead_zone] + val_dfs, ignore_index=True)
+        # df_all = pd.concat(val_dfs, ignore_index=True)
         del df_train, df_test, df_dead_zone, val_dfs, df_vals_dict
         gc.collect()
 
@@ -1254,13 +1382,19 @@ def run(
         
         model.to(device)
 
-        # 2. Setup the Evaluaton Transforms
+        # 2. Setup the Evaluation Transforms
+        # MUST match the pipeline used during training/validation exactly:
+        # scale uint16→float32, then apply ImageNet normalization.
+        nbands = params.get("nbands", 4)
+        mean = [0.485, 0.456, 0.406] + [0.5] * max(0, nbands - 3)
+        std = [0.229, 0.224, 0.225] + [0.5] * max(0, nbands - 3)
         eval_transform = transforms.Compose([
-            transforms.ToDtype(torch.float32, scale=True)
+            transforms.ToDtype(torch.float32, scale=True),
+            transforms.Normalize(mean=mean, std=std)  # 🔴 ImageNet Normalization — must match training
         ])
         
-        for year in years:
-            n_processed_image = 0
+        for year in [2024]:
+
             print(f"\n--- Processing Predictions for Year: {year} ---")
             df_year = df_all[df_all["year"] == year].copy()
             if df_year.empty:
@@ -1270,96 +1404,26 @@ def run(
             # Sort by spatial location so sequential shards read contiguous zarr chunks
             df_year = df_year.sort_values(["dataset", "row_start", "col_start"]).reset_index(drop=True)
 
-            predict_shard_size = CACHE_SIZE // 10 # Or whatever matches cache
-            predict_num_shards = max(1, (len(df_year) + predict_shard_size - 1) // predict_shard_size)
-            
-            predict_cache_manager = CyclicCacheManager(
-                df=df_year,
-                all_years_datasets=all_years_datasets,
-                params=params,
-                cache_dir=CACHE_DIR,
-                num_shards=0,  # We manage shards manually
-                shard_size=predict_shard_size,
-                single_shard_mode=True, 
-                type=f"predict_{year}",
-                clear_cache=True, 
+            # Predict (Scale batch size up by 8x since models in eval + FP16 take virtually 0 vRAM)
+            batch_size = params.get("batch_size", 32) * 8
+            prediction_loader = FastPredictLoader(
+                df=df_year, 
+                all_years_datasets=all_years_datasets, 
+                params=params, 
+                batch_size=batch_size, 
+                eval_transform=eval_transform
             )
             
-            df_result_list = []
-            import threading
-            
-            # Start generating the first shard
-            current_thread = threading.Thread(
-                target=predict_cache_manager._worker_generate, 
-                args=(0, False) # Hide progress to avoid terminal clutter
-            )
-            current_thread.start()
-            
-            shard_bar = tqdm(range(predict_num_shards), desc=f"Predicting {year} shards")
-            for shard_id in shard_bar:
-                # 1. Wait for current shard to be ready
-                if current_thread is not None:
-                    current_thread.join()
-                
-                shard_path = predict_cache_manager.cache_dir / f"shard_{shard_id}.pt"
-                
-                # 2. Kick off next shard generation
-                next_shard_id = shard_id + 1
-                if next_shard_id < predict_num_shards:
-                    current_thread = threading.Thread(
-                        target=predict_cache_manager._worker_generate, 
-                        args=(next_shard_id, False)
-                    )
-                    current_thread.start()
-                else:
-                    current_thread = None
+            output_path = RESULTS_DIR / f"{year}_predictions_{savename}.csv"
+            df_result = predict_buildings(model, prediction_loader, device, output_path, verbose=True)
 
-                # 3. Ensure the shard has valid images
-                if not shard_path.exists():
-                    break
-                    
-                data = torch.load(shard_path, weights_only=False)
-                if len(data["images"]) == 0:
-                    print(f"Shard {shard_id} is empty (all invalid), skipping.")
-                    shard_path.unlink()
-                    continue
-
-                prediction_dataset = StaticShardedDataset(
-                    active_shards=[shard_path],
-                    transform=eval_transform,
-                    verbose=False
-                )
-                
-                # 4. Wrap in DataLoader (Double batch size since no gradients are stored)
-                prediction_loader = DataLoader(
-                    prediction_dataset, 
-                    batch_size=params.get("batch_size", 32) * 4, 
-                    shuffle=False, 
-                    num_workers=0 
-                )
-
-                # 5. Predict and store
-                df_shard_result = predict_buildings(model, prediction_loader, device, verbose=False)
-
-                
-                csv_dir = RESULTS_DIR / f"{year}_predictions_{savename}.csv"
-                if os.path.exists(csv_dir):
-                    df_shard_result.to_csv(csv_dir, index=False, mode="a", header=False)
-                else:
-                    df_shard_result.to_csv(csv_dir, index=False, mode="w", header=True)
-
-                n_processed_image += len(df_shard_result)
-                shard_bar.set_postfix({"Items Built": n_processed_image})
-                
-                # 6. Cleanup to save space
-                try: shard_path.unlink()
-                except: pass
-
-            if not df_result_list:
+            if len(df_result) == 0:
                 print(f"No valid predictions generated for year {year}.")
                 continue
-                
-            df_result = pd.read_csv(RESULTS_DIR / f"{year}_predictions_{savename}.csv")
+
+            # Save CSV as backup
+            csv_dir = RESULTS_DIR / f"{year}_predictions_{savename}.csv"
+            df_result.to_csv(csv_dir, index=False)
                       
             # 6. Save flat table results
             df_result.to_parquet(RESULTS_DIR / f"{year}_buildings_with_predictions_{savename}.parquet")
@@ -1394,14 +1458,14 @@ if __name__ == "__main__":
         "nbands": 3,
         "batch_size": 16,
         "small_sample": False,
-        "n_epochs": 200,
+        "n_epochs": 100,
         "learning_rate": 0.00005,
         "sat_data": "aerial",
-        "years": [2022], # Only the data inside WSL! all data is: [2010, 2012, 2014, 2016, 2018, 2020, 2022, 2024],
-        "test_years": [],
+        "years": [2010, 2012, 2014, 2016, 2018, 2020, 2022, 2024], # Only the data inside WSL! all data is: [2010, 2012, 2014, 2016, 2018, 2020, 2022, 2024],
+        "test_years": [2016],
         "test_column": None,
         "extra": "",  # Extra info to add to the savename (e.g. for ablation studies)
     }
 
     # Run full pipeline
-    run(params, train=True, retrain=True, compute_loss=False, generate_predictions=True)
+    run(params, train=True, retrain=False, compute_loss=False, generate_predictions=True)
