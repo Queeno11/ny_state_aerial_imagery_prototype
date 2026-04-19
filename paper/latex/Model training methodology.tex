@@ -1,63 +1,110 @@
+\documentclass{article}
+\usepackage{graphicx} % Required for inserting images
+
+\title{NY Aerial Imagery}
+\author{Nicolas Abbate}
+\date{April 2026}
+
+\usepackage{etoolbox}
+\AtBeginEnvironment{quote}{\par\singlespacing\small}
 \usepackage{etoolbox}
 \AtBeginEnvironment{quote}{\par\singlespacing\small}
 \begin{document}
-\section{Computer Vision and Mixed Spatial-Temporal Siamese Architecture}
+\section{Computer Vision and Ordinal Triplet Ranking Architecture}
 
-To capture the full economic dynamics of the urban environment while ensuring strict out-of-sample generalizability across diverse urban typologies, our architecture is explicitly designed with a \textbf{dual objective}. First, it acts as an ordinal feature extractor to predict the relative ranking of neighborhood structural wealth at a given point in time. Second, it predicts the directional magnitude of structural change (gentrification or decay) across a multi-year panel. 
+At its core, the model takes as input an aerial image tile centered on a building footprint---together with a set of geographic covariates---and produces a single scalar score representing that building's relative structural wealth position at a given point in time. The full pipeline then aggregates these building-level scores to the census tract, maps their empirical quantiles to a target income distribution, and delivers zero-shot econometric estimates for any city without requiring additional labeled data.
 
-To achieve this without suffering from spatial cardinality mismatch or catastrophic forgetting, we employ a Mixed Spatial-Temporal Siamese framework. This architecture utilizes stochastic batch composition to simultaneously map the static visual hierarchy of wealth and regularize the network against temporal survey noise.
+The architecture is designed around a \textbf{dual objective}. First, it learns a monotonic ordinal continuum: the scalar score must strictly preserve the cross-sectional wealth ranking of buildings within a city at any given point in time. Second, it enforces temporal consistency: a physically stable building should occupy an invariant position on that continuum regardless of the year of observation, while a building that undergoes structural transformation should be displaced accordingly. Achieving both objectives simultaneously requires careful attention to which comparisons are econometrically valid.
 
-\subsection{Feature Extraction and Spatial Spillover ($\tau$)}
-To isolate the temporal learning mechanism from extraneous optical noise (e.g., building shadows, changes in sun angles and lighting), the prototype model utilizes rasterized vector building footprints sourced from the official New York City Department of Information Technology and Telecommunications (DoITT). 
+\paragraph{Theoretical grounding: inverse spatial sorting.}
+The model is motivated by the spatial sorting literature in urban economics \citep{ahlfeldt2015economics, diamond2016determinants}. In standard spatial equilibrium models, households sort across locations based on skill, intergenerational wealth endowments, and amenity preferences. Equilibrium prices capitalize the willingness-to-pay of the marginal bidder at each location, so the physical housing stock---its scale, quality, density, and morphology---reflects not merely architecture but the \textit{capitalized, permanent manifestation} of the long-run human wealth of its occupants. Human wealth here is understood in the permanent income sense: the expected present value of future earnings plus accumulated assets (skills and endowments).
 
-Because neighborhood wealth is influenced by localized externalities, the visual input for tract $i$ is not strictly bounded by its census geometry. We introduce a \textbf{spatial spillover hyperparameter, $\tau$}, defined as a buffer radius (in meters) extending beyond each building centroid. Let $X_{i,t}^\tau$ represent the multi-channel rasterized matrix of tract $i$ in year $t \in \{2008, 2010, 2012, 2014, 2016, 2018, 2020, 2022, 2024\}$ inclusive of the $\tau$-meter spillover, encoding the features latent in the aerial imagery.
-Because neighborhood wealth is influenced by localized externalities, the visual input for tract $i$ is not strictly bounded by its census geometry. We introduce a \textbf{spatial spillover hyperparameter, $\tau$}, defined as a buffer radius (in meters) extending beyond each building centroid. Let $X_{b, i,t}^\tau$ represent the multi-channel matrix of building $b$ in tract $i$ in year $t \in \{2008, 2010, 2012, 2014, 2016, 2018, 2020, 2022, 2024\}$ inclusive of the $\tau$-meter spillover, encoding the features latent in the aerial imagery. 
+This model inverts that mechanism. Rather than predicting sorting from fundamentals, it observes the durable physical capital of a neighborhood and recovers the baseline human wealth required to successfully outbid all others for that locational and structural bundle. Formally, the scalar output $\hat{R}_{b,i,t}$ can be interpreted as a \textit{latent monotonic mapping of human wealth}: it preserves the strict ordering of the present-discounted income expectations of the marginal occupant across buildings, without claiming to recover the cardinal dollar value of those expectations. This monotonic---but not cardinal---interpretation is precisely what the spatial equilibrium supports: the equilibrium pins down who wins the bid, not the exact magnitude of the winning bid.
 
-We define a feature extraction sub-network, $f_\theta(\cdot)$, parameterized by weights $\theta$. This sub-network projects the physical infrastructure matrix into a lower-dimensional latent representation, $h_{b,i,t} \in \mathbb{R}^d$:
+\paragraph{The comparability constraint.}
+This theoretical interpretation disciplines which comparisons the model may learn from. The network is a deterministic function of the image tile and its covariates. Given the same physical structure and the same local environment, it must produce the same score---this is not merely a desirable property but a logical consequence of the human wealth interpretation: a stable building in an unchanged neighborhood represents the same latent wealth bundle across time, so its mapping must be invariant. This gives rise to a strict comparability constraint on valid training pairs.
+
+Two observations of the same building at different times---$(b, i, t)$ and $(b, i, t')$---are \textit{directly comparable}. If no structural change has occurred, the human wealth bundle is identical and the scores should agree; if change has occurred, the displacement in score space is identified by the change in the bundle itself. Two different buildings observed in the \textit{same} year---$(b, i, t)$ and $(c, j, t)$---are also \textit{directly comparable}, since both are positioned within the same city-wide income distribution at the same moment in time and the cross-sectional ordering is well-defined.
+
+However, comparing a building across \textit{both} dimensions simultaneously---$(b, i, t)$ against $(c, j, t')$ for $b \neq c$ and $t \neq t'$---is \textbf{not valid}. While such a comparison is numerically computable, it is economically unidentified: the monotonic transformation from visual features to wealth quantile is city-year specific, and as the city's overall income distribution shifts over time, that transformation itself changes. A different building at a different time is positioned within a \textit{shifted} distribution, so the direction of any observed difference in scores conflates the spatial wealth gradient with aggregate temporal drift and cannot be given a structural interpretation. The entire triplet construction and loss design is organized around this constraint: the model is only ever asked to learn from pairs belonging to one of the two valid comparison sets. Additionally, pairs drawn from the \textit{same} census tract are excluded from training entirely: ACS income labels are assigned at the tract level and therefore carry no within-tract variation, and the high spatial autocorrelation of building morphology within a tract means the visual signal is near-identical. Such pairs provide no informative gradient and are discarded.
+
+To enforce these objectives without introducing spatial cardinality mismatch or temporal label drift, we adopt a \textbf{Triplet Margin Ranking Loss} framework and abandon cardinal regression entirely. The loss supervises only the \textit{direction} of pairwise score differences, never their magnitude. This resolves the label-inconsistency problem inherent in longitudinal ACS data: under any magnitude-sensitive loss, a physically stable neighborhood artificially drifts downward in relative rank as the broader city's housing stock grows, producing corrupted gradients. By supervising direction alone, the model learns a transport function that connects how buildings behave over time without anchoring to historically corrupted magnitudes.
+
+\subsection{Image Input and Spatial Spillover ($\tau$)}
+
+Building footprint polygons are sourced from the official New York City Department of Information Technology and Telecommunications (DoITT) dataset. These polygons are used exclusively to identify building centroids; the polygon geometry itself is never fed to the network. Instead, for each building $b$, the model receives a raw multi-spectral aerial image tile centered on the building's centroid.
+
+Because neighborhood wealth is shaped by localized externalities that extend beyond any single structure, the image tile is not clipped to the building footprint. We introduce a \textbf{spatial spillover hyperparameter, $\tau$}, defined as a buffer radius (in meters) around the centroid, so that the tile captures the immediate built environment surrounding the building. Let $X_{b,i,t}^\tau$ denote the aerial image tile of building $b$ in tract $i$ at year $t \in \{2008, 2010, 2012, 2014, 2016, 2018, 2020, 2022, 2024\}$, inclusive of the $\tau$-meter buffer.
+
+\subsection{Feature Extraction and Score Head}
+
+A feature extraction sub-network $f_\theta(\cdot)$, parameterized by weights $\theta$, encodes each image tile into a lower-dimensional latent representation:
 \begin{equation}
-h_{b,i,t} = f_\theta(X_{b,i,t}^\tau)
+h_{b,i,t} = f_\theta\!\left(X_{b,i,t}^\tau\right)
 \end{equation}
 
-A fully connected regression head, $g_\phi(\cdot)$ with weights $\phi$, then maps this physical embedding to a continuous scalar ranking score, representing the tract's relative structural wealth position:
+A fully connected score head $g_\phi(\cdot)$, with weights $\phi$, then projects this latent representation onto a single continuous scalar:
 \begin{equation}
 \hat{R}_{b,i,t} = g_\phi(h_{b,i,t})
 \end{equation}
 
-Inside each tract $i$, every building $b$ has the same relative rank $\hat{R}_{b,i,t} = \hat{R}_{i,t}$. We exploit the fact that there is a strong spatial correlation in building morphology within a tract, and interpret the differences between the real unobserved ranking and the ground truth ranking as measurement errors. Because the model is never feed with more than a few buildings per tract per epoch, it is forced to learn the underlying structural hierarchy of wealth without overfitting to the visual noise of individual buildings.
+This scalar $\hat{R}_{b,i,t}$ represents the building's position on the ordinal poor-to-rich continuum. Within a census tract $i$, buildings share the same underlying socioeconomic context, so in expectation $\hat{R}_{b,i,t} = \hat{R}_{i,t}$ for all $b$. Deviations across buildings within the same tract are treated as measurement error. Because the model is never fed more than a few buildings per tract per epoch, it is regularized against overfitting to the visual idiosyncrasies of individual structures and is instead forced to learn the structural hierarchy of wealth at the neighborhood level.
 
 \subsection{Out-of-Sample Generalizability and Quantile Mapping}
-A core methodological innovation of this architecture is the intentional discarding of spatial cardinality during cross-sectional training. Urban topologies scale differently; a one-standard-deviation increase in structural wealth in New York manifests vertically, whereas in Dallas, it manifests horizontally. By constraining the network to act strictly as a monotonic ordinal ranker within a specific city's batch, we prevent the model from overfitting to the topological density of the training data. 
 
-To deploy this model in a purely out-of-sample city (e.g., Boston), we compute the continuous ranking scores ($\hat{R}$) for all target tracts based purely on their physical morphology. We then compute their empirical quantiles and map them directly to the corresponding quantiles of the target city's actual American Community Survey (ACS) income distribution, allowing for zero-shot econometric moment matching.
+A core methodological commitment of this architecture is the intentional discarding of spatial cardinality at every stage of training and deployment. Urban morphologies scale differently: a one-standard-deviation increase in structural wealth in New York City manifests vertically, in building height and facade quality, whereas in Dallas the same gradient manifests horizontally, in lot size and setback. A model that learns absolute topological anchors from one city's training data will not transfer cleanly to another. By constraining the network to act as a pure monotonic ordinal ranker, we decouple the learned embedding from city-specific scaling.
 
-\subsection{Stochastic Batch Composition}
-We utilize a stochastic weighting strategy via batch composition. Each training batch of size $B$ is explicitly stratified into three pair types to force the network to learn a universal ordinal hierarchy:
+Deployment to an out-of-sample city (e.g., Boston) proceeds as follows. The model computes scalar scores $\hat{R}$ for all target buildings based solely on their aerial imagery. Empirical quantiles of these scores are then mapped directly to the corresponding quantiles of the target city's ACS income distribution, delivering zero-shot econometric moment matching without any fine-tuning on labeled local data.
 
-\begin{itemize}
-    \item \textbf{Spatial Pairs (80\%):} Pairs of distinct buildings drawn from different tracts but within the same city and year $(X_{b,i,t}^\tau, X_{c,j,t}^\tau)$. To prevent the network from overfitting to visual noise within identical socio-economic contexts, spatial pairs are strictly constrained to distinct GEOIDs, ensuring the model assesses structural gradients across genuine geographic bounds.
-    \item \textbf{Stable Temporal Pairs (10\%):} Pairs of the \textit{same} physical building structure across time $(X_{b,i,t_a}^\tau, X_{b,i,t_b}^\tau)$ where the econometrically cleared Macro Gate indicates no structural change ($I_i^{valid} = 0$). Crucially, for these pairs, the network ignores the natural temporal drift in their relative cross-sectional Z-scores (economic filtering) and exclusively penalizes divergence in their latent physical embeddings.
-    \item \textbf{Changing Temporal Pairs (10\%):} Pairs of the \textit{same} physical building structure across time $(X_{b,i,t_a}^\tau, X_{b,i,t_b}^\tau)$ where valid structural change occurred ($I_i^{valid} = 1$).
-\end{itemize}
+\subsection{Triplet Construction and Stochastic Batch Composition}
 
-\subsection{Unified Pairwise Difference Regression Loss}
-To ensure out-of-sample generalization by structurally discarding spatial cardinality, we frame the objective as a continuous relative difference problem \cite{parikh2011relative}. We train the network to minimize the pairwise squared error between predicted and true relative score differences \cite{daudt2018fully, chen2021remote, burges2005learning}. This unifies the cross-sectional ranking and temporal change objectives under a single differentiable loss function that is translation-invariant by construction.
+Every triplet is organized around a \textbf{stable temporal positive pair}, operationalizing the first valid comparison set. The anchor is a building $b$ in tract $i$ observed at year $t$. The positive is the same building at a different year $t'$, conditional on no structural change having occurred in the intervening period ($I_{b,i}^{valid}(t \to t') = 0$):
 
-For any pair of observations $u$ and $v$ drawn from our stochastically composed batch $\mathbb{B}$, let $\hat{R}_u$ and $\hat{R}_v$ be their predicted scalar scores, and $L_u$ and $L_v$ be their true year-specific ACS econometric labels. The unified pairwise loss is defined as:
 \begin{equation}
-\mathcal{L}_{pair}(\theta, \phi) = \frac{1}{|\mathbb{B}|} \sum_{(u, v) \in \mathbb{B}} \left[ \left(\hat{R}_{u} - \hat{R}_{v}\right) - \left(L_{u} - L_{v}\right) \right]^2
+\mathcal{A} = X_{b,i,t}^\tau, \qquad \mathcal{P} = X_{b,i,t'}^\tau \quad \text{s.t.} \quad I_{b,i}^{valid}(t \to t') = 0
 \end{equation}
 
-This single formulation gracefully handles all three pair types in our stochastic batch composition natively:
+This construction encodes the comparability constraint directly into the training data: the only observations treated as ``equivalent'' are those for which temporal identity is physically verified. Cross-sectional positive pairs---two \textit{different} buildings assigned the same income rank---are never constructed. Since cross-sectional wealth rankings constitute a strict totally ordered set, any apparent label equality between distinct buildings reflects ACS measurement noise rather than true economic equivalence. Forcing different buildings to occupy the same point on the continuum would distort the ordinal structure the model is meant to learn.
+
+The negative is sampled under two regimes, governed by the tunable hyperparameter $\lambda$, each corresponding to one of the two valid comparison sets:
+
 \begin{itemize}
-    \item \textbf{Spatial Pairs:} The target is $L_i - L_j$. The model learns to reproduce the full continuous magnitude of cross-sectional wealth differences rather than just their directional ranking, effectively discarding absolute topological anchors while capturing nuanced relative hierarchies.
-    \item \textbf{Stable Temporal Pairs:} The target is explicitly forced to $0$. Because a deterministic CNN must output identical scalars for identical physical inputs, supervising on the noisy, non-zero ACS economic drift would induce gradient gridlock. By setting the target difference to zero, the pairwise formulation elegantly simplifies into a Siamese robustness penalty $(R_{b,i,t_b} - R_{b,i,t_a})^2$, forcing the model to strictly ignore transient survey noise.
-    \item \textbf{Changing Temporal Pairs:} The target is the intertemporal difference $L_{i,t_b} - L_{i,t_a}$. Because MSE penalizes missed magnitudes quadratically, it provides a strong, natural gradient signal proportional to the severity of the structural change, removing the need for an engineered dynamic margin.
+    \item \textbf{$\lambda$-case --- Cross-Sectional Negative (default $\lambda = 0.8$):} The negative is a different building $c$ from tract $j \neq i$, drawn from the \textit{same} year $t$ as the anchor, operationalizing the second valid comparison set. Buildings from the same census tract as the anchor ($j = i$) are excluded: ACS labels carry no within-tract variation by construction, and the high spatial autocorrelation of building morphology within a tract means the visual signal provides no informative gradient. To further avoid injecting corrupted gradients into the middle of the distribution---where ACS sampling noise can reverse the true ordering---the negative pool is additionally restricted to buildings whose ACS confidence intervals do not overlap with the anchor's. This regime trains the model's monotonic cross-sectional ordering.
+
+    \item \textbf{$(1-\lambda)$-case --- Temporal Change Negative (default $1 - \lambda = 0.2$):} The negative is the \textit{same} anchor building $b$ observed at a year $t''$ where structural change did occur ($I_{b,i}^{valid}(t \to t'') = 1$). This is again a temporally valid comparison (same building, different time), but now supervising the opposite signal: physical transformation should displace the embedding, while stability should not.
 \end{itemize}
+
+Crucially, no triplet ever pairs a building at one time against a \textit{different} building at a \textit{different} time. Such cross-spatiotemporal comparisons would conflate the spatial wealth gradient with temporal drift in the city-wide income distribution, violating the comparability constraint and producing unidentified supervision signals.
+
+Anchors are sampled uniformly within each regime. The global ordinal position of structurally changed buildings is recovered across training through their appearance as anchors in $\lambda$-case batches, where cross-sectional negatives from the same year place them correctly within the city-wide distribution.
+
+\subsection{Triplet Margin Ranking Loss}
+
+Because the embedding space is one-dimensional and the network is explicitly required to produce a monotonic poor-to-rich continuum, an unsigned distance triplet loss is insufficient. In high-dimensional metric learning, unsigned distance is appropriate because the embedding has no intrinsic axis; here, by contrast, we require a strict directional ordering. An unsigned formulation would allow a luxury building to satisfy the margin constraint by scoring \textit{below} the anchor rather than above it, leaving the global ordering unidentified. We therefore substitute a signed distance for the negative side of the standard triplet loss while retaining unsigned distance on the positive pair, where no directionality needs to be enforced.
+
+Let $y_{\mathcal{A},\mathcal{N}} \in \{+1, -1\}$ be a directional indicator: $y = +1$ if $\mathcal{N}$ is richer than $\mathcal{A}$, and $y = -1$ if $\mathcal{N}$ is poorer. To prevent the two objectives from being traded off against each other inside a shared hinge, the temporal stability penalty and the directional ranking loss are decoupled into an additive sum:
+
+\begin{equation}
+\mathcal{L}(\theta, \phi) = \frac{1}{|\mathbb{B}|} \sum_{(\mathcal{A}, \mathcal{P}, \mathcal{N}) \in \mathbb{B}} \left[ \left|\hat{R}_\mathcal{A} - \hat{R}_\mathcal{P}\right| + \max\!\left(0,\; -y_{\mathcal{A},\mathcal{N}}\!\left(\hat{R}_\mathcal{N} - \hat{R}_\mathcal{A}\right) + m \right) \right]
+\end{equation}
+
+The first term, $|\hat{R}_\mathcal{A} - \hat{R}_\mathcal{P}|$, is an unconditional L1 stability penalty: it contributes a nonzero gradient whenever the stable temporal twin scores differently from the anchor, regardless of how the negative is positioned. Placing this term outside the hinge is essential: were it nested inside a shared \texttt{max()}, the network could zero the loss---and kill the gradient on the stability term entirely---simply by driving $\hat{R}_\mathcal{N}$ to an extreme value, substituting cheap ranking separation for genuine temporal invariance. The second term, $\max(0,\; -y_{\mathcal{A},\mathcal{N}}(\hat{R}_\mathcal{N} - \hat{R}_\mathcal{A}) + m)$, enforces directional ordering with a hinge: if $\mathcal{N}$ is richer ($y = +1$), it is zero only when $\hat{R}_\mathcal{N} \geq \hat{R}_\mathcal{A} + m$; if $\mathcal{N}$ is poorer ($y = -1$), the constraint is symmetric in the opposite direction. This constructs the monotonic continuum that unsigned distance cannot. The decoupled structure also reflects the theoretical independence of the two objectives: temporal stability and cross-sectional ordering derive from separate comparability sets and should contribute independently to the total loss.
+
+A unified directional indicator $y_{\mathcal{A},\mathcal{N}}$ is applied consistently across both triplet regimes:
+\begin{itemize}
+    \item \textbf{$\lambda$-case:} $y_{\mathcal{A},\mathcal{N}}$ is read directly from ACS labels. Because anchor and negative are drawn from the same year, the cross-sectional comparison is identified and the direction is unambiguous.
+    \item \textbf{$(1-\lambda)$-case:} $y_{\mathcal{A},\mathcal{N}}$ is set from the direction of structural change, determined by the sign of the statistically significant ACS difference between $t$ and $t''$: $y = +1$ if the building gentrified (income rose) and $y = -1$ if it decayed. While the global ordinal position of structurally changed buildings is ultimately recovered through their appearance as anchors in $\lambda$-case batches, applying the signed constraint here is not incorrect and yields a conceptually unified loss: in both regimes, the model is always asked the same question---which of the two buildings in a valid comparison set is richer.
+\end{itemize}
+
+This formulation does not reintroduce cardinality. The stability penalty targets zero, not an ACS magnitude. The signed ranking term uses only $y \in \{+1, -1\}$, which is the \textit{sign} of an ACS difference, not its magnitude. The margin $m$ is a static hyperparameter calibrated to the standard deviation of the score head at initialization and carries no economic information.
+
+\paragraph{Relation to the literature.} The ranking component of the loss in Equation~(4)---the term $\max(0,\; -y(x_1 - x_2) + m)$---is identical to PyTorch's \texttt{nn.MarginRankingLoss} \citep{paszke2019pytorch}, which implements the standard pairwise ranking objective introduced by \citet{joachims2002optimizing} in the context of SVM-based learning to rank. The broader family of pairwise ranking losses---of which this is the directional, margin-augmented variant---is surveyed in \citet{liu2009learning}. \citet{burges2005learning} (RankNet) adopts a probabilistic pairwise formulation with the same directional supervision structure but replaces the hinge with a cross-entropy surrogate; the hinge-margin version used here is preferred in settings where the ordinal structure is deterministic rather than stochastic, as is the case when ACS confidence intervals provide a hard significance threshold for direction. The combination of an unconditional L1 stability penalty on positive pairs with a directional ranking hinge on negatives is structurally analogous to the Large Margin Nearest Neighbor objective of \citet{weinberger2009distance}, adapted here from metric space to a 1-D scalar continuum. To our knowledge, this specific combination---signed ordinal supervision with stable temporal anchors and directional structural change indicators---has not been applied previously in the satellite-imagery-for-economics literature, where existing work relies on cross-sectional regression \citep{jean2016combining} or cardinal pairwise differences \citep{yeh2020using} rather than a purely ordinal framework.
 
 \subsection*{Summary of Core Architectural Hyperparameters}
 \begin{itemize}
-    \item \textbf{$\tau$ (Spillover Threshold):} Determines the spatial context window (in meters) beyond the building centroid to capture localized externalities.
-    \item \textbf{Batch Split $(\rho_{spatial}, \rho_{stable}, \rho_{change})$:} Set to (0.8, 0.1, 0.1) to define the stochastic probability of drawing a cross-sectional comparison versus temporal regularization pairs.
+    \item \textbf{$\tau$ (Spillover Radius):} Buffer radius (in meters) around the building centroid defining the spatial extent of each aerial image tile.
+    \item \textbf{$\lambda$ (Batch Regime Split):} Proportion of triplets using a cross-sectional negative ($\lambda$) versus a temporal change negative ($1 - \lambda$). Default: $\lambda = 0.8$.
+    \item \textbf{$m$ (Triplet Margin):} Static margin enforcing minimum score separation between positive and negative distances. Calibrated to the standard deviation of the score head at initialization.
 \end{itemize}
 
 \end{document}
