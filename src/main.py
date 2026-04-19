@@ -1393,6 +1393,11 @@ def predict_buildings(model, dataloader, device, output_path, verbose=True):
     model.eval()
     first_write = True
 
+    # Create output directory if it doesn't exist
+    output_dir = os.path.dirname(output_path)
+    if output_dir and not os.path.exists(output_dir):
+        os.makedirs(output_dir, exist_ok=True)
+
     if verbose:
         print(f"Starting inference on {len(dataloader.dataset)} items...")
 
@@ -1687,10 +1692,10 @@ def run(
             transforms.Normalize(mean=mean, std=std)  # 🔴 ImageNet Normalization — must match training
         ])
         
-        for year in [2024]:
+        for year in [2018,2020,2022]:
 
             print(f"\n--- Processing Predictions for Year: {year} ---")
-            df_year = df_all[df_all["year"] == year].copy()
+            df_year = df_all[(df_all["year"] == year) & (df_all["type"] == "test")].copy()
             if df_year.empty:
                 print(f"No data for year {year}, skipping.")
                 continue
@@ -1708,7 +1713,7 @@ def run(
                 eval_transform=eval_transform
             )
             
-            output_path = RESULTS_DIR / f"{savename}/{year}_predictions.csv"
+            output_path = RESULTS_DIR / f"{savename}/{year}_predictions_test.csv"
             predict_buildings(model, prediction_loader, device, output_path, verbose=True)
             df_result = pd.read_csv(output_path)
 
@@ -1747,7 +1752,7 @@ if __name__ == "__main__":
         "nbands": 3,
         "batch_size": int(16 / 2),
         "small_sample": False,
-        "n_epochs": 100,
+        "n_epochs": 200,
         "learning_rate": 0.00005,
         "sat_data": "aerial",
         "years": [2010, 2012, 2014, 2016, 2018, 2020, 2022, 2024], # Only the data inside WSL! all data is: [2010, 2012, 2014, 2016, 2018, 2020, 2022, 2024],
@@ -1757,4 +1762,4 @@ if __name__ == "__main__":
     }
 
     # Run full pipeline
-    run(params, train=True, retrain=False, compute_loss=False, generate_predictions=True)
+    run(params, train=False, retrain=False, compute_loss=False, generate_predictions=True)
