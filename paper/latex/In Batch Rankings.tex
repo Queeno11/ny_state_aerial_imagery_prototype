@@ -1,0 +1,77 @@
+\documentclass[12pt]{article}
+\usepackage[utf8]{inputenc}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{geometry}
+\geometry{a4paper, margin=1in}
+
+\title{Methodological Update: In-Batch Ordinal Pairwise Ranking}
+\author{}
+\date{}
+
+\begin{document}
+
+\maketitle
+
+\section{Motivation: From Isolated Triplets to In-Batch Ranking}
+
+While the theoretical properties of the decoupled Triplet Margin Ranking Loss ensure economic comparability and prevent longitudinal label drift, constructing isolated $(A, P, N)$ triplets offline introduces severe computational inefficiencies and gradient instability. Passing three full-resolution images through a Vision Transformer to extract a single pairwise gradient discards over 98\% of the viable cross-sectional supervision available within a mini-batch. Furthermore, adaptive margins calibrated on isolated triplets are vulnerable to variance collapse early in training.
+
+To resolve this, we transition the architecture to an \textbf{In-Batch Pairwise Ranking} framework. This approach strictly preserves the theoretical ``Comparability Constraint'' defined in the core methodology—we still only compare buildings within the same year, or the same building across different years—but it maximizes supervision density by computing all valid pairwise constraints simultaneously from a single, unified forward pass.
+
+\section{Batch Construction and Sampling Strategy}
+
+Instead of pre-assembling triplets, the dataloader constructs a stochastically stratified hybrid batch, $\mathcal{B}$, composed of two subsets: a cross-sectional core and a temporal auxiliary set.
+
+\subsection{1. The Cross-Sectional Core ($\mathcal{B}_{cs}$)}
+\begin{itemize}
+    \item \textbf{Source:} We randomly select a single anchor year, $t$. We then sample $B$ distinct buildings observed in year $t$.
+    \item \textbf{Purpose:} To map the cross-sectional ordinal wealth distribution of the city at a fixed point in time.
+    \item \textbf{Spatial Exclusion:} During loss computation, pairs drawn from the same census tract will be strictly masked out, as American Community Survey (ACS) labels provide no intra-tract variance.
+\end{itemize}
+
+\subsection{2. The Temporal Auxiliary Set ($\mathcal{B}_{temp}$)}
+\begin{itemize}
+    \item \textbf{Source:} For a subset of the $B$ buildings in $\mathcal{B}_{cs}$, we query the longitudinal panel for observations in a different year, $t' \neq t$. 
+    \item \textbf{Stable Twins ($\mathcal{B}_{stable}$):} If building $k$ exists in $t'$ and underwent no structural change ($I_{k}^{valid}(t \to t') = 0$), the image for $t'$ is added to the batch.
+    \item \textbf{Changed Twins ($\mathcal{B}_{change}$):} If building $k$ exists in $t'$ but underwent statistically significant structural change ($I_{k}^{valid}(t \to t') = 1$), the image for $t'$ is added to the batch.
+    \item \textbf{Purpose:} To anchor the latent continuum over time. Stable twins enforce absolute temporal invariance (L1 penalty), while changed twins enforce directional rank mobility (signed hinge).
+\end{itemize}
+
+\section{Mathematical Formulation of the Loss}
+
+A single forward pass encodes the entire batch $\mathcal{B} = \mathcal{B}_{cs} \cup \mathcal{B}_{temp}$ into a vector of scalar scores, $\hat{R}$. The total loss is defined as the decoupled sum of three objectives computed over valid subsets of these scores.
+
+\subsection{Cross-Sectional Ranking (The Unique Pairs Correction)}
+For the $B$ cross-sectional images in year $t$, we compute the directional hinge loss. A naive implementation evaluating the full $B \times B$ score difference matrix would calculate every pair twice (e.g., comparing $k$ to $l$, and $l$ to $k$). Because the signed hinge loss is perfectly symmetric—reversing the order flips both the target direction $y_{k,l}$ and the predicted difference $(\hat{R}_l - \hat{R}_k)$—the resulting loss is identical: $L_{k,l} \equiv L_{l,k}$. Computing both directions double-counts the gradient without adding information.
+
+We therefore restrict comparisons strictly to the upper triangular indices (the unique, undirected pairs). Let $\mathcal{U}$ be the set of unique pairs $(k, l)$ such that $1 \leq k < l \leq B$. We define the valid cross-sectional subset $\mathcal{U}_{valid} \subset \mathcal{U}$ as all unique pairs where building $k$ and building $l$ reside in \textit{different} census tracts.
+
+Let $y_{k,l} \in \{-1, 1\}$ represent the true economic ordering from the ACS (where $+1$ indicates $l$ is richer than $k$). The cross-sectional loss is:
+\begin{equation}
+\mathcal{L}_{cross} = \frac{1}{|\mathcal{U}_{valid}|} \sum_{(k,l) \in \mathcal{U}_{valid}} \max\left(0,\; -y_{k,l}(\hat{R}_l - \hat{R}_k) + m\right)
+\end{equation}
+For a batch of $B=64$, this yields exactly $64 \times 63 / 2 = 2,016$ unique ranking constraints per step. 
+
+\textit{Margin Note:} To prevent collapse, the margin $m$ is defined dynamically with a hard floor: $m = \max(m_{min},\; \alpha \cdot \sigma_{batch})$, where $\sigma_{batch}$ is the detached standard deviation of $\hat{R}$ for the cross-sectional core.
+
+\subsection{Temporal Stability Penalty}
+For buildings in the stable temporal subset $\mathcal{B}_{stable}$, the latent human wealth bundle is physically identical between year $t$ and year $t'$. To enforce temporal invariance regardless of shifting city-wide distributions, we apply an unconditional L1 penalty:
+\begin{equation}
+\mathcal{L}_{stable} = \frac{1}{|\mathcal{B}_{stable}|} \sum_{k \in \mathcal{B}_{stable}} \left| \hat{R}_{k,t} - \hat{R}_{k,t'} \right|
+\end{equation}
+
+\subsection{Temporal Change Ranking}
+For buildings in the changed temporal subset $\mathcal{B}_{change}$, physical alteration identifies a shift in the human wealth bundle. Let $y_{k, t \to t'} \in \{-1, 1\}$ indicate the direction of the structural change (e.g., $+1$ if the tract gentrified between $t$ and $t'$). We supervise this displacement using the same directional hinge formulation applied across time for the \textit{same} building:
+\begin{equation}
+\mathcal{L}_{change} = \frac{1}{|\mathcal{B}_{change}|} \sum_{k \in \mathcal{B}_{change}} \max\left(0,\; -y_{k,t\to t'}(\hat{R}_{k,t'} - \hat{R}_{k,t}) + m\right)
+\end{equation}
+
+\subsection{Total Objective}
+The final unified objective aggregates these valid comparisons:
+\begin{equation}
+\mathcal{L}_{total} = \mathcal{L}_{cross} + \lambda_{s} \mathcal{L}_{stable} + \lambda_{c} \mathcal{L}_{change}
+\end{equation}
+where $\lambda_s$ and $\lambda_c$ are weighting hyperparameters (typically set to 1.0) governing the relative influence of the temporal constraints against the cross-sectional spatial baseline.
+
+\end{document}
