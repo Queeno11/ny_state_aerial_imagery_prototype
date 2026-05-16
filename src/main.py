@@ -75,6 +75,17 @@ class CyclicCacheManager:
         max_jitter=10,
     ):
         self.df = df
+        
+        # [NEW] Group temporal twins together so they end up in the same shard
+        if type == "train":
+            print("Sorting dataframe to group DOITT_IDs for temporal sampling...")
+            doitts = self.df['DOITT_ID'].unique()
+            np.random.shuffle(doitts)  # Shuffle groups to maintain randomness
+            cat_type = pd.CategoricalDtype(categories=doitts, ordered=True)
+            self.df['DOITT_ID_cat'] = self.df['DOITT_ID'].astype(cat_type)
+            self.df = self.df.sort_values(['DOITT_ID_cat', 'year']).reset_index(drop=True)
+            self.df.drop('DOITT_ID_cat', axis=1, inplace=True)
+        
         self.all_years_datasets = all_years_datasets
         self.params = params
         self.max_jitter = max_jitter
@@ -182,215 +193,90 @@ class CyclicCacheManager:
         return list(subsampled)  # list of (C, H//step, W//step) uint8 tensors
 
     def _worker_generate(self, shard_id, show_progress=False):
-        is_train = self.type == "train"
         step = self.params["subsample_step"]
-        jitter_pad = math.ceil(self.max_jitter_pixels / step) * step if is_train else 0
+        jitter_pad = math.ceil(self.max_jitter_pixels / step) * step if self.type == "train" else 0
 
-        triplets_to_extract = []
-
-        if is_train:
-            triplets_per_shard = self.shard_size // 3
-            n_cross = int(0.80 * triplets_per_shard)
-            n_temp  = triplets_per_shard - n_cross
-
-            min_gap = self.params.get("min_label_gap", 0.2)
-            initial_max_gap = self.params.get("max_label_gap", 2.0)
-            final_max_gap = self.params.get("final_max_label_gap", 1.0)
-            
-            # Curriculum Learning: Shrink max_gap as training progresses
-            max_gap = initial_max_gap - self.progress * (initial_max_gap - final_max_gap)
-
-            # 1. Lambda-Case (Cross-Sectional Negatives)
-            years_avail = list(self.year_to_idxs.keys())
-            max_attempts = n_cross * 20
-            attempt = 0
-            collected = 0
-            while collected < n_cross and attempt < max_attempts:
-                attempt += 1
-                y_val = np.random.choice(years_avail)
-                pool = self.year_to_idxs[y_val]
-                if len(pool) < 2:
-                    continue
-                
-                idx_a, idx_n = np.random.choice(pool, 2, replace=False)
-                row_a, row_n = self.df.loc[idx_a], self.df.loc[idx_n]
-                
-                # Crucial spatial constraint: skip if from same census tract
-                if row_a.get('GEOID', None) == row_n.get('GEOID', None):
-                    continue
-                
-                # Semi-hard mining: label distance filter
-                label_gap = abs(row_n['Rel_Score'] - row_a['Rel_Score'])
-                if label_gap < min_gap or label_gap > max_gap:
-                    continue
-                
-                collected += 1
-                
-                # Positive pair (stable temporal twin if available)
-                d = row_a['DOITT_ID']
-                if row_a['Valid_Structural_Change'] == 0 and len(self.doitt_to_idxs.get(d, [])) > 1:
-                    p_pool = [i for i in self.doitt_to_idxs[d] if i != idx_a]
-                    idx_p = np.random.choice(p_pool) if p_pool else idx_a
-                else:
-                    idx_p = idx_a
-                row_p = self.df.loc[idx_p]
-                
-                # y_ind is +1 if N is richer than A, -1 if poorer
-                y_ind = 1.0 if row_n['Rel_Score'] > row_a['Rel_Score'] else -1.0
-                triplets_to_extract.append((row_a, row_p, row_n, y_ind))
-
-            # 2. (1-Lambda)-Case (Temporal Change Negatives)
-            if len(self.change_doitts) > 0:
-                max_attempts_temp = n_temp * 5
-                attempt_temp = 0
-                collected_temp = 0
-                while collected_temp < n_temp and attempt_temp < max_attempts_temp:
-                    attempt_temp += 1
-                    d = np.random.choice(self.change_doitts)
-                    pool = self.doitt_to_idxs.get(d, [])
-                    if len(pool) < 2:
-                        continue
-                    idx_a, idx_n = np.random.choice(pool, 2, replace=False)
-                    row_a, row_n = self.df.loc[idx_a], self.df.loc[idx_n]
-                    
-                    if row_a['year'] > row_n['year']:
-                        row_a, row_n = row_n, row_a
-                        
-                    # If this is a changing building, we assume no stable twin exists and skip computing L1 penalty.
-                    row_p = row_a
-
-                    y_ind = 1.0 if row_n['Rel_Score'] > row_a['Rel_Score'] else -1.0
-                    triplets_to_extract.append((row_a, row_p, row_n, y_ind))
-                    collected_temp += 1
-
-            np.random.shuffle(triplets_to_extract)
-
+        # Grab sequential chunk (twins are naturally adjacent now)
+        start_idx = (shard_id * self.shard_size) % len(self.df)
+        end_idx = start_idx + self.shard_size
+        if end_idx > len(self.df):
+            sampled_df = pd.concat([self.df.iloc[start_idx:], self.df.iloc[:end_idx % len(self.df)]])
         else:
-            # Validation mode
-            start_idx = shard_id * self.shard_size
-            end_idx = min(start_idx + self.shard_size, len(self.df))
             sampled_df = self.df.iloc[start_idx:end_idx]
-            if sampled_df.empty:
-                return
-            triplets_to_extract = [(row, None, None, None) for _, row in sampled_df.iterrows()]
 
-        # ---------------------------------------------------------
-        # Threaded Extraction
-        # ---------------------------------------------------------
-        valid_a, valid_p, valid_n, valid_y = [], [], [], []
-        valid_metas_a, valid_metas_p, valid_metas_n = [], [], []
+        if sampled_df.empty: return
+
+        items_to_extract = [(row, pos) for pos, (_, row) in enumerate(sampled_df.iterrows())]
+
+        valid_images, valid_scores, valid_geoids = [], [], []
+        valid_years, valid_doitt_ids, valid_change = [], [], []
+        valid_metas, valid_score_bins = [], []
+
         CHUNK_SIZE = 8
         MAX_EXTRACT_WORKERS = 4
 
         def _extract(item):
-            row_a, row_p, row_n, y_ind = item
-
-            if pd.isna(row_a["Rel_Score"]): return None
-            raw_a = self._extract_raw_image(row_a, n_bands=self.params["nbands"], pad=jitter_pad)
-            if raw_a is None: return None
-
-            if row_p is not None:
-                if pd.isna(row_p["Rel_Score"]): return None
-                raw_p = self._extract_raw_image(row_p, n_bands=self.params["nbands"], pad=jitter_pad)
-                if raw_p is None: return None
-            else:
-                raw_p = None
-
-            if row_n is not None:
-                if pd.isna(row_n["Rel_Score"]): return None
-                raw_n = self._extract_raw_image(row_n, n_bands=self.params["nbands"], pad=jitter_pad)
-                if raw_n is None: return None
-            else:
-                raw_n = None
-
-            return raw_a, raw_p, raw_n, y_ind, row_a, row_p, row_n
+            row, pos = item
+            if pd.isna(row["Rel_Score"]): return None
+            raw_img = self._extract_raw_image(row, n_bands=self.params["nbands"], pad=jitter_pad)
+            if raw_img is None: return None
+            return raw_img, row
 
         with ThreadPoolExecutor(max_workers=MAX_EXTRACT_WORKERS) as pool:
-            futures = [pool.submit(_extract, item) for item in triplets_to_extract]
-            iterator = as_completed(futures)
-            if show_progress:
-                iterator = tqdm(iterator, total=len(futures), desc=f"Generating shard {shard_id}")
+            futures = [pool.submit(_extract, item) for item in items_to_extract]
+            iterator = tqdm(as_completed(futures), total=len(futures), desc=f"Generating shard {shard_id}") if show_progress else as_completed(futures)
 
-            raw_chunk_a, raw_chunk_p, raw_chunk_n = [], [], []
-            chunk_mu_a, chunk_mu_p, chunk_mu_n, chunk_y = [], [], [], []
-            
+            raw_chunk, chunk_meta = [], []
             for future in iterator:
                 res = future.result()
-                if res is None:
-                    continue
-                raw_a, raw_p, raw_n, y_ind, row_a, row_p, row_n = res
+                if res is None: continue
+                raw_img, row = res
+                
+                raw_chunk.append(raw_img)
+                chunk_meta.append(row)
 
-                raw_chunk_a.append(raw_a)
-                chunk_mu_a.append(row_a.get("dist_to_center", 0.0))
-
-                if raw_p is not None and raw_n is not None:
-                    raw_chunk_p.append(raw_p)
-                    raw_chunk_n.append(raw_n)
-                    chunk_y.append(y_ind)
-                    chunk_mu_p.append(row_p.get("dist_to_center", 0.0))
-                    chunk_mu_n.append(row_n.get("dist_to_center", 0.0))
-                else:
-                    chunk_y.append(row_a['Rel_Score'])
-
-                if len(raw_chunk_a) >= CHUNK_SIZE:
-                    processed_a = self._batch_subsample_and_convert(raw_chunk_a)
-                    processed_p = self._batch_subsample_and_convert(raw_chunk_p) if raw_chunk_p else [None] * len(processed_a)
-                    processed_n = self._batch_subsample_and_convert(raw_chunk_n) if raw_chunk_n else [None] * len(processed_a)
-                    
-                    mu_iter_p = chunk_mu_p if chunk_mu_p else [None] * len(processed_a)
-                    mu_iter_n = chunk_mu_n if chunk_mu_n else [None] * len(processed_a)
-
-                    for pa, pp, pn, y, ma, mp, mn in zip(processed_a, processed_p, processed_n, chunk_y, chunk_mu_a, mu_iter_p, mu_iter_n):
-                        if pa.max() > 0 and (pp is None or pp.max() > 0) and (pn is None or pn.max() > 0):
-                            valid_a.append(pa)
-                            valid_y.append(y)
-                            valid_metas_a.append(ma)
-                            if pp is not None and pn is not None:
-                                valid_p.append(pp)
-                                valid_n.append(pn)
-                                valid_metas_p.append(mp)
-                                valid_metas_n.append(mn)
-
-                    raw_chunk_a.clear(); raw_chunk_p.clear(); raw_chunk_n.clear()
-                    chunk_y.clear(); chunk_mu_a.clear(); chunk_mu_p.clear(); chunk_mu_n.clear()
+                if len(raw_chunk) >= CHUNK_SIZE:
+                    processed = self._batch_subsample_and_convert(raw_chunk)
+                    for img_tensor, r in zip(processed, chunk_meta):
+                        if img_tensor.max() > 0:
+                            valid_images.append(img_tensor)
+                            valid_scores.append(r['Rel_Score'])
+                            valid_geoids.append(hash(str(r.get('GEOID', ''))) % (2**31))
+                            valid_years.append(r['year'])
+                            valid_doitt_ids.append(r['DOITT_ID'])
+                            valid_change.append(r.get('Valid_Structural_Change', 0)) # Save change flag!
+                            valid_metas.append(r.get("dist_to_center", 0.0))
+                            valid_score_bins.append(r.get("score_bin", 0))
+                    raw_chunk.clear(); chunk_meta.clear()
 
             # Process remainder
-            if raw_chunk_a:
-                processed_a = self._batch_subsample_and_convert(raw_chunk_a)
-                processed_p = self._batch_subsample_and_convert(raw_chunk_p) if raw_chunk_p else [None] * len(processed_a)
-                processed_n = self._batch_subsample_and_convert(raw_chunk_n) if raw_chunk_n else [None] * len(processed_a)
-                
-                mu_iter_p = chunk_mu_p if chunk_mu_p else [None] * len(processed_a)
-                mu_iter_n = chunk_mu_n if chunk_mu_n else [None] * len(processed_a)
-
-                for pa, pp, pn, y, ma, mp, mn in zip(processed_a, processed_p, processed_n, chunk_y, chunk_mu_a, mu_iter_p, mu_iter_n):
-                    if pa.max() > 0 and (pp is None or pp.max() > 0) and (pn is None or pn.max() > 0):
-                        valid_a.append(pa)
-                        valid_y.append(y)
-                        valid_metas_a.append(ma)
-                        if pp is not None and pn is not None:
-                            valid_p.append(pp)
-                            valid_n.append(pn)
-                            valid_metas_p.append(mp)
-                            valid_metas_n.append(mn)
+            if raw_chunk:
+                processed = self._batch_subsample_and_convert(raw_chunk)
+                for img_tensor, r in zip(processed, chunk_meta):
+                    if img_tensor.max() > 0:
+                        valid_images.append(img_tensor)
+                        valid_scores.append(r['Rel_Score'])
+                        valid_geoids.append(hash(str(r.get('GEOID', ''))) % (2**31))
+                        valid_years.append(r['year'])
+                        valid_doitt_ids.append(r['DOITT_ID'])
+                        valid_change.append(r.get('Valid_Structural_Change', 0))
+                        valid_metas.append(r.get("dist_to_center", 0.0))
+                        valid_score_bins.append(r.get("score_bin", 0))
 
         shard_path = self.cache_dir / f"shard_{shard_id}.pt"
-        if valid_a:
-            save_dict = {
-                "images_a": torch.stack(valid_a),
-                "targets": torch.tensor(valid_y, dtype=torch.float32),
-                "metas_a": torch.tensor(valid_metas_a, dtype=torch.float32).unsqueeze(1),
-            }
-            if is_train and valid_p and valid_n:
-                save_dict["images_p"] = torch.stack(valid_p)
-                save_dict["images_n"] = torch.stack(valid_n)
-                save_dict["metas_p"]  = torch.tensor(valid_metas_p, dtype=torch.float32).unsqueeze(1)
-                save_dict["metas_n"]  = torch.tensor(valid_metas_n, dtype=torch.float32).unsqueeze(1)
-
-            torch.save(save_dict, shard_path)
+        if valid_images:
+            torch.save({
+                "images": torch.stack(valid_images),
+                "scores": torch.tensor(valid_scores, dtype=torch.float32),
+                "geoids": torch.tensor(valid_geoids, dtype=torch.int64),
+                "years": torch.tensor(valid_years, dtype=torch.int64),
+                "doitt_ids": torch.tensor(valid_doitt_ids, dtype=torch.int64),
+                "structural_change": torch.tensor(valid_change, dtype=torch.int64), # Replaces twin/pair logic
+                "metas": torch.tensor(valid_metas, dtype=torch.float32).unsqueeze(1),
+                "score_bins": torch.tensor(valid_score_bins, dtype=torch.int64),
+            }, shard_path)
         else:
-            logging.warning(f"Shard {shard_id}: all extracted images were black/invalid.")
-            torch.save({"images_a": torch.empty(0), "targets": torch.empty(0)}, shard_path)
+            torch.save({"images": torch.empty(0), "scores": torch.empty(0)}, shard_path)
 
     def build_initial_cache(self):
         """Synchronously generates the initial num_shards shards. Call once before training."""
@@ -467,85 +353,144 @@ class CyclicCacheManager:
         return False
  
 
-class CyclicRAMDataset(Dataset):
+class InBatchRankingDataset(Dataset):
     """
-    Loads pre-packaged (a, p, n, y) triplets directly from training shards.
-    Triplets follow the lambda/(1-lambda) cross-sectional/temporal change split
-    because they were constructed at shard-generation time by CyclicCacheManager.
+    Loads individual images with rich metadata from training shards.
+    The HybridBatchSampler constructs valid hybrid batches at iteration time
+    using the exposed metadata (year_to_idxs, doitt_to_idxs).
     """
     def __init__(self, cache_manager: CyclicCacheManager, transform=None):
         if not cache_manager._is_initialized:
             raise RuntimeError(
-                "Call cache_manager.build_initial_cache() before instantiating CyclicRAMDataset."
+                "Call cache_manager.build_initial_cache() before instantiating InBatchRankingDataset."
             )
         self.cache_manager = cache_manager
         self.transform = transform
-        self.images_a = None
-        self.images_p = None
-        self.images_n = None
-        self.targets  = None
-        self.metas_a  = None
-        self.metas_p  = None
-        self.metas_n  = None
+        self.images = None
+        self.scores = None
+        self.geoids = None
+        self.years = None
+        self.doitt_ids = None
+        self.structural_change = None
+        self.metas = None
+        self.score_bins = None
+
+        # Lookups for the HybridBatchSampler (built after loading)
+        self.year_to_idxs = {}
+        self.doitt_to_idxs = {}
         self.refresh()
 
     def refresh(self):
-        """Drops the current in-RAM tensors and reloads pre-packaged pairs from active shards."""
+        """Drops the current in-RAM tensors and reloads from active shards."""
         if not self.cache_manager.active_shards:
             raise RuntimeError("No active shards to load. Call build_initial_cache() first.")
 
-        self.images_a = None
-        self.images_p = None
-        self.images_n = None
-        self.targets  = None
-        self.metas_a  = None
-        self.metas_p  = None
-        self.metas_n  = None
+        self.images = None
+        self.scores = None
         gc.collect()
 
-        a_list, p_list, n_list, t_list, ma_list, mp_list, mn_list = [], [], [], [], [], [], []
+        img_list, sc_list, geo_list, yr_list = [], [], [], []
+        did_list, ch_list, mt_list, sb_list = [], [], [], []
+
         for shard_path in self.cache_manager.active_shards:
             data = torch.load(shard_path, weights_only=False)
-            a_list.append(data["images_a"])
-            p_list.append(data["images_p"])
-            n_list.append(data["images_n"])
-            t_list.append(data["targets"])
-            ma_list.append(data["metas_a"])
-            mp_list.append(data["metas_p"])
-            mn_list.append(data["metas_n"])
+            shard_len = len(data["images"])
+            img_list.append(data["images"])
+            sc_list.append(data["scores"])
+            geo_list.append(data.get("geoids", torch.zeros(shard_len, dtype=torch.int64)))
+            yr_list.append(data.get("years", torch.zeros(shard_len, dtype=torch.int64)))
+            did_list.append(data.get("doitt_ids", torch.zeros(shard_len, dtype=torch.int64)))
+            ch_list.append(data.get("structural_change", torch.zeros(shard_len, dtype=torch.int64)))
+            mt_list.append(data.get("metas", torch.zeros(shard_len, 1)))
+            sb_list.append(data.get("score_bins", torch.zeros(shard_len, dtype=torch.int64)))
 
-        self.images_a = torch.cat(a_list)
-        self.images_p = torch.cat(p_list)
-        self.images_n = torch.cat(n_list)
-        self.targets  = torch.cat(t_list)
-        self.metas_a  = torch.cat(ma_list)
-        self.metas_p  = torch.cat(mp_list)
-        self.metas_n  = torch.cat(mn_list)
+        self.images           = torch.cat(img_list)
+        self.scores           = torch.cat(sc_list)
+        self.geoids           = torch.cat(geo_list)
+        self.years            = torch.cat(yr_list)
+        self.doitt_ids        = torch.cat(did_list)
+        self.structural_change = torch.cat(ch_list)
+        self.metas            = torch.cat(mt_list)
+        self.score_bins       = torch.cat(sb_list)
 
-        print(f"[CyclicRAMDataset] Loaded {len(self.images_a)} triplets from {len(self.cache_manager.active_shards)} shards.")
+        # Build lookups for the batch sampler
+        self.year_to_idxs = {}
+        self.doitt_to_idxs = {}
+        for i in range(len(self.images)):
+            yr = self.years[i].item()
+            did = self.doitt_ids[i].item()
+            self.year_to_idxs.setdefault(yr, []).append(i)
+            self.doitt_to_idxs.setdefault(did, []).append(i)
+
+        n_stable = (self.structural_change == 0).sum().item()
+        n_change = (self.structural_change == 1).sum().item()
+        print(f"[InBatchRankingDataset] Loaded {len(self.images)} images "
+              f"(Stable: {n_stable} | Change: {n_change}) "
+              f"from {len(self.cache_manager.active_shards)} shards.")
 
     def __len__(self):
-        return len(self.images_a)
+        return len(self.images)
 
     def __getitem__(self, idx):
-        img_a = self.images_a[idx]
-        img_p = self.images_p[idx]
-        img_n = self.images_n[idx]
-
-        # Apply transforms independently so random augmentations differ for all three
+        img = self.images[idx]
         if self.transform:
-            img_a = self.transform(img_a)
-            img_p = self.transform(img_p)
-            img_n = self.transform(img_n)
+            img = self.transform(img)
+        return (img, self.scores[idx], self.geoids[idx], self.years[idx],
+                self.doitt_ids[idx], self.structural_change[idx], self.metas[idx], self.score_bins[idx])
 
-        return img_a, img_p, img_n, self.targets[idx], self.metas_a[idx], self.metas_p[idx], self.metas_n[idx]
+
+class HybridBatchSampler(torch.utils.data.Sampler):
+    """
+    Constructs valid hybrid batches for In-Batch Pairwise Ranking.
+
+    Each batch contains:
+      - B_cs cross-sectional images from the SAME year (maximizes pairwise supervision)
+      - Their temporal twins (stable + change) from the loaded data
+    """
+    def __init__(self, dataset: InBatchRankingDataset, batch_size_cs: int, max_temporal_per_batch: int = 32):
+        self.dataset = dataset
+        self.batch_size_cs = batch_size_cs
+        self.max_temporal = max_temporal_per_batch
+        self.num_batches = max(1, len(dataset) // batch_size_cs)
+
+    def __iter__(self):
+        for _ in range(self.num_batches):
+            # Pick random year from loaded data
+            year = random.choice(list(self.dataset.year_to_idxs.keys()))
+            pool = self.dataset.year_to_idxs[year]
+
+            # Sample cross-sectional core
+            cs_size = min(self.batch_size_cs, len(pool))
+            cs_idxs = random.sample(pool, cs_size)
+
+            batch = list(cs_idxs)
+
+            # Find temporal twins for CS buildings (if they exist in loaded data)
+            temporal_added = 0
+            for idx in cs_idxs:
+                if temporal_added >= self.max_temporal:
+                    break
+                doitt = self.dataset.doitt_ids[idx].item()
+                twin_candidates = [
+                    i for i in self.dataset.doitt_to_idxs.get(doitt, [])
+                    if i != idx and self.dataset.years[i].item() != year
+                ]
+                if twin_candidates:
+                    twin = random.choice(twin_candidates)
+                    batch.append(twin)
+                    temporal_added += 1
+
+            yield batch
+
+    def __len__(self):
+        return self.num_batches
 
 
 class StaticShardedDataset(Dataset):
     """
     Evaluates cleanly across many pre-computed shards.
     Only keeps one shard in RAM at a time to prevent OOM when the validation set is massive.
-    Validation shards store single images (no pairs), using the keys 'images_a' and 'targets'.
+    Validation shards store single images using the keys 'images' and 'scores'.
     """
     def __init__(self, active_shards, transform=None, verbose=True):
         if not active_shards:
@@ -553,16 +498,16 @@ class StaticShardedDataset(Dataset):
         self.shard_paths = active_shards
         self.transform = transform
         self.current_shard_idx = -1
-        self.images_a = None
-        self.targets  = None
-        self.metas_a  = None
+        self.images = None
+        self.scores = None
+        self.metas  = None
 
         if verbose:
             print(f"Loading metadata for {len(self.shard_paths)} shards to establish dataset sizes...")
         self.shard_lengths = []
         for p in self.shard_paths:
             data = torch.load(p, weights_only=False)
-            self.shard_lengths.append(len(data["images_a"]))
+            self.shard_lengths.append(len(data["images"]))
 
         self.total_length = sum(self.shard_lengths)
         if verbose:
@@ -579,9 +524,9 @@ class StaticShardedDataset(Dataset):
             return
         # Drops the old tensor, loads the new one
         data = torch.load(self.shard_paths[shard_idx], weights_only=False)
-        self.images_a  = data["images_a"]
-        self.targets   = data["targets"]
-        self.metas_a   = data.get("metas_a")
+        self.images  = data["images"]
+        self.scores  = data["scores"]
+        self.metas   = data.get("metas")
         self.current_shard_idx = shard_idx
 
     def __len__(self):
@@ -591,9 +536,9 @@ class StaticShardedDataset(Dataset):
         shard_idx, item_idx = self.idx_mapping[idx]
         self._load_shard(shard_idx)
 
-        img  = self.images_a[item_idx]
-        lbl  = self.targets[item_idx]
-        meta = self.metas_a[item_idx] if self.metas_a is not None else torch.zeros(1)
+        img  = self.images[item_idx]
+        lbl  = self.scores[item_idx]
+        meta = self.metas[item_idx] if self.metas is not None else torch.zeros(1)
 
         if self.transform:
             img = self.transform(img)
@@ -642,12 +587,17 @@ def setup_dataloaders(df_train, dfs_val_dict, df_test, all_years_datasets, param
         transforms.Normalize(mean=mean, std=std) # 🔴 ImageNet Normalization
     ])
 
-    # Pairs are pre-packaged in shards by CyclicCacheManager — no wrapper needed
-    train_dataset = CyclicRAMDataset(
+    # In-Batch Pairwise Ranking: individual images + metadata, grouped by HybridBatchSampler
+    train_dataset = InBatchRankingDataset(
         cache_manager=train_cache_manager,
         transform=train_transform,
     )
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=0)
+    hybrid_sampler = HybridBatchSampler(
+        dataset=train_dataset,
+        batch_size_cs=batch_size,
+        max_temporal_per_batch=max(1, int(batch_size * params.get("temporal_fraction", 0.20))),
+    )
+    train_loader = DataLoader(train_dataset, batch_sampler=hybrid_sampler, num_workers=0)
     
     # VAL
     val_loaders = {}
@@ -741,10 +691,12 @@ def fill_params_defaults(params):
         "tau_meters": 100,
         "subsample_step": 1,
         "max_jitter": 10,
-        "alpha": 0.5,
-        "min_label_gap": 0.5,
-        "max_label_gap": 2.0,
-        "final_max_label_gap": 1.0,
+        # In-Batch Pairwise Ranking hyperparameters
+        "m_min": 0.1,         # Hard floor for pairwise margin (prevents collapse)
+        "m_base": 1.0,        # Margin scale factor: m_kl = max(m_min, m_base * |Z_l - Z_k|)
+        "lambda_s": 1.0,      # Weight for temporal stability L1 penalty
+        "lambda_c": 1.0,      # Weight for temporal change ranking hinge
+        "temporal_fraction": 0.20,  # Fraction of batch reserved for temporal auxiliary (split 50/50 stable/change)
     }
     validate_parameters(params, default_params)
 
@@ -759,52 +711,202 @@ def fill_params_defaults(params):
     return updated_params
 
 
-class AdaptiveOrdinalTripletLoss(nn.Module):
-    """Triplet Margin Ranking Loss with Adaptive Margin (Methodology Eq. 4).
+class InBatchPairwiseRankingLoss(nn.Module):
+    """In-Batch Pairwise Ranking Loss with Score-Based Margins (Ordinal Framework).
 
-    L = |R_a - R_p| + max(0, -y * (R_n - R_a) + m)
-    where m = alpha * std(all scores in batch), detached to prevent score collapse.
-    
-    Returns (loss, diagnostics_dict) so the training loop can log internals to W&B
-    without duplicating the margin computation.
+    Computes three decoupled objectives from a single forward pass:
+      1. L_cross:  Smooth logistic surrogate (RankNet) over all valid unique cross-sectional pairs
+                   T = max(m_min, m_base * σ_batch) — temperature scales with score spread, NOT ACS magnitude
+      2. L_stable: L1 temporal invariance for stable twins
+      3. L_change: Smooth logistic surrogate for directional rank mobility of changed twins
+
+    L_total = L_cross + lambda_s * L_stable + lambda_c * L_change
+
+    Key design: margins carry zero economic information. They scale with the model's own output
+    distribution (σ_batch) to prevent collapse at initialization, never with ACS label magnitudes.
+    This preserves the ordinal framework: supervision is purely directional (sign), never cardinal.
+
+    Returns (loss, diagnostics_dict) so the training loop can log internals to W&B.
     """
-    def __init__(self, alpha=0.5):
+    def __init__(self, m_base=1.0, m_min=0.1, lambda_s=1.0, lambda_c=1.0):
         super().__init__()
-        self.alpha = alpha
+        self.m_base = m_base
+        self.m_min = m_min
+        self.lambda_s = lambda_s
+        self.lambda_c = lambda_c
 
-    def forward(self, r_a, r_p, r_n, y):
-        r_a = r_a.squeeze(-1)
-        r_p = r_p.squeeze(-1)
-        r_n = r_n.squeeze(-1)
-        y   = y.float().squeeze(-1)
+    def forward(self, scores, labels, geoids, years, doitt_ids, structural_change, score_bins=None, current_epoch=None):
+        scores = scores.squeeze(-1)
+        labels = labels.float()
+        
+        # Because HybridBatchSampler puts CS core first, the first year is the CS anchor year
+        anchor_year = years[0].item()
+        
+        cs_mask = (years == anchor_year)
+        temp_mask = (years != anchor_year)
 
-        with torch.no_grad():
-            all_scores = torch.cat([r_a, r_p, r_n])
-            score_std  = all_scores.std().clamp(min=0.1)
-            m = self.alpha * score_std
+        # ──────────────────────────────────────────────────────────
+        # 1. CROSS-SECTIONAL RANKING (L_cross)
+        # ──────────────────────────────────────────────────────────
+        cs_scores = scores[cs_mask]
+        cs_labels = labels[cs_mask]
+        cs_geoids = geoids[cs_mask]
+        B_cs = cs_scores.shape[0]
 
-        stability_penalty = torch.abs(r_a - r_p)
-        ranking_hinge     = F.relu(-y * (r_n - r_a) + m)
-        loss = (stability_penalty + ranking_hinge).mean()
+        L_cross = torch.tensor(0.0, device=scores.device)
+        n_valid_pairs = 0
+        cross_hinge_active, avg_margin = 0.0, 0.0
 
+        if B_cs >= 2:
+            idx_k, idx_l = torch.triu_indices(B_cs, B_cs, offset=1, device=scores.device)
+            valid_mask = cs_geoids[idx_k] != cs_geoids[idx_l]
+            
+            # --- Easy-to-Hard Curriculum Filtering ---
+            if current_epoch is not None and score_bins is not None:
+                cs_bins = score_bins[cs_mask]
+                bin_diff = torch.abs(cs_bins[idx_k] - cs_bins[idx_l])
+                
+                if current_epoch < 50:
+                    valid_mask &= (bin_diff >= 3)
+                elif current_epoch < 100:
+                    valid_mask &= (bin_diff >= 2)
+                else:
+                    # PERMANENT FILTER: Never train on bin_diff == 0. 
+                    # The ACS margin of error makes intra-quintile rankings pure noise.
+                    # Forcing a strict margin on them causes variance collapse.
+                    valid_mask &= (bin_diff >= 1)
+
+            if valid_mask.any():
+                idx_k, idx_l = idx_k[valid_mask], idx_l[valid_mask]
+                n_valid_pairs = idx_k.shape[0]
+
+                z_k, z_l = cs_labels[idx_k], cs_labels[idx_l]
+                y_kl = torch.sign(z_l - z_k)
+
+                # [CORRECTED] Margin is score-based (σ_batch), NOT ACS-magnitude-based
+                # This preserves the ordinal framework: no economic information in margins
+                with torch.no_grad():
+                    sigma_batch = cs_scores.std()
+                    m_scalar = torch.clamp(self.m_base * sigma_batch, min=self.m_min)
+                    avg_margin = m_scalar.item()
+
+                r_k, r_l = cs_scores[idx_k], cs_scores[idx_l]
+                delta = y_kl * (r_l - r_k)
+                # Use F.softplus for numerical stability (prevents NaN from exp overflow)
+                # We DO NOT multiply by m_scalar, because m * softplus(-delta/m) goes to 0 as m goes to 0, 
+                # which causes the model to collapse the variance to artificially shrink the margin.
+                L_cross = F.softplus(-delta / m_scalar).mean()
+
+                with torch.no_grad():
+                    # Diagnostic: proportion of pairs that would violate a hard margin
+                    cross_hinge_active = (-delta + m_scalar > 0).float().mean().item()
+
+        # ──────────────────────────────────────────────────────────
+        # 2 & 3. TEMPORAL PENALTIES (L_stable & L_change)
+        # ──────────────────────────────────────────────────────────
+        L_stable = torch.tensor(0.0, device=scores.device)
+        L_change = torch.tensor(0.0, device=scores.device)
+        n_stable, n_change, change_hinge_active = 0, 0, 0.0
+
+        if temp_mask.any():
+            temp_scores, temp_labels = scores[temp_mask], labels[temp_mask]
+            temp_doitts = doitt_ids[temp_mask]
+            temp_change = structural_change[temp_mask]
+            
+            cs_doitts = doitt_ids[cs_mask]
+            cs_scores_full = scores[cs_mask]
+            cs_labels_full = labels[cs_mask]
+            
+            # Vectorized dynamic pairing: match temporal doitt to cross-sectional doitt
+            matches = (temp_doitts.unsqueeze(1) == cs_doitts.unsqueeze(0))
+            has_match, match_idx_in_cs = matches.max(dim=1)
+            
+            # Filter to twins that successfully matched a CS anchor
+            valid_temp = has_match
+            if valid_temp.any():
+                v_temp_scores, v_temp_labels = temp_scores[valid_temp], temp_labels[valid_temp]
+                v_temp_change = temp_change[valid_temp]
+                
+                v_partner_scores = cs_scores_full[match_idx_in_cs[valid_temp]]
+                v_partner_labels = cs_labels_full[match_idx_in_cs[valid_temp]]
+
+                # STABLE Penalty
+                stable_idx = (v_temp_change == 0)
+                if stable_idx.any():
+                    L_stable = torch.abs(v_temp_scores[stable_idx] - v_partner_scores[stable_idx]).mean()
+                    n_stable = stable_idx.sum().item()
+
+                # CHANGE Ranking
+                change_idx = (v_temp_change == 1)
+                if change_idx.any():
+                    c_temp_scores = v_temp_scores[change_idx]
+                    c_partner_scores = v_partner_scores[change_idx]
+                    
+                    y_change = torch.sign(v_temp_labels[change_idx] - v_partner_labels[change_idx])
+                    
+                    with torch.no_grad():
+                        sigma_batch_change = torch.cat([cs_scores_full, c_temp_scores, c_partner_scores]).std()
+                        m_change = torch.clamp(self.m_base * sigma_batch_change, min=self.m_min)
+                        
+                    delta_change = y_change * (c_temp_scores - c_partner_scores)
+                    # Use F.softplus for numerical stability
+                    L_change = F.softplus(-delta_change / m_change).mean()
+                    n_change = change_idx.sum().item()
+                    with torch.no_grad():
+                        # Diagnostic: proportion of pairs that would violate a hard margin
+                        change_hinge_active = (-delta_change + m_change > 0).float().mean().item()
+
+        # VICReg-style variance hinge to explicitly prevent collapse
+        variance_penalty = torch.tensor(0.0, device=scores.device)
+        if scores.shape[0] > 1:
+            variance_penalty = torch.relu(0.5 - scores.std())
+            
+        loss = L_cross + self.lambda_s * L_stable + self.lambda_c * L_change + 1.0 * variance_penalty
+        
+        # --- Compute gradient norms of each loss component w.r.t predictions (very low overhead) ---
+        grad_cross, grad_stable, grad_change = 0.0, 0.0, 0.0
+        try:
+            if L_cross.requires_grad and L_cross.item() > 0:
+                g_c = torch.autograd.grad(L_cross, scores, retain_graph=True)[0]
+                if g_c is not None: grad_cross = g_c.norm(p=2).item()
+                
+            if L_stable.requires_grad and L_stable.item() > 0:
+                g_s = torch.autograd.grad(self.lambda_s * L_stable, scores, retain_graph=True)[0]
+                if g_s is not None: grad_stable = g_s.norm(p=2).item()
+                
+            if L_change.requires_grad and L_change.item() > 0:
+                g_ch = torch.autograd.grad(self.lambda_c * L_change, scores, retain_graph=True)[0]
+                if g_ch is not None: grad_change = g_ch.norm(p=2).item()
+        except Exception:
+            pass # Fail gracefully (e.g. if graph is disconnected or autograd anomalies)
+        
         # Diagnostics — all detached, zero overhead on the backward pass
         with torch.no_grad():
             diag = {
-                "loss/adaptive_margin":      m.item(),
-                "loss/score_std":            score_std.item(),
-                "loss/hinge_active_rate":    (ranking_hinge > 0).float().mean().item(),
-                "loss/stability_penalty":    stability_penalty.mean().item(),
-                "loss/ranking_hinge":        ranking_hinge.mean().item(),
-                "loss/score_mean":           all_scores.mean().item(),
-                "loss/score_min":            all_scores.min().item(),
-                "loss/score_max":            all_scores.max().item(),
+                "loss/L_cross":              L_cross.item(),
+                "loss/L_stable":             L_stable.item(),
+                "loss/L_change":             L_change.item(),
+                "grad_norm/cross":           grad_cross,
+                "grad_norm/stable":          grad_stable,
+                "grad_norm/change":          grad_change,
+                "loss/cross_valid_pairs":    n_valid_pairs,
+                "loss/cross_hinge_active":   cross_hinge_active,
+                "loss/change_hinge_active":  change_hinge_active,
+                "loss/avg_margin":           avg_margin,
+                "loss/n_stable":             n_stable,
+                "loss/n_change":             n_change,
+                "loss/score_std":            scores.std().item() if scores.shape[0] > 1 else 0.0,
+                "loss/score_mean":           scores.mean().item(),
+                "loss/score_min":            scores.min().item(),
+                "loss/score_max":            scores.max().item(),
             }
 
         return loss, diag
 
 
 def set_model_and_loss_function(
-    model_name: str, kind: str, image_size: int, bands: int = 4, weights: str = None, meta_dim: int = 0, alpha: float = 0.5
+    model_name: str, kind: str, image_size: int, bands: int = 4, weights: str = None, meta_dim: int = 0,
+    m_base: float = 1.0, m_min: float = 0.1, lambda_s: float = 1.0, lambda_c: float = 1.0
 ):
     """
     Initializes the PyTorch model and appropriate loss function.
@@ -831,8 +933,10 @@ def set_model_and_loss_function(
 
     # 2. Set loss functions
     if kind == "reg":
-        # Triplet Margin Ranking Loss (Eq. 4) replaces cardinal regression.
-        loss_fn = AdaptiveOrdinalTripletLoss(alpha=alpha)
+        # In-Batch Pairwise Ranking Loss with economic-distance-proportional margins.
+        loss_fn = InBatchPairwiseRankingLoss(
+            m_base=m_base, m_min=m_min, lambda_s=lambda_s, lambda_c=lambda_c
+        )
         
     elif kind == "cla":
         # CrossEntropyLoss expects raw logits (no softmax in the model output)
@@ -914,7 +1018,7 @@ def train_model(
         initial_best_val_loss if initial_best_val_loss is not None else float(-1)
     )
 
-    # Pointwise MSE for validation — training uses triplet_margin_ranking_loss but validation
+    # Pointwise MSE for validation — training uses in-batch pairwise ranking but validation
     # evaluates individual predictions against their labels for interpretable tracking.
     val_loss_fn = nn.MSELoss()
     
@@ -938,17 +1042,10 @@ def train_model(
         running_train_correct = 0.0 # Tracking Pairwise Accuracy
         
         # Accumulator for diagnostic metrics — reset each epoch
-        diag_accum = {
-            "loss/adaptive_margin":   0.0,
-            "loss/score_std":         0.0,
-            "loss/hinge_active_rate": 0.0,
-            "loss/stability_penalty": 0.0,
-            "loss/ranking_hinge":     0.0,
-            "loss/score_mean":        0.0,
-            "loss/score_min":         0.0,
-            "loss/score_max":         0.0,
-        }
+        diag_accum = {}
         diag_steps = 0
+        total_pairs_epoch = 0  # Track total cross-sectional pairs trained on (after curriculum mask)
+        total_acc_pairs_epoch = 0 # Track total cross-sectional pairs evaluated for accuracy
         
         # Zero the gradients
         optimizer.zero_grad()
@@ -961,42 +1058,40 @@ def train_model(
         )
 
         t_batch_start = time.perf_counter()  # start timer before first batch
-        for batch_idx, (images_a, images_p, images_n, y_inds, metas_a, metas_p, metas_n) in train_bar:
+        for batch_idx, (images, scores, geoids, years, doitt_ids, structural_change, metas, score_bins) in train_bar:
             t_data_end = time.perf_counter()  # data is ready; measure load time
 
             # Move all to device
-            images_a = images_a.to(device)
-            images_p = images_p.to(device)
-            images_n = images_n.to(device)
-            y_inds   = y_inds.to(device)
-            metas_a  = metas_a.to(device)
-            metas_p  = metas_p.to(device)
-            metas_n  = metas_n.to(device)
+            images     = images.to(device)
+            scores_lbl = scores.to(device)
+            geoids     = geoids.to(device)
+            years      = years.to(device)
+            doitt_ids  = doitt_ids.to(device)
+            structural_change = structural_change.to(device)
+            metas      = metas.to(device)
+            score_bins = score_bins.to(device)
             
-            # Siamese forward pass: same backbone weights
+            # Single unified forward pass over the entire hybrid batch
             t_forward_start = time.perf_counter()
-            
-            # 1. Combine inputs along the batch dimension (Batch size becomes 3 * B)
-            combined_images = torch.cat([images_a, images_p, images_n], dim=0)
-            combined_metas = torch.cat([metas_a, metas_p, metas_n], dim=0)
 
             with autocast(device_type='cuda'):
-                # 2. Single forward pass
-                combined_outputs = model(combined_images, metadata=combined_metas)
+                # One forward pass — all images (CS + temporal) through same backbone
+                outputs = model(images, metadata=metas)
                 
-                # 3. Split the outputs back into a, p, n thirds
-                outputs_a, outputs_p, outputs_n = torch.chunk(combined_outputs, 3, dim=0)
-                
-                # 4. Triplet Margin Ranking Loss (Eq. 4)
-                loss, diag = loss_fn(outputs_a, outputs_p, outputs_n, y_inds)
+                # In-Batch Pairwise Ranking Loss (3 decoupled objectives)
+                loss, diag = loss_fn(
+                    outputs, scores_lbl, geoids, years, doitt_ids, structural_change, 
+                    score_bins=score_bins, current_epoch=epoch
+                )
 
                 # Scale loss to account for accumulation
                 loss = loss / accumulation_steps
                 
             # Accumulate diagnostics for epoch-level averaging
             for k, v in diag.items():
-                diag_accum[k] += v
+                diag_accum[k] = diag_accum.get(k, 0.0) + v
             diag_steps += 1
+            total_pairs_epoch += diag.get("loss/cross_valid_pairs", 0)
             
             # Backward pass with scaler
             scaler.scale(loss).backward()
@@ -1016,7 +1111,7 @@ def train_model(
                 data_ms   = (t_data_end   - t_batch_start) * 1000
                 forward_ms = (t_forward_end - t_forward_start) * 1000
                 total_ms   = data_ms + forward_ms
-                batch_sz   = images_a.size(0)
+                batch_sz   = images.size(0)
                 
                 step_log = {
                     "perf/data_load_ms":    data_ms,
@@ -1029,44 +1124,60 @@ def train_model(
                 wandb.log(step_log)
             t_batch_start = time.perf_counter()  # reset for next batch's data-load window
             
-            # De-scale loss for logging (triplets count as 3 samples each for the running avg)
+            # De-scale loss for logging
             step_loss = loss.item() * accumulation_steps
-            running_train_loss += step_loss * images_a.size(0)
+            running_train_loss += step_loss * images.size(0)
             
-            # Pairwise Accuracy: Does relative distance direction match y_inds?
+            # Pairwise Concordance: fraction of valid cross-sectional pairs correctly ranked
             with torch.no_grad():
-                diff = outputs_n.squeeze() - outputs_a.squeeze()
-                correct = (torch.sign(diff) == torch.sign(y_inds.squeeze())).float().sum()
-                running_train_correct += correct.item()
+                anchor_year = years[0].item()
+                cs_mask = (years == anchor_year)
+                cs_out = outputs.squeeze(-1)[cs_mask]
+                cs_lbl = scores_lbl[cs_mask]
+                cs_geo = geoids[cs_mask]
+                B_cs = cs_out.shape[0]
+                if B_cs >= 2:
+                    idx_k, idx_l = torch.triu_indices(B_cs, B_cs, offset=1, device=device)
+                    # [NEW] Exclude same-tract comparisons from accuracy!
+                    valid_acc_mask = cs_geo[idx_k] != cs_geo[idx_l]
+                    if valid_acc_mask.any():
+                        idx_k = idx_k[valid_acc_mask]
+                        idx_l = idx_l[valid_acc_mask]
+                        pred_sign = torch.sign(cs_out[idx_l] - cs_out[idx_k])
+                        true_sign = torch.sign(cs_lbl[idx_l] - cs_lbl[idx_k])
+                        correct = (pred_sign == true_sign).float().sum()
+                        running_train_correct += correct.item()
+                        total_acc_pairs_epoch += idx_k.shape[0]
             
-            samples_seen = (batch_idx + 1) * images_a.size(0)
-            running_avg = running_train_loss / samples_seen
-            running_acc = running_train_correct / samples_seen
+            samples_seen = (batch_idx + 1) * images.size(0)
+            running_avg = running_train_loss / max(samples_seen, 1)
 
             # Live loss update in the bar
             train_bar.set_postfix(
-                loss=f"{step_loss:.4f}",       # current batch loss (keras-style: loss per step)
-                acc=f"{running_acc:.4f}"       # running epoch pairwise accuracy
+                loss=f"{step_loss:.4f}",
+                pairs=f"{diag.get('loss/cross_valid_pairs', 0)}"
             )
 
         epoch_train_loss = running_train_loss / max(len(train_loader.dataset), 1)
-        epoch_train_acc = running_train_correct / max(len(train_loader.dataset), 1)
+        epoch_train_acc = running_train_correct / max(total_acc_pairs_epoch, 1)
         
         # ── Epoch-averaged loss diagnostics ──
         if diag_steps > 0:
             epoch_diag = {k: v / diag_steps for k, v in diag_accum.items()}
+            epoch_diag["loss/total_pairs_epoch"] = total_pairs_epoch
             # Check health and warn in console
-            har = epoch_diag["loss/hinge_active_rate"]
+            har = epoch_diag.get("loss/cross_hinge_active", 0)
             if har < 0.30:
-                tqdm.write(f"⚠️  Hinge active rate {har:.2f} < 0.30 — alpha may be too low, margin is too easy.")
+                tqdm.write(f"⚠️  Cross hinge active rate {har:.2f} < 0.30 — m_base may be too low.")
             elif har > 0.80:
-                tqdm.write(f"⚠️  Hinge active rate {har:.2f} > 0.80 — alpha may be too high, training may be unstable.")
+                tqdm.write(f"⚠️  Cross hinge active rate {har:.2f} > 0.80 — m_base may be too high, training may be unstable.")
         else:
             epoch_diag = {}
             
         # Always step scheduler at end of epoch
-        if scheduler:
-            scheduler.step()
+        # Scheduler step moved to after validation for ReduceLROnPlateau compatibility
+        # if scheduler:
+        #     scheduler.step()
 
         # ==========================
         # 2. VALIDATION PHASE
@@ -1119,6 +1230,13 @@ def train_model(
         else:
             epoch_val_spearman = float('-inf')  # No validation data
 
+        # Step the scheduler (ReduceLROnPlateau needs the metric)
+        if scheduler:
+            if isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
+                scheduler.step(epoch_val_spearman)
+            else:
+                scheduler.step()
+
         # ==========================
         # 3. LOGGING & CHECKPOINTING
         # ==========================
@@ -1143,6 +1261,7 @@ def train_model(
         # Model Checkpoint logic (Maximize Spearman)
         if epoch_val_spearman > best_val_spearman:
             tqdm.write(f"⭐ Val Spearman improved from {best_val_spearman:.4f} to {epoch_val_spearman:.4f}. Saving...")
+            tqdm.write(f"   📊 [Loss Components] L_cross: {epoch_diag.get('loss/L_cross', 0.0):.4f} | L_stable: {epoch_diag.get('loss/L_stable', 0.0):.4f} | L_change: {epoch_diag.get('loss/L_change', 0.0):.4f}")
             best_val_spearman = epoch_val_spearman
             
             model_path = save_dir / f"{savename}_best.pth"
@@ -1165,7 +1284,7 @@ def train_model(
         # 4. ROTATE CACHE FOR NEXT EPOCH
         # ==========================
         if cache_manager:
-            k = 3
+            k = 7
             progress = epoch / max(1, epochs)
             cache_updated = cache_manager.step(k=k, progress=progress)
             if cache_updated:
@@ -1173,7 +1292,7 @@ def train_model(
                     tqdm.write(f"⚠️ The cache is falling behind the GPU! {cache_manager._pending_k} new train background shard(s) ready, but {cache_manager._pending_k / k * 100}% of the cache is stale. Consider increasing k.")
                 else:
                     tqdm.write(f"🔄 {cache_manager._pending_k} new train background shard(s) ready! Reloading pre-packaged pairs from disk...")
-                    # CyclicRAMDataset.refresh() reloads the pre-packaged pair tensors directly
+                    # InBatchRankingDataset.refresh() reloads flat images + metadata tensors from disk
                     train_loader.dataset.refresh()
 
         if val_cache_managers:
@@ -1532,13 +1651,16 @@ def run(
             image_size=image_size, 
             weights=weights,
             meta_dim=1,
-            alpha=params.get("alpha", 0.5)
+            m_base=params.get("m_base", 1.0),
+            m_min=params.get("m_min", 0.1),
+            lambda_s=params.get("lambda_s", 1.0),
+            lambda_c=params.get("lambda_c", 1.0),
         )
-        learning_rate = learning_rate / 2
+
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=0.05)
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
-            optimizer, T_0=200, T_mult=1, eta_min=5e-7
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer, mode='max', factor=0.8, patience=10, min_lr=learning_rate/20
         )
 
         # If we found a saved checkpoint from a previous run, resume from it
@@ -1556,10 +1678,7 @@ def run(
                     optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
                 if scheduler and checkpoint.get("scheduler_state_dict"):
                     scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
-                    # Force restart in CosineAnnealing
-                    print("Forcing restart in CosineAnnealing scheduler...")
-                    scheduler.T_cur = 0
-                    scheduler.step(0)
+
                 start_epoch = checkpoint.get("epoch", 0)
                 initial_best_val_loss = checkpoint.get("best_val_spearman")
 
@@ -1615,8 +1734,7 @@ def run(
             kind=kind,
             bands=nbands, 
             image_size=image_size,
-            meta_dim=1, # Set back to 1 for dist_to_center
-            alpha=params.get("alpha", 0.5)
+            meta_dim=1,  # Set back to 1 for dist_to_center
         )
         
         best_model_path = MODELS_DIR / "models_by_epoch" / savename / f"{savename}_best.pth"
@@ -1647,7 +1765,7 @@ def run(
             transforms.Normalize(mean=mean, std=std)  # 🔴 ImageNet Normalization — must match training
         ])
         
-        for year in [2016]:
+        for year in [2016, 2018, 2020, 2022, 2024]:
 
             print(f"\n--- Processing Predictions for Year: {year} ---")
             df_year = df_all[(df_all["year"] == year) & (df_all["type"] == "test")].copy()
@@ -1705,16 +1823,22 @@ if __name__ == "__main__":
         "image_size": 224,
         "tau_meters": 100,
         "nbands": 3,
-        "batch_size": 5,
+        "batch_size": 16,
         "small_sample": False,
         "n_epochs": 1000,
-        "learning_rate": 0.00005,
+        "learning_rate": 0.0001,
         "sat_data": "aerial",
-        "years": [2010, 2012, 2014, 2016, 2018, 2020, 2022, 2024], # Only the data inside WSL! all data is: [2010, 2012, 2014, 2016, 2018, 2020, 2022, 2024],
+        "years": [2010, 2012, 2014, 2016, 2018, 2020, 2022, 2024],
         "test_years": [2016],
         "test_column": None,
-        "extra": "_siam3plets",  # Extra info to add to the savename (e.g. for ablation studies)
-    }
+        "extra": "_ranknet_mining_lambda_s_05",
+        # In-Batch Ranking hyperparameters
+        "m_base": 1.0,
+        "m_min": 0.05,
+        "lambda_s": 0.02,
+        "lambda_c": 0.1,
+        "temporal_fraction": 0.20,
+    } 
 
     # Run full pipeline
-    run(params, train=False, retrain=False, compute_loss=False, generate_predictions=True)
+    run(params, train=True, retrain=False, compute_loss=False, generate_predictions=True)
