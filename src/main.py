@@ -735,7 +735,7 @@ class InBatchPairwiseRankingLoss(nn.Module):
         self.lambda_s = lambda_s
         self.lambda_c = lambda_c
 
-    def forward(self, scores, labels, geoids, years, doitt_ids, structural_change, score_bins=None, current_epoch=None):
+    def forward(self, scores, labels, geoids, years, doitt_ids, structural_change, score_bins=None, current_epoch=None, current_step=None):
         scores = scores.squeeze(-1)
         labels = labels.float()
         
@@ -766,9 +766,9 @@ class InBatchPairwiseRankingLoss(nn.Module):
                 cs_bins = score_bins[cs_mask]
                 bin_diff = torch.abs(cs_bins[idx_k] - cs_bins[idx_l])
                 
-                if current_epoch < 50:
+                if current_epoch < 60:
                     valid_mask &= (bin_diff >= 3)
-                elif current_epoch < 100:
+                elif current_epoch < 150:
                     valid_mask &= (bin_diff >= 2)
                 else:
                     # PERMANENT FILTER: Never train on bin_diff == 0. 
@@ -856,29 +856,38 @@ class InBatchPairwiseRankingLoss(nn.Module):
                         # Diagnostic: proportion of pairs that would violate a hard margin
                         change_hinge_active = (-delta_change + m_change > 0).float().mean().item()
 
-        # VICReg-style variance hinge to explicitly prevent collapse
+        # CS-only variance regularizer: targets the exact distribution L_cross operates on.
+        # Eliminates the tug-of-war with L_stable (temporal scores are excluded).
+        # Internally consistent: both m_scalar and variance_penalty reference cs_scores.std().
         variance_penalty = torch.tensor(0.0, device=scores.device)
-        if scores.shape[0] > 1:
-            variance_penalty = torch.relu(0.5 - scores.std())
+        if B_cs > 1:
+            variance_penalty = (cs_scores.std() - 1.0).pow(2)
             
         loss = L_cross + self.lambda_s * L_stable + self.lambda_c * L_change + 1.0 * variance_penalty
         
-        # --- Compute gradient norms of each loss component w.r.t predictions (very low overhead) ---
-        grad_cross, grad_stable, grad_change = 0.0, 0.0, 0.0
-        try:
-            if L_cross.requires_grad and L_cross.item() > 0:
-                g_c = torch.autograd.grad(L_cross, scores, retain_graph=True)[0]
-                if g_c is not None: grad_cross = g_c.norm(p=2).item()
-                
-            if L_stable.requires_grad and L_stable.item() > 0:
-                g_s = torch.autograd.grad(self.lambda_s * L_stable, scores, retain_graph=True)[0]
-                if g_s is not None: grad_stable = g_s.norm(p=2).item()
-                
-            if L_change.requires_grad and L_change.item() > 0:
-                g_ch = torch.autograd.grad(self.lambda_c * L_change, scores, retain_graph=True)[0]
-                if g_ch is not None: grad_change = g_ch.norm(p=2).item()
-        except Exception:
-            pass # Fail gracefully (e.g. if graph is disconnected or autograd anomalies)
+        # --- Compute gradient norms of each loss component w.r.t predictions ---
+        # Only compute every 10 steps to avoid 4x extra backward traversals per step
+        grad_cross, grad_stable, grad_change, grad_variance = 0.0, 0.0, 0.0, 0.0
+        compute_grad_norms = (current_step is not None and current_step % 10 == 0)
+        if compute_grad_norms:
+            try:
+                if L_cross.requires_grad and L_cross.item() > 0:
+                    g_c = torch.autograd.grad(L_cross, scores, retain_graph=True)[0]
+                    if g_c is not None: grad_cross = g_c.norm(p=2).item() * 10
+                    
+                if L_stable.requires_grad and L_stable.item() > 0:
+                    g_s = torch.autograd.grad(self.lambda_s * L_stable, scores, retain_graph=True)[0]
+                    if g_s is not None: grad_stable = g_s.norm(p=2).item() * 10
+                    
+                if L_change.requires_grad and L_change.item() > 0:
+                    g_ch = torch.autograd.grad(self.lambda_c * L_change, scores, retain_graph=True)[0]
+                    if g_ch is not None: grad_change = g_ch.norm(p=2).item() * 10
+                    
+                if variance_penalty.requires_grad and variance_penalty.item() > 0:
+                    g_v = torch.autograd.grad(variance_penalty, scores, retain_graph=True)[0]
+                    if g_v is not None: grad_variance = g_v.norm(p=2).item() * 10
+            except Exception:
+                pass # Fail gracefully (e.g. if graph is disconnected or autograd anomalies)
         
         # Diagnostics — all detached, zero overhead on the backward pass
         with torch.no_grad():
@@ -889,6 +898,7 @@ class InBatchPairwiseRankingLoss(nn.Module):
                 "grad_norm/cross":           grad_cross,
                 "grad_norm/stable":          grad_stable,
                 "grad_norm/change":          grad_change,
+                "grad_norm/variance":        grad_variance,
                 "loss/cross_valid_pairs":    n_valid_pairs,
                 "loss/cross_hinge_active":   cross_hinge_active,
                 "loss/change_hinge_active":  change_hinge_active,
@@ -896,6 +906,7 @@ class InBatchPairwiseRankingLoss(nn.Module):
                 "loss/n_stable":             n_stable,
                 "loss/n_change":             n_change,
                 "loss/score_std":            scores.std().item() if scores.shape[0] > 1 else 0.0,
+                "loss/cs_score_std":         cs_scores.std().item() if B_cs > 1 else 0.0,
                 "loss/score_mean":           scores.mean().item(),
                 "loss/score_min":            scores.min().item(),
                 "loss/score_max":            scores.max().item(),
@@ -1081,7 +1092,7 @@ def train_model(
                 # In-Batch Pairwise Ranking Loss (3 decoupled objectives)
                 loss, diag = loss_fn(
                     outputs, scores_lbl, geoids, years, doitt_ids, structural_change, 
-                    score_bins=score_bins, current_epoch=epoch
+                    score_bins=score_bins, current_epoch=epoch, current_step=batch_idx
                 )
 
                 # Scale loss to account for accumulation
@@ -1660,7 +1671,7 @@ def run(
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=0.05)
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer, mode='max', factor=0.8, patience=10, min_lr=learning_rate/20
+            optimizer, mode='max', factor=0.8, patience=20, min_lr=learning_rate/20
         )
 
         # If we found a saved checkpoint from a previous run, resume from it
@@ -1678,6 +1689,12 @@ def run(
                     optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
                 if scheduler and checkpoint.get("scheduler_state_dict"):
                     scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+                    
+                    # Force learning rate override to 0.000064 on resume
+                    # override_lr = 0.000064
+                    # print(f"Forcing learning rate override to {override_lr}...")
+                    # for param_group in optimizer.param_groups:
+                    #     param_group['lr'] = override_lr
 
                 start_epoch = checkpoint.get("epoch", 0)
                 initial_best_val_loss = checkpoint.get("best_val_spearman")
