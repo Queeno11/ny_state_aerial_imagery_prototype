@@ -10,7 +10,7 @@
 \usepackage{etoolbox}
 \AtBeginEnvironment{quote}{\par\singlespacing\small}
 \begin{document}
-\section{Computer Vision and Ordinal Triplet Ranking Architecture}
+\section{Computer Vision and In-Batch Ordinal Pairwise Ranking Architecture}
 
 At its core, the model takes as input an aerial image tile centered on a building footprint---together with a set of geographic covariates---and produces a single scalar score representing that building's relative structural wealth position at a given point in time. The full pipeline then aggregates these building-level scores to the census tract, maps their empirical quantiles to a target income distribution, and delivers zero-shot econometric estimates for any city without requiring additional labeled data.
 
@@ -26,9 +26,9 @@ This theoretical interpretation disciplines which comparisons the model may lear
 
 Two observations of the same building at different times---$(b, i, t)$ and $(b, i, t')$---are \textit{directly comparable}. If no structural change has occurred, the human wealth bundle is identical and the scores should agree; if change has occurred, the displacement in score space is identified by the change in the bundle itself. Two different buildings observed in the \textit{same} year---$(b, i, t)$ and $(c, j, t)$---are also \textit{directly comparable}, since both are positioned within the same city-wide income distribution at the same moment in time and the cross-sectional ordering is well-defined.
 
-However, supervising the network with direct ACS label comparisons across \textit{both} dimensions simultaneously---$(b, i, t)$ against $(c, j, t')$ for $b \neq c$ and $t \neq t'$---is empirically unidentified. While Lemma 1 of our Representation Theorem guarantees that a true cross-spatiotemporal ordering exists in the latent wealth space, the observed ACS income distributions drift aggregately over time. A naive comparison of ACS labels across different buildings and different years conflates the true spatial wealth gradient with aggregate temporal drift. Therefore, our triplet construction strictly masks out spatiotemporal pairs during training. The network is forced to \textit{learn} the cross-spatiotemporal bridge (Lemma 1) endogenously, by chaining together valid cross-sectional and temporal-trajectory gradients, rather than anchoring to historically drifted labels.
+However, supervising the network with direct ACS label comparisons across \textit{both} dimensions simultaneously---$(b, i, t)$ against $(c, j, t')$ for $b \neq c$ and $t \neq t'$---is empirically unidentified. While Lemma 1 of our Representation Theorem guarantees that a true cross-spatiotemporal ordering exists in the latent wealth space, the observed ACS income distributions drift aggregately over time. A naive comparison of ACS labels across different buildings and different years conflates the true spatial wealth gradient with aggregate temporal drift. Therefore, the in-batch pairwise framework strictly masks out spatiotemporal pairs during training. The network is forced to \textit{learn} the cross-spatiotemporal bridge (Lemma 1) endogenously, by chaining together valid cross-sectional and temporal-trajectory gradients, rather than anchoring to historically drifted labels.
 
-To enforce these objectives without introducing spatial cardinality mismatch or temporal label drift, we adopt a \textbf{Triplet Margin Ranking Loss} framework and abandon cardinal regression entirely. The loss supervises only the \textit{direction} of pairwise score differences, never their magnitude. This resolves the label-inconsistency problem inherent in longitudinal ACS data: under any magnitude-sensitive loss, a physically stable neighborhood artificially drifts downward in relative rank as the broader city's housing stock grows, producing corrupted gradients. By supervising direction alone, the model learns a transport function that connects how buildings behave over time without anchoring to historically corrupted magnitudes.
+To enforce these objectives without introducing spatial cardinality mismatch or temporal label drift, we adopt an \textbf{In-Batch Pairwise Ranking} framework and abandon cardinal regression entirely. The loss supervises only the \textit{direction} of pairwise score differences, never their magnitude. This resolves the label-inconsistency problem inherent in longitudinal ACS data: under any magnitude-sensitive loss, a physically stable neighborhood artificially drifts downward in relative rank as the broader city's housing stock grows, producing corrupted gradients. By supervising direction alone, the model learns a transport function that connects how buildings behave over time without anchoring to historically corrupted magnitudes.
 
 \subsection{Image Input and Spatial Spillover ($\tau$)}
 
@@ -36,17 +36,33 @@ Building footprint polygons are sourced from the official New York City Departme
 
 Because neighborhood wealth is shaped by localized externalities that extend beyond any single structure, the image tile is not clipped to the building footprint. We introduce a \textbf{spatial spillover hyperparameter, $\tau$}, defined as a buffer radius (in meters) around the centroid, so that the tile captures the immediate built environment surrounding the building. Let $X_{b,i,t}^\tau$ denote the aerial image tile of building $b$ in tract $i$ at year $t \in \{2008, 2010, 2012, 2014, 2016, 2018, 2020, 2022, 2024\}$, inclusive of the $\tau$-meter buffer.
 
-\subsection{Feature Extraction and Score Head}
 
-A feature extraction sub-network $f_\theta(\cdot)$, parameterized by weights $\theta$, encodes each image tile into a lower-dimensional latent representation:
-\begin{equation}
-h_{b,i,t} = f_\theta\!\left(X_{b,i,t}^\tau\right)
-\end{equation}
 
-A fully connected score head $g_\phi(\cdot)$, with weights $\phi$, then projects this latent representation onto a single continuous scalar:
+\subsection{Feature Extraction: ScaleMAE with Low-Rank Adaptation}
+
+The feature extractor is a \textbf{ScaleMAE} (Scale-aware Masked Autoencoder) backbone \citep{reed2023scalemae}, a Vision Transformer (ViT-Large/16) pretrained on multi-scale remote sensing imagery via masked image modeling. ScaleMAE is specifically designed to encode spatial resolution as a learned positional signal, making it well-suited for aerial imagery where the ground sampling distance (GSD) varies across acquisitions and zoom levels.
+
+To adapt the pretrained backbone to the ordinal ranking task without catastrophic forgetting, we apply \textbf{Low-Rank Adaptation (LoRA)} \citep{hu2021lora} to the attention and MLP projection matrices of every transformer block. Specifically, trainable low-rank decomposition matrices of rank $r = 16$ are injected into the fused query-key-value attention projections (\texttt{qkv}) and the two MLP layers (\texttt{fc1}, \texttt{fc2}) of each block. The original pretrained weights remain frozen; only the LoRA adapters and the downstream regression head are updated during training. This reduces the trainable parameter count by over 99\% relative to full fine-tuning while preserving the rich spatial representations learned during pretraining.
+
+The ScaleMAE backbone encodes each image tile $X_{b,i,t}^\tau$ into a sequence of patch token embeddings. Mean-pooling across the spatial patch dimension yields a single feature vector:
 \begin{equation}
-\hat{R}_{b,i,t} = g_\phi(h_{b,i,t})
+h_{b,i,t} = \text{MeanPool}\!\left( f_\theta\!\left(X_{b,i,t}^\tau\right) \right) \in \mathbb{R}^{1024}
 \end{equation}
+where $f_\theta$ denotes the LoRA-augmented ScaleMAE backbone.
+
+\subsection{Late Fusion Score Head}
+
+A \textbf{Late Fusion Head} projects the pooled image embedding---concatenated with an optional geographic covariate vector---onto a single scalar score. The architecture consists of:
+\begin{enumerate}
+    \item A linear compression layer that maps the 1024-dimensional image embedding to 64 dimensions, followed by GELU activation, layer normalization, and 40\% dropout.
+    \item A final linear layer that maps the concatenation of the 64-dimensional compressed image features and the metadata vector $\mathbf{m}_{b,i,t}$ (currently a single covariate: distance-to-city-center) to the scalar output.
+\end{enumerate}
+
+The scalar output is:
+\begin{equation}
+\hat{R}_{b,i,t} = g_\phi\!\left(h_{b,i,t},\; \mathbf{m}_{b,i,t}\right)
+\end{equation}
+where $g_\phi$ denotes the late fusion head with weights $\phi$.
 
 This scalar $\hat{R}_{b,i,t}$ represents the building's position on the ordinal poor-to-rich continuum. Within a census tract $i$, buildings share the same underlying socioeconomic context, so in expectation $\hat{R}_{b,i,t} = \hat{R}_{i,t}$ for all $b$. Deviations across buildings within the same tract are treated as measurement error. Because the model is never fed more than a few buildings per tract per epoch, it is regularized against overfitting to the visual idiosyncrasies of individual structures and is instead forced to learn the structural hierarchy of wealth at the neighborhood level.
 
@@ -56,56 +72,114 @@ A core methodological commitment of this architecture is the intentional discard
 
 Deployment to an out-of-sample city (e.g., Boston) proceeds as follows. The model computes scalar scores $\hat{R}$ for all target buildings based solely on their aerial imagery. Empirical quantiles of these scores are then mapped directly to the corresponding quantiles of the target city's ACS income distribution, delivering zero-shot econometric moment matching without any fine-tuning on labeled local data.
 
-\subsection{Triplet Construction and Stochastic Batch Composition}
+\subsection{In-Batch Pairwise Ranking: Batch Construction and Sampling Strategy}
 
-Every triplet is organized around a \textbf{stable temporal positive pair}, operationalizing the first valid comparison set. The anchor is a building $b$ in tract $i$ observed at year $t$. The positive is the same building at a different year $t'$, conditional on no structural change having occurred in the intervening period ($I_{b,i}^{valid}(t \to t') = 0$):
+The training pipeline constructs stochastically stratified \textbf{hybrid batches}, each designed to maximize pairwise supervision density from a single unified forward pass through the backbone.
 
-\begin{equation}
-\mathcal{A} = X_{b,i,t}^\tau, \qquad \mathcal{P} = X_{b,i,t'}^\tau \quad \text{s.t.} \quad I_{b,i}^{valid}(t \to t') = 0
-\end{equation}
+\subsubsection{The Cross-Sectional Core ($\mathcal{B}_{cs}$)}
+A \texttt{HybridBatchSampler} randomly selects a single anchor year $t$ and draws $B_{cs}$ distinct buildings observed in that year from the loaded cache shards. This cross-sectional core is the primary source of ordinal ranking supervision: every unique pair of buildings from different census tracts provides a valid directional constraint.
 
-This construction encodes the comparability constraint directly into the training data: the only observations treated as ``equivalent'' are those for which temporal identity is physically verified. Cross-sectional positive pairs---two \textit{different} buildings assigned the same income rank---are never constructed. Since cross-sectional wealth rankings constitute a strict totally ordered set, any apparent label equality between distinct buildings reflects ACS measurement noise rather than true economic equivalence. Forcing different buildings to occupy the same point on the continuum would distort the ordinal structure the model is meant to learn.
-
-The negative is sampled under two regimes, governed by the tunable hyperparameter $\lambda$, each corresponding to one of the two valid comparison sets:
-
+\subsubsection{The Temporal Auxiliary Set ($\mathcal{B}_{temp}$)}
+For a fraction of the buildings in $\mathcal{B}_{cs}$ (controlled by the hyperparameter $\rho_{temp}$, default 0.20), the sampler queries the longitudinal panel for observations of the same building in a different year $t' \neq t$:
 \begin{itemize}
-    \item \textbf{$\lambda$-case --- Cross-Sectional Negative (default $\lambda = 0.8$):} The negative is a different building $c$ from tract $j \neq i$, drawn from the \textit{same} year $t$ as the anchor, operationalizing the second valid comparison set. Buildings from the same census tract as the anchor ($j = i$) are excluded: ACS labels carry no within-tract variation by construction, and therefore, while theoretically comparable under our axioms, they provide no identified gradient for empirical training. 
-    % To further avoid injecting corrupted gradients into the middle of the distribution---where ACS sampling noise can reverse the true ordering---the negative pool is additionally restricted to buildings whose ACS confidence intervals do not overlap with the anchor's. This regime trains the model's monotonic cross-sectional ordering.
-
-    \item \textbf{$(1-\lambda)$-case --- Temporal Change Negative (default $1 - \lambda = 0.2$):} The negative is the \textit{same} anchor building $b$ observed at a year $t''$ where structural change did occur ($I_{b,i}^{valid}(t \to t'') = 1$). This is again a temporally valid comparison (same building, different time), but now supervising the opposite signal: physical transformation should displace the embedding, while stability should not.
+    \item \textbf{Stable twins:} If building $k$ exists in $t'$ and underwent no structural change ($I_{k}^{valid}(t \to t') = 0$), the image for $t'$ is appended to the batch, contributing to the temporal stability penalty.
+    \item \textbf{Changed twins:} If building $k$ exists in $t'$ but underwent statistically significant structural change ($I_{k}^{valid}(t \to t') = 1$), the image for $t'$ is appended to the batch, contributing to the temporal change ranking objective.
 \end{itemize}
 
-Crucially, no triplet ever pairs a building at one time against a \textit{different} building at a \textit{different} time. Such cross-spatiotemporal comparisons would conflate the spatial wealth gradient with temporal drift in the city-wide income distribution, violating the comparability constraint and producing unidentified supervision signals.
+\noindent The complete hybrid batch is therefore $\mathcal{B} = \mathcal{B}_{cs} \cup \mathcal{B}_{temp}$, processed in a \textit{single forward pass} through the shared backbone.
 
-Anchors are sampled uniformly within each regime. The global ordinal position of structurally changed buildings is recovered across training through their appearance as anchors in $\lambda$-case batches, where cross-sectional negatives from the same year place them correctly within the city-wide distribution.
+\subsection{In-Batch Pairwise Ranking Loss}
 
-\subsection{Triplet Margin Ranking Loss}
+A single forward pass encodes the entire hybrid batch $\mathcal{B}$ into a vector of scalar scores $\hat{R}$. The total loss is the decoupled sum of three objectives computed over valid subsets of these scores, plus a variance regularizer that prevents score collapse.
 
-Because the embedding space is one-dimensional and the network is explicitly required to produce a monotonic poor-to-rich continuum, an unsigned distance triplet loss is insufficient. In high-dimensional metric learning, unsigned distance is appropriate because the embedding has no intrinsic axis; here, by contrast, we require a strict directional ordering. An unsigned formulation would allow a luxury building to satisfy the margin constraint by scoring \textit{below} the anchor rather than above it, leaving the global ordering unidentified. We therefore substitute a signed distance for the negative side of the standard triplet loss while retaining unsigned distance on the positive pair, where no directionality needs to be enforced.
+\subsubsection{Cross-Sectional Ranking ($\mathcal{L}_{cross}$)}
 
-Let $y_{\mathcal{A},\mathcal{N}} \in \{+1, -1\}$ be a directional indicator: $y = +1$ if $\mathcal{N}$ is richer than $\mathcal{A}$, and $y = -1$ if $\mathcal{N}$ is poorer. To prevent the two objectives from being traded off against each other inside a shared hinge, the temporal stability penalty and the directional ranking loss are decoupled into an additive sum:
+For the $B_{cs}$ cross-sectional images in year $t$, we enumerate all $\binom{B_{cs}}{2}$ unique, undirected pairs via the upper-triangular indices. Let $\mathcal{U}_{valid}$ denote the subset of unique pairs $(k, l)$ where buildings $k$ and $l$ reside in \textit{different} census tracts (same-tract pairs are masked out, as ACS labels provide no intra-tract variation).
 
+Let $y_{k,l} = \text{sign}(Z_l - Z_k) \in \{-1, +1\}$ denote the true economic ordering from ACS labels, where $Z$ is the label (relative income score). We define the signed agreement as $\delta_{k,l} = y_{k,l} \cdot (\hat{R}_l - \hat{R}_k)$, which is positive when the model's ranking agrees with the ground truth.
+
+The cross-sectional loss uses a \textbf{smooth logistic (RankNet) surrogate} rather than a hard hinge:
 \begin{equation}
-\mathcal{L}(\theta, \phi) = \frac{1}{|\mathbb{B}|} \sum_{(\mathcal{A}, \mathcal{P}, \mathcal{N}) \in \mathbb{B}} \left[ \left|\hat{R}_\mathcal{A} - \hat{R}_\mathcal{P}\right| + \max\!\left(0,\; -y_{\mathcal{A},\mathcal{N}}\!\left(\hat{R}_\mathcal{N} - \hat{R}_\mathcal{A}\right) + m \right) \right]
+\mathcal{L}_{cross} = \frac{1}{|\mathcal{U}_{valid}|} \sum_{(k,l) \in \mathcal{U}_{valid}} \log\!\left(1 + \exp\!\left(-\frac{\delta_{k,l}}{T}\right)\right)
+\end{equation}
+where $T$ is a temperature parameter that controls the sharpness of the logistic sigmoid. Note that $\log(1 + e^x) = \text{softplus}(x)$.
+
+\paragraph{Score-based temperature (preserving the ordinal framework).}
+Critically, the temperature $T$ scales with the model's own output distribution, \textit{not} with ACS label magnitudes:
+\begin{equation}
+T = \max\!\left(m_{min},\;\; m_{base} \cdot \sigma_{batch}\right)
+\end{equation}
+where $\sigma_{batch} = \text{std}(\hat{R}_{cs})$ is the detached standard deviation of the cross-sectional scores within the current batch, $m_{base}$ is a scaling hyperparameter (default 1.0), and $m_{min}$ is a hard floor (default 0.05) that prevents division by near-zero values at initialization. Both $\sigma_{batch}$ and $m_{min}$ carry zero economic information---they are purely functions of the score head's output distribution. This design choice is essential to the ordinal framework: supervision is purely directional (sign of label differences), and the temperature merely adapts the gradient magnitude to the current prediction scale without injecting cardinal economic content.
+
+\paragraph{Curriculum learning: easy-to-hard pair filtering.}
+To improve gradient quality and prevent the model from fitting to noisy, ambiguous comparisons early in training, we implement an epoch-dependent curriculum that progressively admits harder pairwise comparisons. Each building is assigned to a score quintile bin $q \in \{1, 2, 3, 4, 5\}$ based on its ACS label. The absolute bin difference $|q_k - q_l|$ between paired buildings determines the difficulty of the comparison: large differences correspond to ``easy'' pairs with unambiguous ordinal direction, while small differences correspond to ``hard'' pairs where ACS measurement error may reverse the true ordering.
+
+The curriculum schedule is:
+\begin{itemize}
+    \item \textbf{Epochs 0--59:} Only pairs with $|q_k - q_l| \geq 3$ (extreme quintile contrasts).
+    \item \textbf{Epochs 60--149:} Pairs with $|q_k - q_l| \geq 2$ (adjacent quintile pairs admitted).
+    \item \textbf{Epoch 150+:} Pairs with $|q_k - q_l| \geq 1$ (all inter-quintile pairs admitted).
+\end{itemize}
+Intra-quintile comparisons ($|q_k - q_l| = 0$) are \textit{permanently excluded}. The ACS margin of error makes within-quintile rankings pure noise; forcing a strict directional constraint on such pairs causes variance collapse as the model learns to shrink its output spread to trivially satisfy the loss.
+
+\subsubsection{Temporal Stability Penalty ($\mathcal{L}_{stable}$)}
+
+For buildings in the stable temporal subset $\mathcal{B}_{stable}$, the latent human wealth bundle is physically identical between years $t$ and $t'$. The model enforces temporal invariance via an unconditional L1 penalty. Each temporal twin is dynamically paired with its cross-sectional anchor by matching on building identifier (DOITT\_ID):
+\begin{equation}
+\mathcal{L}_{stable} = \frac{1}{|\mathcal{B}_{stable}|} \sum_{k \in \mathcal{B}_{stable}} \left| \hat{R}_{k,t} - \hat{R}_{k,t'} \right|
 \end{equation}
 
-The first term, $|\hat{R}_\mathcal{A} - \hat{R}_\mathcal{P}|$, is an unconditional L1 stability penalty: it contributes a nonzero gradient whenever the stable temporal twin scores differently from the anchor, regardless of how the negative is positioned. Placing this term outside the hinge is essential: were it nested inside a shared \texttt{max()}, the network could zero the loss---and kill the gradient on the stability term entirely---simply by driving $\hat{R}_\mathcal{N}$ to an extreme value, substituting cheap ranking separation for genuine temporal invariance. The second term, $\max(0,\; -y_{\mathcal{A},\mathcal{N}}(\hat{R}_\mathcal{N} - \hat{R}_\mathcal{A}) + m)$, enforces directional ordering with a hinge: if $\mathcal{N}$ is richer ($y = +1$), it is zero only when $\hat{R}_\mathcal{N} \geq \hat{R}_\mathcal{A} + m$; if $\mathcal{N}$ is poorer ($y = -1$), the constraint is symmetric in the opposite direction. This constructs the monotonic continuum that unsigned distance cannot. The decoupled structure also reflects the theoretical independence of the two objectives: temporal stability and cross-sectional ordering derive from separate comparability sets and should contribute independently to the total loss.
+\subsubsection{Temporal Change Ranking ($\mathcal{L}_{change}$)}
 
-A unified directional indicator $y_{\mathcal{A},\mathcal{N}}$ is applied consistently across both triplet regimes:
-\begin{itemize}
-    \item \textbf{$\lambda$-case:} $y_{\mathcal{A},\mathcal{N}}$ is read directly from ACS labels. Because anchor and negative are drawn from the same year, the cross-sectional comparison is identified and the direction is unambiguous.
-    \item \textbf{$(1-\lambda)$-case:} $y_{\mathcal{A},\mathcal{N}}$ is set from the direction of structural change, determined by the sign of the statistically significant ACS difference between $t$ and $t''$: $y = +1$ if the building gentrified (income rose) and $y = -1$ if it decayed. While the global ordinal position of structurally changed buildings is ultimately recovered through their appearance as anchors in $\lambda$-case batches, applying the signed constraint here is not incorrect and yields a conceptually unified loss: in both regimes, the model is always asked the same question---which of the two buildings in a valid comparison set is richer.
-\end{itemize}
+For buildings in the changed temporal subset $\mathcal{B}_{change}$, physical alteration identifies a shift in the human wealth bundle. Let $y_{k, t \to t'} \in \{-1, +1\}$ indicate the direction of the structural change (e.g., $+1$ if the tract gentrified). We supervise this displacement using the same smooth logistic surrogate used for cross-sectional ranking, applied to temporal pairs of the \textit{same} building:
+\begin{equation}
+\mathcal{L}_{change} = \frac{1}{|\mathcal{B}_{change}|} \sum_{k \in \mathcal{B}_{change}} \log\!\left(1 + \exp\!\left(-\frac{y_{k,t\to t'} \cdot (\hat{R}_{k,t'} - \hat{R}_{k,t})}{T_{change}}\right)\right)
+\end{equation}
+where $T_{change} = \max(m_{min}, \; m_{base} \cdot \sigma')$ and $\sigma'$ is the detached standard deviation computed over the union of cross-sectional and temporal change scores, ensuring the temperature reflects the full prediction-scale context.
 
-This formulation does not reintroduce cardinality. The stability penalty targets zero, not an ACS magnitude. The signed ranking term uses only $y \in \{+1, -1\}$, which is the \textit{sign} of an ACS difference, not its magnitude. The margin $m$ is a static hyperparameter calibrated to the standard deviation of the score head at initialization and carries no economic information.
+\subsubsection{Variance Regularizer}
 
-\paragraph{Relation to the literature.} The ranking component of the loss in Equation~(4)---the term $\max(0,\; -y(x_1 - x_2) + m)$---is identical to PyTorch's \texttt{nn.MarginRankingLoss} \citep{paszke2019pytorch}, which implements the standard pairwise ranking objective introduced by \citet{joachims2002optimizing} in the context of SVM-based learning to rank. The broader family of pairwise ranking losses---of which this is the directional, margin-augmented variant---is surveyed in \citet{liu2009learning}. \citet{burges2005learning} (RankNet) adopts a probabilistic pairwise formulation with the same directional supervision structure but replaces the hinge with a cross-entropy surrogate; the hinge-margin version used here is preferred in settings where the ordinal structure is deterministic rather than stochastic, as is the case when ACS confidence intervals provide a hard significance threshold for direction. The combination of an unconditional L1 stability penalty on positive pairs with a directional ranking hinge on negatives is structurally analogous to the Large Margin Nearest Neighbor objective of \citet{weinberger2009distance}, adapted here from metric space to a 1-D scalar continuum. To our knowledge, this specific combination---signed ordinal supervision with stable temporal anchors and directional structural change indicators---has not been applied previously in the satellite-imagery-for-economics literature, where existing work relies on cross-sectional regression \citep{jean2016combining} or cardinal pairwise differences \citep{yeh2020using} rather than a purely ordinal framework.
+To prevent the score head from collapsing its output to a near-constant value---a failure mode in which the softplus loss can be trivially minimized by shrinking $\sigma_{batch}$ toward zero---we add a quadratic variance penalty computed exclusively over the cross-sectional scores:
+\begin{equation}
+\mathcal{L}_{var} = \left(\sigma_{cs} - 1\right)^2
+\end{equation}
+where $\sigma_{cs} = \text{std}(\hat{R}_{cs})$. This targets a unit standard deviation for the cross-sectional score distribution, ensuring the model maintains a well-spread prediction landscape. The penalty is applied only to cross-sectional scores (not temporal), maintaining internal consistency: both the temperature $T$ and the variance target reference the same $\sigma_{cs}$, eliminating any tug-of-war between temporal invariance and score spread.
+
+\subsubsection{Total Objective}
+
+The final unified objective aggregates the valid comparisons:
+\begin{equation}
+\mathcal{L}_{total} = \mathcal{L}_{cross} + \lambda_{s} \cdot \mathcal{L}_{stable} + \lambda_{c} \cdot \mathcal{L}_{change} + \mathcal{L}_{var}
+\end{equation}
+where $\lambda_s$ and $\lambda_c$ are weighting hyperparameters governing the relative influence of the temporal constraints against the cross-sectional ranking baseline.
+
+\paragraph{Relation to the literature.} The cross-sectional ranking component of the loss is a smooth logistic pairwise surrogate, structurally identical to the RankNet formulation of \citet{burges2005learning}. The logistic surrogate is preferred over the hard hinge variant of \citet{joachims2002optimizing} because the smooth gradient propagates useful learning signal even for correctly ranked pairs, avoiding the dead-zone problem inherent in hinge losses where gradients vanish for pairs satisfying the margin constraint. The addition of an adaptive, score-based temperature $T$ that scales with the model's output distribution rather than with label magnitudes is, to our knowledge, novel in the satellite-imagery-for-economics literature. The combination of an unconditional L1 stability penalty on temporal positives with a directional logistic surrogate on negatives is structurally analogous to the Large Margin Nearest Neighbor objective of \citet{weinberger2009distance}, adapted from metric space to a 1-D scalar continuum. The curriculum learning schedule over quintile-based pair difficulty draws on the general curriculum learning framework of \citet{bengio2009curriculum}. To our knowledge, this specific combination---smooth ordinal supervision with score-based adaptive temperature, stable temporal anchors, directional structural change indicators, and progressive pair-difficulty curriculum---has not been applied previously in the satellite-imagery-for-economics literature, where existing work relies on cross-sectional regression \citep{jean2016combining} or cardinal pairwise differences \citep{yeh2020using} rather than a purely ordinal framework.
+
+\subsection{Training Infrastructure}
+
+\paragraph{Cyclic cache management.}
+Because the full panel of aerial imagery for New York City exceeds available RAM, the training pipeline employs a \textbf{cyclic cache manager} that maintains a rotating window of pre-extracted, subsampled image shards on disk. Training proceeds over a fixed number of active shards; while the GPU processes the current shards, a background thread asynchronously generates the next batch of shards from the zarr-backed imagery store. This ensures the GPU is never starved for data while keeping RAM usage bounded.
+
+\paragraph{Mixed-precision training and gradient accumulation.}
+All forward passes are executed under \textbf{automatic mixed precision} (AMP) with float16 compute and float32 master weights, managed by a \texttt{GradScaler}. To achieve an effective batch size larger than the physical GPU memory allows, gradients are accumulated over $K$ micro-batches (default $K = 8$) before each optimizer step. This is equivalent to training with an effective batch of $B_{cs} \times K$ cross-sectional images, dramatically increasing the number of valid pairwise constraints per parameter update.
+
+\paragraph{Optimizer and learning rate schedule.}
+The optimizer is AdamW with weight decay 0.05. The learning rate follows a \textbf{ReduceLROnPlateau} schedule that monitors mean validation Spearman correlation, decaying by a factor of 0.8 after 20 epochs of no improvement, with a minimum learning rate floor of $\text{lr}/20$.
+
+\paragraph{Data augmentation.}
+Training tiles are extracted with a jitter pad of $\pm 10$ meters around the centroid, which is then realized as a random spatial crop at model resolution. Photometric augmentations include color jitter (brightness $\pm 0.3$, contrast $\pm 0.3$, saturation $\pm 0.2$), random grayscale (10\%), random horizontal and vertical flips. Validation and inference tiles receive no augmentation beyond ImageNet normalization.
+
+\paragraph{Validation metric.}
+Validation is performed using pointwise MSE loss for interpretable per-image tracking, complemented by \textbf{Spearman rank correlation} between predicted scores and ACS labels as the primary model selection criterion. The best model checkpoint is selected to maximize mean Spearman correlation across validation splits.
 
 \subsection*{Summary of Core Architectural Hyperparameters}
 \begin{itemize}
-    \item \textbf{$\tau$ (Spillover Radius):} Buffer radius (in meters) around the building centroid defining the spatial extent of each aerial image tile.
-    \item \textbf{$\lambda$ (Batch Regime Split):} Proportion of triplets using a cross-sectional negative ($\lambda$) versus a temporal change negative ($1 - \lambda$). Default: $\lambda = 0.8$.
-    \item \textbf{$m$ (Triplet Margin):} Static margin enforcing minimum score separation between positive and negative distances. Calibrated to the standard deviation of the score head at initialization.
+    \item \textbf{$\tau$ (Spillover Radius):} Buffer radius (in meters) around the building centroid defining the spatial extent of each aerial image tile. Automatically snapped to an exact subsampling multiple.
+    \item \textbf{$\rho_{temp}$ (Temporal Fraction):} Fraction of the batch reserved for temporal auxiliary images (split between stable and changed twins). Default: 0.20.
+    \item \textbf{$m_{base}$ (Margin Scale Factor):} Scaling coefficient for the adaptive temperature $T = \max(m_{min}, \; m_{base} \cdot \sigma_{batch})$. Default: 1.0.
+    \item \textbf{$m_{min}$ (Margin Floor):} Hard minimum for the temperature, preventing numerical instability at initialization. Default: 0.05.
+    \item \textbf{$\lambda_s$ (Stable Temporal Weight):} Weighting of the temporal stability L1 penalty. Default: 0.02.
+    \item \textbf{$\lambda_c$ (Change Temporal Weight):} Weighting of the temporal change ranking loss. Default: 0.1.
 \end{itemize}
 
 \end{document}
