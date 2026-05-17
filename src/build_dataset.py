@@ -723,19 +723,6 @@ def assign_buildings_train_test_val(
     }
     if test_years:  # Only add temporal val key if test_years were provided; avoids IndexError
         final_val_masks[f"val_{test_years[0]}"] = final_val_time_mask
-        
-    # Samples all years of 1 building over 30% of all the tracts in val
-    val_tracts_unique = df[total_val_mask]['GEOID'].unique()
-    num_sampled_tracts = int(0.3 * len(val_tracts_unique))
-    final_val_spatial_temporal_mask = pd.Series(np.zeros(len(df), dtype=bool), index=df.index)
-    if num_sampled_tracts > 0:
-        sampled_tracts = np.random.choice(val_tracts_unique, size=num_sampled_tracts, replace=False)
-        val_buildings_in_sampled = df[total_val_mask & df['GEOID'].isin(sampled_tracts)][['GEOID', 'DOITT_ID']].drop_duplicates()
-        if not val_buildings_in_sampled.empty:
-            sampled_buildings = val_buildings_in_sampled.groupby('GEOID', group_keys=False).apply(lambda x: x.sample(n=1))
-            final_val_spatial_temporal_mask_np = df['DOITT_ID'].isin(sampled_buildings['DOITT_ID']).values & total_val_mask.values
-            final_val_spatial_temporal_mask = pd.Series(final_val_spatial_temporal_mask_np, index=df.index)
-    final_val_masks["val_spatial_temporal"] = final_val_spatial_temporal_mask
     
     # Compute logs
     overlaps = (spatial_test_mask & time_mask_np).sum() + (spatial_test_mask & other_mask_np).sum() + (time_mask_np & other_mask_np).sum()
@@ -750,7 +737,6 @@ def assign_buildings_train_test_val(
     df.loc[final_test_mask, "type"] = "test"
     df.loc[final_val_spatial_mask, "type"] = "val_spatial"
     df.loc[final_val_time_mask, "type"] = "val_time"
-    df.loc[final_val_spatial_temporal_mask, "type"] = "val_spatial_temporal"
     df.loc[final_dead_zone_mask, "type"] = "dead_zone"
 
     train_tracts = df[final_train_mask].drop_duplicates("GEOID").shape[0]

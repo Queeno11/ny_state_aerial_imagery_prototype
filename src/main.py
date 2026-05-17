@@ -501,9 +501,6 @@ class StaticShardedDataset(Dataset):
         self.images = None
         self.scores = None
         self.metas  = None
-        self.doitt_ids = None
-        self.years = None
-        self.structural_change = None
 
         if verbose:
             print(f"Loading metadata for {len(self.shard_paths)} shards to establish dataset sizes...")
@@ -530,9 +527,6 @@ class StaticShardedDataset(Dataset):
         self.images  = data["images"]
         self.scores  = data["scores"]
         self.metas   = data.get("metas")
-        self.doitt_ids = data.get("doitt_ids")
-        self.years   = data.get("years")
-        self.structural_change = data.get("structural_change")
         self.current_shard_idx = shard_idx
 
     def __len__(self):
@@ -545,14 +539,11 @@ class StaticShardedDataset(Dataset):
         img  = self.images[item_idx]
         lbl  = self.scores[item_idx]
         meta = self.metas[item_idx] if self.metas is not None else torch.zeros(1)
-        doitt_id = self.doitt_ids[item_idx] if self.doitt_ids is not None else 0
-        year = self.years[item_idx] if self.years is not None else 0
-        structural_change = self.structural_change[item_idx] if self.structural_change is not None else 0
 
         if self.transform:
             img = self.transform(img)
 
-        return img, lbl, meta, doitt_id, year, structural_change
+        return img, lbl, meta
                                         
 class PhotometricAugmentation:
     def __init__(self):
@@ -1204,22 +1195,17 @@ def train_model(
         # ==========================
         val_losses = {}
         val_spearmans = {}
-        val_temporal_vars = {}
-        val_stable_temporal_vars = {}
         if len(val_loaders.values()) > 0:
             for val_name, val_loader in val_loaders.items():
                 model.eval() # Set model to eval mode (disables dropout)
                 running_val_loss = 0.0
                 all_preds = []
                 all_labels = []
-                all_doitts = []
-                all_years = []
-                all_changes = []
                 val_bar = tqdm(val_loader, desc=f"Epoch [{epoch+1}/{epochs}] {val_name}", leave=False)
 
                 # Disable gradient calculation for validation (saves RAM and compute)
                 with torch.no_grad():
-                    for images, labels, metas, doitt_ids, val_years, val_structural_changes in val_bar:
+                    for images, labels, metas in val_bar:
                         images, labels, metas = images.to(device), labels.to(device), metas.to(device)
                         if images.dtype != torch.float32 or images.max() > 10.0:
                             raise RuntimeError(
@@ -1239,12 +1225,6 @@ def train_model(
                         
                         all_preds.extend(outputs.view(-1).cpu().numpy())
                         all_labels.extend(labels.view(-1).cpu().numpy())
-                        if doitt_ids is not None:
-                            all_doitts.extend(doitt_ids.cpu().numpy())
-                        if val_years is not None:
-                            all_years.extend(val_years.cpu().numpy())
-                        if val_structural_changes is not None:
-                            all_changes.extend(val_structural_changes.cpu().numpy())
                         
                         val_bar.set_postfix(loss=f"{loss.item():.4f}")
                 
@@ -1254,34 +1234,7 @@ def train_model(
                 val_losses[val_name] = running_val_loss / len(val_loader.dataset)
                 val_spearmans[val_name] = spearman_corr
                 
-                # Compute temporal variance if we have the metadata
-                if len(all_doitts) > 0 and len(all_doitts) == len(all_preds):
-                    val_df = pd.DataFrame({
-                        'DOITT_ID': all_doitts,
-                        'year': all_years,
-                        'pred': all_preds,
-                        'change': all_changes
-                    })
-                    
-                    val_counts = val_df['DOITT_ID'].value_counts()
-                    valid_doitts = val_counts[val_counts >= 2].index
-                    
-                    if len(valid_doitts) > 0:
-                        valid_df = val_df[val_df['DOITT_ID'].isin(valid_doitts)]
-                        group_vars = valid_df.groupby('DOITT_ID')['pred'].var()
-                        val_temporal_vars[val_name] = group_vars.mean()
-                        
-                        # Just stable buildings
-                        stable_df = valid_df[valid_df['change'] == 0]
-                        if len(stable_df) > 0:
-                            stable_counts = stable_df['DOITT_ID'].value_counts()
-                            stable_valid = stable_counts[stable_counts >= 2].index
-                            if len(stable_valid) > 0:
-                                stable_group_vars = stable_df[stable_df['DOITT_ID'].isin(stable_valid)].groupby('DOITT_ID')['pred'].var()
-                                val_stable_temporal_vars[val_name] = stable_group_vars.mean()
-
-                temp_var_str = f" | Temp Var: {val_stable_temporal_vars.get(val_name, val_temporal_vars.get(val_name, 0.0)):.4f}" if val_name in val_temporal_vars else ""
-                tqdm.write(f"{val_name} MSE:{val_losses[val_name]:.4f} | Spearman: {spearman_corr:.4f}{temp_var_str}")
+                tqdm.write(f"{val_name} MSE:{val_losses[val_name]:.4f} | Spearman: {spearman_corr:.4f}")
             
             # Use mean validation spearman for early stopping / best model checkpointing
             epoch_val_spearman = sum(val_spearmans.values()) / len(val_spearmans)
@@ -1313,10 +1266,6 @@ def train_model(
             for val_name, val_loader in val_loaders.items():
                 log_dict[f"{val_name}_mse"] = val_losses[val_name]
                 log_dict[f"{val_name}_spearman"] = val_spearmans[val_name]
-                if val_name in val_temporal_vars:
-                    log_dict[f"{val_name}_temporal_var"] = val_temporal_vars[val_name]
-                if val_name in val_stable_temporal_vars:
-                    log_dict[f"{val_name}_stable_temporal_var"] = val_stable_temporal_vars[val_name]
 
         wandb.log(log_dict)
 
@@ -1671,8 +1620,7 @@ def run(
         for val_name, df_val in df_vals_dict.items():
             if df_val.shape[0] > 0:
                 # Take up to 5 buildings per shard for validation to keep RAM usage low, since we load the whole shard at once during validation
-                if val_name != "val_spatial_temporal":
-                    df_val = df_val.groupby(['GEOID', 'year'], group_keys=False)[df_val.columns].apply(lambda x: x.sample(n=min(len(x), 2)))
+                df_val = df_val.groupby(['GEOID', 'year'], group_keys=False)[df_val.columns].apply(lambda x: x.sample(n=min(len(x), 2)))
                 val_num_shards = max(1, (len(df_val) + current_shard_size - 1) // current_shard_size)
                 val_cache_manager = CyclicCacheManager(
                     df=df_val, # Or full df_val
