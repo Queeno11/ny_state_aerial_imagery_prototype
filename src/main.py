@@ -1295,7 +1295,7 @@ def train_model(
         # 4. ROTATE CACHE FOR NEXT EPOCH
         # ==========================
         if cache_manager:
-            k = 7
+            k = 4
             progress = epoch / max(1, epochs)
             cache_updated = cache_manager.step(k=k, progress=progress)
             if cache_updated:
@@ -1782,7 +1782,7 @@ def run(
             transforms.Normalize(mean=mean, std=std)  # 🔴 ImageNet Normalization — must match training
         ])
         
-        for year in [2016, 2018, 2020, 2022, 2024]:
+        for year in [2016, 2018, 2020, 2022, 2024, 2010, 2012, 2014]:
 
             print(f"\n--- Processing Predictions for Year: {year} ---")
             df_year = df_all[(df_all["year"] == year) & (df_all["type"] == "test")].copy()
@@ -1842,7 +1842,7 @@ if __name__ == "__main__":
         "nbands": 3,
         "batch_size": 16,
         "small_sample": False,
-        "n_epochs": 1000,
+        "n_epochs": 300,
         "learning_rate": 0.0001,
         "sat_data": "aerial",
         "years": [2010, 2012, 2014, 2016, 2018, 2020, 2022, 2024],
@@ -1858,4 +1858,4 @@ if __name__ == "__main__":
     } 
 
     # Run full pipeline
-    run(params, train=True, retrain=False, compute_loss=False, generate_predictions=True)
+    run(params, train=False, retrain=False, compute_loss=False, generate_predictions=True)
