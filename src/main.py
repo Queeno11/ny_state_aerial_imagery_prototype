@@ -1204,8 +1204,9 @@ def train_model(
         # ==========================
         val_losses = {}
         val_spearmans = {}
-        val_temporal_vars = {}
-        val_stable_temporal_vars = {}
+        val_stable_masd = {}
+        val_changed_masd = {}
+        val_changed_da = {}
         if len(val_loaders.values()) > 0:
             for val_name, val_loader in val_loaders.items():
                 model.eval() # Set model to eval mode (disables dropout)
@@ -1254,12 +1255,13 @@ def train_model(
                 val_losses[val_name] = running_val_loss / len(val_loader.dataset)
                 val_spearmans[val_name] = spearman_corr
                 
-                # Compute temporal variance if we have the metadata
+                # ── Temporal metrics: MASD (stable vs changed) + Directional Accuracy ──
                 if len(all_doitts) > 0 and len(all_doitts) == len(all_preds):
                     val_df = pd.DataFrame({
                         'DOITT_ID': all_doitts,
                         'year': all_years,
                         'pred': all_preds,
+                        'label': all_labels,
                         'change': all_changes
                     })
                     
@@ -1267,21 +1269,56 @@ def train_model(
                     valid_doitts = val_counts[val_counts >= 2].index
                     
                     if len(valid_doitts) > 0:
-                        valid_df = val_df[val_df['DOITT_ID'].isin(valid_doitts)]
-                        group_vars = valid_df.groupby('DOITT_ID')['pred'].var()
-                        val_temporal_vars[val_name] = group_vars.mean()
+                        valid_df = val_df[val_df['DOITT_ID'].isin(valid_doitts)].sort_values(['DOITT_ID', 'year'])
                         
-                        # Just stable buildings
-                        stable_df = valid_df[valid_df['change'] == 0]
-                        if len(stable_df) > 0:
-                            stable_counts = stable_df['DOITT_ID'].value_counts()
-                            stable_valid = stable_counts[stable_counts >= 2].index
-                            if len(stable_valid) > 0:
-                                stable_group_vars = stable_df[stable_df['DOITT_ID'].isin(stable_valid)].groupby('DOITT_ID')['pred'].var()
-                                val_stable_temporal_vars[val_name] = stable_group_vars.mean()
+                        # Per-building: compute MASD and directional accuracy over all year-ordered pairs
+                        building_change_flag = valid_df.groupby('DOITT_ID')['change'].first()
+                        stable_ids = building_change_flag[building_change_flag == 0].index
+                        changed_ids = building_change_flag[building_change_flag == 1].index
+                        
+                        stable_abs_disps = []
+                        changed_abs_disps = []
+                        da_correct = 0
+                        da_total = 0
+                        
+                        for doitt_id, grp in valid_df.groupby('DOITT_ID'):
+                            preds_arr = grp['pred'].values
+                            labels_arr = grp['label'].values
+                            is_changed = grp['change'].iloc[0]
+                            n = len(preds_arr)
+                            # All ordered pairs (j > i by year)
+                            for i in range(n):
+                                for j in range(i + 1, n):
+                                    pred_d = preds_arr[j] - preds_arr[i]
+                                    label_d = labels_arr[j] - labels_arr[i]
+                                    if is_changed == 0:
+                                        stable_abs_disps.append(abs(pred_d))
+                                    else:
+                                        changed_abs_disps.append(abs(pred_d))
+                                        if label_d != 0:  # skip tied labels
+                                            da_total += 1
+                                            if (pred_d > 0) == (label_d > 0):
+                                                da_correct += 1
+                        
+                        if stable_abs_disps:
+                            val_stable_masd[val_name] = float(np.mean(stable_abs_disps))
+                        if changed_abs_disps:
+                            val_changed_masd[val_name] = float(np.mean(changed_abs_disps))
+                        if da_total > 0:
+                            val_changed_da[val_name] = da_correct / da_total
 
-                temp_var_str = f" | Temp Var: {val_stable_temporal_vars.get(val_name, val_temporal_vars.get(val_name, 0.0)):.4f}" if val_name in val_temporal_vars else ""
-                tqdm.write(f"{val_name} MSE:{val_losses[val_name]:.4f} | Spearman: {spearman_corr:.4f}{temp_var_str}")
+                # Build display string (minimal: Spearman for spatial sets, MASD/DA for temporal set)
+                if val_name == "val_spatial_temporal":
+                    parts = []
+                    if val_name in val_stable_masd:
+                        parts.append(f"S-MASD: {val_stable_masd[val_name]:.4f}")
+                    if val_name in val_changed_masd:
+                        parts.append(f"C-MASD: {val_changed_masd[val_name]:.4f}")
+                    if val_name in val_changed_da:
+                        parts.append(f"C-DA: {val_changed_da[val_name]:.2%}")
+                    tqdm.write(f"{val_name} {' | '.join(parts)}")
+                else:
+                    tqdm.write(f"{val_name} Spearman: {spearman_corr:.4f}")
             
             # Use mean validation spearman for early stopping / best model checkpointing
             epoch_val_spearman = sum(val_spearmans.values()) / len(val_spearmans)
@@ -1298,7 +1335,7 @@ def train_model(
         # ==========================
         # 3. LOGGING & CHECKPOINTING
         # ==========================
-        val_display = " | ".join([f"{k} Spearman: {v:.4f}" for k, v in val_spearmans.items()])
+        val_display = " | ".join([f"{k} Spearman: {v:.4f}" for k, v in val_spearmans.items() if k != "val_spatial_temporal"])
         tqdm.write(f"Epoch [{epoch+1}/{epochs}] | Train Loss: {epoch_train_loss:.4f} | Train Acc: {epoch_train_acc:.4f} | {val_display}")
         
         # 🎯 Log metrics directly to W&B cloud!
@@ -1313,10 +1350,12 @@ def train_model(
             for val_name, val_loader in val_loaders.items():
                 log_dict[f"{val_name}_mse"] = val_losses[val_name]
                 log_dict[f"{val_name}_spearman"] = val_spearmans[val_name]
-                if val_name in val_temporal_vars:
-                    log_dict[f"{val_name}_temporal_var"] = val_temporal_vars[val_name]
-                if val_name in val_stable_temporal_vars:
-                    log_dict[f"{val_name}_stable_temporal_var"] = val_stable_temporal_vars[val_name]
+                if val_name in val_stable_masd:
+                    log_dict[f"{val_name}_stable_masd"] = val_stable_masd[val_name]
+                if val_name in val_changed_masd:
+                    log_dict[f"{val_name}_changed_masd"] = val_changed_masd[val_name]
+                if val_name in val_changed_da:
+                    log_dict[f"{val_name}_changed_da"] = val_changed_da[val_name]
 
         wandb.log(log_dict)
 
@@ -1742,11 +1781,16 @@ def run(
                 if scheduler and checkpoint.get("scheduler_state_dict"):
                     scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
                     
+                    # Reset patience counter to wait a full 20 epochs in the new run before reducing LR
+                    if isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
+                        scheduler.num_bad_epochs = 0
+                        print("Reset ReduceLROnPlateau num_bad_epochs to 0 for the new run.")
+
                     # Force learning rate override to 0.000064 on resume
-                    # override_lr = 0.000064
-                    # print(f"Forcing learning rate override to {override_lr}...")
-                    # for param_group in optimizer.param_groups:
-                    #     param_group['lr'] = override_lr
+                    override_lr = 0.000032
+                    print(f"Forcing learning rate override to {override_lr}...")
+                    for param_group in optimizer.param_groups:
+                        param_group['lr'] = override_lr
 
                 start_epoch = checkpoint.get("epoch", 0)
                 initial_best_val_loss = checkpoint.get("best_val_spearman")
@@ -1892,9 +1936,9 @@ if __name__ == "__main__":
         "image_size": 224,
         "tau_meters": 100,
         "nbands": 3,
-        "batch_size": 16,
+        "batch_size": 8,
         "small_sample": False,
-        "n_epochs": 300,
+        "n_epochs": 500,
         "learning_rate": 0.0001,
         "sat_data": "aerial",
         "years": [2010, 2012, 2014, 2016, 2018, 2020, 2022, 2024],
@@ -1904,10 +1948,10 @@ if __name__ == "__main__":
         # In-Batch Ranking hyperparameters
         "m_base": 1.0,
         "m_min": 0.05,
-        "lambda_s": 0.02,
-        "lambda_c": 0.1,
-        "temporal_fraction": 0.20,
+        "lambda_s": 0.08,
+        "lambda_c": 0.2,
+        "temporal_fraction": 0.4,
     } 
 
     # Run full pipeline
-    run(params, train=False, retrain=False, compute_loss=False, generate_predictions=True)
+    run(params, train=True, retrain=False, compute_loss=False, generate_predictions=True)
