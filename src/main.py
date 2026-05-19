@@ -471,9 +471,10 @@ class HybridBatchSampler(torch.utils.data.Sampler):
                 if temporal_added >= self.max_temporal:
                     break
                 doitt = self.dataset.doitt_ids[idx].item()
+                # [PATCH] Avoid sampling changed tracts for now
                 twin_candidates = [
                     i for i in self.dataset.doitt_to_idxs.get(doitt, [])
-                    if i != idx and self.dataset.years[i].item() != year
+                    if i != idx and self.dataset.years[i].item() != year and self.dataset.structural_change[i].item() == 0
                 ]
                 if twin_candidates:
                     twin = random.choice(twin_candidates)
@@ -704,7 +705,7 @@ def fill_params_defaults(params):
         "m_min": 0.1,         # Hard floor for pairwise margin (prevents collapse)
         "m_base": 1.0,        # Margin scale factor: m_kl = max(m_min, m_base * |Z_l - Z_k|)
         "lambda_s": 1.0,      # Weight for temporal stability L1 penalty
-        "lambda_c": 1.0,      # Weight for temporal change ranking hinge
+        "lambda_c": 0.0,      # [PATCH] Weight for temporal change ranking hinge (temporarily disabled)
         "temporal_fraction": 0.20,  # Fraction of batch reserved for temporal auxiliary (split 50/50 stable/change)
     }
     validate_parameters(params, default_params)
