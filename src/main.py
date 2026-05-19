@@ -792,18 +792,15 @@ class InBatchPairwiseRankingLoss(nn.Module):
                 z_k, z_l = cs_labels[idx_k], cs_labels[idx_l]
                 y_kl = torch.sign(z_l - z_k)
 
-                # [CORRECTED] Margin is score-based (σ_batch), NOT ACS-magnitude-based
-                # This preserves the ordinal framework: no economic information in margins
-                with torch.no_grad():
-                    sigma_batch = cs_scores.std()
-                    m_scalar = torch.clamp(self.m_base * sigma_batch, min=self.m_min)
-                    avg_margin = m_scalar.item()
+                # [FIXED] Fixed margin for Smooth RankNet. 
+                # We removed sigma_batch because RankNet doesn't need dynamic margins,
+                # and the variance_penalty already anchors the scale to 1.0.
+                m_scalar = self.m_base
+                avg_margin = m_scalar
 
                 r_k, r_l = cs_scores[idx_k], cs_scores[idx_l]
                 delta = y_kl * (r_l - r_k)
-                # Use F.softplus for numerical stability (prevents NaN from exp overflow)
-                # We DO NOT multiply by m_scalar, because m * softplus(-delta/m) goes to 0 as m goes to 0, 
-                # which causes the model to collapse the variance to artificially shrink the margin.
+                # Standard smooth logistic loss
                 L_cross = F.softplus(-delta / m_scalar).mean()
 
                 with torch.no_grad():
@@ -853,12 +850,8 @@ class InBatchPairwiseRankingLoss(nn.Module):
                     
                     y_change = torch.sign(v_temp_labels[change_idx] - v_partner_labels[change_idx])
                     
-                    with torch.no_grad():
-                        sigma_batch_change = torch.cat([cs_scores_full, c_temp_scores, c_partner_scores]).std()
-                        m_change = torch.clamp(self.m_base * sigma_batch_change, min=self.m_min)
-                        
+                    m_change = self.m_base
                     delta_change = y_change * (c_temp_scores - c_partner_scores)
-                    # Use F.softplus for numerical stability
                     L_change = F.softplus(-delta_change / m_change).mean()
                     n_change = change_idx.sum().item()
                     with torch.no_grad():
@@ -1762,7 +1755,7 @@ def run(
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=0.05)
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer, mode='max', factor=0.8, patience=20, min_lr=learning_rate/20
+            optimizer, mode='max', factor=0.8, patience=30, min_lr=learning_rate/20
         )
 
         # If we found a saved checkpoint from a previous run, resume from it
@@ -1787,7 +1780,7 @@ def run(
                         print("Reset ReduceLROnPlateau num_bad_epochs to 0 for the new run.")
 
                     # Force learning rate override to 0.000064 on resume
-                    override_lr = 0.000032
+                    override_lr = 0.00005
                     print(f"Forcing learning rate override to {override_lr}...")
                     for param_group in optimizer.param_groups:
                         param_group['lr'] = override_lr
@@ -1948,7 +1941,7 @@ if __name__ == "__main__":
         # In-Batch Ranking hyperparameters
         "m_base": 1.0,
         "m_min": 0.05,
-        "lambda_s": 0.08,
+        "lambda_s": 0.2,
         "lambda_c": 0.2,
         "temporal_fraction": 0.4,
     } 
