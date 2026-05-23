@@ -39,9 +39,14 @@ from torch.amp import autocast, GradScaler # Add this to the top of main.py
 from torch.utils.data import Dataset, DataLoader
 
 ### HARDCODED PARAMETERS
-# Set a VRAM hard limit (e.g., 7.5GB to be safe)
-limit_in_bytes = 7.5 * 1024**3 
-torch.cuda.set_per_process_memory_fraction(0.95, device=0)
+# Set a VRAM hard limit (e.g., 6.0GB to be safe and avoid driver crashes on 8GB GPUs)
+limit_in_bytes = 7.0 * 1024**3 
+if torch.cuda.is_available():
+    total_memory = torch.cuda.get_device_properties(0).total_memory
+    # Cap at a maximum of 80% to leave sufficient overhead for OS and other applications
+    fraction = min(0.80, limit_in_bytes / total_memory)
+    torch.cuda.set_per_process_memory_fraction(fraction, device=0)
+    print(f"--- 🛡️ Dynamic VRAM safety limit set to {fraction:.2%} ({limit_in_bytes / 1024**3:.2f} GB) of total {total_memory / 1024**3:.2f} GB ---")
 
 os.environ['WANDB_API_KEY'] = os.getenv("WANDB_API_KEY")
 os.environ['HF_TOKEN'] = os.getenv("HF_TOKEN")
@@ -213,7 +218,7 @@ class CyclicCacheManager:
         valid_metas, valid_score_bins = [], []
 
         CHUNK_SIZE = 8
-        MAX_EXTRACT_WORKERS = 4
+        MAX_EXTRACT_WORKERS = 2
 
         def _extract(item):
             row, pos = item
@@ -561,12 +566,23 @@ class PhotometricAugmentation:
         self.gr = transforms.RandomGrayscale(p=0.1)
         
     def __call__(self, img):
-        if img.shape[0] >= 3:
-            rgb = img[:3]
-            rgb = self.gr(self.cj(rgb))
-            if img.shape[0] == 3:
-                return rgb
-            return torch.cat([rgb, img[3:]], dim=0)
+        is_batch = img.ndim == 4
+        c_dim = 1 if is_batch else 0
+        
+        n_channels = img.shape[c_dim]
+        if n_channels >= 3:
+            if is_batch:
+                rgb = img[:, :3]
+                rgb = self.gr(self.cj(rgb))
+                if n_channels == 3:
+                    return rgb
+                return torch.cat([rgb, img[:, 3:]], dim=c_dim)
+            else:
+                rgb = img[:3]
+                rgb = self.gr(self.cj(rgb))
+                if n_channels == 3:
+                    return rgb
+                return torch.cat([rgb, img[3:]], dim=c_dim)
         return img
 
 def setup_dataloaders(df_train, dfs_val_dict, df_test, all_years_datasets, params, train_cache_manager=None, val_cache_manager=None):
@@ -583,12 +599,17 @@ def setup_dataloaders(df_train, dfs_val_dict, df_test, all_years_datasets, param
 
     # TRAIN
     image_size = params.get("image_size", 224)
-    train_transform = transforms.Compose([
+    # CPU: Fast spatial crops and flips on uint8
+    train_transform_cpu = transforms.Compose([
         transforms.RandomCrop(image_size),   # Realizes per-batch spatial jitter from the padded shard tiles
-        PhotometricAugmentation(),           # 🔴 Handle photometric augmentation securely
         transforms.RandomHorizontalFlip(p=0.5),
         transforms.RandomVerticalFlip(p=0.5),
+    ])
+    
+    # GPU: Photometric augmentation, float scaling, and normalization
+    train_transform_gpu = transforms.Compose([
         transforms.ToDtype(torch.float32, scale=True),
+        PhotometricAugmentation(),           # 🔴 Handle photometric augmentation securely on GPU
         transforms.Normalize(mean=mean, std=std) # 🔴 ImageNet Normalization
     ])
     
@@ -600,7 +621,7 @@ def setup_dataloaders(df_train, dfs_val_dict, df_test, all_years_datasets, param
     # In-Batch Pairwise Ranking: individual images + metadata, grouped by HybridBatchSampler
     train_dataset = InBatchRankingDataset(
         cache_manager=train_cache_manager,
-        transform=train_transform,
+        transform=train_transform_cpu,
     )
     hybrid_sampler = HybridBatchSampler(
         dataset=train_dataset,
@@ -608,6 +629,7 @@ def setup_dataloaders(df_train, dfs_val_dict, df_test, all_years_datasets, param
         max_temporal_per_batch=max(1, int(batch_size * params.get("temporal_fraction", 0.20))),
     )
     train_loader = DataLoader(train_dataset, batch_sampler=hybrid_sampler, num_workers=0)
+    train_loader.gpu_transform = train_transform_gpu
     
     # VAL
     val_loaders = {}
@@ -1062,7 +1084,7 @@ def train_model(
         total_acc_pairs_epoch = 0 # Track total cross-sectional pairs evaluated for accuracy
         
         # Zero the gradients
-        optimizer.zero_grad()
+        optimizer.zero_grad(set_to_none=True)
         
         train_bar = tqdm(
             enumerate(train_loader), 
@@ -1077,6 +1099,10 @@ def train_model(
 
             # Move all to device
             images     = images.to(device)
+            if hasattr(train_loader, "gpu_transform") and train_loader.gpu_transform is not None:
+                with torch.no_grad():
+                    images = train_loader.gpu_transform(images)
+            
             scores_lbl = scores.to(device)
             geoids     = geoids.to(device)
             years      = years.to(device)
@@ -1114,14 +1140,14 @@ def train_model(
             if (batch_idx + 1) % accumulation_steps == 0 or (batch_idx + 1) == len(train_loader):
                 scaler.step(optimizer)
                 scaler.update()
-                optimizer.zero_grad()
-
-            # Sync GPU before stopping the timer so we measure real GPU time, not just kernel launch
-            torch.cuda.synchronize()
-            t_forward_end = time.perf_counter()
+                optimizer.zero_grad(set_to_none=True)
 
             # ── Per-step W&B perf metrics (logged every 50 steps to reduce overhead) ──
             if batch_idx % 50 == 0:
+                # Sync GPU before stopping the timer so we measure real GPU time, not just kernel launch
+                torch.cuda.synchronize()
+                t_forward_end = time.perf_counter()
+                
                 data_ms   = (t_data_end   - t_batch_start) * 1000
                 forward_ms = (t_forward_end - t_forward_start) * 1000
                 total_ms   = data_ms + forward_ms
@@ -1136,6 +1162,7 @@ def train_model(
                     **{f"step/{k.split('/')[1]}": v for k, v in diag.items()},
                 }
                 wandb.log(step_log)
+            
             t_batch_start = time.perf_counter()  # reset for next batch's data-load window
             
             # De-scale loss for logging
@@ -1247,7 +1274,9 @@ def train_model(
                 spearman_corr, _ = spearmanr(all_preds, all_labels)
                 
                 val_losses[val_name] = running_val_loss / len(val_loader.dataset)
-                val_spearmans[val_name] = spearman_corr
+                # Exclude val_spatial_temporal: that spearman is inconsistent as it compares geoids across time and space!
+                if val_name != "val_spatial_temporal":
+                    val_spearmans[val_name] = spearman_corr
                 
                 # ── Temporal metrics: MASD (stable vs changed) + Directional Accuracy ──
                 if len(all_doitts) > 0 and len(all_doitts) == len(all_preds):
@@ -1343,7 +1372,8 @@ def train_model(
         if len(val_loaders.values())>0:
             for val_name, val_loader in val_loaders.items():
                 log_dict[f"{val_name}_mse"] = val_losses[val_name]
-                log_dict[f"{val_name}_spearman"] = val_spearmans[val_name]
+                if val_name in val_spearmans:
+                    log_dict[f"{val_name}_spearman"] = val_spearmans[val_name]
                 if val_name in val_stable_masd:
                     log_dict[f"{val_name}_stable_masd"] = val_stable_masd[val_name]
                 if val_name in val_changed_masd:
@@ -1374,6 +1404,11 @@ def train_model(
             # Report feature importance for the best model
             check_feature_importance(model)
 
+
+        # Free unused cached VRAM and run garbage collection to prevent fragmentation/OOM/crashes
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
         # ==========================
         # 4. ROTATE CACHE FOR NEXT EPOCH
@@ -1756,7 +1791,7 @@ def run(
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=0.05)
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer, mode='max', factor=0.8, patience=30, min_lr=learning_rate/20
+            optimizer, mode='max', factor=0.5, patience=100, min_lr=learning_rate/20
         )
 
         # If we found a saved checkpoint from a previous run, resume from it
@@ -1781,7 +1816,7 @@ def run(
                         print("Reset ReduceLROnPlateau num_bad_epochs to 0 for the new run.")
 
                     # Force learning rate override to 0.000064 on resume
-                    override_lr = 0.00005
+                    override_lr = 0.000025
                     print(f"Forcing learning rate override to {override_lr}...")
                     for param_group in optimizer.param_groups:
                         param_group['lr'] = override_lr
@@ -1932,7 +1967,7 @@ if __name__ == "__main__":
         "nbands": 3,
         "batch_size": 8,
         "small_sample": False,
-        "n_epochs": 500,
+        "n_epochs": 700,
         "learning_rate": 0.0001,
         "sat_data": "aerial",
         "years": [2010, 2012, 2014, 2016, 2018, 2020, 2022, 2024],
@@ -1942,7 +1977,7 @@ if __name__ == "__main__":
         # In-Batch Ranking hyperparameters
         "m_base": 1.0,
         "m_min": 0.05,
-        "lambda_s": 0.2,
+        "lambda_s": 0.3,
         "lambda_c": 0.2,
         "temporal_fraction": 0.4,
     } 
