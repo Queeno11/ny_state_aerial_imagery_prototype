@@ -862,7 +862,7 @@ class InBatchPairwiseRankingLoss(nn.Module):
                 # STABLE Penalty
                 stable_idx = (v_temp_change == 0)
                 if stable_idx.any():
-                    L_stable = torch.abs(v_temp_scores[stable_idx] - v_partner_scores[stable_idx]).mean()
+                    L_stable = ((v_temp_scores[stable_idx] - v_partner_scores[stable_idx]) ** 2).mean()
                     n_stable = stable_idx.sum().item()
 
                 # CHANGE Ranking
