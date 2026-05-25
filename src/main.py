@@ -10,6 +10,7 @@ import shutil
 import random
 import logging
 import warnings
+import queue
 import threading
 import xarray as xr
 import pandas as pd
@@ -64,6 +65,329 @@ def generate_savename(
     )
 
     return savename
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ZARR CHUNK MANAGEMENT UTILITIES
+# ══════════════════════════════════════════════════════════════════════════════
+
+class ZarrChunkCache:
+    """
+    Thread-safe LRU cache for zarr chunks. Holds recently-loaded chunks in RAM
+    to enable reuse across buildings that span multiple chunks.
+
+    A threading.Lock guards all mutations so multiple extraction threads can
+    call get/put concurrently without data races.
+
+    When cache exceeds max_memory_gb, oldest chunks are evicted.
+    """
+    def __init__(self, max_memory_gb=5.0, max_chunks=None):
+        self.max_memory_bytes = int(max_memory_gb * 1024**3)
+        self.max_chunks = max_chunks
+        self.cache = {}          # {(dataset_name, chunk_row, chunk_col): numpy_array}
+        self.access_order = []   # LRU order
+        self.total_bytes = 0
+        self.stats = {'hits': 0, 'misses': 0, 'loads': 0}
+        self._lock = threading.Lock()   # protects all mutable state
+
+    def key(self, dataset_name, chunk_row, chunk_col):
+        return (dataset_name, chunk_row, chunk_col)
+
+    def get(self, dataset_name, chunk_row, chunk_col):
+        """Return cached chunk or None if not cached."""
+        k = self.key(dataset_name, chunk_row, chunk_col)
+        with self._lock:
+            if k in self.cache:
+                self.stats['hits'] += 1
+                self.access_order.remove(k)
+                self.access_order.append(k)
+                return self.cache[k]
+            self.stats['misses'] += 1
+            return None
+
+    def put(self, dataset_name, chunk_row, chunk_col, chunk_array):
+        """Store chunk in cache, evicting old entries if needed.
+
+        If another thread already inserted this key between our cache-miss check
+        and this put(), we skip silently to avoid double-counting bytes.
+        """
+        k = self.key(dataset_name, chunk_row, chunk_col)
+        with self._lock:
+            if k in self.cache:
+                return  # already inserted by a racing thread — skip
+            chunk_bytes = chunk_array.nbytes
+            self.cache[k] = chunk_array
+            self.access_order.append(k)
+            self.total_bytes += chunk_bytes
+            self.stats['loads'] += 1
+            # Evict oldest chunks until under memory limit
+            while self.total_bytes > self.max_memory_bytes and len(self.cache) > 1:
+                oldest_k = self.access_order.pop(0)
+                evicted_bytes = self.cache[oldest_k].nbytes
+                del self.cache[oldest_k]
+                self.total_bytes -= evicted_bytes
+
+    def clear(self):
+        """Clear entire cache."""
+        with self._lock:
+            self.cache.clear()
+            self.access_order.clear()
+            self.total_bytes = 0
+
+    def get_stats(self):
+        """Return cache statistics."""
+        with self._lock:
+            total_requests = self.stats['hits'] + self.stats['misses']
+            hit_rate = (self.stats['hits'] / total_requests * 100) if total_requests > 0 else 0
+            return {
+                'hit_rate_pct': hit_rate,
+                'total_bytes_mb': self.total_bytes / 1024**2,
+                'num_chunks': len(self.cache),
+                **self.stats
+            }
+
+
+def get_zarr_chunks_for_image(row, chunk_dims, image_size):
+    """
+    Compute which zarr chunks are needed to extract an image.
+    
+    Args:
+        row: dataframe row with row_start, col_start
+        chunk_dims: (nbands, chunk_h, chunk_w) from zarr metadata
+        image_size: side length in pixels (assumes square images)
+    
+    Returns:
+        List of (chunk_row, chunk_col) tuples needed to extract this image.
+    """
+    nbands, chunk_h, chunk_w = chunk_dims
+    row_start = int(row["row_start"])
+    col_start = int(row["col_start"])
+    row_stop = row_start + image_size
+    col_stop = col_start + image_size
+    
+    # Compute which chunks overlap with [row_start:row_stop, col_start:col_stop]
+    chunk_rows = set()
+    chunk_cols = set()
+    
+    # Row chunks
+    first_row_chunk = row_start // chunk_h
+    last_row_chunk = (row_stop - 1) // chunk_h
+    for cr in range(first_row_chunk, last_row_chunk + 1):
+        chunk_rows.add(cr)
+    
+    # Column chunks
+    first_col_chunk = col_start // chunk_w
+    last_col_chunk = (col_stop - 1) // chunk_w
+    for cc in range(first_col_chunk, last_col_chunk + 1):
+        chunk_cols.add(cc)
+    
+    return [(cr, cc) for cr in chunk_rows for cc in chunk_cols]
+
+
+def extract_image_from_chunks(row, cache, zarr_array, all_years_datasets, chunk_dims, image_size, nbands):
+    """
+    Extract a full image by loading required zarr chunks from cache (or loading
+    on cache-miss and storing the result).
+
+    Both the single-chunk and multi-chunk paths now go through the shared
+    ZarrChunkCache, so the preloading done by preload_zarr_chunks_async is
+    actually used instead of bypassed.  The cache is thread-safe, so this
+    function can be called from multiple threads concurrently.
+
+    Args:
+        row: dict-like row with row_start, col_start, dataset, DOITT_ID …
+        cache: ZarrChunkCache instance (thread-safe)
+        zarr_array: unused — kept for API compatibility (resolved via all_years_datasets)
+        all_years_datasets: dict of all zarr datasets
+        chunk_dims: (nbands, chunk_h, chunk_w)
+        image_size: square image side length in pixels
+        nbands: number of bands to extract
+
+    Returns:
+        numpy array of shape (nbands, image_size, image_size), or None on error.
+        Returns a *copy* of the slice so callers don't hold references into the
+        large cached chunk arrays.
+    """
+    dataset_name = row.get("dataset")
+    zarr_array   = all_years_datasets[dataset_name]["value"]
+    _, chunk_h, chunk_w = chunk_dims
+
+    row_start = int(row["row_start"])
+    col_start = int(row["col_start"])
+    row_stop  = row_start + image_size
+    col_stop  = col_start + image_size
+
+    required_chunks = get_zarr_chunks_for_image(row, chunk_dims, image_size)
+
+    def _load_chunk_into_cache(cr, cc):
+        """Check cache; load from zarr and populate cache on miss."""
+        chunk = cache.get(dataset_name, cr, cc)
+        if chunk is None:
+            try:
+                raw = zarr_array[:nbands,
+                                 cr * chunk_h:(cr + 1) * chunk_h,
+                                 cc * chunk_w:(cc + 1) * chunk_w]
+                chunk = raw.to_numpy()
+                cache.put(dataset_name, cr, cc, chunk)
+            except Exception as e:
+                logging.error(
+                    f"Failed to load zarr chunk ({dataset_name},{cr},{cc}): {e}"
+                )
+                return None
+        return chunk
+
+    if len(required_chunks) == 1:
+        # ── Single-chunk path ─────────────────────────────────────────────────
+        # Previously bypassed the cache entirely — now reads from cache first.
+        cr, cc = required_chunks[0]
+        chunk = _load_chunk_into_cache(cr, cc)
+        if chunk is None:
+            return None
+
+        chunk_row_start = cr * chunk_h
+        chunk_col_start = cc * chunk_w
+        local_r0 = row_start - chunk_row_start
+        local_c0 = col_start - chunk_col_start
+
+        try:
+            tile = chunk[:, local_r0:local_r0 + image_size,
+                            local_c0:local_c0 + image_size]
+            if tile.shape == (nbands, image_size, image_size):
+                return tile.copy()   # copy so we don't pin the full chunk
+        except Exception as e:
+            logging.error(
+                f"Failed single-chunk extract for DOITT_ID {row.get('DOITT_ID', '?')}: {e}"
+            )
+        return None
+
+    else:
+        # ── Multi-chunk path ──────────────────────────────────────────────────
+        try:
+            out = np.zeros((nbands, image_size, image_size), dtype=np.uint8)
+
+            for cr, cc in required_chunks:
+                chunk = _load_chunk_into_cache(cr, cc)
+                if chunk is None:
+                    return None
+
+                chunk_row_start = cr * chunk_h
+                chunk_col_start = cc * chunk_w
+
+                overlap_r0 = max(row_start, chunk_row_start)
+                overlap_r1 = min(row_stop,  chunk_row_start + chunk_h)
+                overlap_c0 = max(col_start, chunk_col_start)
+                overlap_c1 = min(col_stop,  chunk_col_start + chunk_w)
+
+                out[:,
+                    overlap_r0 - row_start : overlap_r1 - row_start,
+                    overlap_c0 - col_start : overlap_c1 - col_start
+                ] = chunk[:,
+                          overlap_r0 - chunk_row_start : overlap_r1 - chunk_row_start,
+                          overlap_c0 - chunk_col_start : overlap_c1 - chunk_col_start]
+
+            return out
+        except Exception as e:
+            logging.error(
+                f"Failed multi-chunk extract for DOITT_ID {row.get('DOITT_ID', '?')}: {e}"
+            )
+        return None
+
+
+def assign_groupby_chunk_ids(df, image_size, groupby_chunk_size=2000):
+    """
+    Assign each building to a groupby chunk based on its image centroid.
+    
+    Groupby chunks are logical, large tiles (default 2000x2000 px) that organize
+    the prediction workflow. Buildings are grouped by which logical chunk their
+    centroid falls into. This allows handling boundary-crossing buildings efficiently.
+    
+    Args:
+        df: DataFrame with row_start, col_start columns
+        image_size: side length of image (px)
+        groupby_chunk_size: logical chunk size (default 2000x2000)
+    
+    Returns:
+        DataFrame with added 'groupby_chunk_id' column (tuple: (chunk_row, chunk_col))
+    """
+    df = df.copy()
+    
+    # Compute image centroid for each building
+    df['centroid_row'] = df['row_start'] + image_size / 2.0
+    df['centroid_col'] = df['col_start'] + image_size / 2.0
+    
+    # Assign to groupby chunk using integer division
+    df['groupby_chunk_id'] = df.apply(
+        lambda row: (
+            int(row['centroid_row'] // groupby_chunk_size),
+            int(row['centroid_col'] // groupby_chunk_size)
+        ),
+        axis=1
+    )
+    
+    return df
+
+
+def preload_zarr_chunks_async(df_group, all_years_datasets, cache, chunk_dims, 
+                              max_workers=4):
+    """
+    Asynchronously preload all zarr chunks needed for a groupby group.
+    
+    Identifies all unique zarr chunks required to extract all buildings in the group,
+    then loads them in parallel using a thread pool.
+    
+    Args:
+        df_group: DataFrame subset for one groupby chunk (all buildings in that group)
+        all_years_datasets: dict of all zarr datasets
+        cache: ZarrChunkCache instance
+        chunk_dims: (nbands, chunk_h, chunk_w) from zarr metadata
+        max_workers: number of parallel loader threads
+    
+    Returns:
+        cache (updated with preloaded chunks)
+    """
+    # Identify all unique zarr chunks needed
+    required_chunks_set = set()
+    for _, row in df_group.iterrows():
+        dataset_name = row.get("dataset")
+        image_size = int(row["row_stop"] - row["row_start"])
+        chunks_for_building = get_zarr_chunks_for_image(row, chunk_dims, image_size)
+        for cr, cc in chunks_for_building:
+            required_chunks_set.add((dataset_name, cr, cc))
+    
+    required_chunks = list(required_chunks_set)
+    
+    # Filter to chunks not already in cache
+    chunks_to_load = [
+        (dataset_name, cr, cc) for dataset_name, cr, cc in required_chunks
+        if cache.get(dataset_name, cr, cc) is None
+    ]
+    
+    if not chunks_to_load:
+        return cache  # All chunks already cached
+    
+    def _load_chunk(item):
+        dataset_name, cr, cc = item
+        zarr_array = all_years_datasets[dataset_name]["value"]
+        chunk_nbands, chunk_h, chunk_w = chunk_dims
+        
+        try:
+            chunk_row_start = cr * chunk_h
+            chunk_col_start = cc * chunk_w
+            chunk = zarr_array[:chunk_nbands,
+                              chunk_row_start:chunk_row_start + chunk_h,
+                              chunk_col_start:chunk_col_start + chunk_w]
+            return dataset_name, cr, cc, chunk.to_numpy()
+        except Exception as e:
+            logging.error(f"Failed to load zarr chunk ({dataset_name}, {cr}, {cc}): {e}")
+            return dataset_name, cr, cc, None
+    
+    # Load chunks in parallel
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        for dataset_name, cr, cc, chunk_array in pool.map(_load_chunk, chunks_to_load):
+            if chunk_array is not None:
+                cache.put(dataset_name, cr, cc, chunk_array)
+    
+    return cache
+
 
 class CyclicCacheManager:
     def __init__(
@@ -1581,6 +1905,260 @@ class FastPredictLoader:
         return max(1, len(self.df) // self.batch_size)
 
 
+def predict_buildings_chunked(model, df, all_years_datasets, params,
+                              device, output_path, eval_transform, verbose=True):
+    """
+    Generate predictions using a producer-consumer pipeline that keeps the GPU
+    near 100% utilisation.
+
+    Architecture
+    ────────────
+    ┌─────────────────────────────────────────────────────────────────────────┐
+    │  PRODUCER THREAD                                                        │
+    │                                                                         │
+    │  For each spatial groupby-chunk K:                                      │
+    │    ① Wait for group K's zarr preload to finish  (SSD → RAM)           │
+    │    ② Kick off group K+1's preload in background (overlaps with ③④)    │
+    │    ③ Extract + subsample images in parallel     (EXTRACT_WORKERS)      │
+    │    ④ Pack full batches → push to batch_queue                           │
+    └──────────────────────────────┬──────────────────────────────────────────┘
+                                   │  queue.Queue (bounded = QUEUE_DEPTH)
+                                   │  (blocks producer when GPU is slow →
+                                   │   provides back-pressure automatically)
+    ┌──────────────────────────────▼──────────────────────────────────────────┐
+    │  CONSUMER  (main thread)                                                │
+    │    ① Pull batch from queue                                              │
+    │    ② Move tensors to GPU with non_blocking=True                        │
+    │    ③ autocast forward pass                                              │
+    │    ④ Append results to CSV                                              │
+    └─────────────────────────────────────────────────────────────────────────┘
+
+    The GPU is always either running inference or waiting for the very next
+    batch.  Because the queue is pre-filled (QUEUE_DEPTH deep) the typical
+    case is that a new batch is ready the moment the previous one finishes.
+
+    Args:
+        model:              PyTorch model (will be set to eval mode)
+        df:                 DataFrame with all buildings to predict
+        all_years_datasets: dict of zarr datasets keyed by dataset name
+        params:             config dict — batch_size, subsample_step, nbands
+        device:             torch.device
+        output_path:        CSV file path for results
+        eval_transform:     torchvision transform (scale + normalise)
+        verbose:            print summary stats when done
+    """
+    model.eval()
+
+    # ── Hyperparameters ───────────────────────────────────────────────────────
+    batch_size      = params.get("batch_size", 32) * 8   # scale up for eval
+    image_size      = int((df["row_stop"] - df["row_start"]).min())
+    nbands          = params["nbands"]
+    subsample_step  = params["subsample_step"]
+    chunk_dims      = (nbands, 2500, 2500)
+    groupby_chunk_size = 2500
+
+    # Number of threads for each stage.  These are I/O or numpy-bound so
+    # threads (not processes) are the right tool — numpy releases the GIL.
+    PRELOAD_WORKERS = 8    # SSD → RAM (zarr → numpy), fully I/O-bound
+    EXTRACT_WORKERS = 16   # RAM slice + subsample, numpy-bound (releases GIL)
+    QUEUE_DEPTH     = 12   # batches buffered; tune down if RAM is tight
+
+    # ── Setup ─────────────────────────────────────────────────────────────────
+    df = assign_groupby_chunk_ids(df, image_size, groupby_chunk_size)
+    cache = ZarrChunkCache(max_memory_gb=5.0)   # thread-safe after our rewrite
+
+    output_dir = os.path.dirname(output_path)
+    if output_dir and not os.path.exists(output_dir):
+        os.makedirs(output_dir, exist_ok=True)
+
+    groups      = list(df.groupby('groupby_chunk_id'))
+    batch_queue = queue.Queue(maxsize=QUEUE_DEPTH)
+
+    if verbose:
+        print(f"Processing {len(df)} buildings across {len(groups)} groupby chunks...")
+        print(f"  Pipeline: PRELOAD_WORKERS={PRELOAD_WORKERS}  "
+              f"EXTRACT_WORKERS={EXTRACT_WORKERS}  "
+              f"QUEUE_DEPTH={QUEUE_DEPTH}  "
+              f"batch_size={batch_size}")
+
+    # ── Helpers ───────────────────────────────────────────────────────────────
+
+    def _preload_group(df_grp):
+        """Load all zarr chunks needed by df_grp into the shared cache."""
+        rows_list = df_grp.to_dict('records')   # avoids slow iterrows()
+
+        # Collect unique (dataset, chunk_row, chunk_col) triples
+        needed = set()
+        for row in rows_list:
+            img_sz = int(row["row_stop"] - row["row_start"])
+            for cr, cc in get_zarr_chunks_for_image(row, chunk_dims, img_sz):
+                needed.add((row["dataset"], cr, cc))
+
+        to_load = [(ds, cr, cc) for ds, cr, cc in needed
+                   if cache.get(ds, cr, cc) is None]
+        if not to_load:
+            return
+
+        def _load_one(item):
+            ds, cr, cc = item
+            zarr_arr = all_years_datasets[ds]["value"]
+            _, ch, cw = chunk_dims
+            try:
+                arr = zarr_arr[:nbands,
+                               cr * ch:(cr + 1) * ch,
+                               cc * cw:(cc + 1) * cw]
+                return ds, cr, cc, arr.to_numpy()
+            except Exception as e:
+                logging.error(f"Preload failed ({ds},{cr},{cc}): {e}")
+                return ds, cr, cc, None
+
+        with ThreadPoolExecutor(max_workers=PRELOAD_WORKERS) as pool:
+            for ds, cr, cc, arr in pool.map(_load_one, to_load):
+                if arr is not None:
+                    cache.put(ds, cr, cc, arr)
+
+    def _extract_one(row):
+        """Extract, validate, and subsample one image. Returns (tensor, row) or None."""
+        if pd.isna(row.get("Rel_Score")):
+            return None
+        raw = extract_image_from_chunks(
+            row, cache, None, all_years_datasets, chunk_dims, image_size, nbands
+        )
+        if raw is None:
+            return None
+        # Subsample on CPU (cheap numpy op); keep as uint8 until eval_transform
+        tensor = torch.from_numpy(raw)[:, ::subsample_step, ::subsample_step]
+        return tensor, row
+
+    def _pack_batch(items):
+        """Stack a list of (tensor, row) into GPU-ready tensors + metadata lists."""
+        tensors, rows = zip(*items)
+        # eval_transform: uint16→float32 scale + ImageNet normalise
+        batch_tensor = eval_transform(torch.stack(tensors))
+        metas_tensor = torch.tensor(
+            [r.get("dist_to_center", 0.0) for r in rows],
+            dtype=torch.float32
+        ).unsqueeze(1)
+        return (
+            batch_tensor,
+            metas_tensor,
+            [r["Rel_Score"]          for r in rows],
+            [r.get("DOITT_ID", 0)    for r in rows],
+            [str(r.get("GEOID", "")) for r in rows],
+            [r.get("year", 0)        for r in rows],
+            [str(r.get("type", ""))  for r in rows],
+        )
+
+    # ── Producer thread ───────────────────────────────────────────────────────
+    def _producer():
+        """
+        Iterates spatial groups.  For each group:
+          1. Waits for that group's preload to finish.
+          2. Immediately fires off the *next* group's preload in background.
+          3. Extracts images in parallel and pushes packed batches to the queue.
+
+        The queue's maxsize creates automatic back-pressure: if the GPU falls
+        behind, put() blocks here, throttling extraction so we don't waste RAM
+        storing thousands of pre-built batches.
+        """
+        # One persistent thread for background preloading of the next group
+        preload_executor = ThreadPoolExecutor(max_workers=1)
+        extract_executor = ThreadPoolExecutor(max_workers=EXTRACT_WORKERS)
+
+        try:
+            # Kick off preload for group 0 before the loop starts
+            pending_preload = preload_executor.submit(_preload_group, groups[0][1])
+
+            for i, (chunk_id, df_grp) in enumerate(groups):
+
+                # ① Block until this group's zarr chunks are in RAM
+                pending_preload.result()
+
+                # ② Fire preload for next group immediately (overlaps with ③)
+                if i + 1 < len(groups):
+                    pending_preload = preload_executor.submit(
+                        _preload_group, groups[i + 1][1]
+                    )
+
+                # ③ Submit all extractions for this group concurrently
+                rows_list = df_grp.to_dict('records')
+                futures   = [extract_executor.submit(_extract_one, r) for r in rows_list]
+
+                # ④ As results arrive, accumulate and push full batches
+                pending = []
+                for fut in as_completed(futures):
+                    result = fut.result()
+                    if result is None:
+                        continue
+                    pending.append(result)
+                    if len(pending) >= batch_size:
+                        batch_queue.put(_pack_batch(pending))
+                        pending = []
+
+                # Flush any remainder from this group
+                if pending:
+                    batch_queue.put(_pack_batch(pending))
+
+        except Exception as e:
+            logging.error(f"Producer thread crashed: {e}", exc_info=True)
+        finally:
+            preload_executor.shutdown(wait=False)
+            extract_executor.shutdown(wait=False)
+            batch_queue.put(None)   # sentinel: tells consumer we're done
+
+    producer_thread = threading.Thread(target=_producer, daemon=True,
+                                       name="zarr-producer")
+    producer_thread.start()
+
+    # ── Consumer (main thread): GPU inference + CSV write ─────────────────────
+    first_write  = True
+    total_approx = max(1, len(df) // batch_size)
+
+    with torch.no_grad():
+        pbar = tqdm(total=total_approx, desc="Generating predictions", leave=False)
+        while True:
+            item = batch_queue.get()
+            if item is None:
+                break   # producer finished
+
+            batch_tensor, metas_tensor, labels, doitt_ids, geoids, years, types = item
+
+            # non_blocking=True overlaps H2D transfer with prior GPU work
+            batch_tensor = batch_tensor.to(device, non_blocking=True)
+            metas_tensor = metas_tensor.to(device, non_blocking=True)
+
+            with autocast(device_type='cuda'):
+                outputs = model(batch_tensor, metadata=metas_tensor)
+
+            preds = outputs.view(-1).cpu().numpy()
+
+            pd.DataFrame({
+                "Rel_Score":       labels,
+                "predicted_value": preds,
+                "DOITT_ID":        doitt_ids,
+                "GEOID":           geoids,
+                "year":            years,
+                "type":            types,
+            }).to_csv(output_path,
+                      mode='w' if first_write else 'a',
+                      header=first_write,
+                      index=False)
+            first_write = False
+            pbar.update(1)
+
+        pbar.close()
+
+    producer_thread.join()
+
+    if verbose:
+        stats = cache.get_stats()
+        print(f"\n✅ Predictions saved to {output_path}")
+        print(f"   Cache — chunks: {stats['num_chunks']} | "
+              f"hit rate: {stats['hit_rate_pct']:.1f}% | "
+              f"RAM used: {stats['total_bytes_mb']:.0f} MB | "
+              f"loads: {stats['loads']}")
+
+
 def predict_buildings(model, dataloader, device, output_path, verbose=True):
     """
     Streams predictions directly to CSV in chunks — no full-dataset RAM accumulation.
@@ -1896,7 +2474,7 @@ def run(
         
         model.to(device)
 
-        # 2. Setup the Evaluation Transforms
+        # 3. Setup the Evaluation Transforms
         # MUST match the pipeline used during training/validation exactly:
         # scale uint16→float32, then apply ImageNet normalization.
         nbands = params.get("nbands", 4)
@@ -1907,29 +2485,34 @@ def run(
             transforms.Normalize(mean=mean, std=std)  # 🔴 ImageNet Normalization — must match training
         ])
         
+        # 4. Process each year using the new chunk-grouped strategy
         for year in [2016, 2018, 2020, 2022, 2024, 2010, 2012, 2014]:
 
-            print(f"\n--- Processing Predictions for Year: {year} ---")
-            df_year = df_all[(df_all["year"] == year) & (df_all["type"] == "test")].copy()
+            print(f"\n{'='*80}")
+            print(f"🚀 Processing Predictions for Year: {year}")
+            print(f"{'='*80}")
+            
+            df_year = df_all[(df_all["year"] == year)].copy()
             if df_year.empty:
                 print(f"No data for year {year}, skipping.")
                 continue
 
-            # Sort by spatial location so sequential shards read contiguous zarr chunks
-            df_year = df_year.sort_values(["dataset", "row_start", "col_start"]).reset_index(drop=True)
+            print(f"Found {len(df_year)} buildings to predict for {year}")
 
-            # Predict (Scale batch size up by 8x since models in eval + FP16 take virtually 0 vRAM)
-            batch_size = params.get("batch_size", 32) * 8
-            prediction_loader = FastPredictLoader(
-                df=df_year, 
-                all_years_datasets=all_years_datasets, 
-                params=params, 
-                batch_size=batch_size, 
-                eval_transform=eval_transform
+            output_path = RESULTS_DIR / f"{savename}/{year}_predictions.csv"
+            
+            # Use new chunk-grouped prediction strategy
+            predict_buildings_chunked(
+                model=model,
+                df=df_year,
+                all_years_datasets=all_years_datasets,
+                params=params,
+                device=device,
+                output_path=output_path,
+                eval_transform=eval_transform,
+                verbose=True
             )
             
-            output_path = RESULTS_DIR / f"{savename}/{year}_predictions_test.csv"
-            predict_buildings(model, prediction_loader, device, output_path, verbose=True)
             df_result = pd.read_csv(output_path)
 
             if len(df_result) == 0:
@@ -1983,4 +2566,4 @@ if __name__ == "__main__":
     } 
 
     # Run full pipeline
-    run(params, train=True, retrain=False, compute_loss=False, generate_predictions=True)
+    run(params, train=False, retrain=False, compute_loss=False, generate_predictions=True)
