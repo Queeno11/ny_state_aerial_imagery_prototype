@@ -895,7 +895,6 @@ def part_b(results_dir: Path, processed_dir: Path, out: Path) -> None:
     def _plot_event_study_intensity_pooled(
         ev_df: pd.DataFrame,
         split_type: str,
-        target_change_year: int,
         intensity_label: str,
         min_n_new: int,
         out_path: Path,
@@ -990,8 +989,11 @@ def part_b(results_dir: Path, processed_dir: Path, out: Path) -> None:
                 continue
             fname = f"B_event_study_{split_type}_intensity_{thresh_name}_pooled.png"
             _plot_event_study_intensity_pooled(
-                ev_df_int, split_type, thresh_label, min_n_new,
-                out / "figures" / fname,
+                ev_df=ev_df_int,
+                split_type=split_type,
+                intensity_label=thresh_label,
+                min_n_new=min_n_new,
+                out_path=out / "figures" / fname,
             )
 
 # ─── Part C ───────────────────────────────────────────────────────────────────
