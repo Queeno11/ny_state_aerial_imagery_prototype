@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """
 src/evaluation.py  –  Post-hoc evaluation of already-computed predictions.
 
@@ -37,6 +38,7 @@ from src.utils.paths import (
     PROCESSED_DATA_DIR,
     IMAGERY_ROOT,
     ACS_ROOT_DIR,
+    PROJECT_ROOT
 )
 from src.geo_utils import calculate_exact_tau
 
@@ -44,6 +46,28 @@ warnings.filterwarnings("ignore", category=FutureWarning)
 warnings.filterwarnings("ignore", category=UserWarning)
 
 # ─── constants ────────────────────────────────────────────────────────────────
+
+### Figure styling constants
+
+# Figsize, inspired by journal guidelines, 
+# https://www.elsevier.com/authors/policies-and-guidelines/artwork-and-media-instructions/artwork-sizing-instructions
+pt = 1./72.27 # Hundreds of years of history... 72.27 points to an inch.
+journal_sizes = {
+    "Latex": {"onecol": 354.*pt, "twocol": (354-35)/2*pt},
+    "CQG": {"onecol": 374.*pt}, # CQG is only one column
+    # Add more journals below. Can add more properties to each journal
+}
+my_width = journal_sizes["Latex"]["onecol"]
+# Our figure's aspect ratio
+golden = (1 + 5 ** 0.5) / 2
+FIG_DPI = 300
+FIG_SIZE_ONE_COL = (my_width, my_width/golden)
+FIG_SIZE_TWO_COL = (my_width, my_width/golden)
+
+# Style
+import matplotlib.pyplot as plt
+plt.style.use(PROJECT_ROOT / "src" / "utils" / "paper.mplstyle")
+###
 
 YEARS = [2010, 2012, 2014, 2016, 2018, 2020, 2022, 2024]
 # Year pair used for rank-autocorrelation: both 2016 (temporal holdout) and 2024
@@ -55,7 +79,7 @@ CRS_GEO  = 4326
 TAU_METERS = 100
 IMAGE_SIZE  = 224
 _EXACT_TAU_M, _N = calculate_exact_tau(TAU_METERS, IMAGE_SIZE)
-# EPSG:6539 native unit is US survey foot → 1 ft = 0.3048006096 m
+# EPSG:6539 native unit is US survey foot ->1 ft = 0.3048006096 m
 _M_PER_FT = 0.3048006096
 TAU_FT    = _EXACT_TAU_M / _M_PER_FT   # ≈ 336 US-survey-feet
 
@@ -78,14 +102,14 @@ def _make_dirs(out: Path) -> None:
     (out / "figures").mkdir(parents=True, exist_ok=True)
 
 
-def _savefig(fig: plt.Figure, path: Path, dpi: int = 150) -> None:
-    fig.savefig(path, dpi=dpi, bbox_inches="tight")
+def _savefig(fig: plt.Figure, path: Path) -> None:
+    fig.savefig(path, dpi=FIG_DPI, bbox_inches="tight")
     plt.close(fig)
     print(f"    saved {path.name}")
 
 
 def _load_tract_long(results_dir: Path) -> pd.DataFrame:
-    """Stack predictions_by_tract_<year>.parquet for all YEARS → long DF."""
+    """Stack predictions_by_tract_<year>.parquet for all YEARS ->long DF."""
     frames = []
     for yr in YEARS:
         df = pd.read_parquet(results_dir / f"predictions_by_tract_{yr}.parquet")
@@ -116,6 +140,17 @@ def _bootstrap_spearman(
     hi = float(np.percentile(boots, (1 + ci) / 2 * 100))
     return float(np.median(boots)), lo, hi
 
+def _bootstrap_kendall(x: np.ndarray, y: np.ndarray, n_boot: int = 2000, ci: float = 0.95) -> tuple[float, float, float]:
+    rng = np.random.default_rng(42)
+    n = len(x)
+    boots = []
+    for _ in range(n_boot):
+        idx = rng.integers(0, n, n)
+        boots.append(kendalltau(x[idx], y[idx]).statistic)
+    boots = np.array(boots)
+    lo = float(np.percentile(boots, (1 - ci) / 2 * 100))
+    hi = float(np.percentile(boots, (1 + ci) / 2 * 100))
+    return float(np.median(boots)), lo, hi
 
 # ─── Part A ───────────────────────────────────────────────────────────────────
 
@@ -131,9 +166,11 @@ def part_a(results_dir: Path, processed_dir: Path, out: Path) -> None:
     rho, p_rho = spearmanr(x, y)
     tau_k, p_tau = kendalltau(x, y)
     _, lo, hi = _bootstrap_spearman(x, y)
+    _, lo_k, hi_k = _bootstrap_kendall(x, y)
+
 
     print(f"  Spearman ρ = {rho:.3f}  (95% CI [{lo:.3f}, {hi:.3f}])  p={p_rho:.2e}")
-    print(f"  Kendall τ  = {tau_k:.3f}  p={p_tau:.2e}")
+    print(f"  Kendall τ  = {tau_k:.3f}  (95% CI [{lo_k:.3f}, {hi_k:.3f}])  p={p_tau:.2e}")
 
     # Building-level (not headline)
     bldg16 = gpd.read_parquet(results_dir / "predictions_2016.parquet")
@@ -153,25 +190,25 @@ def part_a(results_dir: Path, processed_dir: Path, out: Path) -> None:
          "ci_lo_95": np.nan, "ci_hi_95": np.nan, "n": int(bm.sum())},
     ]).to_csv(out / "tables" / "A_cross_sectional_2016.csv", index=False)
 
-    # Scatter with 20-bin overlay
-    fig, ax = plt.subplots(figsize=(6, 5))
-    ax.scatter(x, y, s=4, alpha=0.22, color="steelblue", linewidths=0)
+    # Scatter with 10-bin overlay
+    fig, ax = plt.subplots(figsize=FIG_SIZE_TWO_COL)
+    ax.scatter(y, x, s=4, alpha=0.22, color="steelblue", linewidths=0)
 
-    bin_edges = np.percentile(x, np.linspace(0, 100, 21))
+    bin_edges = np.percentile(x, np.linspace(0, 100, 11))
     bin_ids = np.digitize(x, bin_edges[1:-1])  # 0..19
-    bx_m = [x[bin_ids == b].mean() for b in range(20) if (bin_ids == b).any()]
-    by_m = [y[bin_ids == b].mean() for b in range(20) if (bin_ids == b).any()]
-    ax.plot(bx_m, by_m, "o-", color="firebrick", ms=5, lw=1.5, label="20-bin mean")
-
-    ax.set_xlabel("predicted_value (tract mean)")
-    ax.set_ylabel("Rel_Score (ACS z-score)")
-    ax.set_title(
-        f"2016 held-out year  |  Spearman ρ = {rho:.3f}  "
-        f"(95% CI [{lo:.3f}, {hi:.3f}])"
+    bx_m = [x[bin_ids == b].mean() for b in range(10) if (bin_ids == b).any()]
+    by_m = [y[bin_ids == b].mean() for b in range(10) if (bin_ids == b).any()]
+    ax.plot(by_m, bx_m, "o-", color="firebrick", ms=5, lw=1.5, label="10-bin mean")
+    ax.set_xlim(-3, 4)
+    ax.set_xlabel("ACS Tract Z-score")
+    ax.set_ylabel("Average Tract Predicted Value")
+    # Add text to the plot with the statistics
+    ax.text(0.05, 0.87, f"Spearman $\\rho$ = {rho:.3f}\nKendall $\\tau$ = {tau_k:.3f}",
+            transform=ax.transAxes, fontsize=8, 
     )
     ax.legend(fontsize=8)
     fig.tight_layout()
-    _savefig(fig, out / "figures" / "A_scatter_2016.png")
+    _savefig(fig, out / "figures" / "A_scatter_2016.pdf")
 
 
 # ─── Part B helpers ───────────────────────────────────────────────────────────
@@ -262,739 +299,200 @@ def _rank_autocorr(wide_sub: pd.DataFrame, pair: tuple[int, int]) -> tuple[float
 
 # ─── Part B ───────────────────────────────────────────────────────────────────
 
+SPLIT_GROUPS = {
+    "test":  ["test", "val_spatial_temporal", "val_spatial", "dead_zone"],
+    "train": ["train"],
+}
+
+
 def part_b(results_dir: Path, processed_dir: Path, out: Path) -> None:
-    print("\n=== Part B: Temporal stability ===")
+    print("\n=== Part B: Temporal stability (Tract-Level CSA DiD) ===")
+
+    import csa
+    import polars as pl
 
     splits = _load_splits(processed_dir)
-    test_geoids  = set(splits.loc[splits["type"] == "test",  "GEOID_str"])
-    train_geoids = set(splits.loc[splits["type"] == "train", "GEOID_str"])
 
-    # ── B.1 Tract panel ───────────────────────────────────────────────────────
-    print("  B.1 tract panel...")
+    print("  B.1 Tract panel...")
     tract_long = _load_tract_long(results_dir)
     tract_long = tract_long.merge(splits[["GEOID_str", "type"]], on="GEOID_str", how="left")
 
-    tract_wide = (
-        tract_long.pivot_table(
-            index="GEOID_str", columns="year",
-            values="predicted_value", aggfunc="first",
-        )
-    )
-    tract_wide.columns = [int(c) for c in tract_wide.columns]
-    tract_type = (
-        tract_long.drop_duplicates("GEOID_str")
-        .set_index("GEOID_str")[["type"]]
-    )
-    tract_wide = tract_wide.join(tract_type)
+    print("  B.2 Building footprints (loaded once)...")
+    bldg_nyc = gpd.read_parquet(processed_dir / "buildings_nyc.parquet").to_crs(CRS_PROJ)
+    bldg_nyc["area"] = bldg_nyc.geometry.area
+    bldg_centroids = bldg_nyc.copy()
+    bldg_centroids.geometry = bldg_centroids.geometry.centroid
 
-    # ── B.1 Building panel ────────────────────────────────────────────────────
-    print("  B.1 building panel (loading 8 prediction files, may take a moment)...")
-    # Use 2024 (broadest coverage: 190 test tracts) to identify analysis building IDs
-    pred_ref = gpd.read_parquet(results_dir / "predictions_2024.parquet")
-    pred_ref["GEOID_str"] = pred_ref["GEOID"].apply(_norm_geoid)
+    splits_geom = gpd.read_feather(processed_dir / "tract_splits.feather").to_crs(CRS_PROJ)
+    splits_geom["GEOID_str"] = splits_geom["GEOID"].astype(str).str.zfill(11)
 
-    test_ids  = pred_ref.index[pred_ref["GEOID_str"].isin(test_geoids)].tolist()
-    train_all = pred_ref.index[pred_ref["GEOID_str"].isin(train_geoids)].tolist()
-    rng = np.random.default_rng(0)
-    train_sample = rng.choice(
-        train_all, min(50_000, len(train_all)), replace=False
-    ).tolist()
-    analysis_set = set(test_ids) | set(train_sample)
-    
-    bldg_frames = []
-    for yr in YEARS:
-        df = gpd.read_parquet(results_dir / f"predictions_{yr}.parquet")
-        sub = df.loc[df.index.isin(analysis_set), ["predicted_value", "GEOID", "geometry"]]
-        sub = sub.copy()
-        sub.index.name = "DOITT_ID"
-        sub["year"] = yr
-        bldg_frames.append(sub.reset_index())
-
-    bldg_long = pd.concat(bldg_frames, ignore_index=True)
-    bldg_long["GEOID_str"] = bldg_long["GEOID"].apply(_norm_geoid)
-    bldg_long = bldg_long.merge(splits[["GEOID_str", "type"]], on="GEOID_str", how="left")
-
-    bldg_wide = bldg_long.pivot_table(
-        index="DOITT_ID", columns="year",
-        values="predicted_value", aggfunc="first",
-    )
-    bldg_wide.columns = [int(c) for c in bldg_wide.columns]
-    bldg_meta = (
-        bldg_long.drop_duplicates("DOITT_ID")
-        .set_index("DOITT_ID")[["GEOID_str", "type"]]
-    )
-    bldg_wide = bldg_wide.join(bldg_meta)
-
-    # ── B.2 Change detection ──────────────────────────────────────────────────
-    print("  B.2 change detection...")
-    bldg_nyc = gpd.read_parquet(processed_dir / "buildings_nyc.parquet")
-    # New buildings: constructed strictly after 2009 and no later than 2024
-    new_bldg = bldg_nyc.loc[
-        bldg_nyc["CONSTRUCTION_YEAR"].between(2009, 2024, inclusive="right")
-    ].to_crs(CRS_PROJ)
-
-    # Get geometry for analysis buildings: take the first available year per building
-    geom_all = (
-        bldg_long[["DOITT_ID", "geometry", "year"]]
-        .sort_values("year")
-        .drop_duplicates("DOITT_ID")
-        .set_index("DOITT_ID")[["geometry"]]
-    )
-    geom_gdf = gpd.GeoDataFrame(geom_all, crs=CRS_PROJ)
-
-    change_df = _detect_change_vectorized(geom_gdf, new_bldg)
-    bldg_wide = bldg_wide.join(change_df, how="left")
-    bldg_wide["changed"] = bldg_wide["changed"].fillna(False).astype(bool)
-    year_cols = YEARS
-
-    # ── Export intensity indicators ──────────────────────────────────────────
-    # Write one parquet with all changed buildings that meet each intensity
-    # threshold, tagged with split type, change_year, and n_new_buildings.
-    # Geometry is intentionally omitted — join back on DOITT_ID from the
-    # prediction parquets when needed. This keeps the file small (~KB not MB).
-    #
-    # Thresholds exported: multi (>=2) and dense (>=5).
-    # "any" (>=1) is just the full changed set and is already implicit in
-    # B_stability_metrics.csv, so we skip it here to avoid redundancy.
-    EXPORT_THRESHOLDS = [
-        ("any", 1),
-        ("multi", 2),
-        ("dense", 5),
-    ]
-
-    intensity_rows = []
-    for did, row in bldg_wide.iterrows():
-        if not row.get("changed", False):
-            continue
-        cy = row.get("change_year")
-        n_new = int(row.get("n_new_buildings", 0))
-        for thresh_name, min_n_new in EXPORT_THRESHOLDS:
-            if n_new >= min_n_new:
-                intensity_rows.append({
-                    "DOITT_ID":       did,
-                    "split_type":     row.get("type"),
-                    "change_year":    int(cy),
-                    "n_new_buildings": n_new,
-                    "intensity":      thresh_name,
-                })
-
-    if intensity_rows:
-        intensity_df = pd.DataFrame(intensity_rows)
-        intensity_path = out / "tables" / "B_intensity_indicators.parquet"
-        intensity_df.to_parquet(intensity_path, index=False)
-        print(
-            f"    saved B_intensity_indicators.parquet  "
-            f"({len(intensity_df):,} rows  |  "
-            f"multi: {(intensity_df['intensity']=='multi').sum():,}  "
-            f"dense: {(intensity_df['intensity']=='dense').sum():,})"
-        )
-        buildings = gpd.read_parquet(processed_dir / "building_geometries_years2010-2024.parquet")
-        buildings.join(intensity_df.set_index("DOITT_ID"), how="inner").to_parquet(out / "tables" / "B_intensity_indicators_with_geometries.parquet")  
-    else:
-        print("    no intensity rows to export (check change detection output)")
-
-
-    # ── B.3 Metrics ───────────────────────────────────────────────────────────
-    print("  B.3 metrics...")
-    # NaN-aware: keep every unit with >=2 observed years (the intermediate years
-    # are predicted for only ~220 tracts, so requiring all 8 would shrink the
-    # test set to a tiny, geographically-biased subset). Within-unit volatility
-    # is computed over each unit's available years; rank-autocorrelation uses the
-    # fully-covered RANK_PAIR (2016 vs 2024).
-    val_arr = bldg_wide[year_cols].values.astype(float)
-    keep = np.isfinite(val_arr).sum(axis=1) >= 2
-    bw = bldg_wide[keep].copy()
-    va = bw[year_cols].values.astype(float)
-    changed_m = bw["changed"].values
-    stable_m  = ~changed_m
-
-    metric_rows = []
-
-    for mask, label in [
-        (stable_m  & (bw["type"] == "test").values,  "stable_test"),
-        (stable_m  & (bw["type"] == "train").values, "stable_train"),
-        (changed_m & (bw["type"] == "test").values,  "changed_test"),
-        (changed_m & (bw["type"] == "train").values, "changed_train"),
-    ]:
-        arr = va[mask]
-        if arr.shape[0] == 0:
-            continue
-        within_std = np.nanstd(arr, axis=1)
-        within_mad = np.nanmedian(
-            np.abs(arr - np.nanmean(arr, axis=1, keepdims=True)), axis=1
-        )
-        icc_val         = _icc(arr)
-        rank_auto, rk_n = _rank_autocorr(bw[mask], RANK_PAIR)
-        metric_rows.append({
-            "label": label, "n": int(mask.sum()),
-            "within_std_median": float(np.nanmedian(within_std)),
-            "within_std_IQR_lo": float(np.nanpercentile(within_std, 25)),
-            "within_std_IQR_hi": float(np.nanpercentile(within_std, 75)),
-            "within_MAD_median": float(np.nanmedian(within_mad)),
-            "ICC": icc_val,
-            "rank_autocorr": rank_auto,
-            "rank_autocorr_n": rk_n,
-            "rank_pair": f"{RANK_PAIR[0]}-{RANK_PAIR[1]}",
-        })
-
-    # Changed set: pre/post delta (NaN-aware — average over observed years only)
-    for lbl_sfx, type_val in [("test", "test"), ("train", "train")]:
-        chg_bw = bw[changed_m & (bw["type"] == type_val).values]
-        deltas = []
-        for _, row in chg_bw.iterrows():
-            cy = row["change_year"]
-            if pd.isna(cy):
-                continue
-            pre  = [row[c] for c in year_cols if c <  cy and pd.notna(row[c])]
-            post = [row[c] for c in year_cols if c >= cy and pd.notna(row[c])]
-            if not pre or not post:
-                continue
-            deltas.append(float(np.mean(post) - np.mean(pre)))
-        if deltas:
-            deltas = np.array(deltas)
-            metric_rows.append({
-                "label": f"changed_delta_{lbl_sfx}",
-                "n": int(len(deltas)),
-                "share_positive": float((deltas > 0).mean()),
-                "median_delta": float(np.median(deltas)),
-                "median_abs_delta": float(np.median(np.abs(deltas))),
-            })
-
-    # Tract-level stability (NaN-aware, >=2 observed years)
-    for split_type in ["test", "train"]:
-        sub_w  = tract_wide[(tract_wide["type"] == split_type).values].copy()
-        arr    = sub_w[year_cols].values.astype(float)
-        keep_t = np.isfinite(arr).sum(axis=1) >= 2
-        sub_w, arr = sub_w[keep_t], arr[keep_t]
-        if arr.shape[0] == 0:
-            continue
-        within_std      = np.nanstd(arr, axis=1)
-        icc_val         = _icc(arr)
-        rank_auto, rk_n = _rank_autocorr(sub_w, RANK_PAIR)
-        metric_rows.append({
-            "label": f"tract_{split_type}",
-            "n": int(arr.shape[0]),
-            "within_std_median": float(np.nanmedian(within_std)),
-            "ICC": float(icc_val),
-            "rank_autocorr": rank_auto,
-            "rank_autocorr_n": rk_n,
-            "rank_pair": f"{RANK_PAIR[0]}-{RANK_PAIR[1]}",
-        })
+    def get_change_year(group, threshold):
+        treated = group[group["change_pct"] > threshold]
+        return treated["year"].min() if len(treated) > 0 else 0
 
     pd.DataFrame(metric_rows).to_csv(
         out / "tables" / "B_stability_metrics.csv", index=False
+    thresholds = [0.01, 0.05, 0.1]
+    n_rows, n_cols = len(SPLIT_GROUPS), len(thresholds)
+
+    fig, axes = plt.subplots(
+        n_rows, n_cols,
+        figsize=(my_width * 1.5, my_width),
+        sharey=False,
     )
     print("    saved B_stability_metrics.csv")
 
-    # ── B.4 Plots ─────────────────────────────────────────────────────────────
-    print("  B.4 plots...")
+    legend_handles = None
 
-    # Tract spaghetti: test vs train side-by-side
-    fig, axes = plt.subplots(1, 2, figsize=(13, 5), sharey=True)
-    for ax, split_type, title in [
-        (axes[0], "test",  "Test tracts (n=190, spatial holdout)"),
-        (axes[1], "train", "Train tracts (random sample n=190)"),
-    ]:
-        sub = tract_wide[tract_wide["type"] == split_type]
-        if split_type == "train":
-            sub = sub.sample(min(190, len(sub)), random_state=0)
-        yt = sub[year_cols].values.astype(float)
-        for row_vals in yt:
-            ax.plot(year_cols, row_vals, color="steelblue", alpha=0.12, lw=0.6)
-        med = np.nanmedian(yt, axis=0)
-        q25 = np.nanpercentile(yt, 25, axis=0)
-        q75 = np.nanpercentile(yt, 75, axis=0)
-        ax.plot(year_cols, med, color="black", lw=2, label="Median")
-        ax.fill_between(year_cols, q25, q75, alpha=0.22, color="black", label="IQR")
-        ax.set_title(title, fontsize=10)
-        ax.set_xlabel("Year")
-        ax.legend(fontsize=8)
-        ax.set_xticks(year_cols)
-    axes[0].set_ylabel("predicted_value (tract mean)")
-    fig.suptitle("Temporal trajectories: are predictions stable where nothing changed?")
-    fig.tight_layout()
-    _savefig(fig, out / "figures" / "B_tract_trajectories.png")
+    for row_i, (split_name, split_types) in enumerate(SPLIT_GROUPS.items()):
+        print(f"\n  --- Split group: {split_name} ---")
 
-    # Example building trajectories (use any buildings with ≥2 years, not just complete)
-    n_ex = 5
-    n_year_valid = np.isfinite(bldg_wide[year_cols].values.astype(float)).sum(axis=1)
-    has_2yr = n_year_valid >= 2
-    stab_test_any  = has_2yr & ~bldg_wide["changed"].fillna(False).astype(bool) & (bldg_wide["type"] == "test").fillna(False)
-    chng_test_any  = has_2yr &  bldg_wide["changed"].fillna(False).astype(bool) & (bldg_wide["type"] == "test").fillna(False)
-    stable_ex  = bldg_wide[stab_test_any].sample(n_ex, random_state=825)
-    changed_ex = bldg_wide[chng_test_any].dropna(subset=["change_year"]).sample(n_ex, random_state=528)
-    n_changed_ex = len(changed_ex)
+        group_tract_long = tract_long[tract_long["type"].isin(split_types)].copy()
+        group_tracts = splits_geom[splits_geom["type"].isin(split_types)][["GEOID_str", "geometry"]]
 
-    fig, axes = plt.subplots(2, n_ex, figsize=(14, 6), sharey="row")
-    for col, (did, row) in enumerate(stable_ex.iterrows()):
-        ax = axes[0, col]
-        ax.plot(year_cols, row[year_cols].values, "o-", color="steelblue", ms=4, lw=1.2)
-        ax.set_title(f"DOITT {did}", fontsize=7)
-        if col == 0:
-            ax.set_ylabel("Stable", fontsize=9)
+        print(f"  B.2 Tract-level change detection (Area-based) [{split_name}]...")
+        bldg_tract = gpd.sjoin(bldg_centroids, group_tracts, how="inner", predicate="intersects")
 
-    for col in range(n_ex):
-        ax = axes[1, col]
-        if col < n_changed_ex:
-            did, row = list(changed_ex.iterrows())[col]
-            ax.plot(year_cols, row[year_cols].values, "o-", color="firebrick", ms=4, lw=1.2)
-            cy = row["change_year"]
-            if not pd.isna(cy):
-                ax.axvline(cy, color="black", ls="--", lw=1)
-            ax.set_title(f"DOITT {did}", fontsize=7)
-        if col == 0:
-            ax.set_ylabel("Changed\n(-- = change_year)", fontsize=9)
+        bldg_tract["base"] = bldg_tract["CONSTRUCTION_YEAR"] <= 2009
+        bldg_tract["new"] = bldg_tract["CONSTRUCTION_YEAR"].between(2010, 2024, inclusive="both")
 
-    for ax in axes.flat:
-        ax.set_xlabel("Year", fontsize=7)
-        ax.tick_params(labelsize=7)
-        ax.set_xticks(year_cols)
-        ax.tick_params(axis="x", rotation=45)
-    fig.suptitle("Example building trajectories (test tracts)", fontsize=11)
-    fig.tight_layout()
-    _savefig(fig, out / "figures" / "B_building_trajectories.png")
+        base_area = bldg_tract[bldg_tract["base"]].groupby("GEOID_str")["area"].sum()
+        new_bldgs = bldg_tract[bldg_tract["new"]]
+        yearly_new_area = new_bldgs.groupby(["GEOID_str", "CONSTRUCTION_YEAR"])["area"].sum().reset_index()
 
-    # Event study: align changed buildings at change_year = 0
-    # Rules:
-    #   – test and train are plotted as separate charts so the two can be compared
-    #   – buildings with change_year == 2010 (no pre-event observations) or
-    #     change_year == 2024 (no post-event observations) are excluded
-    print("  B.4 event study...")
-    ev_rng = np.random.default_rng(1)
-    EXCLUDE_CHANGE_YEARS = {2010, 2024}
+        tract_ids = group_tracts["GEOID_str"].unique()
+        all_years = list(range(2010, 2025))
+        grid_all = pd.MultiIndex.from_product(
+            [tract_ids, all_years], names=["GEOID_str", "year"]
+        ).to_frame(index=False)
 
-    def _build_event_df(
-        bldg_wide: pd.DataFrame,
-        split_type: str,
-        n_stable_sample: int = 5_000,
-    ) -> pd.DataFrame:
-        """
-        Build a long event-study DataFrame for one split (test or train).
-
-        Changed group  – all changed buildings in `split_type` tracts whose
-                         change_year is not in EXCLUDE_CHANGE_YEARS.
-        Stable group   – up to `n_stable_sample` stable buildings from the
-                         same split, event-time anchored at 2016 (arbitrary
-                         calendar midpoint; the line should be flat regardless).
-        """
-        type_mask    = (bldg_wide["type"] == split_type).fillna(False)
-        chg_mask     = bldg_wide["changed"].fillna(False).astype(bool)
-        stb_mask     = ~chg_mask
-
-        rows = []
-
-        # ── changed buildings ──
-        chg_pool = bldg_wide[type_mask & chg_mask]
-        for _, row in chg_pool.iterrows():
-            cy = row["change_year"]
-            if pd.isna(cy) or int(cy) in EXCLUDE_CHANGE_YEARS:
-                continue
-            for yr in year_cols:
-                v = row[yr]
-                if pd.isna(v):
-                    continue
-                rows.append({
-                    "event_time": yr - int(cy),
-                    "value":      float(v),
-                    "group":      "changed",
-                })
-
-        # ── stable reference ──
-        stb_pool = bldg_wide[type_mask & stb_mask]
-        n_sample = min(n_stable_sample, len(stb_pool))
-        stb_sample = stb_pool.sample(n_sample, random_state=2)
-        for _, row in stb_sample.iterrows():
-            for yr in year_cols:
-                v = row[yr]
-                if pd.isna(v):
-                    continue
-                rows.append({
-                    "event_time": yr - 2016,
-                    "value":      float(v),
-                    "group":      "stable",
-                })
-
-        return pd.DataFrame(rows)
-
-    def _plot_event_study(
-        ev_df: pd.DataFrame,
-        split_type: str,
-        out_path: Path,
-    ) -> None:
-        """Plot and save one event-study figure for a single split."""
-        n_chg = ev_df[ev_df["group"] == "changed"]["event_time"].notna().sum()
-        fig, ax = plt.subplots(figsize=(8, 5))
-
-        for grp, color, label in [
-            ("changed", "firebrick", "Changed buildings"),
-            ("stable",  "steelblue", "Stable (reference)"),
-        ]:
-            sub = ev_df[ev_df["group"] == grp]
-            times = sorted(sub["event_time"].unique())
-            means, los, his, valid_times = [], [], [], []
-            for t in times:
-                vals = sub.loc[sub["event_time"] == t, "value"].dropna().values
-                if len(vals) < 5:
-                    continue
-                boot = [
-                    vals[ev_rng.integers(0, len(vals), len(vals))].mean()
-                    for _ in range(500)
-                ]
-                means.append(float(vals.mean()))
-                los.append(float(np.percentile(boot, 2.5)))
-                his.append(float(np.percentile(boot, 97.5)))
-                valid_times.append(t)
-            if valid_times:
-                ax.plot(valid_times, means, "o-", color=color,
-                        lw=2, ms=5, label=label)
-                ax.fill_between(valid_times, los, his,
-                                alpha=0.18, color=color)
-
-        ax.axvline(0, color="black", ls="--", lw=1, label="t = 0 (change_year)")
-        ax.set_xlabel("Event time (years relative to change_year)")
-        ax.set_ylabel("predicted_value")
-        ax.set_title(
-            f"Event study: model response around new construction\n"
-            f"({split_type} tracts  |  change_year ∉ {{2010, 2024}})"
+        merged = grid_all.merge(
+            yearly_new_area,
+            left_on=["GEOID_str", "year"],
+            right_on=["GEOID_str", "CONSTRUCTION_YEAR"],
+            how="left",
         )
-        ax.legend(fontsize=9)
-        fig.tight_layout()
-        _savefig(fig, out_path)
+        merged["area"] = merged["area"].fillna(0)
+        merged["cum_area"] = merged.groupby("GEOID_str")["area"].cumsum()
+        merged = merged.merge(base_area.rename("base_area"), on="GEOID_str", how="left")
+        merged["base_area"] = merged["base_area"].fillna(np.inf)
+        merged["change_pct"] = merged["cum_area"] / merged["base_area"]
+        merged_panel = merged[merged["year"].isin(YEARS)]
 
-    # ── pooled event study (one chart per split, all valid change years) ──
-    for split_type in ("test", "train"):
-        ev_df = _build_event_df(bldg_wide, split_type)
-        fname = f"B_event_study_{split_type}.png"
-        _plot_event_study(ev_df, split_type, out / "figures" / fname)
+        print(f"  B.3 CSA DiD Estimation [{split_name}]...")
+        for col_i, thresh in enumerate(thresholds):
+            ax = axes[row_i, col_i]
+            col_name = f"change_year_{int(thresh * 100)}pct"
+            change_years = merged_panel.groupby("GEOID_str").apply(
+                get_change_year, threshold=thresh
+            ).rename(col_name)
+            df_thresh = group_tract_long.merge(change_years, on="GEOID_str", how="left")
 
-    # ── per-change-year event study ──
-    # Only years with a genuine pre AND post window are plotted.
-    # 2010 → no pre-event observations.
-    # 2012 → only one pre-event year (2010); too thin.
-    # 2022 → only one post-event year (2024); too thin.
-    # 2024 → no post-event observations.
-    # Valid set: 2014, 2016, 2018, 2020.
-    PER_YEAR_CHANGE_YEARS = [2014, 2016, 2018, 2020]
-
-    def _build_event_df_single_year(
-        bldg_wide: pd.DataFrame,
-        split_type: str,
-        target_change_year: int,
-        n_stable_sample: int = 5_000,
-    ) -> pd.DataFrame:
-        """
-        Like _build_event_df but restricts the changed group to buildings
-        whose change_year == target_change_year exactly.  The stable reference
-        pool is drawn from the same split and anchored at target_change_year
-        (so event_time=0 on the stable line is the same calendar year as the
-        treatment, making the two lines directly comparable).
-        """
-        type_mask = (bldg_wide["type"] == split_type).fillna(False)
-        chg_mask  = bldg_wide["changed"].fillna(False).astype(bool)
-        stb_mask  = ~chg_mask
-
-        rows = []
-
-        # ── changed: only this change_year ──
-        chg_pool = bldg_wide[type_mask & chg_mask]
-        for _, row in chg_pool.iterrows():
-            cy = row["change_year"]
-            if pd.isna(cy) or int(cy) != target_change_year:
-                continue
-            for yr in year_cols:
-                v = row[yr]
-                if pd.isna(v):
-                    continue
-                rows.append({
-                    "event_time": yr - target_change_year,
-                    "value":      float(v),
-                    "group":      "changed",
-                })
-
-        # ── stable reference: anchor at target_change_year ──
-        stb_pool   = bldg_wide[type_mask & stb_mask]
-        n_sample   = min(n_stable_sample, len(stb_pool))
-        stb_sample = stb_pool.sample(n_sample, random_state=2)
-        for _, row in stb_sample.iterrows():
-            for yr in year_cols:
-                v = row[yr]
-                if pd.isna(v):
-                    continue
-                rows.append({
-                    "event_time": yr - target_change_year,
-                    "value":      float(v),
-                    "group":      "stable",
-                })
-
-        return pd.DataFrame(rows)
-
-    def _plot_event_study_single_year(
-        ev_df: pd.DataFrame,
-        split_type: str,
-        target_change_year: int,
-        out_path: Path,
-    ) -> None:
-        """
-        Plot one event-study panel for a single change_year cohort.
-        The x-axis label shows the actual calendar years so the reader can
-        orient without having to do the arithmetic themselves.
-        """
-        fig, ax = plt.subplots(figsize=(8, 5))
-
-        for grp, color, label in [
-            ("changed", "firebrick", "Changed buildings"),
-            ("stable",  "steelblue", "Stable (reference)"),
-        ]:
-            sub = ev_df[ev_df["group"] == grp]
-            if sub.empty:
-                continue
-            times = sorted(sub["event_time"].unique())
-            means, los, his, valid_times = [], [], [], []
-            for t in times:
-                vals = sub.loc[sub["event_time"] == t, "value"].dropna().values
-                if len(vals) < 5:
-                    continue
-                boot = [
-                    vals[ev_rng.integers(0, len(vals), len(vals))].mean()
-                    for _ in range(500)
-                ]
-                means.append(float(vals.mean()))
-                los.append(float(np.percentile(boot, 2.5)))
-                his.append(float(np.percentile(boot, 97.5)))
-                valid_times.append(t)
-            if valid_times:
-                ax.plot(valid_times, means, "o-", color=color,
-                        lw=2, ms=5, label=label)
-                ax.fill_between(valid_times, los, his,
-                                alpha=0.18, color=color)
-
-        # Mark t=0 and annotate with the actual calendar year
-        ax.axvline(0, color="black", ls="--", lw=1,
-                   label=f"t = 0  ({target_change_year})")
-
-        # Secondary x-axis tick labels: show calendar year alongside event time
-        event_times = [yr - target_change_year for yr in year_cols]
-        ax.set_xticks(event_times)
-        ax.set_xticklabels(
-            [f"{et:+d}\n({target_change_year + et})" for et in event_times],
-            fontsize=7,
-        )
-
-        # Count how many changed buildings fed this chart
-        n_chg_buildings = (
-            ev_df[ev_df["group"] == "changed"]
-            .groupby("event_time")["value"]
-            .count()
-            .max()
-        )
-        n_chg_buildings = int(n_chg_buildings) if not pd.isna(n_chg_buildings) else 0
-
-        ax.set_xlabel("Event time (years relative to change_year)")
-        ax.set_ylabel("predicted_value")
-        ax.set_title(
-            f"Event study: change_year cohort = {target_change_year}  "
-            f"({split_type} tracts)\n"
-            f"n_changed ≈ {n_chg_buildings}  |  "
-            f"change_year ∉ {{2010, 2012, 2022, 2024}}"
-        )
-        ax.legend(fontsize=9)
-        fig.tight_layout()
-        _savefig(fig, out_path)
-
-    for split_type in ("test", "train"):
-        for cy_target in PER_YEAR_CHANGE_YEARS:
-            ev_df_yr = _build_event_df_single_year(
-                bldg_wide, split_type, cy_target
+            df_csa = df_thresh.dropna(subset=[col_name, "predicted_value"]).copy()
+            df_csa[col_name] = df_csa[col_name].astype(int)
+            df_csa["year"] = df_csa["year"].astype(int)
+            df_csa = df_csa[df_csa["year"] != 2010]
+            df_csa["year"] = (df_csa["year"] - 2010) // 2  # 2012->1, ..., 2024->7
+            df_csa[col_name] = np.where(
+                df_csa[col_name] == 0, 0, (df_csa[col_name] - 2010) // 2
             )
-            fname = f"B_event_study_{split_type}_cy{cy_target}.png"
-            _plot_event_study_single_year(
-                ev_df_yr, split_type, cy_target,
-                out / "figures" / fname,
-            )
-            
-    # ── pooled event study, stratified by construction intensity ──
-    # All valid change years (PER_YEAR_CHANGE_YEARS) are pooled together so
-    # event_time = yr - change_year, matching the existing _build_event_df
-    # convention.  One chart is produced per split × intensity threshold,
-    # giving a high-power view of whether the model response scales with the
-    # intensity of physical change.
-    #
-    # n_new_buildings == 1  → isolated infill
-    # n_new_buildings >= 2  → multiple new footprints (coordinated infill)
-    # n_new_buildings >= 5  → dense redevelopment wave
-    INTENSITY_THRESHOLDS = [
-        ("any",   1, "any new construction (n_new ≥ 1)"),
-        ("multi", 2, "multiple new buildings (n_new ≥ 2)"),
-        ("dense", 5, "dense redevelopment (n_new ≥ 5)"),
-    ]
+            df_csa["unit_id"] = pd.factorize(df_csa["GEOID_str"])[0]
 
-    def _build_event_df_intensity_pooled(
-        bldg_wide: pd.DataFrame,
-        split_type: str,
-        min_n_new: int,
-        n_stable_sample: int = 5_000,
-    ) -> pd.DataFrame:
-        """
-        Build a pooled event-study DataFrame for one split × intensity cell.
+            if df_csa[col_name].shape[0] <= 0:
+                raise ValueError(f"No data for selected threshold: {int(thresh * 100)}%")
 
-        Changed group  – all changed buildings in `split_type` tracts whose
-                         change_year is in PER_YEAR_CHANGE_YEARS and whose tile
-                         contains at least `min_n_new` new constructions.
-                         event_time = yr - change_year (each building anchors at
-                         its own change_year, same as _build_event_df).
-        Stable group   – up to `n_stable_sample` stable buildings from the same
-                         split, anchored at 2016 (the calendar midpoint used by
-                         the pooled baseline).
-        """
-        type_mask = (bldg_wide["type"] == split_type).fillna(False)
-        chg_mask  = bldg_wide["changed"].fillna(False).astype(bool)
-        stb_mask  = ~chg_mask
-
-        if "n_new_buildings" in bldg_wide.columns:
-            intensity_mask = bldg_wide["n_new_buildings"].fillna(0).astype(int) >= min_n_new
-        else:
-            intensity_mask = pd.Series(True, index=bldg_wide.index)
-
-        rows = []
-
-        # ── changed: all valid change years, intensity-filtered ──
-        chg_pool = bldg_wide[type_mask & chg_mask & intensity_mask]
-        for _, row in chg_pool.iterrows():
-            cy = row["change_year"]
-            if pd.isna(cy) or int(cy) not in PER_YEAR_CHANGE_YEARS:
-                continue
-            for yr in year_cols:
-                v = row[yr]
-                if pd.isna(v):
-                    continue
-                rows.append({
-                    "event_time":        yr - int(cy),
-                    "value":             float(v),
-                    "group":             "changed",
-                    "construction_year": int(cy),
-                })
-
-        # ── stable reference: anchored at 2016 ──
-        stb_pool   = bldg_wide[type_mask & stb_mask]
-        n_sample   = min(n_stable_sample, len(stb_pool))
-        stb_sample = stb_pool.sample(n_sample, random_state=2)
-        for _, row in stb_sample.iterrows():
-            for yr in year_cols:
-                v = row[yr]
-                if pd.isna(v):
-                    continue
-                rows.append({
-                    "event_time":        yr - 2016,
-                    "value":             float(v),
-                    "group":             "stable",
-                    "construction_year": None,
-                })
-
-        return pd.DataFrame(rows)
-
-    def _plot_event_study_intensity_pooled(
-        ev_df: pd.DataFrame,
-        split_type: str,
-        intensity_label: str,
-        min_n_new: int,
-        out_path: Path,
-    ) -> None:
-        """
-        Plot a pooled event-study chart for one split × intensity cell.
-        The x-axis shows event time only (no calendar year annotation, since
-        buildings from different cohorts are pooled).  A per-construction-year
-        breakdown is overlaid as thin coloured lines so cohort heterogeneity
-        is visible without cluttering the headline comparison.
-        """
-        fig, ax = plt.subplots(figsize=(9, 5))
-
-        # ── headline changed vs stable ──
-        for grp, color, label in [
-            ("changed", "firebrick", "Changed buildings (pooled)"),
-            ("stable",  "steelblue", "Stable (reference)"),
-        ]:
-            sub = ev_df[ev_df["group"] == grp]
-            if sub.empty:
-                continue
-            times = sorted(sub["event_time"].unique())
-            means, los, his, valid_times = [], [], [], []
-            for t in times:
-                vals = sub.loc[sub["event_time"] == t, "value"].dropna().values
-                if len(vals) < 5:
-                    continue
-                boot = [
-                    vals[ev_rng.integers(0, len(vals), len(vals))].mean()
-                    for _ in range(500)
-                ]
-                means.append(float(vals.mean()))
-                los.append(float(np.percentile(boot, 2.5)))
-                his.append(float(np.percentile(boot, 97.5)))
-                valid_times.append(t)
-            if valid_times:
-                ax.plot(valid_times, means, "o-", color=color,
-                        lw=2.5, ms=6, label=label, zorder=3)
-                ax.fill_between(valid_times, los, his,
-                                alpha=0.15, color=color, zorder=2)
-
-        # ── per-construction-year overlay (thin lines, changed only) ──
-        chg_sub = ev_df[ev_df["group"] == "changed"]
-        cy_palette = plt.cm.tab10.colors
-        for ci, cy in enumerate(sorted(chg_sub["construction_year"].dropna().unique())):
-            cy_rows = chg_sub[chg_sub["construction_year"] == cy]
-            times = sorted(cy_rows["event_time"].unique())
-            means_cy, valid_t_cy = [], []
-            for t in times:
-                vals = cy_rows.loc[cy_rows["event_time"] == t, "value"].dropna().values
-                if len(vals) < 3:
-                    continue
-                means_cy.append(float(vals.mean()))
-                valid_t_cy.append(t)
-            if valid_t_cy:
-                color_cy = cy_palette[ci % len(cy_palette)]
-                ax.plot(valid_t_cy, means_cy, "s--", color=color_cy,
-                        lw=1.0, ms=3, alpha=0.55, label=f"cy={int(cy)}", zorder=1)
-
-        ax.axvline(0, color="black", ls="--", lw=1, label="t = 0 (change_year)")
-
-        n_chg_buildings = (
-            ev_df[ev_df["group"] == "changed"]
-            .groupby("event_time")["value"]
-            .count()
-            .max()
-        )
-        n_chg_buildings = int(n_chg_buildings) if not pd.isna(n_chg_buildings) else 0
-
-        ax.set_xlabel("Event time (years relative to change_year)")
-        ax.set_ylabel("predicted_value")
-        ax.set_title(
-            f"Event study (pooled years): {intensity_label}\n"
-            f"({split_type} tracts  |  change_years {PER_YEAR_CHANGE_YEARS}"
-            f"  |  n_changed ≈ {n_chg_buildings})"
-        )
-        ax.legend(fontsize=7, ncol=2)
-        fig.tight_layout()
-        _savefig(fig, out_path)
-
-    for split_type in ("test", "train"):
-        for thresh_name, min_n_new, thresh_label in INTENSITY_THRESHOLDS:
-            ev_df_int = _build_event_df_intensity_pooled(
-                bldg_wide, split_type, min_n_new
-            )
-            n_chg = (ev_df_int["group"] == "changed").sum()
-            if n_chg < 10:
-                print(
-                    f"    skipping {split_type} {thresh_name} (pooled): "
-                    f"only {n_chg} changed observations"
+            try:
+                np.random.seed(42)
+                res = csa.estimate(
+                    data=pl.from_pandas(df_csa),
+                    outcome="predicted_value",
+                    unit="unit_id",
+                    group=col_name,
+                    time="year",
+                    control="never",
+                    method="reg",
                 )
-                continue
-            fname = f"B_event_study_{split_type}_intensity_{thresh_name}_pooled.png"
-            _plot_event_study_intensity_pooled(
-                ev_df=ev_df_int,
-                split_type=split_type,
-                intensity_label=thresh_label,
-                min_n_new=min_n_new,
-                out_path=out / "figures" / fname,
-            )
+                agg = csa.agg_te(res, method="dynamic", boot=True, B=10_000, verbose=True)
+
+                if getattr(agg, "boot", None) is None:
+                    print(f"      Skipping {int(thresh * 100)}% [{split_name}]: bootstrap did not run")
+                    ax.text(0.5, 0.5, "bootstrap\nfailed", ha="center", va="center",
+                            transform=ax.transAxes, fontsize=10, color="gray")
+                    continue
+
+                est_df = agg.boot.estimates.to_pandas()
+                e_col = "k" if "k" in est_df.columns else (
+                    "e" if "e" in est_df.columns else est_df.columns[0]
+                )
+                ks    = est_df[e_col].to_numpy()
+                means = est_df["att"].to_numpy()
+                lower = est_df["lower"].to_numpy()
+                upper = est_df["upper"].to_numpy()
+
+                if len(ks) == 0:
+                    print(f"      Skipping {int(thresh * 100)}% [{split_name}]: no valid event times")
+                    continue
+
+                # Normalize to k=-1 reference period: subtract the k=-1 ATT from all three
+                # arrays (means, lower, upper) as a rigid vertical shift. This anchors the
+                # last pre-treatment period at 0 without altering CI width or coverage.
+                ref_mask = ks == -1
+                if ref_mask.any():
+                    ref_att = means[ref_mask][0]
+                    means = means - ref_att
+                    lower = lower - ref_att
+                    upper = upper - ref_att
+
+                n_treated = int(df_csa[df_csa[col_name] > 0]["unit_id"].nunique())
+                n_control = int(df_csa[df_csa[col_name] == 0]["unit_id"].nunique())
+                print(f"    [{split_name}] {int(thresh * 100)}%: n_treated={n_treated}, n_control={n_control}")
+
+                h_att, = ax.plot(ks, means, "o-", color="firebrick", lw=1, ms=4,
+                                 label="ATT (CSA)")
+                h_ci = ax.fill_between(ks, lower, upper, alpha=0.18, color="firebrick",
+                                       label=r"95\% simultaneous CI")
+                h_vline = ax.axvline(-0.5, color="black", ls="--", lw=0.8,
+                                     label="Treatment year")
+                ax.axhline(0, color="gray", ls="-", lw=0.6)
+
+                if legend_handles is None:
+                    legend_handles = [h_att, h_ci, h_vline]
+
+                ax.set_xticks(ks)
+                ax.tick_params(labelsize=8)
+                if row_i == n_rows - 1:
+                    ax.set_xlabel("Event time (relative to treatment)", fontsize=10)
+                if col_i == 0:
+                    if split_name == "test":
+                        split_label = "Test Set"
+                    elif split_name == "train":
+                        split_label = "Train Set"
+                    ax.set_ylabel(f"{split_label} ATT \n (Tract Avg. Prediction)", fontsize=10)
+                ax.set_title(f"{int(thresh * 100)}\%", fontsize=10)
+
+                csa.agg_te(res, method="simple").summary()
+
+            except Exception as exc:
+                print(f"    Error [{split_name}] {int(thresh * 100)}%: {exc}")
+                ax.text(0.5, 0.5, f"error\n{exc}", ha="center", va="center",
+                        transform=ax.transAxes, fontsize=8, color="red")
+
+    # fig.suptitle(
+    #     "Tract-Level DiD Event Study (CSA): cumulative new building area thresholds",
+    #     fontsize=11, fontweight="bold",
+    # )
+    if legend_handles:
+        fig.legend(
+            handles=legend_handles,
+            loc="lower center",
+            ncol=len(legend_handles),
+            fontsize=10,
+            framealpha=0.9,
+            bbox_to_anchor=(0.5, 0.0),
+        )
+    fig.tight_layout(rect=[0, 0.07, 1, 0.95])
+    _savefig(fig, out / "figures" / "B_event_study_grid.pdf")
+
 
 # ─── Part C ───────────────────────────────────────────────────────────────────
 
@@ -1068,7 +566,7 @@ def part_c(results_dir: Path, processed_dir: Path, out: Path) -> pd.DataFrame | 
     city_df.to_csv(out / "tables" / "C_quantile_mapping.csv", index=False)
     print("    saved C_quantile_mapping.csv")
 
-    fig, ax = plt.subplots(figsize=(8, 5))
+    fig, ax = plt.subplots(figsize=FIG_SIZE_TWO_COL)
     ax.plot(city_df["year"], city_df["ACS_mean_matched"], "o-",  color="black",     lw=2,   ms=6,
             label="ACS (same tracts as preds)")
     ax.plot(city_df["year"], city_df["ACS_mean_all_nyc"], ":",   color="0.55",      lw=1.5,
@@ -1086,13 +584,13 @@ def part_c(results_dir: Path, processed_dir: Path, out: Path) -> pd.DataFrame | 
     ax.legend(fontsize=8)
     ax.set_xticks(YEARS)
     fig.tight_layout()
-    _savefig(fig, out / "figures" / "C_city_avg_trajectory.png")
+    _savefig(fig, out / "figures" / "C_city_avg_trajectory.pdf")
 
-    # Long-difference scatter: ACS 2009→2024 vs mapped prediction 2010→2024
+    # Long-difference scatter: ACS 2009->2024 vs mapped prediction 2010->2024
     panel = pd.read_feather(processed_dir / "ny_tracts_panel_2009_2014_2019_2024.feather")
-    panel["GEOID_str"] = panel["geoid_2024"].astype(str).str.zfill(11)
+    panel["GEOID_str"] = panel["geoid_2022"].astype(str).str.zfill(11)
     panel["acs_change"] = (
-        panel["per_capita_income_usd_2024"] - panel["per_capita_income_usd_2009"]
+        panel["per_capita_income_usd_2022"] - panel["per_capita_income_usd_2009"]
     )
 
     for map_col in ["qmap20", "qmaplogn"]:
@@ -1100,9 +598,9 @@ def part_c(results_dir: Path, processed_dir: Path, out: Path) -> pd.DataFrame | 
             index="GEOID_str", columns="year", values=map_col, aggfunc="first"
         )
         wide_map.columns = [int(c) for c in wide_map.columns]
-        if 2010 not in wide_map.columns or 2024 not in wide_map.columns:
+        if 2010 not in wide_map.columns or 2022 not in wide_map.columns:
             continue
-        wide_map["pred_change"] = wide_map[2024] - wide_map[2010]
+        wide_map["pred_change"] = wide_map[2022] - wide_map[2010]
         merged = (
             panel[["GEOID_str", "acs_change"]]
             .merge(wide_map[["pred_change"]].reset_index(), on="GEOID_str", how="inner")
@@ -1114,22 +612,22 @@ def part_c(results_dir: Path, processed_dir: Path, out: Path) -> pd.DataFrame | 
         rho_c, _ = spearmanr(x_c, y_c)
         slope_c  = np.polyfit(x_c, y_c, 1)[0]
 
-        fig, ax = plt.subplots(figsize=(6, 5))
+        fig, ax = plt.subplots(figsize=FIG_SIZE_TWO_COL)
         ax.scatter(x_c, y_c, s=5, alpha=0.3, color="steelblue", linewidths=0)
         ax.axhline(0, color="gray", lw=0.5)
         ax.axvline(0, color="gray", lw=0.5)
         xlim = np.array([x_c.min(), x_c.max()])
         ax.plot(xlim, np.polyval(np.polyfit(x_c, y_c, 1), xlim),
                 "r-", lw=1.5, label=f"slope={slope_c:.3f}")
-        ax.set_xlabel("ACS per-capita income change 2009→2024 (USD)")
-        ax.set_ylabel(f"{map_col} change 2010→2024 (USD)")
+        ax.set_xlabel("ACS per-capita income change 2009→2022 (USD)")
+        ax.set_ylabel(f"{map_col} change 2010→2022 (USD)")
         ax.set_title(
-            f"Long-difference scatter ({map_col})  —  tracts predicted in both 2010 & 2024\n"
-            f"Spearman ρ = {rho_c:.3f}  n = {len(merged)}"
+            f"Long-difference scatter ({map_col})  —  tracts predicted in both 2010 \\& 2022\n"
+            f"Spearman $\\rho$ = {rho_c:.3f}  n = {len(merged)}"
         )
         ax.legend(fontsize=8)
         fig.tight_layout()
-        _savefig(fig, out / "figures" / f"C_long_diff_{map_col}.png")
+        _savefig(fig, out / "figures" / f"C_long_diff_{map_col}.pdf")
 
     return qmap_long
 
@@ -1144,7 +642,7 @@ def _lonlat_to_6539(lon: float, lat: float) -> tuple[float, float]:
 def _slice_zarr(ds, cx: float, cy: float, half: float,
                 max_px: int = 1400) -> np.ndarray | None:
     """Extract a square tile (4, H, W) uint8 from a zarr Dataset, strided so the
-    longest side is ~max_px pixels (plan §D.1: 'downsampled for size'). Striding
+    longest side is ~max_px pixels (plan D.1: 'downsampled for size'). Striding
     in the .isel slice keeps the materialised array small (~MB, not ~GB)."""
     try:
         x_vals = ds.x.values
@@ -1170,7 +668,7 @@ def _slice_zarr(ds, cx: float, cy: float, half: float,
 
 
 def _stretch_rgb(tile: np.ndarray) -> np.ndarray:
-    """Convert (4, H, W) uint8 → (H, W, 3) uint8 with percentile stretch."""
+    """Convert (4, H, W) uint8 -> (H, W, 3) uint8 with percentile stretch."""
     rgb = np.stack([tile[0], tile[1], tile[2]], axis=-1).astype(float)
     for ch in range(3):
         lo, hi = np.percentile(rgb[:, :, ch], [2, 98])
@@ -1310,15 +808,15 @@ def part_d(
     cbar = fig_g.colorbar(sm, ax=axes_g[:, 2], shrink=0.5, pad=0.2)
     cbar.set_label("predicted_value", fontsize=8)
 
-    patch_old = mpatches.Patch(color="0.65",    label="Pre-existing (built ≤2009)")
-    patch_new = mpatches.Patch(color="crimson", label="New construction (2010–year)")
+    patch_old = mpatches.Patch(color="0.65",    label="Pre-existing (built $\\leq 2009$)")
+    patch_new = mpatches.Patch(color="crimson", label="New construction (built $\\geq 2009$)")
     fig_g.legend(handles=[patch_old, patch_new], loc="lower left",
                  fontsize=7, framealpha=0.85, ncol=2)
 
     fig_g.suptitle("Hudson Yards: 2010–2024 aerial imagery, buildings, predictions",
                    fontsize=11, fontweight="bold")
     fig_g.tight_layout(rect=[0, 0.03, 1, 0.97])
-    _savefig(fig_g, out / "figures" / "D_hudson_yards_grid.png", dpi=300)
+    _savefig(fig_g, out / "figures" / "D_hudson_yards_grid.pdf")
 
     # ── D.2 Per-building trajectories ─────────────────────────────────────────
     print("  D.2 per-building line chart...")
@@ -1327,7 +825,7 @@ def part_d(
         for did, row in df.iterrows():
             traj.setdefault(did, {})[yr] = float(row["predicted_value"])
 
-    fig_l, ax_l = plt.subplots(figsize=(10, 5))
+    fig_l, ax_l = plt.subplots(figsize=FIG_SIZE_TWO_COL)
     n_plotted = 0
     for did, yr_vals in traj.items():
         if len(yr_vals) < 2:
@@ -1340,15 +838,15 @@ def part_d(
         n_plotted += 1
 
     print(f"    plotted {n_plotted} building trajectories")
-    p_old = mpatches.Patch(color="steelblue", alpha=0.7, label="Pre-existing (built ≤2009)")
-    p_new = mpatches.Patch(color="crimson",   alpha=0.7, label="New construction (built >2009)")
+    p_old = mpatches.Patch(color="steelblue", alpha=0.7, label="Pre-existing (built $\\leq 2009$)")
+    p_new = mpatches.Patch(color="crimson",   alpha=0.7, label="New construction (built $\\geq 2009$)")
     ax_l.legend(handles=[p_old, p_new], fontsize=8)
     ax_l.set_xlabel("Year")
     ax_l.set_ylabel("predicted_value")
     ax_l.set_title("Hudson Yards: per-building prediction trajectories")
     ax_l.set_xticks(YEARS)
     fig_l.tight_layout()
-    _savefig(fig_l, out / "figures" / "D_buildings_lines.png")
+    _savefig(fig_l, out / "figures" / "D_buildings_lines.pdf")
 
     # ── D.3 Tract ACS vs model predictions ───────────────────────────────────
     print("  D.3 tract ACS vs prediction chart...")
@@ -1399,7 +897,7 @@ def part_d(
     panel_years = [2009, 2014, 2019, 2024]
     colors_t    = plt.cm.tab10.colors
 
-    fig_t, ax_t = plt.subplots(figsize=(9, 5))
+    fig_t, ax_t = plt.subplots(figsize=FIG_SIZE_TWO_COL)
     for i, geoid in enumerate(overlap_geoids):
         color   = colors_t[i % len(colors_t)]
         pan_row = panel[panel["GEOID_str"] == geoid]
@@ -1436,7 +934,7 @@ def part_d(
     ax_t.legend(fontsize=7, loc="upper left")
     ax_t.set_xticks(YEARS)
     fig_t.tight_layout()
-    _savefig(fig_t, out / "figures" / "D_tract_acs_vs_pred.png")
+    _savefig(fig_t, out / "figures" / "D_tract_acs_vs_pred.pdf")
 
 
 # ─── entry point ──────────────────────────────────────────────────────────────
@@ -1481,8 +979,8 @@ def main() -> None:
         part_d(results_dir, PROCESSED_DATA_DIR, out_dir, qmap_long=qmap_long)
 
     print("\n=== Done ===")
-    print(f"  Tables  → {out_dir / 'tables'}")
-    print(f"  Figures → {out_dir / 'figures'}")
+    print(f"  Tables  ->{out_dir / 'tables'}")
+    print(f"  Figures ->{out_dir / 'figures'}")
 
 
 if __name__ == "__main__":
