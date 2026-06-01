@@ -1,0 +1,178 @@
+\documentclass{article}
+\usepackage{amsmath, amssymb, amsthm}
+
+% Define standard theorem environments
+\newtheorem{theorem}{Theorem}
+\newtheorem{lemma}{Lemma}
+\newtheorem{definition}{Definition}
+\newtheorem{axiom}{Axiom}
+
+\begin{document}
+\section*{Theoretical Framework: From Local Trajectories to Global Latent Space}
+
+Let $\mathcal{X}$ denote the universal space of household observations. We partition
+this space into a finite set of discrete, non-overlapping geographies $g \in G$. To
+accommodate continuous dynamics, let time $\mathcal{T} \subset \mathbb{R}$ be a
+continuous interval, and $\mathcal{S} \subset \mathbb{R}^n$ denote the cross-sectional
+state space of household attributes.
+
+The full set of observations for a specific geography is defined as the product space
+$X_g = \mathcal{T} \times \mathcal{S}$. We equip $X_g$ with the standard Euclidean
+subspace topology. The universal space is the disjoint union
+$\mathcal{X} = \bigsqcup_{g \in G} X_g$, equipped with the disjoint union topology
+(meaning a subset is open in $\mathcal{X}$ if and only if its intersection with every
+geography $X_g$ is open).
+
+Let $I$ be a set of indexed households. A specific household $i \in I$'s trajectory
+through time is given by a transport function $f^{g,i}_{t,k} : \mathcal{S} \to \mathcal{S}$,
+which maps household $i$'s realized state at time $t$ to its own realized state at time
+$k$ within the same geography.
+
+We introduce an economic ordering $\succsim$ representing real wealth. Rather than
+assuming universal global comparability outright---which is fraught with spatial and
+intertemporal measurement issues---we impose comparability only along strictly defined,
+localized empirical dimensions. By explicitly leaving certain pairs incomparable,
+$\succsim$ constitutes an \textit{incomplete} empirical preference relation.
+
+\textbf{Axiom 1} (Restricted Domain of Comparability). \textit{Let $\succsim$ be an
+empirical binary relation representing real wealth. $\succsim$ is strictly defined only
+under the following localized conditions:}
+\begin{itemize}
+    \item \textbf{Cross-Sectional Comparability:} Within any geography $g$ and a fixed
+    time $t \in \mathcal{T}$, any two household states $x = (t, s_x)$ and
+    $y = (t, s_y)$ in $X_g$ are directly comparable.
+    \item \textbf{Trajectory Comparability:} For a specific household $i$'s trajectory,
+    its state at time $t$, $x = (t, s) \in X_g$, and its transported state at time $k$,
+    $x' = (k, f^{g,i}_{t,k}(s)) \in X_g$, are directly comparable.
+    \item \textbf{Orthogonal Incomparability (Intertemporal Cross-Household):} The
+    relation cannot be evaluated across both dimensions simultaneously in the empirical
+    data. For distinct households $i \neq j$ observed at distinct times $t \neq k$,
+    direct comparison is strictly undefined ($x_{i,t} \parallel x_{j,k}$).
+    \item \textbf{Spatial Incomparability:} For any two observations in different
+    geographies, $x \in X_g$ and $y \in X_h$ (where $g \neq h$), the relation is
+    strictly undefined ($x \parallel y$).
+\end{itemize}
+
+\textbf{Axiom 2} (Acyclicity and Continuous Transitive Closure). \textit{Transitivity
+of the empirical relation $\succsim$ holds strictly within the defined domains in
+Axiom~1, but does not explicitly chain across orthogonal domains. However, the global
+relation $\succsim$ on $X_g$ is strictly acyclic. Furthermore, we assume the transitive
+closure of this relation, denoted $\succsim^*$, forms a continuous partial preorder on
+$X_g$, meaning its upper and lower contour sets are closed under the standard product
+topology of $X_g$.}
+
+Because we embrace the natural incompleteness of the empirical data, we do not require
+the topological space to be perfectly ordered. Instead, we demonstrate that a global
+machine learning architecture can validly map this disjoint and partially ordered space
+into a single continuous scalar dimension, preserving the known data while bridging the
+gaps via continuous spatial projection.
+
+\begin{lemma}[Local Continuous Representation]
+For each geography $g \in G$, there exists a continuous function
+$u_g : X_g \to \mathbb{R}$ such that for all $x, y \in X_g$:
+$$x \succ^* y \implies u_g(x) > u_g(y)
+  \quad\text{and}\quad
+  x \sim^* y \implies u_g(x) = u_g(y),$$
+where $\succ^*$ and $\sim^*$ denote the strict and symmetric parts of the transitive
+closure $\succsim^*$, respectively.
+\end{lemma}
+
+\begin{proof}
+Fix an arbitrary geography $g \in G$. We verify the two hypotheses required to apply
+the continuous representation theorem for partial preorders (Herden, 1989; Ok, 2002).
+
+\medskip
+\noindent\textbf{Step 1: Second-countability of $X_g$.}
+By definition, $X_g = \mathcal{T} \times \mathcal{S}$ where $\mathcal{T} \subset \mathbb{R}$
+and $\mathcal{S} \subset \mathbb{R}^n$, so $X_g$ embeds as a subspace of $\mathbb{R}^{1+n}$.
+The Euclidean space $\mathbb{R}^{1+n}$ is second-countable, admitting a countable base of
+open balls with rational centers and radii. Since second-countability is hereditary under
+subspaces, $X_g$ is second-countable under the Euclidean subspace topology.
+
+\medskip
+\noindent\textbf{Step 2: $\succsim^*$ is a continuous partial preorder on $X_g$.}
+We verify the three required properties.
+
+\textit{Reflexivity.} The base relation $\succsim$ is an economic ordering representing
+real wealth; any household state is at least as wealthy as itself, so $x \succsim x$ for
+all $x \in X_g$. This base reflexivity is inherited by $\succsim^*$.
+
+\textit{Transitivity.} Transitivity holds by the construction of the transitive closure.
+
+\textit{Continuity.} Axiom~2 stipulates that all upper contour sets
+$U(x) = \{y \in X_g : y \succsim^* x\}$ and lower contour sets
+$L(x) = \{y \in X_g : x \succsim^* y\}$ are closed in the product topology of $X_g$.
+This is precisely the definition of a \textit{continuous} partial preorder.
+
+Together, these three properties confirm that $(X_g, \succsim^*)$ is a continuous
+partial preorder. Note that completeness is not required.
+
+\medskip
+\noindent\textbf{Step 3: Existence of $u_g$.}
+A continuous partial preorder with closed contour sets on a second-countable topological
+space admits a continuous, order-preserving scalar representation (Herden, 1989,
+Theorem~1; Ok, 2002, Theorem~1). Applying this result to $(X_g, \succsim^*)$ yields the
+existence of a continuous function $u_g : X_g \to \mathbb{R}$ satisfying the stated
+order-preservation conditions. Since $\succsim^*$ is the transitive closure of the base
+empirical relation $\succsim$, every comparison defined by $\succsim$ is preserved by
+$\succsim^*$, and hence by $u_g$.
+\end{proof}
+
+\begin{theorem}[Global Latent Representation]
+If the incomplete relation $\succsim$ on the space $\mathcal{X}$ satisfies Axioms~1
+and~2, there exists a global continuous scalar function
+$\hat{U} : \mathcal{X} \to \mathbb{R}$ providing a forward representation, such that
+for any empirically defined comparable pair $x, y \in X_g$:
+$$ x \succ y \implies \hat{U}(x) > \hat{U}(y)
+   \quad\text{and}\quad
+   x \sim y \implies \hat{U}(x) = \hat{U}(y). $$
+\end{theorem}
+
+\begin{proof}
+By Lemma~1, for each geography $g \in G$ there exists a continuous, order-preserving
+local function $u_g : X_g \to \mathbb{R}$ representing $\succsim^*$ on $X_g$. Define
+$\hat{U} : \mathcal{X} \to \mathbb{R}$ piecewise by
+$$ \hat{U}(x) = u_g(x) \quad \text{where } x \in X_g. $$
+
+\noindent\textbf{Global continuity.}
+The universal space $\mathcal{X} = \bigsqcup_{g \in G} X_g$ carries the disjoint union
+topology, under which a function is continuous if and only if its restriction to each
+component $X_g$ is continuous. Since every $u_g$ is continuous by Lemma~1, $\hat{U}$
+is globally continuous on $\mathcal{X}$.
+
+\noindent\textbf{Order-preservation.}
+Let $x, y \in X_g$ be any empirically comparable pair. Since $\succsim$ is defined
+within a single geography (Axiom~1) and $u_g$ represents $\succsim^*$ on $X_g$, the
+stated forward implications hold immediately.
+
+\noindent\textbf{No violation of incomparability.}
+By Axiom~1 (Spatial Incomparability), $\succsim$ defines no comparisons between $X_g$
+and $X_h$ for $g \neq h$. Because $\hat{U}$ is only claimed to preserve comparisons
+defined within a single $X_g$, projecting disjoint geographies into the shared codomain
+$\mathbb{R}$ introduces no contradiction with any established economic relation.
+\hfill$\square$
+\end{proof}
+
+\textbf{Remark on AI Latent Space and Residual Projections:}
+Axiom~1 explicitly leaves the intertemporal relationship between distinct households,
+as well as cross-geography comparisons, formally undefined in the empirical data.
+However, a neural network maps these disjoint and partially ordered topologies into a
+shared, totally ordered latent space ($\mathbb{R}$).
+
+Because $\mathbb{R}$ is totally ordered, for any two mathematically incomparable
+observations $x, y \in \mathcal{X}$, the model will inherently output scalar values such
+that either $\hat{U}(x) \ge \hat{U}(y)$ or $\hat{U}(y) \ge \hat{U}(x)$. These forced
+comparisons are \textbf{residual mathematical artifacts} of the latent projection (which
+is why Theorem~1 only claims a one-way, forward implication). They do not come from
+unfounded empirical assumptions forced onto the raw data, but rather emerge naturally
+and interpretably as the machine learning architecture interpolates across the shared
+continuous spatial and attribute features.
+
+Furthermore, this topological formulation maintains a critical advantage for empirical
+measurement: it does not require the household physical transport function ($f$) to be
+continuous. Empirical data can be noisy and households can experience discontinuous
+shocks. As long as the underlying economic valuation of those states (Axiom~2) is
+continuous, a smooth latent space mapping remains mathematically valid and strictly
+preserves the true local intertemporal economic dynamics established in the data.
+
+\end{document}

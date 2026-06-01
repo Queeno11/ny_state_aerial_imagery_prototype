@@ -1,0 +1,94 @@
+\relax 
+\providecommand\hyper@newdestlabel[2]{}
+\providecommand\HyField@AuxAddToFields[1]{}
+\providecommand\HyField@AuxAddToCoFields[2]{}
+\citation{jean2016combining,yeh2020using,henderson2012measuring}
+\citation{Zheng2025}
+\citation{kachiyian2022}
+\citation{abbate2025longitudinal}
+\@writefile{toc}{\contentsline {section}{\numberline {I}Introduction}{1}{section.1}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {II}Data}{2}{section.2}\protected@file@percent }
+\newlabel{sec:data}{{II}{2}{Data}{section.2}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {\mbox  {II-A}}Aerial Imagery}{2}{subsection.2.1}\protected@file@percent }
+\newlabel{sec:aerial}{{\mbox  {II-A}}{2}{Aerial Imagery}{subsection.2.1}{}}
+\@writefile{toc}{\contentsline {paragraph}{\numberline {\mbox  {II-A}0a}Tile geometry.}{2}{paragraph.2.1.0.1}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{\numberline {\mbox  {II-A}0b}Data augmentation.}{2}{paragraph.2.1.0.2}\protected@file@percent }
+\citation{csa}
+\@writefile{toc}{\contentsline {subsection}{\numberline {\mbox  {II-B}}ACS Data Processing}{3}{subsection.2.2}\protected@file@percent }
+\newlabel{sec:acs}{{\mbox  {II-B}}{3}{ACS Data Processing}{subsection.2.2}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {\mbox  {II-C}}NYC Building Footprints}{3}{subsection.2.3}\protected@file@percent }
+\newlabel{sec:buildings}{{\mbox  {II-C}}{3}{NYC Building Footprints}{subsection.2.3}{}}
+\citation{ahlfeldt2015economics,diamond2016determinants}
+\@writefile{toc}{\contentsline {section}{\numberline {III}Methodology}{4}{section.3}\protected@file@percent }
+\newlabel{sec:methodology}{{III}{4}{Methodology}{section.3}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {\mbox  {III-A}}Theoretical Grounding}{4}{subsection.3.1}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {\mbox  {III-B}}Train, Validation, and Test Split}{4}{subsection.3.2}\protected@file@percent }
+\newlabel{sec:splits}{{\mbox  {III-B}}{4}{Train, Validation, and Test Split}{subsection.3.2}{}}
+\@writefile{toc}{\contentsline {paragraph}{\numberline {\mbox  {III-B}0a}Spatial holdout (test tracts)}{4}{paragraph.3.2.0.1}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{\numberline {\mbox  {III-B}0b}Temporal holdout (2016)}{4}{paragraph.3.2.0.2}\protected@file@percent }
+\citation{reed2023scalemae}
+\citation{hu2021lora}
+\@writefile{toc}{\contentsline {paragraph}{\numberline {\mbox  {III-B}0c}Spatial validation sets (validation tracts)}{5}{paragraph.3.2.0.3}\protected@file@percent }
+\@writefile{lof}{\contentsline {figure}{\numberline {1}{\ignorespaces Census tract partition: train (blue), test (red), validation (green), and dead-zone buffer (grey). Test tracts form geographically compact, income-stratified clusters. The dead zone prevents training tiles from capturing visual context from within test-tract boundaries.}}{5}{figure.caption.1}\protected@file@percent }
+\providecommand*\caption@xref[2]{\@setref\relax\@undefined{#1}}
+\newlabel{fig:splits}{{1}{5}{Census tract partition: train (blue), test (red), validation (green), and dead-zone buffer (grey). Test tracts form geographically compact, income-stratified clusters. The dead zone prevents training tiles from capturing visual context from within test-tract boundaries}{figure.caption.1}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {\mbox  {III-C}}Model Architecture and Training}{5}{subsection.3.3}\protected@file@percent }
+\newlabel{sec:model}{{\mbox  {III-C}}{5}{Model Architecture and Training}{subsection.3.3}{}}
+\@writefile{toc}{\contentsline {subsubsection}{\numberline {\mbox  {III-C}1}Feature Extraction: ScaleMAE with Low-Rank Adaptation}{5}{subsubsection.3.3.1}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsubsection}{\numberline {\mbox  {III-C}2}Late Fusion Score Head}{6}{subsubsection.3.3.2}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsubsection}{\numberline {\mbox  {III-C}3}Batch Construction and Sampling Strategy}{6}{subsubsection.3.3.3}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{\numberline {\mbox  {III-C}3a}The Cross-Sectional Core ($\mathcal  {B}_{cs}$)}{6}{paragraph.3.3.3.1}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{\numberline {\mbox  {III-C}3b}The Temporal Auxiliary Set ($\mathcal  {B}_{temp}$)}{6}{paragraph.3.3.3.2}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsubsection}{\numberline {\mbox  {III-C}4}Loss function}{6}{subsubsection.3.3.4}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{\numberline {\mbox  {III-C}4a}Cross-Sectional Ranking ($\mathcal  {L}_{cross}$)}{6}{paragraph.3.3.4.1}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{\numberline {\mbox  {III-C}4b}Temporal Stability Penalty ($\mathcal  {L}_{stable}$)}{6}{paragraph.3.3.4.2}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{\numberline {\mbox  {III-C}4c}Variance Regularizer}{6}{paragraph.3.3.4.3}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{\numberline {\mbox  {III-C}4d}Total Objective}{7}{paragraph.3.3.4.4}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsubsection}{\numberline {\mbox  {III-C}5}Curriculum learning: easy-to-hard pair filtering.}{7}{subsubsection.3.3.5}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsubsection}{\numberline {\mbox  {III-C}6}Out-of-Sample Generalizability and Quantile Mapping}{7}{subsubsection.3.3.6}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {IV}Results}{7}{section.4}\protected@file@percent }
+\newlabel{sec:results}{{IV}{7}{Results}{section.4}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {\mbox  {IV-A}}Model predictions}{7}{subsection.4.1}\protected@file@percent }
+\@writefile{lof}{\contentsline {figure}{\numberline {2}{\ignorespaces Comparison of ACS per-capita income deciles (2014) and tract-level model predictions (2016) across New York City. The left panel shows the ground-truth deciles from the American Community Survey, with missing survey data represented in grey. The right panel displays the model's aggregated predictions. Both maps share the income decile scale shown at the bottom, where D1 represents the lowest income decile and D10 represents the highest.}}{8}{figure.caption.3}\protected@file@percent }
+\newlabel{fig:map}{{2}{8}{Comparison of ACS per-capita income deciles (2014) and tract-level model predictions (2016) across New York City. The left panel shows the ground-truth deciles from the American Community Survey, with missing survey data represented in grey. The right panel displays the model's aggregated predictions. Both maps share the income decile scale shown at the bottom, where D1 represents the lowest income decile and D10 represents the highest}{figure.caption.3}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {\mbox  {IV-B}}Cross-Sectional Validity}{8}{subsection.4.2}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {\mbox  {IV-C}}Longitudinal Consistency}{8}{subsection.4.3}\protected@file@percent }
+\citation{callaway2021difference}
+\@writefile{lof}{\contentsline {figure}{\numberline {3}{\ignorespaces Comparison of tract-level and building-level predictions in Manhattan, Brooklyn and Queens. The left panel shows the 2014 ACS per-capita income deciles (with missing data in grey), the middle panel shows the aggregated 2016 tract-level model predictions, and the right panel displays the 2016 individual building-level predictions. The comparison highlights the model's capacity to resolve micro-spatial variations and sub-tract socio-economic heterogeneity.}}{9}{figure.caption.4}\protected@file@percent }
+\newlabel{fig:map_zoom}{{3}{9}{Comparison of tract-level and building-level predictions in Manhattan, Brooklyn and Queens. The left panel shows the 2014 ACS per-capita income deciles (with missing data in grey), the middle panel shows the aggregated 2016 tract-level model predictions, and the right panel displays the 2016 individual building-level predictions. The comparison highlights the model's capacity to resolve micro-spatial variations and sub-tract socio-economic heterogeneity}{figure.caption.4}{}}
+\@writefile{lof}{\contentsline {figure}{\numberline {4}{\ignorespaces Cross-sectional validity at the temporal holdout year (2016). Each dot is a test-set census tract. The horizontal axis is the ACS relative income Z-score; the vertical axis is the tract-averaged model prediction. The red line connects 10-decile conditional means. The test tracts are spatially isolated from all training data and 2016 imagery was not used in training, making this a joint spatial-and-temporal out-of-sample test.}}{9}{figure.caption.5}\protected@file@percent }
+\newlabel{fig:scatter2016}{{4}{9}{Cross-sectional validity at the temporal holdout year (2016). Each dot is a test-set census tract. The horizontal axis is the ACS relative income Z-score; the vertical axis is the tract-averaged model prediction. The red line connects 10-decile conditional means. The test tracts are spatially isolated from all training data and 2016 imagery was not used in training, making this a joint spatial-and-temporal out-of-sample test}{figure.caption.5}{}}
+\@writefile{toc}{\contentsline {subsubsection}{\numberline {\mbox  {IV-C}1}Stability of predictions for unchanged buildings.}{9}{table.caption.6}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsubsection}{\numberline {\mbox  {IV-C}2}Event study: new construction as a structural shock.}{9}{subsubsection.4.3.2}\protected@file@percent }
+\citation{mcdonald1984}
+\@writefile{lot}{\contentsline {table}{\numberline {I}{\ignorespaces Building-level stability metrics by data split and trend group. Within-unit Std.\ Dev.\ is computed across each unit's observed years; ICC measures between-unit consistency; rank autocorrelation is the Spearman rank correlation between 2016 and 2024.}}{10}{table.caption.6}\protected@file@percent }
+\newlabel{tab:metrics}{{I}{10}{Building-level stability metrics by data split and trend group. Within-unit Std.\ Dev.\ is computed across each unit's observed years; ICC measures between-unit consistency; rank autocorrelation is the Spearman rank correlation between 2016 and 2024}{table.caption.6}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {\mbox  {IV-D}}City-average trajectory.}{10}{subsection.4.4}\protected@file@percent }
+\newlabel{sec:cardinal}{{\mbox  {IV-D}}{10}{City-average trajectory}{subsection.4.4}{}}
+\@writefile{lot}{\contentsline {table}{\numberline {II}{\ignorespaces Average Treatment Effect on the Treated (ATT) by Threshold and Split}}{10}{table.caption.8}\protected@file@percent }
+\newlabel{tab:att_summary_se}{{II}{10}{Average Treatment Effect on the Treated (ATT) by Threshold and Split}{table.caption.8}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {\mbox  {IV-E}}Long-difference correlation. \textbf  {The Weakness (for now!)}}{10}{subsection.4.5}\protected@file@percent }
+\@writefile{lof}{\contentsline {figure}{\numberline {5}{\ignorespaces Callaway--Sant'Anna event-study plots. Rows correspond to the test set (top) and train set (bottom). Columns correspond to construction intensity thresholds of 1\,\%, 5\,\%, and 10\,\% of pre-existing building footprint area. The horizontal axis is event time relative to the treatment year; the dashed vertical line marks the onset of treatment. ATTs and 95\,\% simultaneous bootstrap confidence bands are shown. Pre-treatment coefficients are normalized to $k = -1$.}}{11}{figure.caption.7}\protected@file@percent }
+\newlabel{fig:eventstudy}{{5}{11}{Callaway--Sant'Anna event-study plots. Rows correspond to the test set (top) and train set (bottom). Columns correspond to construction intensity thresholds of 1\,\%, 5\,\%, and 10\,\% of pre-existing building footprint area. The horizontal axis is event time relative to the treatment year; the dashed vertical line marks the onset of treatment. ATTs and 95\,\% simultaneous bootstrap confidence bands are shown. Pre-treatment coefficients are normalized to $k = -1$}{figure.caption.7}{}}
+\@writefile{lof}{\contentsline {figure}{\numberline {6}{\ignorespaces City-average trajectory. Black solid line: ACS mean per-capita income for the same census tracts with model predictions. Dashed line: ACS mean for all NYC tracts (context). Blue squares: GB2-mapped model predictions. Annotations show the number of predicted tracts per year.}}{11}{figure.caption.9}\protected@file@percent }
+\newlabel{fig:cityavg}{{6}{11}{City-average trajectory. Black solid line: ACS mean per-capita income for the same census tracts with model predictions. Dashed line: ACS mean for all NYC tracts (context). Blue squares: GB2-mapped model predictions. Annotations show the number of predicted tracts per year}{figure.caption.9}{}}
+\bibstyle{apa}
+\bibdata{references}
+\bibcite{abbate2025longitudinal}{{1}{2026}{{Abbate et~al.}}{{}}}
+\bibcite{ahlfeldt2015economics}{{2}{2015}{{Ahlfeldt et~al.}}{{}}}
+\bibcite{csa}{{3}{2021a}{{Callaway and Sant'Anna}}{{}}}
+\bibcite{callaway2021difference}{{4}{2021b}{{Callaway and Sant'Anna}}{{}}}
+\bibcite{diamond2016determinants}{{5}{2016}{{Diamond}}{{}}}
+\bibcite{henderson2012measuring}{{6}{2012}{{Henderson et~al.}}{{}}}
+\bibcite{hu2021lora}{{7}{2022}{{Hu et~al.}}{{}}}
+\bibcite{jean2016combining}{{8}{2016}{{Jean et~al.}}{{}}}
+\bibcite{kachiyian2022}{{9}{2022}{{Khachiyan et~al.}}{{}}}
+\bibcite{mcdonald1984}{{10}{1984}{{McDonald}}{{}}}
+\bibcite{reed2023scalemae}{{11}{2023}{{Reed et~al.}}{{}}}
+\bibcite{yeh2020using}{{12}{2020}{{Yeh et~al.}}{{}}}
+\bibcite{Zheng2025}{{13}{2026}{{Zheng et~al.}}{{}}}
+\@writefile{lof}{\contentsline {figure}{\numberline {7}{\ignorespaces Long-difference scatter: ACS per-capita income change 2009--2024 (horizontal) versus GB2-mapped model prediction change 2010--2024 (vertical). The positive slope confirms directional consistency, but the modest correlation reflects the model's inability to detect income changes without a corresponding physical footprint.}}{12}{figure.caption.10}\protected@file@percent }
+\newlabel{fig:longdiff}{{7}{12}{Long-difference scatter: ACS per-capita income change 2009--2024 (horizontal) versus GB2-mapped model prediction change 2010--2024 (vertical). The positive slope confirms directional consistency, but the modest correlation reflects the model's inability to detect income changes without a corresponding physical footprint}{figure.caption.10}{}}
+\@writefile{toc}{\contentsline {section}{\numberline {V}Conclusions}{12}{section.5}\protected@file@percent }
+\newlabel{sec:conclusions}{{V}{12}{Conclusions}{section.5}{}}
+\gdef \@abspage@last{12}

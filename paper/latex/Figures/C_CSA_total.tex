@@ -1,0 +1,20 @@
+\begin{table}[htbp]
+\centering
+\begin{tabular}{lcc}
+\toprule
+\textbf{Threshold} & \textbf{Test ATT} & \textbf{Train ATT} \\
+\midrule
+1\%  & 0.0407\textsuperscript{*} & 0.0505\textsuperscript{*} \\
+     & (0.0173)                  & (0.0109)                  \\
+\addlinespace
+5\%  & 0.0872\textsuperscript{*} & 0.0761\textsuperscript{*} \\
+     & (0.0247)                  & (0.0159)                  \\
+\addlinespace
+10\% & 0.1439\textsuperscript{*} & 0.1232\textsuperscript{*} \\
+     & (0.0342)                  & (0.0249)                  \\
+\bottomrule
+\multicolumn{3}{l}{\footnotesize \textsuperscript{*} Significant based on 95\% confidence band.} \\
+\end{tabular}
+\caption{Average Treatment Effect on the Treated (ATT) by Threshold and Split}
+\label{tab:att_summary_se}
+\end{table}

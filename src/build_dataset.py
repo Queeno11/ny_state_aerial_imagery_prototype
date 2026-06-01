@@ -1,4 +1,5 @@
 ##############      Configuración      ##############
+from tqdm import tqdm
 from ast import Return
 import os
 import math
@@ -631,6 +632,9 @@ def assign_buildings_train_test_val(
     ###############################
     ##### SPATIAL SPLIT LOGIC #####
     ###############################
+    # NOTE: We process in chunks to prevent GEOS C library stack overflow
+    # ("stack smashing detected") when creating millions of geometries at once.
+    CHUNK_SIZE = 50_000
 
     # Pre-extract building arrays with Jitter Buffer applied to BBOX
     jitter_buffer_crs = geo_utils.meters_to_projected_units(jitter_buffer, epsg_code=6539)
@@ -638,40 +642,71 @@ def assign_buildings_train_test_val(
     b_miny = df['bbox_miny'].values - jitter_buffer_crs
     b_maxx = df['bbox_maxx'].values + jitter_buffer_crs
     b_maxy = df['bbox_maxy'].values + jitter_buffer_crs
-    bboxes = gpd.GeoSeries(
-        shapely.box(b_minx, b_miny, b_maxx, b_maxy), 
-        crs="EPSG:6539",
-        index=df.index
-    )
-    
-    # Generate centroid arrays for point-in-polygon checks
-    centroids = gpd.GeoSeries(
-        gpd.points_from_xy(df['centroid_x'], df['centroid_y']), 
-        crs="EPSG:6539", 
-        index=df.index
-    )
 
     # Initialize boolean masks as NumPy arrays (default False)
     spatial_test_mask = np.zeros(len(df), dtype=bool)
     spatial_val_mask = np.zeros(len(df), dtype=bool)
     train_drop_mask = np.zeros(len(df), dtype=bool) 
-    
 
-    ## Assigment logic:
-    # - If a building falls entirely inside ANY test/val patch, assign it to that set
-    # - If a building's BBOX expanded by jitter_buffer intersects ANY test/val patch, drop it from train
-    
-    # Assign to test/val based on centroids first (strict point-in-polygon)
+    # Prepare STRtrees for hyper-fast spatial predicates
+    test_tree = None
     if test_polygon is not None:
-        spatial_test_mask = centroids.within(test_polygon)
+        test_geoms = np.asarray(test_polygon) if hasattr(test_polygon, '__len__') else np.array([test_polygon])
+        test_tree = shapely.STRtree(test_geoms)
+
+    val_tree = None
     if val_polygon is not None:
-        spatial_val_mask = centroids.within(val_polygon)
-    
-    # Remove any building that whose image intersects with test/val from the train drop mask consideration
-    if test_polygon is not None:
-        train_drop_mask |= bboxes.intersects(test_polygon)
-    if val_polygon is not None:
-        train_drop_mask |= bboxes.intersects(val_polygon)
+        val_geoms = np.asarray(val_polygon) if hasattr(val_polygon, '__len__') else np.array([val_polygon])
+        val_tree = shapely.STRtree(val_geoms)
+
+    ## Assignment logic (chunked to avoid GEOS stack overflow + STRtree for speed):
+    n_rows = len(df)
+    cx = df['centroid_x'].values
+    cy = df['centroid_y'].values
+
+    bboxes_list = []
+
+    for start in tqdm(range(0, n_rows, CHUNK_SIZE), desc="Building bboxes", total=(n_rows // CHUNK_SIZE)):
+        end = min(start + CHUNK_SIZE, n_rows)
+        sl = slice(start, end)
+        
+        # 1. Build and collect bbox geometries
+        chunk_bboxes = shapely.box(b_minx[sl], b_miny[sl], b_maxx[sl], b_maxy[sl])
+        bboxes_list.append(chunk_bboxes)
+        
+        # 2. Build centroid points
+        chunk_centroids = shapely.points(cx[sl], cy[sl])
+
+        # 3. Query STRtrees for centroids (within) and bboxes (intersects)
+        if test_tree is not None:
+            # query() returns [indices_of_chunk, indices_of_tree]
+            test_within_idx = test_tree.query(chunk_centroids, predicate='within')[0]
+            # Advanced indexing assignment is local to the slice if we do it in two steps:
+            # But it's easier to just create a local mask for the slice and apply it
+            local_mask = np.zeros(end - start, dtype=bool)
+            local_mask[test_within_idx] = True
+            spatial_test_mask[sl] = local_mask
+            
+            test_intersects_idx = test_tree.query(chunk_bboxes, predicate='intersects')[0]
+            local_mask_drop = np.zeros(end - start, dtype=bool)
+            local_mask_drop[test_intersects_idx] = True
+            train_drop_mask[sl] |= local_mask_drop
+            
+        if val_tree is not None:
+            val_within_idx = val_tree.query(chunk_centroids, predicate='within')[0]
+            local_mask_val = np.zeros(end - start, dtype=bool)
+            local_mask_val[val_within_idx] = True
+            spatial_val_mask[sl] = local_mask_val
+            
+            val_intersects_idx = val_tree.query(chunk_bboxes, predicate='intersects')[0]
+            local_mask_drop = np.zeros(end - start, dtype=bool)
+            local_mask_drop[val_intersects_idx] = True
+            train_drop_mask[sl] |= local_mask_drop
+
+    bboxes = gpd.GeoSeries(np.concatenate(bboxes_list), crs="EPSG:6539", index=df.index)
+
+    print(f"  Spatial assignment complete ({n_rows:,} buildings in {(n_rows - 1) // CHUNK_SIZE + 1} chunks)")
+
 
     ###############################    
     #####   TIME SPLIT LOGIC  #####
@@ -723,6 +758,19 @@ def assign_buildings_train_test_val(
     }
     if test_years:  # Only add temporal val key if test_years were provided; avoids IndexError
         final_val_masks[f"val_{test_years[0]}"] = final_val_time_mask
+        
+    # Samples all years of 1 building over 30% of all the tracts in val
+    val_tracts_unique = df[total_val_mask]['GEOID'].unique()
+    num_sampled_tracts = int(0.3 * len(val_tracts_unique))
+    final_val_spatial_temporal_mask = pd.Series(np.zeros(len(df), dtype=bool), index=df.index)
+    if num_sampled_tracts > 0:
+        sampled_tracts = np.random.choice(val_tracts_unique, size=num_sampled_tracts, replace=False)
+        val_buildings_in_sampled = df[total_val_mask & df['GEOID'].isin(sampled_tracts)][['GEOID', 'DOITT_ID']].drop_duplicates()
+        if not val_buildings_in_sampled.empty:
+            sampled_buildings = val_buildings_in_sampled.groupby('GEOID', group_keys=False).apply(lambda x: x.sample(n=1))
+            final_val_spatial_temporal_mask_np = df['DOITT_ID'].isin(sampled_buildings['DOITT_ID']).values & total_val_mask.values
+            final_val_spatial_temporal_mask = pd.Series(final_val_spatial_temporal_mask_np, index=df.index)
+    final_val_masks["val_spatial_temporal"] = final_val_spatial_temporal_mask
     
     # Compute logs
     overlaps = (spatial_test_mask & time_mask_np).sum() + (spatial_test_mask & other_mask_np).sum() + (time_mask_np & other_mask_np).sum()
@@ -737,6 +785,7 @@ def assign_buildings_train_test_val(
     df.loc[final_test_mask, "type"] = "test"
     df.loc[final_val_spatial_mask, "type"] = "val_spatial"
     df.loc[final_val_time_mask, "type"] = "val_time"
+    df.loc[final_val_spatial_temporal_mask, "type"] = "val_spatial_temporal"
     df.loc[final_dead_zone_mask, "type"] = "dead_zone"
 
     train_tracts = df[final_train_mask].drop_duplicates("GEOID").shape[0]
@@ -1352,8 +1401,8 @@ def create_train_test_dataframes(buildings_df, savename, test_years=[], test_col
     print(f"Created file: {PROCESSED_DATA_DIR / 'tract_splits.feather'}")
 
     ###### Split Buildings
-    val_area = assigned_tracts[assigned_tracts["type"] == "val"].union_all()
-    test_area = assigned_tracts[assigned_tracts["type"] == "test"].union_all()
+    val_area = assigned_tracts[assigned_tracts["type"] == "val"].geometry.values
+    test_area = assigned_tracts[assigned_tracts["type"] == "test"].geometry.values
     # val_bounds = get_test_area_from_file(filename="Test_NYC_Area.parquet")
 
     train_mask, test_mask, val_masks_dict, dead_zone_mask = assign_buildings_train_test_val(buildings_df, val_area, test_area, test_years=test_years, test_column=test_column, jitter_buffer=max_jitter)

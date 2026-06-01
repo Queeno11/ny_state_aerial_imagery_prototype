@@ -1,0 +1,79 @@
+\begin{thebibliography}{}
+
+\bibitem[\protect\astroncite{Abbate et~al.}{2026}]{abbate2025longitudinal}
+Abbate, N.~F., Gasparini, L., Ronchetti, F., and Quiroga, F.~M. (2026).
+\newblock Deep learning with satellite images enables high-resolution income
+  estimation: {A} case study of {Buenos Aires}.
+\newblock {\em PLOS ONE}, 21(1):e0338110.
+
+\bibitem[\protect\astroncite{Ahlfeldt et~al.}{2015}]{ahlfeldt2015economics}
+Ahlfeldt, G.~M., Redding, S.~J., Sturm, D.~M., and Wolf, N. (2015).
+\newblock The economics of density: {Evidence} from the {Berlin Wall}.
+\newblock {\em Econometrica}, 83(6):2127--2189.
+
+\bibitem[\protect\astroncite{Callaway and Sant'Anna}{2021a}]{csa}
+Callaway, B. and Sant'Anna, P.~H. (2021a).
+\newblock Difference-in-differences with multiple time periods.
+\newblock {\em Journal of Econometrics}, 225(2):200--230.
+
+\bibitem[\protect\astroncite{Callaway and
+  Sant'Anna}{2021b}]{callaway2021difference}
+Callaway, B. and Sant'Anna, P.~H. (2021b).
+\newblock Difference-in-differences with multiple time periods.
+\newblock {\em Journal of Econometrics}, 225(2):200--230.
+
+\bibitem[\protect\astroncite{Diamond}{2016}]{diamond2016determinants}
+Diamond, R. (2016).
+\newblock The determinants and welfare implications of {US} workers' diverging
+  location choices by skill: 1980--2000.
+\newblock {\em American Economic Review}, 106(3):479--524.
+
+\bibitem[\protect\astroncite{Henderson et~al.}{2012}]{henderson2012measuring}
+Henderson, J.~V., Storeygard, A., and Weil, D.~N. (2012).
+\newblock Measuring economic growth from outer space.
+\newblock {\em American Economic Review}, 102(2):994--1028.
+
+\bibitem[\protect\astroncite{Hu et~al.}{2022}]{hu2021lora}
+Hu, E.~J., Shen, Y., Wallis, P., Allen-Zhu, Z., Li, Y., Wang, S., Wang, L., and
+  Chen, W. (2022).
+\newblock {LoRA}: Low-rank adaptation of large language models.
+\newblock In {\em International Conference on Learning Representations (ICLR)}.
+
+\bibitem[\protect\astroncite{Jean et~al.}{2016}]{jean2016combining}
+Jean, N., Burke, M., Xie, M., Davis, W.~M., Lobell, D.~B., and Ermon, S.
+  (2016).
+\newblock Combining satellite imagery and machine learning to predict poverty.
+\newblock {\em Science}, 353(6301):790--794.
+
+\bibitem[\protect\astroncite{Khachiyan et~al.}{2022}]{kachiyian2022}
+Khachiyan, A., Thomas, A., Zhou, H., Hanson, G., Cloninger, A., Rosing, T., and
+  Khandelwal, A.~K. (2022).
+\newblock Using neural networks to predict microspatial economic growth.
+\newblock {\em American Economic Review: Insights}, 4(4):491--506.
+
+\bibitem[\protect\astroncite{McDonald}{1984}]{mcdonald1984}
+McDonald, J.~B. (1984).
+\newblock Some generalized functions for the size distribution of income.
+\newblock {\em Econometrica}, 52(3):647--663.
+
+\bibitem[\protect\astroncite{Reed et~al.}{2023}]{reed2023scalemae}
+Reed, C.~J., Gupta, R., Li, S., Brockman, S., Funk, C., Clipp, B., Keutzer, K.,
+  Candido, S., Uyttendaele, M., and Darrell, T. (2023).
+\newblock {Scale-MAE}: {A} scale-aware masked autoencoder for multiscale
+  geospatial representation learning.
+\newblock In {\em Proceedings of the IEEE/CVF International Conference on
+  Computer Vision (ICCV)}.
+
+\bibitem[\protect\astroncite{Yeh et~al.}{2020}]{yeh2020using}
+Yeh, C., Perez, A., Driscoll, A., Azzari, G., Tang, Z., Lobell, D., Ermon, S.,
+  and Burke, M. (2020).
+\newblock Using publicly available satellite imagery and deep learning to
+  understand economic well-being in africa.
+\newblock {\em Nature Communications}, 11(1):2583.
+
+\bibitem[\protect\astroncite{Zheng et~al.}{2026}]{Zheng2025}
+Zheng, Z., Higuera-Mendieta, I., Lee, R., Newhouse, D., Kilic, T., Ermon, S.,
+  Burke, M., and Lobell, D.~B. (2026).
+\newblock A satellite foundation model for improved wealth monitoring.
+
+\end{thebibliography}

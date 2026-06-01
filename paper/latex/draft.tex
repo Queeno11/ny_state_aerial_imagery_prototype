@@ -1,0 +1,717 @@
+\documentclass[conference]{IEEEtran}
+\IEEEoverridecommandlockouts
+\renewcommand\IEEEkeywordsname{Palabras clave}
+% The preceding line is only needed to identify funding in the first footnote. If that is unneeded, please comment it out.
+\usepackage{cite}
+\usepackage{amsmath,amssymb,amsfonts}
+\usepackage{algorithmic}
+\usepackage{graphicx}
+\usepackage{caption}
+\usepackage{subcaption}
+\usepackage{textcomp}
+\usepackage{xcolor}
+\usepackage{url}
+\usepackage[toc]{appendix}
+\usepackage{multirow}
+\usepackage{hyperref}
+\hypersetup{
+    colorlinks=true,
+    linkcolor=black,
+    filecolor=black,      
+    citecolor=black,
+    urlcolor=blue,
+    pdftitle={Abbate, Gasparini, Ronchetti and Quiroga (2024). High-Resolution Income Estimates Using Satellite Imagery},
+    }
+
+\usepackage{natbib}
+    \bibliographystyle{agsm}
+    \setcitestyle{authoryear,open={(},close={)}}
+
+\newcommand{\linebreakand}{%
+  \end{@IEEEauthorhalign}
+  \hfill\mbox{}\par
+  \mbox{}\hfill\begin{@IEEEauthorhalign}
+}
+
+\def\BibTeX{{\rm B\kern-.05em{\sc i\kern-.025em b}\kern-.08em
+    T\kern-.1667em\lower.7ex\hbox{E}\kern-.125emX}}
+
+
+\newcommand{\source}[1]{\caption*{{#1}} }
+
+\begin{document}
+% \urlstyle{same}
+
+% \title{\huge \textbf{Una estimación geográfica del ingreso per cápita del AMBA utilizando imágenes satelitales}* \\
+\title{\huge \textbf{High-Resolution Income Estimates Using Satellite Imagery}: A Deep Learning Approach applied in Buenos Aires* \\
+\thanks{*This paper is a work derived from the Working Paper: Abbate, Gasparini, Gluzmann, Montes-Rojas, Sznaider and Yatche (2023), “Ingreso Estructural Por Area Geográfica: una aplicación para Argentina”, presented at the LVIII Annual Meeting of the \textit{Asociación Argentina de Economía Política}. We thank the Comisión Nacional de Actividades Especiales (CONAE) for providing the satellite images used in this work. Any mistake or omission falls under our responsibility.}    \vspace{0.5em}
+} 
+
+\author{\IEEEauthorblockN{ Nicolás F. Abbate}
+\IEEEauthorblockA{\textit{CEDLAS} \\
+\textit{Universidad Nacional de la Plata}\\
+La Plata, Argentina \\
+abbatenicolas@gmail.com}
+\and
+\IEEEauthorblockN{ Leonardo Gasparini}
+\IEEEauthorblockA{\textit{CEDLAS} \\
+\textit{Universidad Nacional de la Plata}\\
+La Plata, Argentina \\
+gasparinilc@gmail.com}
+\linebreakand
+\IEEEauthorblockN{Franco Ronchetti}
+\IEEEauthorblockA{\textit{III-LIDI, CICPBA} \\
+\textit{Universidad Nacional de la Plata} \\
+La Plata, Argentina \\
+francoronchetti@gmail.com}
+\and
+\IEEEauthorblockN{Facundo Quiroga}
+\IEEEauthorblockA{\textit{III-LIDI, CICPBA} \\
+\textit{Universidad Nacional de la Plata} \\
+La Plata, Argentina \\
+facundoq@gmail.com}
+}
+
+% \onecolumn % switch to one-column layout
+\maketitle
+
+\begin{abstract}
+In this study, we examine the potential of using high-resolution satellite imagery and machine learning techniques to create income maps with a high level of geographic detail. We trained a convolutional neural network with satellite images from the Metropolitan Area of Buenos Aires (Argentina) and 2010 census data to estimate per capita income at a 50x50 meter resolution for 2013, 2018, and 2022. This outperformed the resolution and frequency of available census information. Based on the EfficientnetV2 architecture, the model achieved high accuracy in predicting household incomes ($R^2=0.878$), surpassing the spatial resolution and model performance of other methods used in the existing literature. This approach presents new opportunities for the generation of highly disaggregated data, enabling the assessment of public policies at a local scale, providing tools for better targeting of social programs, and reducing the information gap in areas where data is not collected.
+\end{abstract}
+
+
+\renewcommand\IEEEkeywordsname{Keywords}
+\begin{IEEEkeywords}
+sociodemographic indicators, inequality, per capita income, satellite images, machine learning
+\end{IEEEkeywords}
+% \vspace{-1em}
+\renewcommand\IEEEkeywordsname{JEL Codes}
+\begin{IEEEkeywords}
+C81, C45, R12
+\end{IEEEkeywords}
+% C810 Methodology for Collecting, Estimating, and Organizing Microeconomic Data; Data Access
+% C450: Neural Networks
+% R120 Size and Spatial Distributions of Regional Economic Activity
+
+
+\section{Introduction}
+
+Sociodemographic indicators are essential for the creation and assessment of public policies since they allow us to measure the efficiency of government programs and the population's well-being, all of which improve transparency and accountability. However, in order for these indicators to be used appropriately, they need to be updated and disaggregated. If not updated regularly, the indicators will not be available in time to implement public policies. In addition, if they are not appropriately detailed and disaggregated, it will not be possible to differentiate correctly the effects of such implemented policies.
+
+Given the traditional data sources for socioeconomic analysis (surveys and censuses), it becomes impossible to achieve both disaggregation and high frequency simultaneously. For instance, in Argentina, the main household survey for collecting data on unemployment and poverty, the \texit{Encuesta Permanente de Hogares}, is published every quarter and covers only the main 31 urban areas, with spatial disaggregation limited to city-level granularity \citep{nuevaeph}. On the other hand, censuses provide information at a census tract level –--these tracts cover entire blocks in areas of a high population density, but they can also include several kilometers in low-density areas\footnote{Census tracts are a statistical units that group an average of 300 houses in urban areas and covers the entire national territory, which leads to a great variability in their size.}--- but they are conducted every 10 years. Moreover, censuses often do not collect information regarding households' incomes or expenses, which hinders the direct estimation of poverty indicators.
+
+High-resolution satellite images have emerged recently as a valuable source of information about welfare, mostly thanks to the advancements in computer vision algorithms. These deep learning advances, such as Convolutional Neural Networks (CNN), enable us to classify images according to endogenously detected patterns and algorithmically identify objects such as cars, construction areas, roads, crops, and different types of ceilings. The ability to identify these features and objects is crucial as they are closely linked to local wealth and incomes.
+
+Despite all these advancements, welfare estimations are generally limited to aggregated areas, such as cities or provinces. This differs from what fields like climatology and demography have recently done with similar inputs: estimating grids-level indicators. Grid estimates allow us to democratize access to information for a great number of uses, many times going beyond the original purpose of the authors. For instance, the Gridded Population of the World project \citep{Gridpop} estimates the population density worldwide in a grid with approximately a 1 km side length. Up to 2024, this database has been quoted in more than 8000 peer-reviewed articles.
+
+The main goal of this work is, by using a convolutional neural network applied to high-resolution satellite images (0.5 meters per pixel, similar to the Google Maps data), to provide per capita income estimates with a high level of disaggregation: a grid with $50x50$ meter cells. These estimates cover the \texit{Area Metropolitana de Buenos Aires} (from now on, Buenos Aires city) for 2013, 2018, and 2022. The maps developed with this method will be available to the public in \href{https://zenodo.org/records/11200070?token=eyJhbGciOiJIUzUxMiJ9.eyJpZCI6IjNhYWNhMDRiLTMwYTEtNDEwMy04MDIwLTA3ZDEzMTlmZTgwYiIsImRhdGEiOnt9LCJyYW5kb20iOiI2MWU4ODAwZjNlYTk0ZGRlOWU1MjIyZWY1YTU5OTk1MyJ9.KvBZ93q8Vt13e0eFxB5mFxBHmuGBZja0pfk4Gse1x0rXCTLioCvFLoXTpD7HkCQCUBpMxuDlL_tqsk8YjJqGMQ}{this repository}. These maps depict a substantial improvement regarding the resolution of the original data. To make these estimates, we used small area per capita income estimates based on the 2010 Census and the household survey for the second semester of 2010, along with the unstructured data available in the high-resolution satellite images.
+
+To develop these maps, we trained a convolutional neural network from the \texit{EfficientNetV2} family \citep{EfficientNetV2}. These models have the distinct advantage of allowing us to identify the key characteristics of the images that best predict income, without making any prior assumptions about which characteristics correlate more with income. This enables better predictive performance compared to simpler models, such as linear regressions based on a set of predefined variables.
+
+The resulting model enables us to make accurate predictions at a census tract level, reaching a $R^2$ of 0.878 over the test dataset. We assessed the consistency of the developed maps by comparing the results with census and survey data, and evaluating case studies of areas with marked income discontinuities, such as informal settlements. In every case, the model’s performance is remarkable, surpassing the results from alternative methods used in the literature.
+
+Developing a model that predicts the average household income from only one satellite image of the area of interest involves various academic and policy applications. If a generalized model were developed for many different cities —not only for the AMBA—,  it could generate spatial income estimates for urban areas where data is currently lacking, simply by collecting satellite images of those areas. This could help bridge the information gap in low-income areas where data collection is limited \citep{burke2021}.
+
+Secondly, the maps created with this technique could make the development of localized impact evaluations easier. For example, it would be significantly easier to assess the effects of new sewage or tap water piping in the urban development of a specific area, by only making use of the model’s predictions before and after the treatment, assuming an appropriate control group is selected.
+
+Finally, improving the temporal and spatial resolution of the maps would facilitate assessing the targeting of social programs, since, in many cases, geolocalized data from the recipients' place of residence are available. Then, these estimations could no longer depend only on outdated or unreliable administrative data, or \textit{ad hoc} predictions based on surveys. Moreover, these techniques could help to develop better tools for the targeting of social program; for example, this data could be used as an exclusion criteria in a \textit{proxy mean test} \textit{proxy mean tests} \citep{Grosh1995}, or as a general exclusion criteria \citep{Smythe2022}.
+
+This work is directly related with the literature that seeks to predict social indicators at a spatial level by using \texit{proxies}, that is, observable variables that strongly correlates to the indicator to be predicted. Among the many relevant works, we can highlight the use of satellite nighttime lights to predict economic growth \citep{Henderson2012} and inequality \citep{Ciaschi2021}, mobile phones data to predict poverty and wealth \citep{Blumenstock2015, Steele2017} or information collected from social media to predict economic development \citep{Weber2018, wikipedia}.
+
+Among this literature, daytime high resolution satellite images has gained relevance for predicting social indicators such as poverty \citep{Jean2016, Engstrom2022}, income \citep{Khachiyan2022, Piaggesi2019, rolf_generalizable_2021} and wealth \citep{Yeh2020, meta_wealth_index}. Although the performance of this type of model is usually good, in general, these models predicts the indicators at a very wide area, typically entire cities; in most disaggregated cases, they predict indicators at cells 1km side length (take, for example, \citet{Piaggesi2019}). The implementation of the model we propose, which combines census and survey information with high-resolution images by applying state-of-the-art models, allows us to develop a model with very high accuracy at an unprecedent spatial resolution.
+
+This document is organized as follows. In section \ref{sec:metodos}, we briefly present the  proposed estimation methodology. In the following sections, we depict in detail the methodology used and specify the database creation (section \ref{sec:datos}), the implementation and training of the convolutional neural network (section \ref{sec:cnn}), and the procedure used to develop the maps for the years 2013, 2018 and 2022 (section \ref{sec:grilla}). The main results of this work are included in section \ref{sec:resultados}. In section \ref{sec:discusión}, the model interpretation and some of its limitations and potential extensions are discussed. In section \ref{sec:disponibilizacion}, we briefly mention how to access the database freely and some recommendations for its use. Section \ref{sec:conclusiones} concludes.
+
+\section{Methodology}\label{sec:metodos}
+
+This research aims to contribute to the emerging field of creating welfare maps using satellite images. We have developed a series of high-resolution maps with a grid of 50x50 meter cells by using machine learning techniques. These maps link characteristics from satellite images with welfare indicators estimated at a census tract level. While this methodology could be applied to various welfare indicators, we specifically focus on per capita income as it is one of the most commonly used indicators.
+
+The proposed estimation strategy in this document can be broken down into three steps: The first (1) step consists in constructing a database appropriate for the training of a neural network. On the one hand, this entails estimating the average per capita income in a census tract, since this information is not available in a disaggregated way in Argentina. We estimate this income with a standard small area estimation technique \citep{Elbers2003, Gasparini2022} with household survey data (\textit{Encuesta Permanente de Hogares}) from the second semester of 2010 along with census data from October 2010. On the other hand, a database of satellite images of Buenos Aires for 2013 is created in a format suitable for use by the neural network. This hole process is described in detail in the following section \ref{sec:datos}. The second (2) step is the training of the convolutional neural network, i.e. finding the parameters that best relate these satellite images with the income of each census tract. This process is depicted in section \ref{sec:cnn}. Finally, the third (3) step consists in making a series of income estimations in a $50x50$ meter grid format for Buenos Aires for 2013, 2018, and 2022 with the previously mentioned model. In this step, described in section \ref{sec:grilla}, a set of highly disaggregated maps is generated.
+
+The main reason to train an artificial intelligence model that will allow us to predict the geographical income of a specific area from a single satellite image arises from the fact that, in many cases, it is possible to recognize at first sight low, middle and high-income regions without any kind of additional information (for example, see Fig. \ref{fig_img_ingresos_diferentes}). The goal is to find a model that can represent such a function that maps the images' observable characteristics ---building shapes, materials, asphalt, green areas--- and the average income of the people living in that area.
+
+\begin{figure*}[htb]
+    \caption{Satellite Imagery Examples by per capita income decile, $200x200$ meters}
+    \label{fig_img_ingresos_diferentes}
+    \centering % <-- added
+    \begin{subfigure}{0.31\textwidth}
+      \includegraphics[width=\linewidth, height=\linewidth]{imagenes/Ingreso ALto.png}
+      \caption{10th decile}
+      \label{fig:1}
+    \end{subfigure}\hfil % <-- added
+    \begin{subfigure}{0.31\textwidth}
+      \includegraphics[width=\linewidth, height=\linewidth]{imagenes/Ingreso Medio.png}
+      \caption{5th decile}
+      \label{fig:2}
+    \end{subfigure}\hfil % <-- added
+    \begin{subfigure}{0.31\textwidth}
+      \includegraphics[width=\linewidth, height=\linewidth]{imagenes/Ingreso Bajo.png}
+      \caption{1st decile}
+      \label{fig:3}
+    \end{subfigure}
+\end{figure*}
+
+Artificial intelligence (AI) algorithms, deep learning models in particular, have successfully solved complex problems that had remained unsolved for decades. Image classification and recognition algorithms have sparked a technological revolution over the past 15 years \citep{LeCun2015}. Currently, supervised learning is the most widely used paradigm in the field of AI, forming the basis for most image processing models.
+
+Specifically for image processing, supervised learning requires (i) a series of images ---ideally a lot of them--- and (ii) a collection of labels for each image. In this work, we use satellite images from Buenos Aires and labels with the average per capita income of the households depicted in the images.\footnote{Specifically, the labels are the average per capita estimated income (using a standard small area estimation technique) of the households of the census tract that corresponds to the image.} Since this information is not available for Argentina, the first (1) step entails estimating which would be the income of each image.
+
+Neural networks, such as the ones we use in this work, are comprised of a series of layers in which a non-linear parameterized transformation is performed of its inputs ---images--- to make a prediction ---the per capita household income from that area. The number of the model parameters can be very high. For instance, the smallest architecture we use, called \textit{EfficientNetV2S}, has 21.6 million parameters \citep{EfficientNetV2}. Parameters are generally initialized randomly, making very poor predictions. In supervised learning, the mentioned databases are used to adjust the model parameters so that predictions have fewer mistakes. During the training, we iteratively show an image the algorithm and it makes a prediction about the indicator. The aim is that such predicted values are as similar as possible to the real value of the labels. To measure this difference between values and mistakes, we use a loss function, usually the Mean Squared Error for regression tasks. The algorithm, then, seeks to minimize this loss function by adjusting its parameters each time a batch of images is shown. To adequately adjust the parameter vector, the algorithm computes the local gradient of the loss function. Then, we adjust the parameter vector in the opposite direction of this gradient vector. To adequately adjust the parameter vector, the algorithm computes the local gradient of the loss function. Each iteration of the hole dataset is called an “epoch”. A model can require a series of epochs in order to be trained ---or, in more general terms, to find the optimum---, in some cases even reaching hundreds of epochs.\footnote{The number of epochs is typically considered a hyperparameter, meaning it is a value defined by the user. As a result, there is no general rule that establishes the correct number of epochs to train a model. Typically, multiple options are tested, and the most performant one is selected.} Finally, once the optimal parameter vector is found, we evaluate the algorithm's ability to generalize by computing how good it performs facing a new unseen set, typically called the test dataset.
+
+In AI algorithms, Convolutional Neural Networks (CNNs) are notable for their widespread use in image processing. These algorithms use the outputs from the first layer as vectorized images, which then serve as inputs for the second layer, and so on. Typically, each layer employs a group or convolution operation for transformation, as described by \citep{Goodfellow-et-al-2016}. However, more recent models, such as the one we use, incorporate more complex transformations \citep{EfficientNetV2}. The output from each layer is another "image" with reduced resolution compared to the original one, where the pixels represent a summary of information from the previous layer. In essence, at each layer, the network summarizes the main characteristics from the previous image. As the model progresses, it reduces the size of these images, also known as feature maps, to ultimately connect them with a single value: the prediction of the model.
+
+Once the model is trained, we obtain the optimal vector of parameters. This vector allows us to make predictions based on images that the model has never accessed. Therefore, it is possible to estimate the per capita income in a grid of images of Buenos Aires for 2013, 2018, and 2022 by simply feeding the model with each one of those images and creating a map with these predictions (step 3). The developed model not only allows us to estimate the income based on images from Buenos Aires, but also from images from anywhere. Nonetheless, the model has not been formally assessed for the prediction in areas that go beyond the region of interest.
+
+\section{Building the Dataset}\label{sec:datos}
+
+\subsection{Creating the labels: small area income estimates of the census tracts}
+\label{metodosae}
+
+
+% Para implementar la estrategia de \citep{Elbers2003} se utiliza una serie de variables disponibles tanto en el Censo como en la EPH, como el nivel educativo de los miembros del hogar, los materiales de la vivienda y características del/la jefe/a del hogar. Luego, se estima un modelo de mínimos cuadrados sobre los datos de la EPH que relacione el ingreso con las variables seleccionadas. Finalmente, se utiliza ese modelo para calcular el ingreso de cada uno de los hogares del censo. Finalmente estos datos se agregan a la identificación geográfica más desagregada posible, que para Argentina son los radios censales. 
+
+% En la Figura \ref{fig:ing_est} se muestra la distribución del ingreso generada para el AMBA (Área Metropolitana de Buenos Aires) utilizando esta metodología.
+
+We estimated the per capita income for each census tract by using microdata from the 2010 Census and the 2010 second-semester household survey data. We followed a derivation of the methodology proposed by \citet{Elbers2003}. While the census provides detailed information about almost every citizen of the country, it does not provide information about household income. The method we implemented allows us to combine spatially disaggregated census data with household survey data, which has a smaller sample size but includes income data of the households.
+
+In their original work, \citep{Elbers2003} proposed a small area estimation methodology, which involves: (i) selecting an indicator of interest available in a survey but not in the census, (ii) identifying covariables related to the indicator found in both the census and the survey, (iii) estimating a generalized least squares model that relates the indicator of interest with the selected covariables for the survey data, and (iv) making predictions of the desired indicator using the available census covariables and the model parameters estimated in the previous step. These predictions have the advantage of being geographically localized, as censuses generally have more spatially disaggregated data than household surveys. Typically, after making these predictions, the indicators are aggregated to the minimum spatial level available, which enables the creation of maps with the relevant estimations.
+
+In order to estimate the per capita income for a small area, we used a linear model based on the microdata from the 2010 second-semester household survey. This model relates the per capita income of each household ($y^{eph}_{i}$) to a set of observable variables ($X^{eph}_{i}$), including the gender, education, and age of the head of the household, as well as various factors related to the quality of the house (such as roof and floor materials, access to water and sewage, bathroom facilities, ownership status, and whether it is a precarious building) and the number of household members. Formally the estimated model is:
+
+\begin{equation} \label{modeloSAE}
+    y^{eph}_{i}= \beta^{eph} X^{eph}_{i} + \varepsilon_{i}
+\end{equation}
+
+Once the model is estimated, we keep the $\beta$ parameters vector and generate predictions using these parameters and the census covariables $X^{c}_{ij}$. In other words, we use the estimated relation from the survey data and used it to predict the income with the census data. Specifically, the following relation is calculated:
+
+\begin{equation} \label{predict}
+    \hat{y}_{ij}= \beta^{eph} X^{c}_{ij}
+\end{equation}
+
+which is fairly similar to equation \ref{modeloSAE}, but instead of estimating the $\beta$ parameters, we use these estimates to make predictions about the income of households in the census based on their observable characteristics. Furthermore, we also label households with a $j$ that identifies census tracts, which we will later use to create the income indicator.
+
+Finally, to create the indicator for the census tract average per capita income, we average the predictions of all the households that live in each tract. Thus, after naming the number of households in the  $j$ census tract $n_j$, the estimated per capita income of such tract ($\hat{Y}_j$) is defined as:
+
+\begin{equation} \label{indicador}
+    \hat{Y}_j = \sum_{i \in j} \frac{\hat{y}_{ij}}{n_j}
+\end{equation}
+
+With such small area estimates, it is possible to create a map of the per capita average income of each census tract. Figure \ref{fig:ing_est} shows the spatial distribution of this indicator in Buenos Aires. The estimated income of each tract is the main input, along with the satellite images, which we use to train the computer vision model.
+
+In contrast to the approach suggested by \citep{Elbers2003}, where estimations were made using generalized least squares (GLS), we opted for an ordinary least squares model due to differences in the available data. The original study had access to a survey that identified households with the census minimum aggregation unit. However, Argentina's survey data does not include information about the specific census tract to which the household data belongs. Consequently, it is not feasible to estimate the covariance matrix required for a GLS estimation.
+
+Despite these difficulties regarding the quality of the original information, we expect the results of these estimations to have only a moderate bias. This has to do with the fact that, although each household estimation will be biased, we expect the aggregation of income per census tract to mitigate this variation to a certain extent, since errors are not perfectly correlated and would counteract themselves to a great extent. For example, \citet{Gasparini2022} resort to a similar implementation for poverty estimations throughout time.
+
+The application of computer vision models in geographical income estimations is not dependent on the validity of the proposed small area estimation technique. These models can be applied to any type of geographical datasets. Furthermore, any improvements in the quality of the indicator estimates would enhance the final results of the AI algorithm.
+
+\begin{figure}
+    \centering
+    \includegraphics[width=.98\linewidth]{imagenes/Resultados/Ingreso SAE.png}
+    \caption{Spatial distribution of per capita average income estimated for Buenos Aires at census tract level.}
+    \label{fig:ing_est}
+\end{figure}
+
+\subsection{Compiling the image set: from census tracts to images}\label{training}
+
+The satellite images used are daytime reflectance images from the earth’s surface taken by the Pléiades satellite constellation, from the Centre national d’études spatiales. This constellation produces images of around 50cm per pixel resolution with a revisiting frequency of 26 days.\footnote{Satellite image resolution refers to the level of detail an image can show, and is measured in units like centimeters or meters per pixel. A resolution of 50cm per pixel means each picture element (pixels or cells) on the image represents a 50cm by 50cm square on the ground. Furthermore, a satellite's revisiting frequency refers to how often it passes over the same location on Earth.} Although the images are not available for the general public, The Argentine Commission of Space Activities (\textit{Comisión Nacional de Actividades Espaciales}) provided us access to them. In comparison, the publicly available satellite images of higher resolution are the ones taken by the Landsat 8 satellite; they have a resolution 30 times lower than Pléiades images (15 meters per pixel).
+
+We utilized a series of images captured in Buenos Aires on February 5th and 7th, 2013, which are the closest available to the census conducted on October 27th, 2010. To ensure a diverse training dataset, we also incorporated images from 2018 and 2022. In Appendix A, we provide empirical evidence demonstrating the enhancement of the model's performance as a result of including these images. The images comprise four spectral bands representing the colors blue (430 - 550 nm), green (500 - 620 nm), red (590 - 710 nm), and the near-infrared region (NIR) (740 - 940 nm). Additionally, the panchromatic band (470 - 830 nm) is also available. Figure \ref{fig:train_test_space} depicts the area covered by the images, which partially encompasses the entire city of Buenos Aires.
+
+We enhanced the color histogram and used the Brovey transformation (Vrabel, 1996) to increase the resolution of the original images from 1 meter per pixel (the red, green, blue, and NIR bands' original resolution) to 0.5 meters per pixel (the panchromatic band resolution). This process, known as ``pansharpening'', involves combining the panchromatic band with the lower resolution spectral bands to match the resolution of the panchromatic bands. The resulting images are clearer and more easily detectable for the computer vision model, as shown in Figure \ref{pansharpen}.
+
+\begin{figure*}[htb]
+   \caption{Satellite Imagery resolution enhancement (\textit{Pansharpening} example)}
+    \label{pansharpen}
+    \centering % <-- added
+    \begin{subfigure}{0.33\textwidth}
+      \includegraphics[width=\linewidth]{imagenes/ms_example.png}
+      \caption{Multispectral}
+    \end{subfigure}\hfil % <-- added
+    \begin{subfigure}{0.33\textwidth}
+      \includegraphics[width=\linewidth]{imagenes/pan_example.png}
+      \caption{Panchromatic}
+    \end{subfigure}\hfil % <-- added
+    \begin{subfigure}{0.33\textwidth}
+      \includegraphics[width=\linewidth]{imagenes/ps_example.png}
+      \caption{Pansharpened}
+    \end{subfigure}
+\end{figure*}
+
+One of the main challenges when implementing an image processing model, such as the one proposed using census information, is the spatial dimension in which to work. Convolutional Neural Networks require all images in the dataset to be squared and have the same size in pixels. Moreover, as illustrated in Figure \ref{fig:ing_est}, the census tracts vary in size, as they are selected to contain a similar number of households. Therefore, as the population density decreases, the census tract size grows. Consequently, it is necessary to preprocess the datasets to ensure that the geographical information has a uniform size.
+
+The image size is not an obvious decision \textit{a priori}. On one hand, including a higher resolution than that from the original data can bring a significant improvement in the resolution of the created maps, despite a possible quality loss of those estimations. In fact, if the images used are too small (say $10x10$ meters), it is likely that the results will be unsatisfactory since many relevant characteristics for the measurement of income will exceed the image size. We assess this trade-off empirically in Appendix \ref{annex:tamañoimgs}.
+
+The images used in this model maintain a constant relation between the size of pixels and their spatial dimension. In other words, every image will have approximately the same size in meters. In this work, we used $50x50$ meter images, which doubles the resolution from the census data resolution in areas with high population density. At the same time, the $50x50$ meter images are combined with $200x200$ meter images (with a resolution compression) in order to add more context about the image. This combination was what enabled a better performance among the assessed combinations in Appendix \ref{annex:tamañoimgs}. In pixels, the developed images have a 128 x 128 px resolution.
+
+During model training, we dynamically create the dataset by selecting a random sample of 5 images from each census tract in each training epoch. To construct these images, we select a random point within the tract and create a $50x50$ (and $200x200$) meter square centered at the selected point. This means that many images will contain partial data about adjacent tracts, which might have valuable information, particularly when there are discrete income variations or relevant characteristics such as freeways or rivers. Selecting a constant number of images for each census tract, instead of building a grid for the hole Buenos Aires area, allows us to avoid overrepresentation of low population density images in the training process. At the same time, since the images from each period are randomized, the model constantly faces slightly different images. Also, we applied other standard data augmentation techniques by randomly modifying the brightness, contrast, and orientation of the images.
+
+We label each image with the average per capita income estimates of the census tract (see section \ref{metodosae}). This decision has to do with the high spatial correlation observed in the per capita income map and the homogeneity of the images from areas and neighborhoods with similar incomes. Although there are significant variations within some census tracts, in general, these tend to be visually homogeneous. Therefore, the average income of the tract is usually a valid estimate of the income of a subgroup of that census tract.
+
+Figure \ref{fig:generacion_datos} shows an example of two census tracts from which we selected 4 images from each. We only show 4 for convenience, but the actual dataset generates 5 images per census tract. On the left, we present two census tracts with different levels of income. On the right, we show the 4 generated images, similar to the ones used to feed the model, along with their labels in the upper left corner of the image.
+
+
+\begin{figure}
+    \centering
+    \includegraphics[width=\linewidth]{imagenes/Resultados/Figura - seleccion de imagenes por Radio Censal 1.png}
+    \caption{Example of images generated from census tract data, 128x128px (50x50 meters)}
+    \label{fig:generacion_datos}
+    \source{Source: Satellite Imagery provided by CONAE.}
+\end{figure}
+
+
+
+\section{Processing Satellite Images Using a Convolutional Neural Network} \label{sec:cnn}
+
+Convolutional neural networks (CNNs), as well as neural networks in general, have the feature of being an universal approximation of functions. This means that, given a sufficiently big network, it is possible to approximate the function that maps the set of images to their labels, independently is its functional form \citep{Yarotsky2018}. In that respect, in this work we assume the existence of a function that maps ---at least imperfectly--- households per capita incomes with observable characteristics in the satellite images.
+
+CNNs have a significant advantage over other methods in the literature, such as linear models, because they can automatically detect important features in the input data without human intervention. This makes them well-suited for complex image processing tasks. Unlike some models discussed in the literature (e.g., \citet{Jean2016} and \citet{Engstrom2022}), CNNs do not require assumptions about the functional form that maps the indicator and the characteristics, nor do they require a priori specification of the most relevant observed characteristics. Additionally, they can capture nonlinear relationships among these features. On the other hand, these models are more difficult to interpret because their learning process involves identifying patterns through multiple interconnected layers with a large number of parameters.
+
+We aim to train a network that extracts relevant economic information available in the satellite images that correlates with per capita income. The distribution of the observable characteristic contained in satellite images varies a lot within the same city: more vegetation and land in suburban areas; more asphalt and cement near freeways; houses built with sheet metal, and dirt roads in informal settlements. The shapes of these characteristics show a variation equally wide: houses with broad gardens and green areas in high and middle-income suburbs; interconnected and compact drain grates in urban centers (Ural, Hussain and Shan, 2011; Pesaresi et al., 2016; Zha, Gao and Ni, 2003). This is the complexity that makes a neural network powerful: the network learns to relate these complex patterns with the indicator \citep{Khachiyan2022}.
+
+% Finalmente, las CNN son robustas a datos ``ruidosos'' en el entrenamiento; es decir, que si los errores en las etiquetas son aleatorios, las CNN tienen la capacidad de generalizar apropiadamente la función latente \citep{Rolnick2017}. Esta propiedad es relevante porque, como se verá en la sección \ref{training}, las etiquetas utilizadas no se corresponderán inequívocamente a las imágenes, ya que el tamaño de los radios censales es irregular, mientras que las imágenes satelitales deben tener siempre el mismo tamaño para el algoritmo. Por ello, en algunos casos se ofrecerá como información de entrenamiento muchas imágenes diferentes de un mismo radio censal ---algunas de partes más ricas del radio, otras más pobres--- todas con la misma etiqueta: el ingreso medio del radio censal. La capacidad de poder generalizar el modelo en presencia de estas dificultades resulta clave. Sin embargo, debe destacarse que la capacidad de aprendizaje del algoritmo sí depende de la validez de los datos de entrada: si existen sesgos sistemáticos en el \texit{ingreso estimado}, entonces el modelo replicará esos sesgos en sus resultados finales. Por lo tanto, es sumamente relevante desarrollar técnicas que permitan mejorar la precisión y validez de las estimaciones de área pequeña. 
+
+In the following subsections, we describe the main inputs required to train a CNN, such as the Training, Validation and Test sets (Section \ref{sec:conjuntos}), evaluation metrics (Section \ref{sec:arquitectura}) and the architecture and the hyperparameters set (Section \ref{sec:arquitectura}). In the Appendix, we detail the selection process of the hyperparameters (\ref{annex:hiperparametros}), the selection of the size of the images (\ref{annex:tamañoimgs}) and the evolution of the evaluation metrics over the training (\ref{annex:entrenamiento}).
+
+\subsection{Splitting into Training, Validation, and Test Sets} \label{sec:conjuntos}
+
+\begin{figure*}[t]
+\begin{subfigure}{.48\textwidth} 
+  \centering
+  \includegraphics[width=1\linewidth]{imagenes/Train test split.png}
+  \vspace{1em}
+  \caption{Spatial distribution of the satellite imagery}
+  \label{fig:train_test_space}
+\end{subfigure}%
+\begin{subfigure}{.48\textwidth}
+  \centering
+  \includegraphics[width=\linewidth]{imagenes/kde_train_test.png}
+  \caption{Census Tracts' per capita average income}
+  \label{fig:train_test_dist}
+\end{subfigure}
+\caption{Distribution of train and test datasets}
+\centering
+\end{figure*}
+
+Neural network models generally tend to overfit, meaning they not only learn the general characteristics of the training set but also memorize specific characteristics, which limits their ability to generalize to other data sets. In this work, we aim to develop a model to estimate income based on images from various areas in Buenos Aires, spanning different years and urban characteristics. Therefore, we need a model that can identify and generalize patterns beyond the training set.
+
+Thus, we follow the standard procedure of using three disjoint subsets of training, validation and test (Hastie, Tibshirani and Friedman, 2001). The division will be made at the census tract level, ensuring that all images from a specific tract are included in the same subset. The training set comprises approximately 75\% of the census tracts in the AMBA (~7000 census tracts), the validation set 5\% of the census tracts (~500), and the test set, 20\% (~2000).
+
+The allocation criteria of each tract to each set was the following. To construct the test set, we selected two 0.05-degree wide strips (around $4.5$km) that cross Buenos Aires from north to south and which include 25\% of the census tracts. Specifically, we selected the area between the longitudes -58.71 and -58.66 and between -58.41 and -58.36. We discarded those images that were crossed by these longitudes to avoid potential cross-contamination between the test and training sets.
+
+Figure \ref{fig:train_test_space} shows the spatial distribution of the training and test sets.  Figure \ref{fig:train_test_dist} compares the per capita income distribution between these two sets. Although the distributions are not identical, the test set presents a higher variability than the training set, which is useful for carrying a complete assessment of the predictive capacity of the model.
+
+For defining the validation set, we randomly allocated the census tracts that were not used for the test set to the training and validation sets, to achieve a distribution of the 70\% census tracts in the training set, 5\% in the validation set, and the remaining 25\% tracts to the test distributions.
+
+\subsection{Evaluation metrics} \label{sec:metricas}
+
+Once the census tracts belonging to the test set and the image selection process are established, it is important to determine the mechanism by which we choose the ``best'' model among the different architectures used and within the same training process for a specific architecture.
+
+We use the Mean Squared Error (MSE) as the main evaluation metric to train and evaluate the model. During the training phase, we used this metric as a loss function to compare the predicted income of each image with the average income of the census tract. However, for model evaluation, we used the MSE computed at a census tract level rather than at an image level. This approach is taken because calculating the MSE directly for each image would overestimate the real error, as part of the difference between the prediction and the income of that tract can be caused by variations within the same tract. In other words, a model that correctly predicts income based on images would have a high MSE in many census tracts, since the prediction is related to a subgroup of the tract (the area delimited by the image) and not the average income of the entire tract. Instead, we propose to compute the MSE of the average of the predictions in each census tract. This way, we would be comparing the average predicted income across all the tract images with the average income of each census tract.
+
+We use this metric, which estimates the MSE by averaging the predictions of each tract, to compute the error in the validation and test sets. To simplify this comparison, in the results section, we estimate the $R`2$, which normalizes the MSE by dividing it with the variance, creating an indicator that goes from 0 to 1, 0 being a model with zero prediction power (MSE equal to the variance) and 1, a model that predicts the indicator perfectly (MSE equal to 0).
+
+Formally, the overestimation of the computed MSE of every image can be seen if we consider the following expression:
+
+\begin{equation} \label{MSE_img}
+    MSE = \frac{1}{n_j n_h} \sum_{j \in J_T}\sum_{h \in H_j}\left(\hat{p}_{hj} - \hat{Y}_j\right)^2
+\end{equation}
+
+where $\hat{p}_{hj}$ represents the prediction of the neural networks model of image h that belongs to the census tract $j$, $\hat{Y}_j$ represents the census tract per capita income, $J_T$ represents the set of census tracts that belong to the test set and $H_j$ represents the set of images that belong to the $j$ census tract.
+
+Following this logic, in a correctly estimated model, $\hat{p}_{hj}$ should have a positive variance within the $j$ census tract, while $\hat{Y}_j$ is constant within the same tract. Therefore, the evaluation metric underestimates the model’s precision. To obtain an appropriate MSE, instead of comparing each image, it is possible to compare the prediction average of every image from the tract with the per capita income according to the households’ information. Taking this into account, the MSE we use to assess the model’s performance is:
+
+\begin{equation} \label{MSE}
+    MSE^{test} = \frac{1}{n_j} \sum_{j \in J_T}\left({\hat{P}}_{j} - \hat{Y}_j\right)^2
+\end{equation}
+
+computed for every census tract $j$ that belongs to the $J_T$ test subset. In this expression, ${\hat{P}}_{j}$ represents the prediction average of every image in the j census tract:
+
+\begin{equation} \label{media_rc}
+{\hat{P}}_j = \frac{1}{n_h} \sum_{h \in H_j}{\hat{p}}_{hj}
+\end{equation}
+
+Since $\hat{Y}_j$ represents the average per capita income of the households within a census tract $j$, we apply a similar logic to compute the model’s mean per capita income prediction of the images within a census tract. For each census tract, we develop a grid of images of the same size that the ones used in the training set ($50x50$mts + $200x200$mts). In other words, we make predictions for the entire area of the census tract. Specifically, we only use the images whose centroid is located in the tract to create the grid. That is why some images might reach other tracts.
+
+Figure \ref{grilla_rc} shows an example of a census tract over which we develop the grid to make the predictions. The $\hat{P}_j$ average prediction of the tract $j$ is made by averaging the income of the images from the constructed grid.
+
+\begin{figure}[t]
+    \centering  
+    \includegraphics[width=0.48\textwidth]{imagenes/grilla radio censal.png}
+    \caption{Construction of a grid of 128x128px (50x50m) images to calculate the average income prediction in a census tract}
+    \label{grilla_rc}
+    \source{Source: Satellite Imagery provided by CONAE.}
+\end{figure}
+
+% \subsubsection{Validación del ingreso estimado}
+
+% - Mostrar que la distribución es similar a la del ingreso real
+% - Varianza intra radio censal (agregar para despues)
+% - Correlación con pm2, ICV, ¿algo más? ¿datos de AYSA? ¿Datos de CEP?
+
+\subsection{Model architecture and configuration} \label{sec:arquitectura}
+
+We employ the EfficientNetV2 architecture for our neural network \citep{EfficientNetV2}. These state-of-the-art models can achieve a high performance with a relatively low number of parameters. Specifically, we use an EfficientNetV2-S network with a learning rate of 0.0001. We use the Nesterov-accelerated Adaptive Moment Estimation as optimizer \citep{dozat_nadam}. The training is carried out across 150 epochs and the model with the lower MSE in the validation set at a census tract level (5\% of the tracts in the training set)  is selected as ``the optimal''. We trained the model by using a GPU Ge-Force RTX 2060 Super and each model instance took approximately 52 hours. In the Appendix, we describe in detail the selection process of the hyperparameters (\ref{annex:hiperparametros}), the selection of the images’ size (\ref{annex:tamañoimgs}) and the evolution of the training metrics (\ref{annex:entrenamiento}).
+
+\section{Predicting income at grid level}\label{sec:grilla}
+
+Once the model is trained, we can obtain an income estimate from a satellite image, without providing more information. Therefore, by applying the neural network over every satellite image from Buenos Aires in a given year, we can generate a highly disaggregated map of the income spatial distribution.
+
+To make these predictions, we first need to create a grid for Buenos Aires, where each cell will be an image on which the income estimation will be made. Once the grid is created, we make the predictions for every available image, both the ones belonging to the training set and the test set, from 2013, 2018 and 2022.
+
+This mapping will allow us to disaggregate the income indicator at a census sub-tract level. This is possible because the image selection for each tract is random. Since CNNs are robusts to non-systematic errors in the input data \citep{burke2021}, we expect that the model will overlook data incongruent with the general pattern in the training process. If this is true, then our model can be applied in every census tract, making consistent estimations. In addition, we will be able to develop time series for each cell of the grid previously created. This can happen because it is the same for the algorithm to analyze images from different points in time. Then, the subsequent predictions in time for an image from the indicator of interest will enable us to develop maps of the indicator throughout time.
+
+It is important to highlight that his approach will not only be able to detect structural changes in the regions produced by changes in the households quality, the urbanization or vegetation level, among other factors. On the same line, it will not be able to detect changes in income caused by the economic context, since the model will never have access to that kind of information. However, a tool like this is extremely useful for identifying poor and rich urban areas.
+
+\section{Results}\label{sec:resultados}
+
+
+\subsection{An estimate of the spatial income of Buenos Aires}
+
+
+\begin{figure*}[t]
+    \centering
+
+    \begin{subfigure}{.45\textwidth} 
+      \centering
+      \includegraphics[width=0.97\linewidth]{imagenes/Resultados/time_effnet_v2S_lr0.0001_size128_y2013-2018-2022_stack1-4_amba_2013.png}
+      \vspace{.4em}
+      \caption{Predictions from our Model}
+      \label{fig:mapa_resultados_128}
+    \end{subfigure}%
+    \begin{subfigure}{.45\textwidth}
+      \centering
+      \includegraphics[width=\linewidth]{imagenes/Resultados/rc_amba_2013_CLEI.png}
+      \caption{Small Area estimation data}
+      \label{fig:mapa_entrenamiento}
+    \end{subfigure}       
+    \begin{subfigure}{.06\textwidth}
+        \centering
+        \raisebox{0.2\height}{\includegraphics[width=\linewidth]{imagenes/Resultados/cbar_vertical.png}}
+    \end{subfigure}
+    \caption{Spatial per capita income estimates of Buenos Aires}
+    \source{Note: Uniformly red areas in the predictions (a) represent locations where satellite images are not available for analysis.}
+\end{figure*}
+
+In this section, we present the main results of our work: a map that estimates, with a $50x50$ meter resolution, the average per capita income of the households living in each cell.\footnote{Formally, our prediction variable is the standarized logarithm of the per capita average income of the cell.} Figure \ref{fig:mapa_resultados_128} shows the predictions for the grid of satellite images from 2013. To the right, Figure \ref{fig:mapa_entrenamiento} presents the original data, that is, the labels of the test and training sets derived by applying small area estimation techniques to the census and survey data. As is apparent from these figures, the main advantage of this methodology is that it allows us to increase the income estimation resolution, by using the available non-structured information of the satellite images.
+
+The selected model has a great predictive performance, reaching an $R^2=0.878$ on the test set. In other words, the model manages to capture more than 87\% of the variability of the spatial income on a set of images that the model has never seen. This high predictive capability becomes evident in Figure \ref{fig:scatter_preds}, which compares, for each census tract, the logarithm of the income of each tract (derived from small area techniques) compared with the average income prediction from the neural network. Both variables are standardized in order to get a 0 mean and a 1 standard deviation. The model predicts with few errors for the lower-income tracts. When dealing with low and middle-income levels, the model depicts a greater variability in its predictions. This is reasonable, since the low-income households have fewer opportunities of choosing the house type. Thus, the observed variability in the satellite images is lower.\footnote{Intuitively, a high or middle-income household can choose to live in a less expensive neighborhood and save its income for other uses, but a low-income household cannot.}
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=\linewidth]{imagenes/Resultados/Figura - Scatter predicciones.drawio.png}
+  \caption{Comparing predicted and observed income by census tract in the test set}
+  \label{fig:scatter_preds}      
+\end{figure}
+
+
+% \begin{figure*}[t]
+%     \centering
+%     \caption{Estimación del ingreso per cápita espacial}
+
+%     \begin{subfigure}{.9\textwidth} 
+%       \centering
+%       \includegraphics[width=1\linewidth]{imagenes/Resultados/effnet_v2S_lr0.0001_size128_y2013-2018-2022_amba_2013.png}
+%       \label{fig:mapa_resultados_128}
+%     \end{subfigure}%
+%     \begin{subfigure}{.06\textwidth}
+%         \centering
+%         \raisebox{0.2\height}{\includegraphics[width=\linewidth]{imagenes/Resultados/cbar_vertical.png}}
+%     \end{subfigure}
+
+% \end{figure*}
+
+In Table \ref{tab:comparación_modelos}, we compare the results of our model with related methodologies used in the literature. These results show an improvement regarding the performance of similar models, since our model has a higher spatial resolution while achieving a better performance than the other proposed strategies, without the need to additional information than the one contained in the satellite images.
+
+\begin{table*}[t]
+\caption{Comparison of our model with other strategies}  \label{tab:comparación_modelos}
+\centering
+\begin{tabular}{lccccc}
+\hline \hline
+ & \multicolumn{1}{c}{Our Model} & \multicolumn{1}{c}{Piaggesi et al (2019)} & 
+ \multicolumn{1}{c}{Rolf et al (2021)} & 
+\multicolumn{1}{c}{Khachiyan et al (2022)} & 
+ \multicolumn{1}{c}{Henderson et al (2012)} \\
+\hline
+Architecture & \multicolumn{1}{c}{EfficientNetV2} & \multicolumn{1}{c}{ResNet50} & \multicolumn{1}{c}{Custom CNN}  & \multicolumn{1}{c}{Custom CNN} & \multicolumn{1}{c}{Linear Model} \\
+Variable & Per capita income & Per capita income & Per capita income  & Total income & Economic growth \\
+Images  & & & \\
+\;\;\; Tipo & Daylight reflectance & Daylight reflectance & Daylight reflectance & Daylight reflectance & Nighttime Light \\
+\;\;\; Source & Pléiades Neo & DigitalGlobe/GMaps & GMaps & LandSat 8 & Suomi NPP/NOAA-20 \\
+\;\;\; Size & 50x50m & 1x1km & 1x1km & 1.2x1.2km & media por país \\
+\;\;\; Pixels & 128x128px & 224x244px & 256x256px & 128x128px  & - \\
+$R^2$ & 0.878 & 0.691 & 0.45 & 0.749  & 0.769 \\
+\hline \hline
+\end{tabular}
+\end{table*}
+
+% En primer lugar, porque utiliza \textit{únicamente} información extraída a partir de las imágenes, sin ninguna información de encuestas y/o datos administrativos añadidos para la predicción. En términos económicos, una correlación de esta magnitud implica que el ingreso per cápita de los hogares ---o al menos, el ingreso per cápita estimado por área pequeña--- es una variable que se correlaciona muy fuertemente con las condiciones materiales y observables de la vivienda.
+
+
+\subsection{Evaluating the per capita income estimation at a grid level}
+
+Given the lack of available data at a census sub-tract level to assess the precision of the grid estimations, in this section we qualitatively assess our results. We present a series of case studies in Figure \ref{fig_casos}, with the aim of highlighting complex situations that might challenge the model’s predictive capacity, such as high-income gated communities next to informal settlements. All the cases comes from the test set, so we can be sure that the model hasn't previously seen these images.
+
+\begin{figure}
+\centering
+\begin{subfigure}{.48\textwidth}
+  \includegraphics[width=.99\linewidth]{imagenes/Resultados/mobnet_v3_large_size128_tiles1_sample5_all_years_VILLA_31_2013.png}
+  \caption{Retiro, CABA.}
+\end{subfigure}
+\begin{subfigure}{.48\textwidth}
+  \includegraphics[width=.99\linewidth]{imagenes/Resultados/mobnet_v3_large_size128_tiles1_sample5_all_years_VILLA_21_24_2013.png}
+  \caption{Nueva Pompeya, CABA.}
+\end{subfigure}
+\begin{subfigure}{.48\textwidth}
+
+  \includegraphics[width=.99\linewidth]{imagenes/Resultados/mobnet_v3_large_size128_tiles1_sample5_all_years_BELLAVISTA_2013.png}
+  \caption{Bellavista, San Miguel.}
+\end{subfigure}
+
+\begin{subfigure}{.48\textwidth}
+    \centering
+    \includegraphics[width=.8\linewidth]{imagenes/Resultados/cbar.png}
+\end{subfigure}
+\caption{Case studies from the test set}
+\label{fig_casos}
+\source{Source: Satellite Imagery provided by CONAE.}
+\end{figure}
+
+It is interesting that, in the presented cases, informal settlements, such as the Barrio 31 (in Retiro) and Barrio 21-24 (in Nueva Pompeya), are correctly identified by the model, delimiting an area where clearly there are poor houses in inhabited areas. In addition, the areas with buildings or houses built with better construction quality are classified as middle or high-income according to the census data.
+
+At the same time, as we can see in the case of Bellavista, some areas with emerging urbanization ---such as the neighborhood with pools under construction shown in the center of the image — are classified as high-income, as opposed to the census data, which classify them as low-income. This can happen due to the fact that the census tract comprises many observations from one relatively poor section and just a few higher-income households. The model seems to correctly capture the “real” distribution of income, being able to detect the characteristics of high-income houses seen in more uniform census tracts.
+
+Finally, Figure \ref{fig:desagregacion} depicts a case in which the same census tract of the city of Tigre includes part of a gated community, with higher-income households, and part of an informal settlement with low-income households. On average, the census tract presents a middle-high income, since that might be the average income of all the households in such tract. As it is portrayed in Figure \ref{fig:desagregacion}, our model can better capture the income spatial distribution, since it allocates the middle-high incomes in the gated community cells and the low incomes in the informal settlements cells. In a case like this one, if we compare each image with the average census tract income, the error will be bigger than the one calculated by comparing the predicted average income with the average census tract income.
+
+\begin{figure}
+    \centering % <-- added
+    \includegraphics[width=\linewidth]{imagenes/Resultados/desagregacion.png}
+    \caption{An example of a proper spatial distribution captured by our model.}
+    \label{fig:desagregacion}
+    \source{Source: Satellite Imagery provided by CONAE.}
+\end{figure}
+
+\subsection{Predicting economic indicators for 2010}
+
+As we previously mentioned, the main objective of the proposed model is to capture the income spatial distribution with a high spatial resolution. However, it is important to assess if, after adding the grid predictions to higher geographical levels, the model estimates precisely some relevant economic indicators. Thus, we compare the predictions of the model with indicators derived from survey data and the small area estimates from the 2010 Census.
+
+In Table \ref{tab:2010_results} we compare descriptive statistics of the income distribution of (1) the 5348 households surveyed in the 2010 second semester in Buenos Aires city, (2) the census income prediction for 13,491 census tracts from Buenos Aires, that is, the small area estimation for each tract (see equation \ref{indicador}) and (3) the income prediction based on satellite images for the grid of images from Buenos Aires, a grid of 539,809 cells.
+
+In cases (2) and (3), where we observe areas rather than households, we calculate the indicators by weighing each area according to the number of households that live there. In the census, this information is available for each census tract. For the grid level predictions, we used the population estimates from Gridded Population of the World project \citep{Gridpop}, which estimates the population in a grid with a 30-arcsecond resolution (around 1 km). This is done to avoid focusing too much on areas with low or zero population density, such as Buenos Aires outskirts. If we do not do this, the average income estimation would be excessively low, underestimating the “real” average income.
+
+We compare the following indicators of income distribution: the mean and median incomes, which show the central trend towards the distribution; the 90/10 and 50/10 Ratios, two economic inequality indicators that compare the income of the household living in the percentile 90 (50) with the income of the one living in the percentile 10; the Gini coefficient, an inequality indicator that compares the income of every household of the distribution; and the Foster-Greer-Thorbecke (FGT) poverty indicators \citep{foster1984}, calculated with the national poverty line from the \citet{SEDLAC} % Socio-Economic Database for Latin America and the Caribbean  
+
+We can draw many conclusions from Table \ref{tab:2010_results}. In the first place, the measures of the central trend derived from our model depict an underestimation regarding the survey data. This is particularly true for the mean income, which goes from an average household per capita income of $ARS_{2010}$ 820.94 to a predicted average income of $ARS_{2010}$ 649.37. It is possible to explain this if we consider that the heterogeneity of houses, observed by the model, can be lower than the heterogeneity of income. For instance, this would happen if the house income elasticity of demand is lower than 1, something seen in, for example, the United States \citep{hansen1998} and Mexico \citep{adamuz2016demanda}. Moreover, when the model's predictions seek to minimize the MSE ---such as the linear regression in the equation \ref{modeloSAE}---, the distribution variability is significantly compressed, reducing the inequality indicators. In an asymmetric distribution, such as income, the average is also expected to decrease in the face of this variability drop, by reducing the influence of extreme incomes over this indicator. In Figure \ref{fig:scatter_preds}, both consequences combined can be seen clearly if we consider that, while the census tracts income along with the census data of most observations are between -2 and 2 standard deviations of the average, most predictions are between -1,5 and 1,5.
+
+For both reasons, inequality measures are also expected to be underestimated, as it is highlighted when comparing the indicators for models (2) and (3) regarding the data observed in the EPH, column (1). Poverty indicators have the same problem: with the processing of both models, the poverty measures cannot be estimated correctly, particularly those more sensitive to the distribution of the left tail, such as the FGT(2). It is important to emphasize that this essential underestimation of the inequality and poverty indicators is explained when going from the column (1) data to the column (2) data, that is, when making small area estimations of the census tracts. In contrast, CNN makes predictions very similar to the data with which it was trained (column (2)). In fact, the neural network might be able to capture non-incorporated variations in the small area model, explaining why the poverty and inequality measures are more similar if columns (3) and (1) are compared than if columns (2) and (1) are compared, the only exception being the FGT(0). This is especially remarkable if we consider that, in order to make the CNN predictions, the data used for the training process were the ones from column (2). In other words, the created model manages to capture variations in the spatial input that were not incorporated in the original data.
+
+\begin{table}[t] 
+\caption{Performance on Predicting Economic Indicators} \label{tab:2010_results}
+\centering
+\begin{tabular}{lccc}
+                    \hline  \hline & (1) & (2) & (3)  \\
+  & Survey Data & Census Estimates & Our Model  \\ \hline
+Unit of analysis                       &  Households          & Census Tracts                        & Cells                \\
+N° of Observations                      & 5,348            & 13,491                         & 539,809                      \\
+Year                                & 2010           & 2010           & 2013                     \\
+Indicators: & & & \\
+\;\;\; \textit{Mean}              & 820.94         & 691.84                      & 649.37                    \\
+\;\;\; \textit{Median      }      & 611.45         & 567.16                        & 541.75                  \\
+\;\;\; \textit{90/10 Ratio }      & 8.05           & 3.59             & 3.78
+                       \\
+\;\;\; \textit{50/10 Ratio  }     & 3.01           & 1.62             & 1.74
+                       \\
+\;\;\; \textit{Gini           }    & 0.426           & 0.275             & 0.282                      \\
+\;\;\; \textit{FGT(0)}             & 32.17            & 30.30                         & 37.01                       \\
+\;\;\; \textit{FGT(1) }            & 12.92           & 4.70           & 7.58                       \\
+\;\;\; \textit{FGT(2)  }           & 7.00             & 1.02             & 1.99     \\ \hline       \hline             
+\end{tabular}
+\end{table}
+
+When the income at a municipal level is considered, the conclusions are similar. Figure \ref{fig:mediana_municipios} compares, for each municipality in the AMBA, different economic indicators computed with the census data, with the same indicators computed with the income predicted by the CNN for each grid cell.\footnote{That is, the developed indicator in expression \ref{indicador}, which belongs to column (2) of Table  \ref{tab:comparación_modelos}.} We can extract three main conclusions. Firstly, at a municipal level, the satellite image estimations systematically underestimate the census mean and median income. This explains why the model also underestimates inequality and poverty, as all the predicted incomes are generally lower than the real ones. Secondly, the model correctly captures the trend of every indicator at a municipal level, since, for instance, municipalities that face greater inequality according to the census data also deal with a higher estimated inequality according to the satellite images. Thirdly, it is worth highlighting that the estimations of the central trend measures are by far the most precise, creating an indicator that, although it underestimates the income, it captures with a high level of accuracy the income ordering of the municipalities. In other words, the model appropriately captures (at a municipal level) the income spatial distribution, but not households’ per capita income.
+
+\begin{figure}
+\centering
+  \includegraphics[width=1\linewidth]{imagenes/Resultados/municipios_paper.png}
+\caption{Comparing indicators at municipal level}
+\label{fig:mediana_municipios}
+\source{Note: every municipality inside Buenos Aires is represented by a dot.}
+\end{figure}
+
+\subsection{Income predictions through time}
+
+By applying the same trained model from previous sections, it is possible to create an income prediction grid for the images from 2018 and 2022. To do so, we simply have to make the predictions for each image of the generated grid of Buenos Aires city, in each of the corresponding years.
+
+Figure \ref{fig:mapas_tiempo} shows the evolution over time of the per capita income, expressed in income deciles from 2010, in the three years analyzed. To the left, we replicate Figure \ref{fig:mapa_resultados_128}, so it is easier to compare the images from previous years. In general, the model predicts a very similar spatial income distribution for the three years, which highlights the consistency of the model when predicting with images from different years. On the other hand, for 2018 and particularly 2022, a lower spatial correlation between the near cells is shown. While the images from 2013 show more consistent clusters of cells that belong to the same decile, in the images from 2022, the predictions for a specific area are more varied. In section \ref{sec:discusión}, we briefly discuss why this might be happening.
+
+\begin{figure*}[t]
+    \centering
+    \begin{subfigure}{.3\textwidth} 
+      \centering
+      \includegraphics[width=1\linewidth]{imagenes/Resultados/time_effnet_v2S_lr0.0001_size128_y2013-2018-2022_stack1-4_amba_2013.png}
+      \caption{2013}
+      \label{fig:time_2013}
+    \end{subfigure}%
+    \begin{subfigure}{.3\textwidth}
+      \centering
+      \includegraphics[width=\linewidth]{imagenes/Resultados/time_effnet_v2S_lr0.0001_size128_y2013-2018-2022_stack1-4_amba_2018.png}
+      \caption{2018}
+    \end{subfigure}  
+    \begin{subfigure}{.3\textwidth}
+      \centering
+      \includegraphics[width=\linewidth]{imagenes/Resultados/time_effnet_v2S_lr0.0001_size128_y2013-2018-2022_stack1-4_amba_2022.png}
+      \caption{2022}
+    \end{subfigure}  
+    \begin{subfigure}{.06\textwidth}
+        \centering
+        \raisebox{0.2\height}{\includegraphics[width=\linewidth]{imagenes/Resultados/cbar_vertical.png}}
+    \end{subfigure}
+    \caption{Per capita income predictions over time}
+    \label{fig:mapas_tiempo}
+\end{figure*}
+
+In the previous sections, we estimated a series of economic indicators for the year 2010. Here, we compute this same indicators for the income grids for 2018 and 2022. As expected, these results have their limitations when compared with the income observed in surveys data, since the current income can be affected by short-term variations and most of the observable characteristics of the satellite images are related to medium and long-term income variations.
+
+Figure \ref{fig:tiempo_indicadores} shows the percentage variation of different income indicators over time, using our model's satellite image predictions and the survey data from the corresponding semester. Although the indicator's growth rate is not perfectly captured by the model ---in every case, the model predictions are a few point behind the survey data---, it is worth emphasizing that for every indicator, the trend is captured by satellite images. Only in a few cases, such as the Ratio 50/10 and the Gini coefficient for 2018, the model incorrectly predicts the temporary evolution of the indicator. In addition, it is important to highlight that the indicators predicted by the model systematically underestimate its evolution through time. This goes hand in hand with the interpretation that the model does not capture the common income of people, but rather their long-term income. We discuss this in detail in section \ref{sec:discusión}.
+
+\begin{figure}[h]
+    \centering
+    \includegraphics[width=\linewidth]{imagenes/Resultados/Indicadores TIempo vertical.png}
+    \caption{Growth rates of income indicators over time}
+    \label{fig:tiempo_indicadores}
+\end{figure}
+
+
+\section{Discussion}\label{sec:discusión}
+
+In the Results section, we stated that the model predicts the (logarithm of the) average per capita income of the households in the image. While the training data measures this variable, the model may predict something slightly different. As the model only uses visual information from the images to make predictions, it can only capture income variations that are visibly apparent as material improvements.
+
+The interpretation we propose in this work is that the model captures a latent variable: the expected income of households. In other words, we are suggesting that the model captures the "long-term" or "average" income of households over time. If a household experiences temporary changes in its income but manages to maintain the same living conditions, the model will not detect such variation. However, if the household is unable to maintain the same conditions, the model may capture the change in the images.
+
+On the other hand, during the training process it became clear that the model's predictions were influenced by contextual factors that were not necessarily relevant when predicting income. For example, when we only used images from 2013 for training, and then combined images from 2013, 2018, and 2022 for the final model, the model consistently predicted lower incomes when analyzing the 2018 images. This was due to the drier month and yellower vegetation depicted in the images, which are correlated with lower-income households. Similarly, an income increase was perceived in the 2022 images due to the evening time they were taken, which cast shadows on the buildings, indicating the presence of taller buildings and, therefore, higher incomes. These types of factors could have been addressed by the model with more diverse examples, highlighting the need to use a greater number of images from different points in time for future developments of these models.
+
+Another fact worth mentioning is the difficulty that the model faces when predicting economic indicators both for the base year and throughout time. A logical solution to this is implementing a similar strategy used by \citet{censusEB} in the small area estimations: weighing the model's predictions with survey indicators. For example, \citet{Khachiyan2022} add indicators such as the average income of each year to the last CNN layer and, thus, achieve a significant improvement in the model’s performance.
+
+A relevant point worth considering is that the current model’s performance, at a census tract level, is compared only with the small area estimates. One of the issues this technique poses is that the observable variables used have a limited power when explaining income, since it depends on a linear regression model. In this sense, any improvement in the data generation process will result in a direct improvement in the proposed model.
+
+Finally, it should be stressed out the main problem posed by the methodology is its current state: the model does not identify if there are households living in the cell where the income is predicted. This is problematic because using this method in areas with no population or low population density would result in the model being fed irrelevant information, which would introduce noise in the gradients and the predictions. To address this, we plan to develop a two-stage model. The first stage will predict the presence of at least one house in the image, and the second stage will estimate the income if a house is present. Additionally, the model could use other factors such as population density to improve accuracy. One challenge we face is the lack of training data with the same level of detail, particularly for Buenos Aires.
+
+\section{Accessing the generated datasets}\label{sec:disponibilizacion}
+
+The income maps developed for 2013, 2018 and 2022 are available \href{https://zenodo.org/records/11200070?token=eyJhbGciOiJIUzUxMiJ9.eyJpZCI6IjNhYWNhMDRiLTMwYTEtNDEwMy04MDIwLTA3ZDEzMTlmZTgwYiIsImRhdGEiOnt9LCJyYW5kb20iOiI2MWU4ODAwZjNlYTk0ZGRlOWU1MjIyZWY1YTU5OTk1MyJ9.KvBZ93q8Vt13e0eFxB5mFxBHmuGBZja0pfk4Gse1x0rXCTLioCvFLoXTpD7HkCQCUBpMxuDlL_tqsk8YjJqGMQ}{here}. Since the predictions for each cell individually present some random variation, we recommend that the results are used averaging out the estimations for each area of interest (municipalities, neighborhoods, sections or census tracts) and not at an individual level. As we detailed throughout this work, the aggregated results, even in small areas such as census tracts, predict in a precise way the households’ income. Likewise, inside the repository, it is possible to access and use the model’s trained parameters to make predictions about different satellite images.
+
+
+\section{Conclusions}\label{sec:conclusiones}
+
+In this study, we present a methodology for developing a Machine Learning model capable of generating highly detailed spatial income estimates using satellite images. In addition to this method, we outline a strategy for constructing a database that can be utilized with a CNN using georeferenced census data in irregular polygons. The model architecture we employed is EfficientNetV2 \citep{EfficientNetV2}. The results demonstrate that the model achieves high precision in predicting per capita income, surpassing the spatial resolution of alternative methodologies found in the literature.
+
+The application of this model allows us to generate a map of the per capita income of the Metropolitan Area of Buenos Aires for the years 2013, 2018, and 2022, improving the spatial resolution of the original census data. This provides a more precise vision of the income distribution in the studied region, at years where no data is available at such spatial level.  It helps identify areas with low-income populations, which is valuable for both academic research and public policy..
+
+The development of this methodology presents four key areas for future investigations with the aim of improving these models. In the first place, it is essential to increase the satellite imagery datasets beyond Buenos Aires. As satellite technology advances and the related costs decrease, this expansion will become more feasible in the near future. Secondly, adding images from many different years instead of only a few points in time will allow us to develop better time series predictions and, thus, create temporal maps for the evolution of the geographical distribution of income. In addition, the subsequent predictions could improve the quality of the estimation, since random differences in the image from a specific year could be filtered out. In the third place, the current model estimates incomes without considering the presence of houses in the images, which could lead to spurious predictions. One possible solution could be the implementation of a two-stage CNN. In the first stage, the network would identify the presence of houses within the area of interest. In the second stage, if houses are found, the network would then predict the per capita income. This strategy would not only improve the results interpretation and precision, but also allow us to estimate better averages in each census tract, considering only the cells with houses and, thus, reducing the estimation general error. Lastly, exploring more advanced models, such as Vision Transformers or stronger CNNs, could improve the model’s performance even more.
+
+The implications of this work are significant at various levels. The ability to generalize the model for other urban areas will help to close the data gap in low-income areas, including cities in countries with no survey data, such as most countries of Sub-Saharan Africa \citep{burke2021}. Moreover, the created maps can help evaluate the impact of localized policies and programs easier, as well as measure and improve the targeting of social programs. Making a grid database available for the general public, such as the one developed in this work, provides access to income geographical information, enabling numerous applications in different disciplines besides economics.
+
+\bibliographystyle{apa}
+
+\bibliography{refs} % Entries are in the refs.bib file
+
+% En caso de desarrollarse un modelo generalizado para muchas ciudades diferentes ---y no limitado únicamente en el AMBA---, podría generarse nueva información para áreas urbanas donde no hay información disponible, mediante la predicción del modelo sobre las imágenes satelitales de dichas áreas. Esto podría ayudar a reducir la brecha de datos existente en zonas rurales y de bajos ingresos, a donde no alcanzan muchas de las encuestas \citep{}. 
+
+% En segundo lugar, los mapas generados con esta técnica podrían facilitar el desarrollo de evaluaciones de impacto localizadas. Por ejemplo, resultaría significativamente más simple evaluar el impacto de nuevas redes cloacales o de agua corriente en el desarrollo inmobiliario de una zona determinada, utilizando únicamente las predicciones del modelo antes y después del tratamiento, seleccionando un grupo de control apropiado. 
+
+% Finalmente, la mejoría de la resolución espacial y temporal de los mapas de ingreso facilitaría la tarea de evaluación de la focalización de programas sociales, ya que en muchos casos se dispone de información geolocalizada del lugar de residencia de los beneficiarios. Estas estimaciones ya no dependerían de datos censales potencialmente desactualizados o de encuestas, y la evaluación podría realizarse analizando la distribución del ingreso de los beneficiarios estimados a partir de su lugar de residencia. Además de esto, estas técnicas podrían ayudar a desarrollar mejores técnicas de focalización de programas sociales, permitiendo nuevos criterios de exclusión que podrían aplicarse dentro de los \textit{proxy mean tests} \citep{Grosh1995}, o como criterios independientes \citep{Smythe2022}.
+
+% Activate the appendix
+% from now on sections are numerated with capital letters
+
+\clearpage
+
+\newpage
+
+\appendix
+
+\subsection{Hyperparameter selection} \label{annex:hiperparametros} 
+
+In order to select the model with the best predictive performance, we evaluate a series of combinations of hyperparameters, in order to find the set that leads to the best results. However, given the number of combinations of potential hyperparameters and the computing time that each model implies (approximately 50h of training), the set of experiments was limited to a series of specific tests. We carried out every experiment with $100x100$mts images (compressed in $128x128$px) to reduce the computational burden, and we trained the model with over 100 epochs. Except when we state otherwise, the models used by default a 0.0001 learning rate, the EfficientNetV2S architecture, the four color bands (RGB+NIR) and only the 2013 images.
+
+Figure \ref{fig:lr} shows, for different learning rates, the MSE evolution through the epochs for the test set. In order to calculate the test set error, we estimate the prediction average of each census tract and compare it with each tract income, according to the evaluation metrics presented in section \ref{sec:cnn}. The chosen hyperparameter was a learning rate of 0.0001 because it converges faster and has achieved the lowest MSE.
+
+Figure \ref{fig:tamaño_modelo} replicates the previous figure, but for different model sizes. Since there is no clear improvement in the assessment of any of the architectures, we decided to keep the smallest one, because it is the one that requires the least time to train. Figure \ref{fig:bandas} replicates the same experiment by changing the image bands. The inclusion of the near-infrared band seems to reduce the variance between each period of the model’s performance. Thus, we decided to include it in the final training process of the model.
+
+\begin{figure}[h!]
+\centering
+\begin{subfigure}{.95\linewidth} 
+  \centering
+  \includegraphics[width=\linewidth]{imagenes/Anexo/learning_rate.png}
+  \caption{Learning rate}
+  \label{fig:lr}
+\end{subfigure}
+\begin{subfigure}{.95\linewidth}
+  \centering
+  \includegraphics[width=\linewidth]{imagenes/Anexo/models.png}
+  \caption{Model Architecture}
+  \label{fig:tamaño_modelo}
+\end{subfigure}
+\begin{subfigure}{.95\linewidth}
+  \centering
+  \includegraphics[width=\linewidth]{imagenes/Anexo/nbands.png}
+  \caption{Number of bands}
+  \label{fig:bandas}
+\end{subfigure}
+\begin{subfigure}{.95\linewidth}
+  \centering
+  \includegraphics[width=\linewidth]{imagenes/Anexo/años_utilizados.png}
+  \caption{Year used for training}
+  \label{fig:años}
+\end{subfigure}
+\caption{Hyperparameters performance}
+\centering
+\end{figure}
+
+Finally, Figure \ref{fig:años} compares the model’s performance by using images from different years. Although including these images might pose a bias (since we will show images from, for example, 2022, with input labels from 2010), the aim of including these images is to enable a better generalization of the model, if we assume there are no great differences between the images from different years. In other words, we assume that urban changes take time and, thus, the bias when showing 10-year apart images is low. This bias-generalization trade-off is evaluated by comparing the model performance on 2010 test images. It is interesting that including ``future'' images from Buenos Aires allows us to improve the model’s performance and to get a higher spatial consistency when predicting in those three periods. Although we do not mention it in this section, if we do not include the images from those three years and only carry out the training with the 2013 images, the future predictions for 2018 and 2022 are far more volatile, possibly due to light, satellite view angle and vegetation differences, which the model interprets as relevant features. That might be true for a single year, but those feature changes through different years should not be considered as features.
+
+
+\subsection{Size of the images} \label{annex:tamañoimgs}
+
+Once we establish the hyperparameters, we try to choose the best size image for the grid prediction. Although we wish to get the smallest and most granular prediction, we expect that, as the predicted area is lower, the predictions variability can be higher. In fact, if we use very small sized images (for instance, $10x10$m), the results are likely to be poor, since many propiedades exceed the image size.
+
+This trade-off is assesed by comparing the models’ performance with $50x50$, $100x100$ and $200x200$ meter images, the last size being the most similar to that from many census tracts. The pixel size always stays at $128x128$ px to guarantee that the results are comparable. In addition, by using a higher number of bands in the images, we assess a strategy that could allow us to solve the scale problem: combining images with a reduced size (for example, $50x50$m) with images with a bigger size (for example, $200x200$m). In other words, instead of using a 4-band image, we build an 8-band stacked-composition where the first 4 correspond to a smaller size image and the next 4, to a bigger one. 
+
+Figure \ref{fig:stacked} provides an example of this stacked image composition for a randomly selected image from Buenos Aires. Combining information from small areas with higher resolution and big areas with lower resolution allows the model to process the information of both images together, without the need to modify the implemented architecture. This could reduce the variance of the predictions or improve it by considering the income relevant factors that may not be included in the near image. For instance, if we compare two neighborhoods with similar buildings and one of them is near a freeway, it is likely that we are talking about a lower-income household than in the opposite case.
+
+
+\begin{figure}[h!]
+\centering
+  \includegraphics[width=0.75\linewidth]{imagenes/Anexo/Imágenes apiladas.drawio.png}
+\caption{How Stacked Images are built}
+\label{fig:stacked}
+\source{Source: Satellite Imagery provided by CONAE.}
+\end{figure}
+
+Table \ref{tab:tamaños}  compares the test set $R^2$ for the different image sizes previously mentioned. According to what is described in the methodology, we use the parameters of the period that minimize the MSE in the validation set. The six selected models have a high predictive power, with all of them exceeding 0.84. The model with the best performance, as we expected, is the one that combines the smaller-sized images ($50x50$m) with the bigger-sized ones ($200x200$m), which reached an R-squared of $0.878$. This model is the one used in the results section. However, it is worth mentioning that, compared to the worst performant model of such table, there's only a small improvement of $0.03$ points in the $R^2$. However, although we do not formally include it in this work, in qualitative assessments the model of stacked images  achieves a better spatial consistency in its predictions.
+
+\begin{table}
+\caption{Model's results for different image sizes}
+\label{tab:tamaños}
+\begin{tabular}{|cl|ccc|}
+\hline \multicolumn{1}{|l}{}         &             & \multicolumn{3}{c|}{Imagen apilada}  \\
+\multicolumn{1}{|l}{}         &             & Ninguna & 100x100 mts & 200x200 mts \\ \hline 
+\multirow{3}{*}{Imagen base} & 50x50 mts   & 0.847  & 0.858      & \textbf{0.878}
+            \\
+                             & 100x100 mts & 0.860  & -           & 0.863       \\
+                             & 200x200 mts & 0.849  & -           & -       \\ \hline    
+\end{tabular}
+\end{table}
+
+\subsection{Training and Validation of the model} \label{annex:entrenamiento}
+
+\begin{figure}[t]
+    \centering
+    \includegraphics[width=\linewidth]{imagenes/Anexo/Entrenamiento.png}
+    \caption{Mean squared error through training}
+    \label{fig:train_metrics}
+\end{figure}
+
+Figure \ref{fig:train_metrics} shows the evolution of the MSE throughout the training process in the training and validation sets. The blue curve depicts the loss function used in the training: the MSE between the predicted income for each image and the census tract average income (equation \ref{MSE_img}). The orange curve presents the same metric over the validation set. Finally, the green curve represents the MSE computed by comparing the average of every prediction of a census tract in the validation set with the average income of that tract (equation \ref{MSE}). As we previously mentioned, this error at a census tract level is lower than the calculated error for each image, since there can be variations in each census tract income. In these cases, since the average per capita income of the census tract is the same for the rest of the images, if the income varies between each image, the error will be bigger.
+
+The model’s parameters selected to produce the results of this work are the ones obtained in the checkpoint for the epoch 141 of the training process, since such epoch presented the lower MSE per census tract over the validation set.
+
+\end{document}
