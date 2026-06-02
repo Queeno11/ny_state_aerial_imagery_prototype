@@ -1,13 +1,13 @@
 # Fdb version 4
-["bibtex main"] 1780347078.93247 "main.aux" "main.bbl" "main" 1780347412.46695 0
+["bibtex main"] 1780421579.70443 "main.aux" "main.bbl" "main" 1780421582.16085 0
   "./references.bib" 1780346918.39766 11608 af4cd0efdf4406f37f7b946011571ddf ""
   "C:/Users/abbat/AppData/Local/Programs/MiKTeX/bibtex/bst/beebe/apa.bst" 954234833 23582 e3c8338eb1efb7432441aa8861285f53 ""
-  "main.aux" 1780347411.46497 14782 e7a61a75bde54ac4c945a85f35402196 "pdflatex"
+  "main.aux" 1780421581.23372 15687 113ce0dcdb0d80e16e04c325dfc75e7c "pdflatex"
   (generated)
   "main.bbl"
   "main.blg"
   (rewritten before read)
-["pdflatex"] 1780347410.11453 "c:/Working Papers/NY State Aerial Imagery Prototype/ny_state_aerial_imagery_prototype/paper/tex_project/NY_Aerial_Imagery/main.tex" "main.pdf" "main" 1780347412.46814 0
+["pdflatex"] 1780421580.21377 "c:/Working Papers/NY State Aerial Imagery Prototype/ny_state_aerial_imagery_prototype/paper/latex/main.tex" "main.pdf" "main" 1780421582.16204 0
   "C:/Users/abbat/AppData/Local/MiKTeX/fonts/map/pdftex/pdftex.map" 1780346164.3459 82507 a9eef8696c92627b87e9975edea03b2a ""
   "C:/Users/abbat/AppData/Local/MiKTeX/miktex/data/le/pdftex/pdflatex.fmt" 1780328639.05394 13353041 cecdf7c33ff644fb516a5f16778d6faa ""
   "C:/Users/abbat/AppData/Local/Programs/MiKTeX/fonts/enc/dvips/base/8r.enc" 1458473887 4993 1194fb36dfcb11d9ae9802f2b00b60a3 ""
@@ -55,6 +55,7 @@
   "C:/Users/abbat/AppData/Local/Programs/MiKTeX/fonts/type1/public/amsfonts/cm/cmr8.pfb" 1247596667 32726 0a1aea6fcd6468ee2cf64d891f5c43c8 ""
   "C:/Users/abbat/AppData/Local/Programs/MiKTeX/fonts/type1/public/amsfonts/cm/cmsy10.pfb" 1247596667 32569 5e5ddc8df908dea60932f3c484a54c0d ""
   "C:/Users/abbat/AppData/Local/Programs/MiKTeX/fonts/type1/public/amsfonts/cm/cmsy5.pfb" 1247596666 32915 7bf7720c61a5b3a7ff25b0964421c9b6 ""
+  "C:/Users/abbat/AppData/Local/Programs/MiKTeX/fonts/type1/public/amsfonts/cm/cmsy6.pfb" 1247596667 32587 1788b0c1c5b39540c96f5e42ccd6dae8 ""
   "C:/Users/abbat/AppData/Local/Programs/MiKTeX/fonts/type1/public/amsfonts/cm/cmsy7.pfb" 1247596666 32716 08e384dc442464e7285e891af9f45947 ""
   "C:/Users/abbat/AppData/Local/Programs/MiKTeX/fonts/type1/public/amsfonts/cm/cmsy8.pfb" 1247596667 32626 4f5c1b83753b1dd3a97d1b399a005b4b ""
   "C:/Users/abbat/AppData/Local/Programs/MiKTeX/fonts/type1/public/amsfonts/symbols/msbm10.pfb" 1247596673 34694 ad62b13721ee8eda1dcc8993c8bd7041 ""
@@ -134,14 +135,16 @@
   "Figures/A_map_zoom_core.pdf" 1780347389.01401 1254088 8e3e6b335d041ade2be1b8b3f35999e7 ""
   "Figures/A_scatter_2016.pdf" 1780297959.91141 167382 98cf91b31755d9bb6b86b921822ad5f5 ""
   "Figures/B_event_study_grid.pdf" 1780297959.88611 139341 dde8fad2622585ec228eb6412b95f9cd ""
+  "Figures/Batch example (Chat GPT).png" 1780420059.42954 1845536 9ca373b9c48957612594265a8d43cdc4 ""
   "Figures/C_CSA_total.tex" 1780297959.92042 788 2648b9a0f438e05170aac1949591c94d ""
   "Figures/C_city_avg_trajectory.pdf" 1780297959.86933 100069 6adbb1080b552acab1437d91038e999e ""
   "Figures/C_long_diff_gb2_map.pdf" 1780297959.85811 305243 17a904fb97d536681199a81f2af356e3 ""
-  "Figures/tract_splits_with_dead_zone.png" 1780297959.97605 608145 6a7c3f4d6eaf77587f63c7f26e7df94e ""
-  "c:/Working Papers/NY State Aerial Imagery Prototype/ny_state_aerial_imagery_prototype/paper/tex_project/NY_Aerial_Imagery/main.tex" 1780347204.02117 72553 872dc2c6c38a1a4b13d637fa4945e529 ""
-  "main.aux" 1780347411.46497 14782 e7a61a75bde54ac4c945a85f35402196 "pdflatex"
-  "main.bbl" 1780347079.11404 3816 45442eeac25ae762a073d5e4759be7f8 "bibtex main"
-  "main.out" 1780347411.49097 4840 9f5c672e33e6d904aff0637b7b38a5b8 "pdflatex"
+  "Figures/D_hudson_yards_grid.pdf" 1780421084.44636 3201491 456fc8dd8cd77d8ad4303dc1b7ee3aec ""
+  "Figures/tract_splits_with_dead_zone.png" 1780421510.00745 625664 1a89ca8fb2808d37a504a95e4348966b ""
+  "c:/Working Papers/NY State Aerial Imagery Prototype/ny_state_aerial_imagery_prototype/paper/latex/main.tex" 1780421577.05464 76597 8c63c0c2f1ae32cb8da0debd5e1ab537 ""
+  "main.aux" 1780421581.23372 15687 113ce0dcdb0d80e16e04c325dfc75e7c "pdflatex"
+  "main.bbl" 1780421580.13995 4062 9bb638a6e358de646e0c9228d649719e "bibtex main"
+  "main.out" 1780421581.25426 4813 2460ad84cd1a298dba01625be4d1933e "pdflatex"
   (generated)
   "main.aux"
   "main.log"

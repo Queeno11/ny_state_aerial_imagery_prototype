@@ -56,6 +56,12 @@ McDonald, J.~B. (1984).
 \newblock Some generalized functions for the size distribution of income.
 \newblock {\em Econometrica}, 52(3):647--663.
 
+\bibitem[\protect\astroncite{Parikh and Grauman}{2011}]{parikh2011relative}
+Parikh, D. and Grauman, K. (2011).
+\newblock Relative attributes.
+\newblock In {\em Proceedings of the IEEE International Conference on Computer
+  Vision (ICCV)}.
+
 \bibitem[\protect\astroncite{Reed et~al.}{2023}]{reed2023scalemae}
 Reed, C.~J., Gupta, R., Li, S., Brockman, S., Funk, C., Clipp, B., Keutzer, K.,
   Candido, S., Uyttendaele, M., and Darrell, T. (2023).

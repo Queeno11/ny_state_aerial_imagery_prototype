@@ -1,6 +1,6 @@
-PWD C:\Working Papers\NY State Aerial Imagery Prototype\ny_state_aerial_imagery_prototype\paper\tex_project\NY_Aerial_Imagery
+PWD C:\Working Papers\NY State Aerial Imagery Prototype\ny_state_aerial_imagery_prototype\paper\latex
 INPUT C:\Users\abbat\AppData\Local\MiKTeX\miktex\data\le\pdftex\pdflatex.fmt
-INPUT c:\Working Papers\NY State Aerial Imagery Prototype\ny_state_aerial_imagery_prototype\paper\tex_project\NY_Aerial_Imagery\main.tex
+INPUT c:\Working Papers\NY State Aerial Imagery Prototype\ny_state_aerial_imagery_prototype\paper\latex\main.tex
 OUTPUT main.log
 INPUT C:\Users\abbat\AppData\Local\Programs\MiKTeX\tex\latex\ieeetran\IEEEtran.cls
 INPUT C:\Users\abbat\AppData\Local\Programs\MiKTeX\tex\latex\ieeetran\IEEEtran.cls
@@ -227,9 +227,18 @@ INPUT .\Figures\tract_splits_with_dead_zone.png
 INPUT .\Figures\tract_splits_with_dead_zone.png
 INPUT .\Figures\tract_splits_with_dead_zone.png
 INPUT .\Figures\tract_splits_with_dead_zone.png
+INPUT C:\Users\abbat\AppData\Local\Programs\MiKTeX\fonts\vf\adobe\times\ptmbi7t.vf
+INPUT C:\Users\abbat\AppData\Local\Programs\MiKTeX\fonts\tfm\adobe\times\ptmbi8r.tfm
 INPUT C:\Users\abbat\AppData\Local\Programs\MiKTeX\fonts\tfm\public\cm\cmbx10.tfm
 INPUT C:\Users\abbat\AppData\Local\Programs\MiKTeX\fonts\tfm\public\cm\cmbx7.tfm
 INPUT C:\Users\abbat\AppData\Local\Programs\MiKTeX\fonts\tfm\public\cm\cmbx5.tfm
+INPUT .\Figures\Batch example (Chat GPT).png
+INPUT .\Figures\Batch example (Chat GPT).png
+INPUT .\Figures\Batch example (Chat GPT).png
+INPUT .\Figures\Batch example (Chat GPT).png
+INPUT .\Figures\Batch example (Chat GPT).png
+INPUT .\Figures\Batch example (Chat GPT).png
+INPUT .\Figures\Batch example (Chat GPT).png
 INPUT C:\Users\abbat\AppData\Local\Programs\MiKTeX\fonts\tfm\public\cm\cmr8.tfm
 INPUT C:\Users\abbat\AppData\Local\Programs\MiKTeX\fonts\tfm\public\cm\cmr6.tfm
 INPUT C:\Users\abbat\AppData\Local\Programs\MiKTeX\fonts\tfm\public\cm\cmmi8.tfm
@@ -279,24 +288,28 @@ INPUT .\Figures\C_CSA_total.tex
 INPUT .\Figures\C_CSA_total.tex
 INPUT .\Figures\C_CSA_total.tex
 INPUT Figures\C_CSA_total.tex
-INPUT .\Figures\C_city_avg_trajectory.pdf
-INPUT .\Figures\C_city_avg_trajectory.pdf
-INPUT .\Figures\C_city_avg_trajectory.pdf
-INPUT .\Figures\C_city_avg_trajectory.pdf
-INPUT .\Figures\C_city_avg_trajectory.pdf
-INPUT .\Figures\C_city_avg_trajectory.pdf
 INPUT C:\Users\abbat\AppData\Local\Programs\MiKTeX\fonts\vf\adobe\times\ptmri7t.vf
 INPUT C:\Users\abbat\AppData\Local\Programs\MiKTeX\fonts\tfm\adobe\times\ptmri8r.tfm
+INPUT .\Figures\C_city_avg_trajectory.pdf
+INPUT .\Figures\C_city_avg_trajectory.pdf
+INPUT .\Figures\C_city_avg_trajectory.pdf
+INPUT .\Figures\C_city_avg_trajectory.pdf
+INPUT .\Figures\C_city_avg_trajectory.pdf
+INPUT .\Figures\C_city_avg_trajectory.pdf
 INPUT C:\Users\abbat\AppData\Local\Programs\MiKTeX\fonts\vf\adobe\times\ptmb7t.vf
 INPUT C:\Users\abbat\AppData\Local\Programs\MiKTeX\fonts\tfm\adobe\times\ptmb8r.tfm
-INPUT C:\Users\abbat\AppData\Local\Programs\MiKTeX\fonts\vf\adobe\times\ptmbi7t.vf
-INPUT C:\Users\abbat\AppData\Local\Programs\MiKTeX\fonts\tfm\adobe\times\ptmbi8r.tfm
 INPUT .\Figures\C_long_diff_gb2_map.pdf
 INPUT .\Figures\C_long_diff_gb2_map.pdf
 INPUT .\Figures\C_long_diff_gb2_map.pdf
 INPUT .\Figures\C_long_diff_gb2_map.pdf
 INPUT .\Figures\C_long_diff_gb2_map.pdf
 INPUT .\Figures\C_long_diff_gb2_map.pdf
+INPUT .\Figures\D_hudson_yards_grid.pdf
+INPUT .\Figures\D_hudson_yards_grid.pdf
+INPUT .\Figures\D_hudson_yards_grid.pdf
+INPUT .\Figures\D_hudson_yards_grid.pdf
+INPUT .\Figures\D_hudson_yards_grid.pdf
+INPUT .\Figures\D_hudson_yards_grid.pdf
 INPUT .\main.bbl
 INPUT .\main.bbl
 INPUT main.bbl
@@ -331,6 +344,8 @@ INPUT C:\Users\abbat\AppData\Local\Programs\MiKTeX\fonts\type1\public\amsfonts\c
 INPUT C:\Users\abbat\AppData\Local\Programs\MiKTeX\fonts\type1\public\amsfonts\cm\cmsy10.pfb
 INPUT C:\Users\abbat\AppData\Local\Programs\MiKTeX\fonts\type1\public\amsfonts\cm\cmsy5.pfb
 INPUT C:\Users\abbat\AppData\Local\Programs\MiKTeX\fonts\type1\public\amsfonts\cm\cmsy5.pfb
+INPUT C:\Users\abbat\AppData\Local\Programs\MiKTeX\fonts\type1\public\amsfonts\cm\cmsy6.pfb
+INPUT C:\Users\abbat\AppData\Local\Programs\MiKTeX\fonts\type1\public\amsfonts\cm\cmsy6.pfb
 INPUT C:\Users\abbat\AppData\Local\Programs\MiKTeX\fonts\type1\public\amsfonts\cm\cmsy7.pfb
 INPUT C:\Users\abbat\AppData\Local\Programs\MiKTeX\fonts\type1\public\amsfonts\cm\cmsy7.pfb
 INPUT C:\Users\abbat\AppData\Local\Programs\MiKTeX\fonts\type1\public\amsfonts\cm\cmsy8.pfb

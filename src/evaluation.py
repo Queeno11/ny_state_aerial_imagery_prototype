@@ -55,7 +55,7 @@ warnings.filterwarnings("ignore", category=UserWarning)
 pt = 1./72.27 # Hundreds of years of history... 72.27 points to an inch.
 journal_sizes = {
     "Latex": {"onecol": 354.*pt, "twocol": (354-35)/2*pt},
-    "IEETRAN": {"onecol": 252.*pt, "twocol": 526.3*pt}, # CQG is only one column
+    "IEETRAN": {"onecol": 252.*pt, "twocol": 526.3*pt, "textheight_a4": 680.*pt}, # CQG is only one column; textheight_a4 = 239 mm for A4
     # Add more journals below. Can add more properties to each journal
 }
 # Our figure's aspect ratio
@@ -712,7 +712,345 @@ def part_b(results_dir: Path, processed_dir: Path, out: Path) -> None:
     fig.tight_layout()
     _savefig(fig, out / "figures" / "B_building_trajectories.pdf")
 
+    _plot_building_income_trajectories(
+        results_dir, processed_dir, out, bldg_long, stable_ex, changed_ex
+    )
+    _plot_tract_income_trajectories(out, tract_long, tract_wide)
 
+
+
+
+def _plot_building_income_trajectories(
+    results_dir: Path,
+    processed_dir: Path,
+    out: Path,
+    bldg_long: pd.DataFrame,
+    stable_ex: pd.DataFrame,
+    changed_ex: pd.DataFrame,
+) -> None:
+    """B_building_income_trajectories: test-set buildings with GB2-mapped income vs ACS (±MOE)."""
+    print("  B.4b building income trajectories (GB2-mapped)...")
+
+    # ── Fit GB2 to ACS + collect income/MOE per year ────────────────────────
+    gb2_raw: dict[int, tuple] = {}
+    acs_frames: dict[int, pd.DataFrame] = {}
+
+    for yr in YEARS:
+        fpath = ACS_ROOT_DIR / str(yr) / f"ny_tracts_acs5_{yr}.feather"
+        if not fpath.exists():
+            continue
+        try:
+            df  = pd.read_feather(fpath)
+            nyc = df[df["geoid"].str.startswith(NYC_COUNTY_PREFIXES)].copy()
+            nyc["geoid"] = nyc["geoid"].astype(str).str.zfill(11)
+            nyc = nyc.drop_duplicates("geoid").set_index("geoid")
+
+            A = nyc["per_capita_income_usd"].dropna().values.astype(float)
+            A = A[A > 0]
+            if len(A) < 20:
+                continue
+
+            gb2_raw[yr] = _fit_gb2(A)
+
+            result = nyc[["per_capita_income_usd"]].copy()
+            result["moe"] = np.nan
+            for moe_cand in [
+                "per_capita_income_usd_moe",
+                "per_capita_income_moe",
+                "per_capita_income_moe_usd",
+            ]:
+                if moe_cand in nyc.columns:
+                    result["moe"] = nyc[moe_cand].astype(float)
+                    break
+            acs_frames[yr] = result
+        except Exception as exc:
+            print(f"    ACS {yr} error: {exc}")
+
+    avail = sorted(gb2_raw)
+    if not avail:
+        print("    No ACS data — skipping B_building_income_trajectories")
+        return
+
+    gb2_smooth = _smooth_gb2_params(avail, gb2_raw)
+
+    # ── Apply GB2 per year: full distribution → per-building income ──────────
+    gb2_bldg: dict[int, pd.Series] = {}
+    for yr in avail:
+        sub = bldg_long[bldg_long["year"] == yr].dropna(subset=["predicted_value"])
+        if len(sub) == 0:
+            continue
+        mapped = _gb2_apply_from_ranks(
+            sub["predicted_value"].values.astype(float),
+            gb2_smooth[yr],
+        )
+        gb2_bldg[yr] = pd.Series(mapped, index=sub["DOITT_ID"].values)
+
+    # ── Per-building trajectory helper ───────────────────────────────────────
+    def _traj(did, geoid):
+        py, pi = [], []
+        for yr in YEARS:
+            if yr not in gb2_bldg:
+                continue
+            s = gb2_bldg[yr]
+            if did in s.index:
+                v = float(s[did])
+                if np.isfinite(v):
+                    py.append(yr); pi.append(v)
+
+        ay, ai, am = [], [], []
+        for yr in YEARS:
+            if yr not in acs_frames or geoid not in acs_frames[yr].index:
+                continue
+            row_acs = acs_frames[yr].loc[geoid]
+            inc = float(row_acs["per_capita_income_usd"])
+            if not np.isfinite(inc):
+                continue
+            moe_v = float(row_acs["moe"]) if pd.notna(row_acs["moe"]) else np.nan
+            ay.append(yr); ai.append(inc)
+            am.append(moe_v if np.isfinite(moe_v) else 0.0)
+        return py, pi, ay, ai, am
+
+    # ── Figure ───────────────────────────────────────────────────────────────
+    n_ex = 5
+    fig, axes = plt.subplots(2, n_ex, figsize=(14, 6), sharey=False)
+
+    _legend_drawn = False
+
+    for col, (did, row) in enumerate(stable_ex.iterrows()):
+        ax = axes[0, col]
+        py, pi, ay, ai, am = _traj(did, row["GEOID_str"])
+
+        if py:
+            ax.plot(py, pi, "o-", color="steelblue", ms=3.5, lw=1.2, label="Model (GB2)")
+        if ay:
+            ai_arr = np.array(ai, dtype=float)
+            am_arr = np.array(am, dtype=float)
+            ax.plot(ay, ai_arr, "s--", color="black", ms=3.5, lw=1.0, label="ACS")
+            moe_ok = am_arr > 0
+            if moe_ok.any():
+                ax.fill_between(
+                    np.array(ay)[moe_ok],
+                    (ai_arr - am_arr)[moe_ok],
+                    (ai_arr + am_arr)[moe_ok],
+                    color="black", alpha=0.15, label="ACS ±MOE",
+                )
+
+        ax.set_title(f"DOITT {did}", fontsize=7)
+        ax.set_xticks(YEARS)
+        ax.tick_params(axis="x", rotation=45, labelsize=6)
+        ax.tick_params(axis="y", labelsize=6)
+        if col == 0:
+            ax.set_ylabel("Income (USD)\n[Stable]", fontsize=8)
+        if not _legend_drawn:
+            ax.legend(fontsize=6, loc="upper left")
+            _legend_drawn = True
+
+    changed_iter = list(changed_ex.iterrows())
+    for col in range(n_ex):
+        ax = axes[1, col]
+        if col < len(changed_iter):
+            did, row = changed_iter[col]
+            py, pi, ay, ai, am = _traj(did, row["GEOID_str"])
+
+            if py:
+                ax.plot(py, pi, "o-", color="firebrick", ms=3.5, lw=1.2, label="Model (GB2)")
+            if ay:
+                ai_arr = np.array(ai, dtype=float)
+                am_arr = np.array(am, dtype=float)
+                ax.plot(ay, ai_arr, "s--", color="black", ms=3.5, lw=1.0, label="ACS")
+                moe_ok = am_arr > 0
+                if moe_ok.any():
+                    ax.fill_between(
+                        np.array(ay)[moe_ok],
+                        (ai_arr - am_arr)[moe_ok],
+                        (ai_arr + am_arr)[moe_ok],
+                        color="black", alpha=0.15, label="ACS ±MOE",
+                    )
+
+            cy = row["change_year"]
+            if pd.notna(cy):
+                ax.axvline(float(cy), color="gray", ls="--", lw=1.0)
+            ax.set_title(f"DOITT {did}", fontsize=7)
+
+        ax.set_xticks(YEARS)
+        ax.tick_params(axis="x", rotation=45, labelsize=6)
+        ax.tick_params(axis="y", labelsize=6)
+        ax.set_xlabel("Year", fontsize=7)
+        if col == 0:
+            ax.set_ylabel("Income (USD)\n[Changed, -- = change year]", fontsize=8)
+
+    fig.suptitle(
+        "Building income trajectories (test tracts): GB2-mapped model vs ACS observed",
+        fontsize=10,
+    )
+    fig.tight_layout()
+    _savefig(fig, out / "figures" / "B_building_income_trajectories.pdf")
+
+
+def _plot_tract_income_trajectories(
+    out: Path,
+    tract_long: pd.DataFrame,
+    tract_wide: pd.DataFrame,
+) -> None:
+    """B_tract_income_trajectories: test-tract GB2-mapped predictions vs ACS observed (±MOE)."""
+    print("  B.4c tract income trajectories (GB2-mapped)...")
+
+    # ── Fit GB2 + load ACS income/MOE per year ──────────────────────────────
+    gb2_raw: dict[int, tuple] = {}
+    acs_frames: dict[int, pd.DataFrame] = {}
+
+    for yr in YEARS:
+        fpath = ACS_ROOT_DIR / str(yr) / f"ny_tracts_acs5_{yr}.feather"
+        if not fpath.exists():
+            continue
+        try:
+            df  = pd.read_feather(fpath)
+            nyc = df[df["geoid"].str.startswith(NYC_COUNTY_PREFIXES)].copy()
+            nyc["geoid"] = nyc["geoid"].astype(str).str.zfill(11)
+            nyc = nyc.drop_duplicates("geoid").set_index("geoid")
+
+            A = nyc["per_capita_income_usd"].dropna().values.astype(float)
+            A = A[A > 0]
+            if len(A) < 20:
+                continue
+
+            gb2_raw[yr] = _fit_gb2(A)
+
+            result = nyc[["per_capita_income_usd"]].copy()
+            result["moe"] = np.nan
+            for moe_cand in [
+                "per_capita_income_usd_moe",
+                "per_capita_income_moe",
+                "per_capita_income_moe_usd",
+            ]:
+                if moe_cand in nyc.columns:
+                    result["moe"] = nyc[moe_cand].astype(float)
+                    break
+            acs_frames[yr] = result
+        except Exception as exc:
+            print(f"    ACS {yr} error: {exc}")
+
+    avail = sorted(gb2_raw)
+    if not avail:
+        print("    No ACS data — skipping B_tract_income_trajectories")
+        return
+
+    gb2_smooth = _smooth_gb2_params(avail, gb2_raw)
+
+    # ── Apply GB2 per year: tract distribution → mapped income ──────────────
+    # Index is GEOID_str; the full tract distribution is used so ranks are city-wide.
+    gb2_tract: dict[int, pd.Series] = {}
+    for yr in avail:
+        sub = tract_long[tract_long["year"] == yr].dropna(subset=["predicted_value"])
+        if len(sub) == 0:
+            continue
+        mapped = _gb2_apply_from_ranks(
+            sub["predicted_value"].values.astype(float),
+            gb2_smooth[yr],
+        )
+        gb2_tract[yr] = pd.Series(mapped, index=sub["GEOID_str"].values)
+
+    # ── Select 10 test tracts stratified by income level ────────────────────
+    year_cols_int = [y for y in YEARS if y in tract_wide.columns]
+    test_wide = tract_wide[tract_wide["type"] == "test"].copy()
+
+    n_complete = np.isfinite(
+        test_wide[year_cols_int].values.astype(float)
+    ).sum(axis=1)
+    candidates = test_wide[n_complete >= 6].copy()
+    if len(candidates) < 5:
+        candidates = test_wide.copy()
+
+    ref_yr = 2016 if 2016 in candidates.columns else year_cols_int[0]
+    candidates = candidates.dropna(subset=[ref_yr])
+
+    n_pick = 10
+    if len(candidates) >= n_pick:
+        candidates["_q"] = pd.qcut(
+            candidates[ref_yr], q=n_pick, labels=False, duplicates="drop"
+        )
+        selected = (
+            candidates.groupby("_q", group_keys=False)
+            .apply(lambda g: g.sample(1, random_state=7))
+            .head(n_pick)
+        )
+        selected = selected.drop(columns=["_q"], errors="ignore")
+    else:
+        selected = candidates
+
+    # ── Per-tract trajectory helper ──────────────────────────────────────────
+    def _traj(geoid):
+        py, pi = [], []
+        for yr in YEARS:
+            if yr not in gb2_tract or geoid not in gb2_tract[yr].index:
+                continue
+            v = float(gb2_tract[yr][geoid])
+            if np.isfinite(v):
+                py.append(yr); pi.append(v)
+
+        ay, ai, am = [], [], []
+        for yr in YEARS:
+            if yr not in acs_frames or geoid not in acs_frames[yr].index:
+                continue
+            row_acs = acs_frames[yr].loc[geoid]
+            inc = float(row_acs["per_capita_income_usd"])
+            if not np.isfinite(inc):
+                continue
+            moe_v = float(row_acs["moe"]) if pd.notna(row_acs["moe"]) else np.nan
+            ay.append(yr); ai.append(inc)
+            am.append(moe_v if np.isfinite(moe_v) else 0.0)
+        return py, pi, ay, ai, am
+
+    # ── Figure: 2 rows × 5 cols ──────────────────────────────────────────────
+    n_rows, n_cols = 2, 5
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(14, 6), sharey=False)
+    axes_list = list(axes.flat)
+    selected_list = list(selected.iterrows())
+
+    _legend_drawn = False
+
+    for i, (geoid, _row) in enumerate(selected_list):
+        ax = axes_list[i]
+        py, pi, ay, ai, am = _traj(geoid)
+
+        if py:
+            ax.plot(py, pi, "o-", color="steelblue", ms=3.5, lw=1.2, label="Model (GB2)")
+        if ay:
+            ai_arr = np.array(ai, dtype=float)
+            am_arr = np.array(am, dtype=float)
+            ax.plot(ay, ai_arr, "s--", color="black", ms=3.5, lw=1.0, label="ACS")
+            moe_ok = am_arr > 0
+            if moe_ok.any():
+                ax.fill_between(
+                    np.array(ay)[moe_ok],
+                    (ai_arr - am_arr)[moe_ok],
+                    (ai_arr + am_arr)[moe_ok],
+                    color="black", alpha=0.15, label="ACS ±MOE",
+                )
+
+        ax.set_title(f"Tract …{geoid[-6:]}", fontsize=7)
+        ax.set_xticks(YEARS)
+        ax.tick_params(axis="x", rotation=45, labelsize=6)
+        ax.tick_params(axis="y", labelsize=6)
+        ax.set_xlabel("Year", fontsize=7)
+
+        if not _legend_drawn:
+            ax.legend(fontsize=6, loc="upper left")
+            _legend_drawn = True
+
+    for ax in axes_list[len(selected_list):]:
+        ax.axis("off")
+
+    for r in range(n_rows):
+        axes[r, 0].set_ylabel("Per-capita income (USD)", fontsize=8)
+
+    fig.suptitle(
+        "Tract income trajectories (test set, stratified by income level):\n"
+        "GB2-mapped model (blue) vs ACS observed (black ± MOE)",
+        fontsize=9,
+    )
+    fig.tight_layout()
+    _savefig(fig, out / "figures" / "B_tract_income_trajectories.pdf")
 
 
 # ─── Part C ───────────────────────────────────────────────────────────────────
@@ -1541,13 +1879,14 @@ def part_e(
     # ── E.1 8×3 grid ─────────────────────────────────────────────────────────
     print("  E.1 8×3 image grid...")
     n_rows = len(YEARS)
-    fw = FIG_SIZE_TWO_COL[0]
-    panel_h = fw / 3 * 0.90          # slightly sub-square panels
+    fw = journal_sizes["IEETRAN"]["onecol"]   # single-column width (252 pt ≈ 3.49 in)
+    # Full A4 text height (IEEEtran: 239 mm ≈ 680 pt) minus a 2-line caption (~30 pt)
+    fh = journal_sizes["IEETRAN"]["textheight_a4"] - 30. * pt
     bottom_pad = 0.055                # figure fraction reserved for cbar + legend
 
     fig_g, axes_g = plt.subplots(
         n_rows, 3,
-        figsize=(fw, n_rows * panel_h),
+        figsize=(fw, fh),
         gridspec_kw={"hspace": 0.015, "wspace": 0.015},
     )
 
