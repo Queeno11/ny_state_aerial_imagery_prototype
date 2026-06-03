@@ -1,0 +1,130 @@
+\documentclass[11pt]{article}
+\usepackage{amsmath,amssymb,amsthm,bm}
+\usepackage[margin=1in]{geometry}
+
+\theoremstyle{plain}
+\newtheorem{assumption}{Assumption}
+\newtheorem{proposition}{Proposition}
+\newtheorem{corollary}{Corollary}
+\theoremstyle{remark}
+\newtheorem{remark}{Remark}
+
+\newcommand{\E}{\mathbb{E}}
+\newcommand{\Var}{\operatorname{Var}}
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\Xt}{X_\tau}
+\newcommand{\pto}{\xrightarrow{p}}
+
+\title{\vspace{-3em}What the Score Identifies: \\ Location-Expected Wealth}
+\author{}
+\date{}
+
+\begin{document}
+\maketitle
+\vspace{-3em}
+
+\paragraph{Setup and notation.}
+Index buildings by $b$, with location $s_b\in\R^2$, census tract $i(b)$, and survey
+year $t$ (suppressed where not needed). Let $w_b\in\R$ denote the latent structural
+(log-)wealth of $b$: the monotone index of the marginal occupant's permanent income
+that, under spatial equilibrium, is capitalized into the location--structure bundle
+at $s_b$. Let $\Xt(b)$ be the orthoimagery tile of radius $\tau$ centered on $b$'s
+footprint centroid---the model's only input---and let $Z_{i,t}$ be the standardized
+ACS tract score used as the training label, so that every $b\in i$ inherits
+$Z_{i(b),t}$. The model produces a scalar
+$R_b = g_\phi\!\big(f_\theta(\Xt(b))\big)\in\R$, where $f_\theta$ is the
+(LoRA-adapted ScaleMAE) encoder and $g_\phi$ the head.
+
+\begin{assumption}[Monotone label]\label{a:label}
+There is a strictly increasing $\Lambda$ with
+$\E[Z_{i,t}\mid i]=\Lambda(\bar w_{i,t})$, where
+$\bar w_{i,t}=\E[w_b\mid b\in i]$. The tract label is a monotone, unbiased signal of
+tract-mean wealth.
+\end{assumption}
+
+\begin{assumption}[Locational sufficiency]\label{a:smooth}
+The regression function
+$m_\tau(x):=\E[\,w_b \mid \Xt(b)=x\,]$ is well-defined and continuous, and the tile
+scale $\tau$ is comparable to the local tract scale, so that
+$\E[\bar w_{i(b)}\mid \Xt(b)] = m_\tau(b)+o(1)$.
+\end{assumption}
+
+\begin{assumption}[Within-tract variation is unsupervised]\label{a:noise}
+Training treats within-tract deviations $w_b-\bar w_{i(b)}$ as mean-zero noise (no
+label distinguishes buildings within a tract); $g_\phi$ minimizes the population
+within-year RankNet risk under the unit-variance normalization $\Var(R)=1$.
+\end{assumption}
+
+\paragraph{Estimand.}
+Define the \emph{location-expected wealth}
+\begin{equation}
+m_\tau(b)\;:=\;\E\!\big[\,w_{b'}\;\big|\;\Xt(b')=\Xt(b)\,\big],
+\end{equation}
+the mean latent wealth over all buildings whose $\tau$-neighborhood imagery coincides
+with $b$'s. This is the regression of wealth on the image---a Nadaraya--Watson
+smoother in the encoder's feature space, with finite-sample analogue
+\begin{equation}
+\hat m_\tau(b)=
+\frac{\sum_j K_h\!\big(f_\theta(\Xt(b))-f_\theta(\Xt(b_j))\big)\,w_{b_j}}
+     {\sum_j K_h\!\big(f_\theta(\Xt(b))-f_\theta(\Xt(b_j))\big)},
+\end{equation}
+for a kernel $K_h$ of bandwidth $h$ on feature space. The trained network is a
+parametric approximation to this smoother; the tile radius $\tau$ acts as a second,
+\emph{spatial} bandwidth governing how much neighborhood context is averaged into each
+prediction.
+
+\begin{proposition}[Locational identification / rank consistency]\label{p:id}
+Under Assumptions~\ref{a:label}--\ref{a:noise}, as the training sample grows the score
+is rank-consistent for the location-expected wealth: there exists a strictly increasing
+$\varphi$ with
+\begin{equation}
+R_b\;\pto\;\varphi\big(m_\tau(b)\big).
+\end{equation}
+Hence $R_b$ identifies the ordering of $m_\tau(b)$---the wealth of the building's
+\emph{location}---and not the ordering of the building-specific wealth $w_b$.
+Equivalently, the population minimizer of the within-year RankNet risk is any monotone
+transform of $x\mapsto \E[\,w\mid \Xt=x\,]$.
+\end{proposition}
+
+\noindent\emph{To be shown.} The population RankNet risk for a fixed year is minimized
+by any score monotone in the conditional label expectation $\E[Z\mid\Xt]$; by
+Assumptions~\ref{a:label}--\ref{a:smooth} this is a strictly increasing transform of
+$m_\tau$, and Assumption~\ref{a:noise} fixes the scale, leaving only the rank.
+
+\begin{corollary}[Shrinkage toward local context, and measurable bounds]\label{c:shrink}
+Decompose $w_b = m_\tau(b)+e_b$ with $\E[e_b\mid\Xt(b)]=0$, and let the tile carry a
+noisy measurement $\tilde\delta_b=\delta_b+\nu_b$ of the within-tract deviation
+$\delta_b=w_b-\bar w_{i(b)}$, with $\Var(\delta)=\sigma_\delta^2$ and
+$\Var(\nu)=\sigma_\nu^2(\tau)$. Working in the standardized score scale, the
+best linear predictor shrinks toward the local mean:
+\begin{equation}
+\E[\,R_b\mid w_b\,]-\bar R_{i(b)}
+=\rho_\tau\,\big(w_b-\bar w_{i(b)}\big),
+\qquad
+\rho_\tau=\frac{\sigma_\delta^2}{\sigma_\delta^2+\sigma_\nu^2(\tau)}\in[0,1].
+\end{equation}
+Consequently:
+\begin{enumerate}
+\itemsep0.1em
+\item[(i)] $R_b$ is rank-unbiased for $m_\tau(b)$ but \emph{attenuated} for $w_b$,
+with building-level bias $(1-\rho_\tau)\,(w_b-\bar w_{i(b)})$;
+\item[(ii)] the bias vanishes for buildings representative of their surroundings and is
+largest for outliers (a rich structure on a poor block, and conversely);
+\item[(iii)] $\rho_\tau$ is decreasing in $\tau$ and in the spatial-autocorrelation
+range relative to $\tau$, with limits $\rho_\tau\to 0$ (degenerate to the tract mean,
+$R_b\to\bar R_{i}$) and $\rho_\tau\uparrow$ as $\tau\downarrow$ (finer building
+resolution at the cost of smoother variance)---the bias--variance role of the spatial
+bandwidth $\tau$.
+\end{enumerate}
+\end{corollary}
+
+\begin{remark}[Testable implication without building-level ground truth]\label{r:test}
+Because $\rho_\tau$ governs how far $R_b$ departs from its tract mean, the within-tract
+dispersion of predicted scores should increase in \emph{observable} within-tract
+built-environment heterogeneity $H_i$ (dispersion of footprint area, height, vintage),
+with $\Var(R_b-\bar R_{i}\mid i)\to 0$ as $H_i\to 0$. This yields an observable proxy
+for $\rho_\tau$ and an external check on the location-wealth interpretation that
+requires no building-level income labels.
+\end{remark}
+
+\end{document}

@@ -713,9 +713,11 @@ def part_b(results_dir: Path, processed_dir: Path, out: Path) -> None:
     _savefig(fig, out / "figures" / "B_building_trajectories.pdf")
 
     _plot_building_income_trajectories(
-        results_dir, processed_dir, out, bldg_long, stable_ex, changed_ex
+        results_dir, processed_dir, out, bldg_long, bldg_wide, year_cols
     )
     _plot_tract_income_trajectories(out, tract_long, tract_wide)
+    _plot_percentile_trajectories(out, tract_long)
+    _plot_tract_rank_trajectories(out, tract_long, tract_wide)
 
 
 
@@ -725,11 +727,20 @@ def _plot_building_income_trajectories(
     processed_dir: Path,
     out: Path,
     bldg_long: pd.DataFrame,
-    stable_ex: pd.DataFrame,
-    changed_ex: pd.DataFrame,
+    bldg_wide: pd.DataFrame,
+    year_cols: list[int],
 ) -> None:
     """B_building_income_trajectories: test-set buildings with GB2-mapped income vs ACS (±MOE)."""
     print("  B.4b building income trajectories (GB2-mapped)...")
+
+    # ── Sample buildings independently from B_building_trajectories ──────────
+    n_ex = 5
+    n_year_valid = np.isfinite(bldg_wide[year_cols].values.astype(float)).sum(axis=1)
+    has_2yr       = n_year_valid >= 2
+    stab_mask = has_2yr & ~bldg_wide["changed"].fillna(False).astype(bool) & (bldg_wide["type"] == "test").fillna(False)
+    chng_mask = has_2yr &  bldg_wide["changed"].fillna(False).astype(bool) & (bldg_wide["type"] == "test").fillna(False)
+    stable_ex  = bldg_wide[stab_mask].sample(n_ex, random_state=555)
+    changed_ex = bldg_wide[chng_mask].dropna(subset=["change_year"]).sample(n_ex, random_state=666)
 
     # ── Fit GB2 to ACS + collect income/MOE per year ────────────────────────
     gb2_raw: dict[int, tuple] = {}
@@ -755,9 +766,9 @@ def _plot_building_income_trajectories(
             result = nyc[["per_capita_income_usd"]].copy()
             result["moe"] = np.nan
             for moe_cand in [
+                "per_capita_income_usd_error",
                 "per_capita_income_usd_moe",
                 "per_capita_income_moe",
-                "per_capita_income_moe_usd",
             ]:
                 if moe_cand in nyc.columns:
                     result["moe"] = nyc[moe_cand].astype(float)
@@ -919,9 +930,9 @@ def _plot_tract_income_trajectories(
             result = nyc[["per_capita_income_usd"]].copy()
             result["moe"] = np.nan
             for moe_cand in [
+                "per_capita_income_usd_error",
                 "per_capita_income_usd_moe",
                 "per_capita_income_moe",
-                "per_capita_income_moe_usd",
             ]:
                 if moe_cand in nyc.columns:
                     result["moe"] = nyc[moe_cand].astype(float)
@@ -1051,6 +1062,275 @@ def _plot_tract_income_trajectories(
     )
     fig.tight_layout()
     _savefig(fig, out / "figures" / "B_tract_income_trajectories.pdf")
+
+
+def _plot_percentile_trajectories(
+    out: Path,
+    tract_long: pd.DataFrame,
+) -> None:
+    """B_percentile_trajectories: ACS vs GB2-mapped model percentile fan over time."""
+    print("  B.4d percentile trajectories (ACS vs model)...")
+
+    PCTS = [10, 25, 50, 75, 90]
+
+    # ── Load ACS + fit GB2 per year ──────────────────────────────────────────
+    gb2_raw: dict[int, tuple] = {}
+    acs_vals: dict[int, np.ndarray] = {}   # raw income arrays
+
+    for yr in YEARS:
+        fpath = ACS_ROOT_DIR / str(yr) / f"ny_tracts_acs5_{yr}.feather"
+        if not fpath.exists():
+            continue
+        try:
+            df  = pd.read_feather(fpath)
+            nyc = df[df["geoid"].str.startswith(NYC_COUNTY_PREFIXES)].copy()
+            nyc["geoid"] = nyc["geoid"].astype(str).str.zfill(11)
+            nyc = nyc.drop_duplicates("geoid")
+            A   = nyc["per_capita_income_usd"].dropna().values.astype(float)
+            A   = A[A > 0]
+            if len(A) < 20:
+                continue
+            acs_vals[yr] = A
+            gb2_raw[yr]  = _fit_gb2(A)
+        except Exception as exc:
+            print(f"    ACS {yr} error: {exc}")
+
+    avail = sorted(gb2_raw)
+    if not avail:
+        print("    No ACS data — skipping B_percentile_trajectories")
+        return
+
+    gb2_smooth = _smooth_gb2_params(avail, gb2_raw)
+
+    # ── Compute percentiles per year ─────────────────────────────────────────
+    acs_pct: dict[int, np.ndarray] = {}
+    mod_pct: dict[int, np.ndarray] = {}
+
+    for yr in avail:
+        acs_pct[yr] = np.percentile(acs_vals[yr], PCTS)
+
+        sub    = tract_long[tract_long["year"] == yr].dropna(subset=["predicted_value"])
+        mapped = _gb2_apply_from_ranks(
+            sub["predicted_value"].values.astype(float),
+            gb2_smooth[yr],
+        )
+        fin = mapped[np.isfinite(mapped)]
+        mod_pct[yr] = np.percentile(fin, PCTS) if len(fin) >= 10 else np.full(len(PCTS), np.nan)
+
+    years = np.array(avail)
+
+    def _pct_series(pct_dict, pct_idx):
+        return np.array([pct_dict[yr][pct_idx] for yr in avail], dtype=float)
+
+    # ── Figure ───────────────────────────────────────────────────────────────
+    fig, ax = plt.subplots(figsize=FIG_SIZE_TWO_COL)
+
+    pct_colors = plt.cm.plasma(np.linspace(0.1, 0.85, len(PCTS)))
+
+    for j, (p, col) in enumerate(zip(PCTS, pct_colors)):
+        acs_y = _pct_series(acs_pct, j)
+        mod_y = _pct_series(mod_pct, j)
+        ax.plot(years, acs_y, "-",  color=col, lw=2.0)
+        ax.plot(years, mod_y, "--", color=col, lw=1.5)
+
+    # IQR shading (P25–P75)
+    ax.fill_between(
+        years,
+        _pct_series(acs_pct, 1), _pct_series(acs_pct, 3),
+        color="gray", alpha=0.12, label="_nolegend_",
+    )
+    ax.fill_between(
+        years,
+        _pct_series(mod_pct, 1), _pct_series(mod_pct, 3),
+        color="steelblue", alpha=0.10, label="_nolegend_",
+    )
+
+    # Legend: percentile colours + line-style explanation
+    pct_handles = [
+        plt.Line2D([0], [0], color=pct_colors[j], lw=2, label=f"P{p}")
+        for j, p in enumerate(PCTS)
+    ]
+    style_handles = [
+        plt.Line2D([0], [0], color="0.35", lw=2.0, ls="-",  label="ACS 5-yr"),
+        plt.Line2D([0], [0], color="0.35", lw=1.5, ls="--", label="Model (GB2)"),
+    ]
+    ax.legend(
+        handles=pct_handles + style_handles,
+        ncol=2, fontsize=7, loc="upper left",
+    )
+
+    ax.set_xlabel("Year")
+    ax.set_ylabel("Per-capita income (USD)")
+    ax.set_xticks(YEARS)
+    ax.tick_params(axis="x", rotation=45)
+    ax.set_title(
+        "NYC tract income distribution over time: ACS (solid) vs GB2-mapped model (dashed)",
+        fontsize=9,
+    )
+    fig.tight_layout()
+    _savefig(fig, out / "figures" / "B_percentile_trajectories.pdf")
+
+
+def _plot_tract_rank_trajectories(
+    out: Path,
+    tract_long: pd.DataFrame,
+    tract_wide: pd.DataFrame,
+) -> None:
+    """B_tract_rank_trajectories: per-tract percentile rank over time, ACS vs model."""
+    from scipy.stats import percentileofscore
+    print("  B.4e tract rank trajectories...")
+
+    # ── Load ACS income + MOE per year ───────────────────────────────────────
+    acs_frames: dict[int, pd.DataFrame] = {}
+
+    for yr in YEARS:
+        fpath = ACS_ROOT_DIR / str(yr) / f"ny_tracts_acs5_{yr}.feather"
+        if not fpath.exists():
+            continue
+        try:
+            df  = pd.read_feather(fpath)
+            nyc = df[df["geoid"].str.startswith(NYC_COUNTY_PREFIXES)].copy()
+            nyc["geoid"] = nyc["geoid"].astype(str).str.zfill(11)
+            nyc = nyc.drop_duplicates("geoid").set_index("geoid")
+            result = nyc[["per_capita_income_usd"]].copy()
+            result["moe"] = np.nan
+            for moe_cand in [
+                "per_capita_income_usd_error",
+                "per_capita_income_usd_moe",
+                "per_capita_income_moe",
+            ]:
+                if moe_cand in nyc.columns:
+                    result["moe"] = nyc[moe_cand].astype(float)
+                    break
+            acs_frames[yr] = result.dropna(subset=["per_capita_income_usd"])
+        except Exception as exc:
+            print(f"    ACS {yr} error: {exc}")
+
+    avail = sorted(acs_frames)
+    if not avail:
+        print("    No ACS data — skipping B_tract_rank_trajectories")
+        return
+
+    # ── Build city-wide ACS and model distributions per year ─────────────────
+    # Used as the reference pool for percentileofscore.
+    acs_dist:  dict[int, np.ndarray] = {}
+    mod_dist:  dict[int, pd.Series]  = {}   # GEOID_str → predicted_value
+
+    for yr in avail:
+        acs_dist[yr] = acs_frames[yr]["per_capita_income_usd"].values.astype(float)
+
+    for yr in avail:
+        sub = tract_long[tract_long["year"] == yr].dropna(subset=["predicted_value"])
+        mod_dist[yr] = sub.set_index("GEOID_str")["predicted_value"].astype(float)
+
+    # ── Select 10 test tracts stratified by 2016 prediction rank ─────────────
+    year_cols_int = [y for y in YEARS if y in tract_wide.columns]
+    test_wide     = tract_wide[tract_wide["type"] == "test"].copy()
+    n_complete    = np.isfinite(test_wide[year_cols_int].values.astype(float)).sum(axis=1)
+    candidates    = test_wide[n_complete >= 6].copy()
+    if len(candidates) < 5:
+        candidates = test_wide.copy()
+
+    ref_yr = 2016 if 2016 in candidates.columns else year_cols_int[0]
+    candidates = candidates.dropna(subset=[ref_yr])
+
+    n_pick = 10
+    if len(candidates) >= n_pick:
+        candidates["_q"] = pd.qcut(
+            candidates[ref_yr], q=n_pick, labels=False, duplicates="drop"
+        )
+        selected = (
+            candidates.groupby("_q", group_keys=False)
+            .apply(lambda g: g.sample(1, random_state=7))
+            .head(n_pick)
+            .drop(columns=["_q"], errors="ignore")
+        )
+    else:
+        selected = candidates
+
+    # ── Per-tract rank trajectory helper ─────────────────────────────────────
+    def _rank_traj(geoid):
+        py, pr = [], []          # predicted rank
+        ay, ar, ar_lo, ar_hi = [], [], [], []   # ACS rank + MOE bounds
+
+        for yr in avail:
+            # Model rank
+            if yr in mod_dist and geoid in mod_dist[yr].index:
+                pv = float(mod_dist[yr][geoid])
+                if np.isfinite(pv):
+                    pool = mod_dist[yr].values
+                    py.append(yr)
+                    pr.append(percentileofscore(pool, pv, kind="rank"))
+
+            # ACS rank + MOE uncertainty
+            if yr in acs_frames and geoid in acs_frames[yr].index:
+                row_acs = acs_frames[yr].loc[geoid]
+                inc  = float(row_acs["per_capita_income_usd"])
+                if not np.isfinite(inc):
+                    continue
+                pool = acs_dist[yr]
+                moe  = float(row_acs["moe"]) if pd.notna(row_acs["moe"]) else 0.0
+                ay.append(yr)
+                ar.append(percentileofscore(pool, inc, kind="rank"))
+                ar_lo.append(percentileofscore(pool, max(inc - moe, pool.min()), kind="rank"))
+                ar_hi.append(percentileofscore(pool, inc + moe, kind="rank"))
+
+        return py, pr, ay, ar, ar_lo, ar_hi
+
+    # ── Figure: 2 rows × 5 cols ───────────────────────────────────────────────
+    n_rows, n_cols = 2, 5
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(14, 6), sharey=False)
+    axes_list    = list(axes.flat)
+    selected_list = list(selected.iterrows())
+
+    _legend_drawn = False
+
+    for i, (geoid, _row) in enumerate(selected_list):
+        ax = axes_list[i]
+        py, pr, ay, ar, ar_lo, ar_hi = _rank_traj(geoid)
+
+        if py:
+            ax.plot(py, pr, "o-", color="steelblue", ms=3.5, lw=1.2, label="Model")
+        if ay:
+            ar_arr    = np.array(ar,    dtype=float)
+            ar_lo_arr = np.array(ar_lo, dtype=float)
+            ar_hi_arr = np.array(ar_hi, dtype=float)
+            ax.plot(ay, ar_arr, "s--", color="black", ms=3.5, lw=1.0, label="ACS")
+            moe_ok = ar_hi_arr > ar_lo_arr
+            if moe_ok.any():
+                ax.fill_between(
+                    np.array(ay)[moe_ok],
+                    ar_lo_arr[moe_ok],
+                    ar_hi_arr[moe_ok],
+                    color="black", alpha=0.15, label="ACS ±MOE",
+                )
+
+        ax.set_title(f"Tract …{geoid[-6:]}", fontsize=7)
+        ax.set_ylim(0, 100)
+        ax.set_yticks([0, 25, 50, 75, 100])
+        ax.set_xticks(YEARS)
+        ax.tick_params(axis="x", rotation=45, labelsize=6)
+        ax.tick_params(axis="y", labelsize=6)
+        ax.set_xlabel("Year", fontsize=7)
+        ax.axhline(50, color="0.75", lw=0.6, ls=":")
+
+        if not _legend_drawn:
+            ax.legend(fontsize=6, loc="upper left")
+            _legend_drawn = True
+
+    for ax in axes_list[len(selected_list):]:
+        ax.axis("off")
+
+    for r in range(n_rows):
+        axes[r, 0].set_ylabel("Percentile rank\n(within NYC tracts)", fontsize=8)
+
+    fig.suptitle(
+        "Tract percentile rank over time (test set, stratified by income level):\n"
+        "Model rank (blue) vs ACS rank (black ± MOE mapped to rank)",
+        fontsize=9,
+    )
+    fig.tight_layout()
+    _savefig(fig, out / "figures" / "B_tract_rank_trajectories.pdf")
 
 
 # ─── Part C ───────────────────────────────────────────────────────────────────

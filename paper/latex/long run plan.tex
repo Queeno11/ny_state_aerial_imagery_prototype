@@ -1,0 +1,202 @@
+\documentclass[11pt]{article}
+\usepackage{amsmath,amssymb,amsthm,bm}
+\usepackage[margin=1in]{geometry}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{enumitem}
+\usepackage[hidelinks]{hyperref}
+
+\theoremstyle{plain}
+\newtheorem{proposition}{Proposition}
+\newtheorem{corollary}{Corollary}
+\theoremstyle{remark}
+\newtheorem{remark}{Remark}
+
+\newcommand{\E}{\mathbb{E}}
+\newcommand{\pto}{\xrightarrow{p}}
+\newcommand{\Xt}{X_\tau}
+\newcolumntype{P}[1]{>{\raggedright\arraybackslash}p{#1}}
+
+\title{\vspace{-3em}Scaling Ordinal Neighborhood--Wealth Estimation\\
+to Cross-Country Zero-Shot Transfer\\[0.3em]
+\large A Research Plan}
+\author{}
+\date{\today}
+
+\begin{document}
+\maketitle
+\vspace{-2.5em}
+
+\section{Objective and central thesis}
+We have a building-level ordinal model that ranks structural wealth from
+high-resolution aerial imagery, trained and validated on New York City
+(2010--2024; out-of-sample Spearman $\rho=0.85$). The plan turns this into a
+high-impact paper by changing the \emph{target domain} from a survey-rich setting
+to settings where comparable small-area income data are stale, asset-only, or
+absent. The thesis: \emph{a model trained only on U.S.\ imagery and labels
+produces valid, temporally consistent neighborhood-wealth estimates in cities
+with no contemporaneous local labels}, recovered by mapping the model's ordinal
+scores onto a local distribution. This directly answers the ``why not just
+download footprints and the ACS'' objection, which is unanswerable wherever such
+data do not exist.
+
+\section{Contributions, ranked}
+\begin{enumerate}[leftmargin=1.4em,itemsep=0.15em]
+\item \textbf{Zero-shot cross-country transfer (headline).} The U.S.-trained
+ordinal model recovers neighborhood wealth in Mexico City and Vancouver with no
+local training, validated against local ground truth.
+\item \textbf{Identification of the estimand (methodological depth).} The score is
+rank-consistent for \emph{location-expected wealth}, a kernel-smoother object; a
+shrinkage corollary characterizes its bias and a testable implication makes the
+building-level claim falsifiable.
+\item \textbf{U.S.\ multi-city training on NAIP (infrastructure / fallback).} A
+national, uniform training pipeline that both enables transfer and stands alone if
+transfer underperforms.
+\end{enumerate}
+
+\section{Model and estimand (recap)}
+The feature extractor is a ScaleMAE ViT-L backbone adapted with LoRA; a late-fusion
+head emits a scalar score $R_b$ for the building tile $\Xt(b)$ (a $200\,$m window,
+$\tau=100\,$m, subsampled to $224^2$). Training uses a RankNet cross-sectional loss
+on within-year tract comparisons, a temporal stability penalty on structurally
+unchanged twins, and a unit-variance regularizer; deployment maps ordinal scores to
+a target city's income distribution by parametric (GB2) or empirical quantile
+matching. The identified object is the \emph{location-expected wealth}
+$m_\tau(b)=\E[\,w\mid \Xt(b)\,]$ (companion note for full statements):
+
+\begin{proposition}[Locational identification]
+The score is rank-consistent for location-expected wealth:
+$R_b\pto\varphi(m_\tau(b))$ for a strictly increasing $\varphi$; i.e.\ it identifies
+the ordering of the building's \emph{location}, not its idiosyncratic wealth.
+\end{proposition}
+\begin{corollary}[Shrinkage and bounds]
+Writing $w_b=m_\tau(b)+e_b$, the score is a shrinkage estimator toward the local
+mean with reliability $\rho_\tau\in[0,1]$ decreasing in $\tau$; building-level bias
+$(1-\rho_\tau)(w_b-\bar w_i)$ vanishes for representative buildings and is largest
+for outliers; $\tau$ is the bias--variance bandwidth.
+\end{corollary}
+\begin{remark}[Testable on NYC, no building-level labels needed]
+Within-tract score dispersion should increase in observable within-tract
+built-environment heterogeneity and vanish as it does---an external check on the
+locational interpretation.
+\end{remark}
+
+\section{Data plan}
+The effective model input is $200\,\mathrm{m}/224\,\mathrm{px}\approx 0.9\,$m/px, so
+all three domains are brought to a common effective resolution; ScaleMAE absorbs
+residual GSD differences. Imagery, centroids, construction timing, and validation
+labels are sourced as follows.
+
+\begin{table}[h]
+\centering\footnotesize
+\begin{tabular}{P{2.2cm} P{3.7cm} P{3.7cm} P{3.7cm}}
+\toprule
+ & \textbf{United States (train)} & \textbf{Mexico City (CDMX)} & \textbf{Vancouver} \\
+\midrule
+Imagery &
+NAIP, 0.6--1\,m, $\sim$2009--present, free (National Map / USDA); leaf-on &
+INEGI ortho, $\le 1$\,m to $<\!30$\,cm, free via geoportal; sub-metre basemap as fallback &
+City open data, 7.5\,cm, 2015/2018/2020/2022, free \\[0.4em]
+Footprints (centroids) &
+Overture (GERS persistent IDs) &
+Google Open Buildings v3 / Overture / Microsoft (single-epoch) &
+City footprint layer (current $+$ dated vintages) \\[0.4em]
+Construction timing (temporal) &
+ACS B25034 ``Year Structure Built'' (tract); assessor data for showcase cities &
+Google Open Buildings 2.5D \emph{Temporal}, annual 2016--2023, 4\,m raster $\to$ aggregate to AGEB &
+Observed footprints 1999/2009/2015/current $+$ BC Assessment year built \\[0.4em]
+Ground truth (labels / validation) &
+ACS tract per-capita income (5-yr) &
+INEGI AGEB census $+$ CONAPO marginalization index (2010/2020) &
+StatCan dissemination-area income (2011/2016/2021) \\[0.4em]
+Role &
+Train $+$ internal OOS (NYC) &
+External transfer: mid-income, harder &
+External transfer: rich, clean \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\noindent\textbf{Key asymmetry.} Training needs only centroids and local income
+labels---\emph{no} construction timing. Timing is required only for the event-study
+and stability validation, which are tract-level; hence both transfer cities can be
+validated cross-sectionally with single-epoch footprints, and temporally where
+timing data exist (clean in Vancouver, AI-derived and tract-aggregated in CDMX).
+
+\section{Experimental design (validation arc)}
+\begin{enumerate}[leftmargin=1.4em,itemsep=0.2em]
+\item \textbf{Training infrastructure.} Retrain the ordinal model on NAIP across a
+national multi-city U.S.\ sample (ACS labels, Overture centroids). This diverse
+distribution is what makes zero-shot transfer credible, and is the fallback result.
+\item \textbf{Internal validity (have it).} NYC spatial-and-temporal holdout
+(unseen tracts $\times$ 2016 holdout year, $\rho=0.85$).
+\item \textbf{External validity (headline).} Zero-shot to Vancouver and CDMX;
+quantile-map ordinal scores to local distributions; validate against StatCan DA
+income and INEGI/CONAPO respectively.
+\item \textbf{Temporal validation.} Vancouver: full Callaway--Sant'Anna event study
+on new construction $+$ a building-level trajectory figure (observed footprints).
+CDMX: tract-/AGEB-level event study using the AI temporal layer for
+new-construction intensity (no building-level figure from the 4\,m raster).
+\item \textbf{Identification result.} State the location-expected-wealth estimand,
+the shrinkage corollary, and \emph{test} the dispersion implication on NYC.
+\end{enumerate}
+
+\section{Usefulness framing}
+Do not claim these cities lack data---they do not. Claim the dimensions that are
+scarce even there: (i) annual frequency vs.\ a decennial census; (ii) building-level
+resolution finer than any administrative unit; (iii) a single comparable instrument
+across heterogeneous data environments; and (iv) coverage at the truly data-void
+margin. The CDMX result---run entirely on free, AI-generated temporal data with no
+register---demonstrates the pipeline can operate where no administrative data exist,
+which is the global generalization claim.
+
+\section{Risks and mitigations}
+\begin{itemize}[leftmargin=1.4em,itemsep=0.15em]
+\item \textbf{Transfer failure on alien morphology} (informal/self-built housing in
+CDMX). Mitigate: lead with Vancouver (morphologically close, clean ground truth) to
+prove the mechanism; present CDMX as the harder, higher-value case; report partial
+transfer ($\rho\!\approx\!0.6$--$0.7$ with zero local labels) as a positive.
+\item \textbf{Domain shift US$\to$targets} (leaf-on/off, sensor, color). Mitigate:
+train on NAIP so train/test effective resolution and sensor family align; rely on
+photometric augmentation and the ordinal (distribution-free) design.
+\item \textbf{AI temporal data quality in CDMX} (4\,m raster, inter-frame
+registration drift, false positives). Mitigate: use it only for tract-level
+treatment intensity, never building-level geometry.
+\item \textbf{Cross-vintage footprint noise in Vancouver} (heterogeneous sources).
+Mitigate: use BC Assessment year built for timing; treat snapshot differencing as a
+cross-check.
+\end{itemize}
+
+\section{Target venues and deliverables}
+Aim at the Jean (2016)/Yeh (2020)/Khachiyan (2022)/Zheng (2026) lineage: a
+top general-science or economics-insights venue, where the data-scarce-transfer hook
+plus a clean identification result is rewarded. Deliverables: (i) the retrained
+multi-city NAIP model; (ii) zero-shot validation tables for Vancouver and CDMX;
+(iii) temporal/event-study figures; (iv) the identification note and its NYC test.
+
+\section{Indicative task sequence}
+\begin{table}[h]
+\centering\footnotesize
+\begin{tabular}{P{0.8cm} P{12.5cm}}
+\toprule
+\textbf{T} & \textbf{Task} \\
+\midrule
+1 & Assemble NAIP $+$ Overture $+$ ACS national multi-city training set; retrain ordinal model. \\
+2 & Reconfirm NYC internal holdout under the NAIP-trained model. \\
+3 & Source Vancouver (7.5\,cm) and CDMX (INEGI/basemap) imagery; build centroid tiles. \\
+4 & Zero-shot inference $+$ quantile mapping; validate vs.\ StatCan DA and INEGI/CONAPO. \\
+5 & Vancouver event study $+$ building-level figure; CDMX AGEB-level event study via OB Temporal. \\
+6 & Finalize identification proposition/corollary; run NYC dispersion test. \\
+7 & Write-up; framing on frequency/resolution/comparability/data-void margin. \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{Primary data sources.}
+NAIP (USDA/USGS National Map); ACS B25034 and tract income (U.S.\ Census Bureau);
+Overture Maps Buildings; Google Open Buildings v3 and 2.5D Temporal (CC-BY-4.0 /
+ODbL); INEGI orthoimagery and AGEB census; CONAPO marginalization index; City of
+Vancouver Open Data (orthophotos, footprints); BC Assessment; Statistics Canada
+dissemination-area census.
+
+\end{document}
