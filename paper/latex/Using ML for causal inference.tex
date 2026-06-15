@@ -1,0 +1,23 @@
+\subsection{Using Ordinal Predictions as Surrogate Outcomes in Causal Inference}
+\label{sec:surrogate_causal}
+
+A primary motivation for generating high-frequency, building-level wealth trajectories is to evaluate the local impact of clean policy interventions (e.g., new transit infrastructure, rezoning, or place-based policies) in cities lacking yearly survey data. However, using a machine learning prediction as the outcome variable in a causal event study requires defining the conditions under which identification is valid. 
+
+Drawing on the literature for surrogate outcomes \citep{athey2019surrogate}, let $D_i \in \{0,1\}$ denote a policy intervention. Let $W_{i,t}(d)$ be the true latent wealth under treatment state $d$, and $X_{i,t}(d)$ be the observed physical built environment in aerial imagery. The true causal parameter of interest is the Average Treatment Effect on the Treated (ATT) for actual wealth:
+\begin{equation}
+    \tau_{true} = \mathbb{E}\left[ W_{i,t}(1) - W_{i,t}(0) \mid D_i = 1 \right]
+\end{equation}
+
+Because $W_{i,t}$ is unobserved at high frequencies, an econometrician must use the model's conditional expectation $\hat{R}_{i,t}(d) = \mathbb{E}[W_{i,t} \mid X_{i,t}(d)]$, yielding the feasible proxy estimator:
+\begin{equation}
+    \tau_{proxy} = \mathbb{E}\left[ \hat{R}_{i,t}(1) - \hat{R}_{i,t}(0) \mid D_i = 1 \right]
+\end{equation}
+
+By definition, true wealth comprises the capitalized physical signal plus an orthogonal residual: $W_{i,t}(d) = \hat{R}_{i,t}(d) + \epsilon_{i,t}(d)$. Substituting this into the true ATT yields the relationship between the empirical estimate and the true economic effect:
+\begin{equation}
+    \tau_{true} = \tau_{proxy} + \mathbb{E}\left[ \epsilon_{i,t}(1) - \epsilon_{i,t}(0) \mid D_i = 1 \right]
+\end{equation}
+
+For $\tau_{proxy}$ to unbiasedly identify $\tau_{true}$, the second term (the surrogate bias) must equal zero. This condition requires that the policy intervention does not systematically alter local wealth without correspondingly altering the physical built environment. 
+
+As discussed in Section \ref{sec:weakness}, pure demographic sorting into existing housing stock (gentrification without physical construction) is inherently invisible to the visual model. In such cases, $\mathbb{E}[\epsilon_{i,t}(1) - \epsilon_{i,t}(0) \mid D_i = 1] > 0$, meaning the ML-based event study will act as a conservative \textit{lower bound} on total wealth effects. However, if the econometrician specifically defines the estimand as the policy's causal effect on \textit{capitalized structural wealth}---the permanent physical manifestation of economic change---then $\tau_{proxy}$ identifies the exact parameter of interest, making zero-shot causal evaluation highly viable.
