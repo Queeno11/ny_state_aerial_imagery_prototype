@@ -402,8 +402,12 @@ class CyclicCacheManager:
         type="train",
         clear_cache=False,
         max_jitter=10,
+        sat_data="aerial",
     ):
+        import pandas as pd
         self.df = df
+        self.sat_data = sat_data
+
         
         # [NEW] Group temporal twins together so they end up in the same shard
         if type == "train":
@@ -419,8 +423,27 @@ class CyclicCacheManager:
         self.params = params
         self.max_jitter = max_jitter
         self.max_jitter_pixels = geo_utils.meters_to_pixels(self.max_jitter, 0.5, epsg_code=6539) # TODO: I should be able to extract this from the zarr
-        self.image_size = int((df["row_stop"] - df["row_start"]).min())  # Assuming all images have the same size in the raw zarr array
         self.nbands = params["nbands"]
+        
+        if self.sat_data == "NAIP":
+            from pyproj import Transformer
+            self._to_4326 = Transformer.from_crs("EPSG:6539", "EPSG:4326", always_xy=True)
+            self.crop_size_meters = params.get("tau_meters", 100) * 2
+            self.params = {**params, "subsample_step": 1}
+            self.image_size = params["image_size"]
+
+            # Load ACS panel mapping for actual-year substitution
+            from src.build_dataset import process_acs_panel
+            panel = process_acs_panel()
+            self.acs_lookup = {}
+            for _, row in panel.iterrows():
+                geoid = row["geoid_2024"]
+                for year_col in [c for c in panel.columns if c.startswith("Rel_Score_")]:
+                    yr = int(year_col.split("_")[-1])
+                    self.acs_lookup[(geoid, yr)] = row[year_col]
+        else:
+            self.image_size = int((df["row_stop"] - df["row_start"]).min())  # Assuming all images have the same size in the raw zarr array
+
 
         self.type = type
         self.cache_dir = cache_dir / f"{self.type}_cache"
@@ -475,6 +498,23 @@ class CyclicCacheManager:
         ) + 1
  
     def _extract_raw_image(self, row, n_bands=None, pad=0):
+        if self.sat_data == "NAIP":
+            from src.data.naip_fetcher import fetch_naip_crop
+            cx, cy = row["centroid_x"], row["centroid_y"]
+            lon, lat = self._to_4326.transform(cx, cy)
+            
+            pad_meters = pad * 0.5 * self.params.get("subsample_step", 1)
+            out_pixels = self.image_size + 2 * pad
+            
+            crop, actual_year = fetch_naip_crop(
+                lon=lon, lat=lat,
+                crop_size_meters=self.crop_size_meters + 2 * pad_meters,
+                nbands=n_bands or self.nbands,
+                out_pixels=out_pixels,
+                year_hint=int(row["year"]),
+            )
+            return (crop, actual_year) if crop is not None else None
+
         dataset_name = row.get("dataset")
         zarr_array = self.all_years_datasets[dataset_name]["value"]  # raw zarr array
 
@@ -542,13 +582,26 @@ class CyclicCacheManager:
         valid_metas, valid_score_bins = [], []
 
         CHUNK_SIZE = 8
-        MAX_EXTRACT_WORKERS = 2
+        MAX_EXTRACT_WORKERS = 16 if self.sat_data == "NAIP" else 2
 
         def _extract(item):
             row, pos = item
             if pd.isna(row["Rel_Score"]): return None
-            raw_img = self._extract_raw_image(row, n_bands=self.params["nbands"], pad=jitter_pad)
-            if raw_img is None: return None
+            res = self._extract_raw_image(row, n_bands=self.params["nbands"], pad=jitter_pad)
+            if res is None: return None
+            
+            if self.sat_data == "NAIP":
+                raw_img, actual_year = res
+                if actual_year is not None and actual_year != int(row["year"]):
+                    geoid = row.get("GEOID", "")
+                    acs_key = (geoid, actual_year)
+                    if acs_key in self.acs_lookup:
+                        row = dict(row)
+                        row["Rel_Score"] = self.acs_lookup[acs_key]
+                        row["year"] = actual_year
+            else:
+                raw_img = res
+
             return raw_img, row
 
         with ThreadPoolExecutor(max_workers=MAX_EXTRACT_WORKERS) as pool:
@@ -591,6 +644,29 @@ class CyclicCacheManager:
                         valid_change.append(r.get('Valid_Structural_Change', 0))
                         valid_metas.append(r.get("dist_to_center", 0.0))
                         valid_score_bins.append(r.get("score_bin", 0))
+
+        # ── NAIP API failure rate check ──
+        total_attempted = len(items_to_extract)
+        total_succeeded = len(valid_images)
+        total_failed = total_attempted - total_succeeded
+
+        if self.sat_data == "NAIP" and total_attempted > 0:
+            failure_rate = total_failed / total_attempted
+            if failure_rate > 0.50:
+                # Option (a): Hard halt
+                raise RuntimeError(
+                    f"🚨 NAIP shard {shard_id}: {failure_rate:.0%} failure rate "
+                    f"({total_failed}/{total_attempted} failed). "
+                    f"Likely Planetary Computer API rate limit exhaustion. "
+                    f"Halting training — restart after cooldown."
+                )
+                # Option (b): Sleep and retry
+                # import logging
+                # logging.error(f"⚠️ NAIP shard {shard_id}: {failure_rate:.0%} failure rate. Sleeping 5 min...")
+                # import time
+                # time.sleep(300)
+                # return self._worker_generate(shard_id, show_progress)
+
 
         shard_path = self.cache_dir / f"shard_{shard_id}.pt"
         if valid_images:
@@ -994,7 +1070,7 @@ def validate_parameters(params, default_params):
     image_size = params["image_size"]
     weights = params["weights"]
 
-    sat_options = ["aerial", "pleiades", "landsat"]
+    sat_options = ["aerial", "pleiades", "landsat", "NAIP"]
     if sat_data not in sat_options:
         raise ValueError("Invalid sat_data type. Expected one of: %s" % sat_options)
 
@@ -2309,6 +2385,7 @@ def run(
             type="train",
             clear_cache=not resume_cache,
             max_jitter=max_jitter,
+            sat_data=sat_data,
         )
         train_cache_manager.build_initial_cache()
 
@@ -2330,6 +2407,7 @@ def run(
                     single_shard_mode=True,     # IMPORTANT: This disables active rotation / generation
                     type=val_name,
                     clear_cache=not resume_cache,
+                    sat_data=sat_data,
                 )
                 val_cache_manager.build_initial_cache() # This will build and show a progress bar
                 vals_cache_manager_dict[val_name] = val_cache_manager
@@ -2369,7 +2447,7 @@ def run(
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=0.05)
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer, mode='max', factor=0.5, patience=100, min_lr=learning_rate/20
+            optimizer, mode='max', factor=0.5, patience=30, min_lr=learning_rate/20
         )
 
         # If we found a saved checkpoint from a previous run, resume from it
@@ -2551,19 +2629,19 @@ if __name__ == "__main__":
         "batch_size": 8,
         "small_sample": False,
         "n_epochs": 700,
-        "learning_rate": 0.0001,
-        "sat_data": "aerial",
-        "years": [2010, 2012, 2014, 2016, 2018, 2020, 2022, 2024],
+        "learning_rate": 0.001,
+        "sat_data": "NAIP",
+        "years": list(range(2010, 2025, 2)),
         "test_years": [2016],
         "test_column": None,
-        "extra": "_ranknet_mining_lambda_s_05",
+        "extra": "_naip",
         # In-Batch Ranking hyperparameters
         "m_base": 1.0,
         "m_min": 0.05,
         "lambda_s": 0.3,
-        "lambda_c": 0.2,
+        "lambda_c": 0,
         "temporal_fraction": 0.4,
     } 
 
     # Run full pipeline
-    run(params, train=False, retrain=False, compute_loss=False, generate_predictions=True)
+    run(params, train=True, retrain=False, compute_loss=False, generate_predictions=True)

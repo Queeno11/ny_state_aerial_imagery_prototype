@@ -1,0 +1,113 @@
+\documentclass[11pt]{article}
+
+\usepackage[utf8]{inputenc}
+\usepackage{amsmath, amssymb, amsthm}
+\usepackage{geometry}
+\geometry{letterpaper, margin=1in}
+\usepackage{titlesec}
+\usepackage{hyperref}
+\usepackage{natbib}
+
+\title{\textbf{Valid Causal Inference with Generated ML Ordinal Variables}}
+\author{}
+\date{}
+
+\begin{document}
+
+\maketitle
+
+\section*{Overview: The Generated Variable Problem}
+
+A primary objective of our model is to provide researchers with a high-frequency, high-resolution neighborhood wealth index for regions lacking continuous survey data. However, using machine learning predictions directly in downstream econometric models introduces the ``generated regressor/regressand'' problem \citep{knox2022testing}. Treating an algorithm's prediction as deterministic truth ignores underlying algorithmic measurement error, rendering standard ordinary least squares (OLS) point estimates biased and standard errors anti-conservative.
+
+Depending on whether the predicted wealth score is used as an outcome variable ($Y$) or a control variable ($X$), this measurement error behaves differently. Below, we formalize the econometric assumptions required to use our ordinal wealth scores safely in causal inference frameworks, and present theoretically optimal estimation strategies to recover valid point estimates and standard errors.
+
+\section{Case 1: Predicted Wealth as the Outcome Variable ($Y$)}
+
+Suppose a researcher wishes to evaluate the impact of a local policy or shock (the Treatment, $T$) on neighborhood structural wealth. The true structural equation is:
+\begin{equation}
+    W^* = \alpha + \beta T + u
+\end{equation}
+where $W^*$ is the true unobserved wealth and $u$ is the structural error term. Because $W^*$ is unobserved, the researcher substitutes the model's predicted score $\hat{W}$. The prediction inherently contains algorithmic measurement error $\epsilon$, such that $\hat{W} = W^* + \epsilon$. Substituting this into the regression yields:
+\begin{equation}
+    \hat{W} = \alpha + \beta T + (u + \epsilon)
+\end{equation}
+
+\subsection*{Non-Classical Measurement Error and Attenuation Bias}
+In classical econometrics, measurement error in the dependent variable merely inflates the residual variance without biasing the point estimate $\beta$. However, machine learning predictions optimized for out-of-sample performance inherently produce \textit{non-classical} measurement error \citep{mullainathan2017machine}. Because the model exhibits ``shrinkage''---underpredicting the wealthiest extremes and overpredicting the poorest---the prediction error $\epsilon$ is structurally negatively correlated with the true value $W^*$. 
+
+If the treatment successfully increases wealth, the model's shrinkage will compress the estimated effect toward zero. This induces an attenuation bias on $\hat{\beta}$. From a policy evaluation standpoint, this property guarantees that the estimated treatment effect acts as a conservative lower bound of the true effect \citep{mullainathan2017machine}, provided that the treatment does not induce spurious visual features that the model systematically misclassifies (visual confounding).
+
+\subsection*{Recovering Valid Standard Errors}
+While the point estimate is a valid lower bound, standard OLS standard errors will be strictly incorrect. First, visual ML models generate highly spatially correlated errors. Second, OLS assumes the left-hand side variable is fixed, ignoring the algorithmic uncertainty in $\epsilon$, which leads to anti-conservative (too small) standard errors and over-rejection of the null hypothesis.
+
+To achieve valid inference, researchers must implement a two-step variance correction. First, regression errors must be estimated using \textbf{Spatial Heteroskedasticity and Autocorrelation Consistent (HAC) standard errors} \citep{conley1999gmm} to account for spatial dependencies. Second, these standard errors must be analytically inflated using \textbf{Post-Prediction Inference} \citep{wang2020methods}, which adjusts the standard errors upward based on the out-of-sample error variance of the ML model, ensuring valid confidence intervals.
+
+\section{Case 2: Predicted Wealth as a Control Variable ($X$)}
+
+A much more dangerous scenario arises when the predicted wealth score is used as a control variable to block spatial confounding. If a researcher includes continuous ML predictions ($\hat{W}$) in a linear regression to control for true wealth ($W^*$), the non-classical measurement error $\epsilon$ causes attenuation bias on the wealth coefficient. 
+
+Crucially, because the model ``under-controls'' for true wealth, the remaining unabsorbed confounding spills over onto the treatment variable. This residual omitted variable bias (OVB) can operate in any direction, potentially generating false positives or masking true effects. Consequently, researchers cannot rely on the continuous ML score as a simple linear control. We propose two robust alternatives.
+
+\subsection*{Alternative 1: Ordinal Stratification and Bounding}
+To safely utilize the predicted score, we can exploit the specific architectural design of our model. Because the network was trained via a pairwise ranking loss (RankNet), it is optimized to preserve \textit{ordinal rankings} rather than cardinal distances. 
+
+The strategy is to coarsen the continuous score into ordinal quantiles (e.g., local wealth deciles) and employ \textbf{Coarsened Exact Matching (CEM)} or stratification \citep{iacus2012causal}. Matching treated and control units strictly within the same ML-predicted wealth decile blocks spatial confounding without relying on the strict parametric assumptions that make linear regressions vulnerable to algorithmic noise. Stratifying an imperfect confounder into subclasses removes the vast majority of initial selection bias \citep{cochran1968effectiveness}. 
+
+To formally account for any residual bias caused by buildings misclassified at the boundaries of these quantiles, researchers can apply \textbf{Oster Bounds} \citep{oster2019unobservable}. This technique bounds the treatment effect by assuming that the remaining unobserved algorithmic confounding is proportional to the confounding already absorbed by the ML quantiles, providing a mathematically robust range for the true causal effect.
+
+\subsection*{Alternative 2: Double/Debiased Machine Learning (DML) on Embeddings}
+For researchers requiring exact point identification rather than bounds, our architecture offers a non-parametric alternative that completely circumvents the generated scalar problem. Instead of using the single predicted score $\hat{W}$, researchers can extract the rich, 64-dimensional latent embedding vector ($h_{b,i,t}$) generated by the model immediately prior to the final prediction head.
+
+Using the \textbf{Double/Debiased Machine Learning (DML)} framework \citep{chernozhukov2018double}, the researcher uses these embeddings to predict both the Treatment ($T$) and the Outcome ($Y$) via cross-validated machine learning (e.g., Random Forests or Lasso), and regresses the resulting residuals on one another. By controlling directly for the latent physical built environment, DML entirely avoids scalar measurement error. Furthermore, DML relies on \textit{Neyman orthogonality}, which guarantees that the standard errors of the final treatment effect are asymptotically normal and valid, even if the intermediate ML predictions contain noise.
+
+
+\vspace{1em}
+\hrule
+\vspace{1em}
+
+\begin{thebibliography}{9}
+
+\bibitem[Chernozhukov et al.(2018)]{chernozhukov2018double}
+Chernozhukov, V., Chetverikov, D., Demirer, M., Duflo, E., Hansen, C., Newey, W., \& Robins, J. (2018). 
+\newblock Double/debiased machine learning for treatment and structural parameters.
+\newblock \emph{The Econometrics Journal}, 21(1), C1-C68.
+
+\bibitem[Cochran(1968)]{cochran1968effectiveness}
+Cochran, W. G. (1968). 
+\newblock The effectiveness of adjustment by subclassification in removing bias in observational studies.
+\newblock \emph{Biometrics}, 24(2), 295--313.
+
+\bibitem[Conley(1999)]{conley1999gmm}
+Conley, T. G. (1999). 
+\newblock GMM estimation with cross sectional dependence.
+\newblock \emph{Journal of Econometrics}, 92(1), 1--45.
+
+\bibitem[Iacus et al.(2012)]{iacus2012causal}
+Iacus, S. M., King, G., \& Porro, G. (2012). 
+\newblock Causal inference without balance checking: Coarsened exact matching.
+\newblock \emph{Political Analysis}, 20(1), 1--24.
+
+\bibitem[Knox et al.(2022)]{knox2022testing}
+Knox, D., Lucas, C., \& Cho, W. K. T. (2022). 
+\newblock Testing causal theories with learned data.
+\newblock \emph{Annual Review of Political Science}, 25, 419--441.
+
+\bibitem[Mullainathan \& Spiess(2017)]{mullainathan2017machine}
+Mullainathan, S., \& Spiess, J. (2017). 
+\newblock Machine learning: an applied econometric approach.
+\newblock \emph{Journal of Economic Perspectives}, 31(2), 87--106.
+
+\bibitem[Oster(2019)]{oster2019unobservable}
+Oster, E. (2019). 
+\newblock Unobservable selection and coefficient stability: Theory and evidence.
+\newblock \emph{Journal of Business \& Economic Statistics}, 37(2), 187--204.
+
+\bibitem[Wang et al.(2020)]{wang2020methods}
+Wang, S., McCormick, T. H., \& Leek, J. T. (2020). 
+\newblock Methods for correcting inference based on outcomes predicted by machine learning.
+\newblock \emph{Proceedings of the National Academy of Sciences}, 117(48), 30266--30275.
+
+\end{thebibliography}
+
+\end{document}

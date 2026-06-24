@@ -38,11 +38,18 @@ def open_datasets(sat_data="aerial", years=[2013, 2018, 2022], tau_meters=100):
         datasets_all_years, extents_all_years = load_satellite_datasets(
             years=years
         )
+        df = assign_datasets_to_gdf(df, datasets_all_years, extents_all_years, years=years, verbose=True, save_plot=False)
+    elif sat_data == "NAIP":
+        datasets_all_years = None
+        extents_all_years = None
+        df["dataset"] = "NAIP"
+        df["row_start"] = 0
+        df["row_stop"] = 0
+        df["col_start"] = 0
+        df["col_stop"] = 0
     elif sat_data == "landsat":
         raise NotImplementedError("Landsat support not implemented yet.")
         sat_imgs_datasets, extents = load_landsat_datasets()
-
-    df = assign_datasets_to_gdf(df, datasets_all_years, extents_all_years, years=years, verbose=True, save_plot=False)
 
     print("Datasets loaded!")
 
@@ -246,6 +253,14 @@ def load_income_dataset(panel_years, tau_meters=50):
         print(f"Preprocessed datasets already exist.\n  Temporal data: {temporal_data_path}\n  Geometries: {geometries_path}")
         print("Loading existing temporal dataset...")
         temporal_data_flat = pd.read_parquet(temporal_data_path)
+        if "dist_to_center" not in temporal_data_flat.columns:
+            print("Calculating missing 'dist_to_center' column...")
+            from shapely.geometry import Point
+            centroids = gpd.GeoSeries([Point(x, y) for x, y in zip(temporal_data_flat["centroid_x"], temporal_data_flat["centroid_y"])], crs="EPSG:6539")
+            nyc_economic_center = gpd.GeoSeries.from_wkt(["POINT (-74.011267 40.706879)"], crs="EPSG:4326").to_crs("EPSG:6539").iloc[0]
+            distances = centroids.distance(nyc_economic_center)
+            temporal_data_flat["dist_to_center"] = distances.apply(lambda x: geo_utils.projected_units_to_meters(x, epsg_code=6539)) / 1000
+            temporal_data_flat.to_parquet(temporal_data_path)
         return temporal_data_flat
 
     buildings_nyc = load_building_data()
@@ -1412,7 +1427,8 @@ def create_train_test_dataframes(buildings_df, savename, test_years=[], test_col
         "DOITT_ID", "GEOID", "year", "type",
         "Rel_Score", "Valid_Structural_Change", "score_bin",
         "dataset", "bbox_minx", "bbox_miny", "bbox_maxx", "bbox_maxy",
-        "row_start", "row_stop", "col_start", "col_stop", "dist_to_center"
+        "row_start", "row_stop", "col_start", "col_stop", "dist_to_center",
+        "centroid_x", "centroid_y"
     ]
     buildings_df = buildings_df[relevant_columns]
 
