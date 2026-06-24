@@ -1,16 +1,17 @@
 #!/usr/bin/env python3
-# /mnt/c/Working Papers/NY State Aerial Imagery Prototype/ny_state_aerial_imagery_prototype/src/download_acs.py
+# /mnt/c/Working Papers/NY State Aerial Imagery Prototype/ny_state_aerial_imagery_prototype/src/data/download_acs.py
 """
-ACS 5-Year Estimates — New York State, Census Tract Level  (2009 → 2024)
+ACS 5-Year Estimates — United States, Census Tract Level  (2009 → 2024)
 =========================================================================
-Loops over every ACS 5-year vintage from START_YEAR to END_YEAR and saves
-one Feather file per vintage inside a user-defined folder tree:
+Loops over every ACS 5-year vintage from START_YEAR to END_YEAR and, for
+each vintage, over every U.S. state (50 states + DC). Saves one Feather file
+per vintage — containing all states — inside a user-defined folder tree:
 
   OUTPUT_ROOT/
-  ├── 2009/   ← 2005-2009 estimates  →  ny_tracts_acs5_2009.feather
-  ├── 2010/   ← 2006-2010 estimates  →  ny_tracts_acs5_2010.feather
+  ├── 2009/   ← 2005-2009 estimates  →  us_tracts_acs5_2009.feather
+  ├── 2010/   ← 2006-2010 estimates  →  us_tracts_acs5_2010.feather
   │   …
-  └── 2024/   ← 2020-2024 estimates  →  ny_tracts_acs5_2024.feather
+  └── 2024/   ← 2020-2024 estimates  →  us_tracts_acs5_2024.feather
 
 Variables collected
 ───────────────────
@@ -28,10 +29,29 @@ Variables collected
     • Education shares            B15003   (< HS / HS+GED / Some col / Bach+)
     • Weighted Mean Age           B01001
 
+  OCCUPANT-WEALTH INDEX  (for the W_i target diagnostic)
+    • V_i  = MEAN owner-occupied home value = B25082 / owner-occupied units.
+        The mean is the correct aggregator for a stock quantity: the median
+        (B25077) understates the value stock non-uniformly, compressing exactly
+        the high-value tracts we want to discriminate.
+    • W_i(r) = (1/r)*PerCapInc + per-capita net housing equity. Both terms are
+        now dollar stocks PER CAPITA. The per-capita equity term collapses
+        algebraically (the owner-unit and occupied-unit counts cancel) to
+          (B25082 / total tract population) * [freeclear_i + mortgaged_i*(1-LTV)]
+        aggregate owner value       B25082 (Aggregate Value by Mortgage Status)
+        owner-occupied units        B25003 (Tenure)  -> alpha_i and V_i denom
+        mortgage status shares      B25081 (Mortgage Status) -> leverage bracket
+        total tract population      B01001_001E -> shared per-capita denominator
+      Total tract population (not B25010 household population) is used so the
+      equity term and the per-capita income term share a denominator definition.
+      Tracts with no B25082 (suppressed / no owner units) get V_i=0, equity=0.
+      One column per discount rate in DISCOUNT_RATES (robustness sweep).
+
 Resilience features
 ───────────────────
   • Skip / resume   — if a Feather file already exists for a year it is skipped
   • Per-year errors — a single bad year is logged and skipped; run continues
+  • Per-state errors — a single bad state is logged and skipped; year continues
   • Variable guard  — missing columns produce NaN rather than crashing
   • Year-compat     — tables unavailable in a given vintage noted & handled
   • Retry logic     — transient HTTP errors are retried up to 3x with back-off
@@ -56,6 +76,7 @@ import numpy as np
 import pandas as pd
 import geopandas as gpd
 import requests
+from dotenv import load_dotenv
 from pygris import tracts
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -72,9 +93,32 @@ except ImportError:
 # ══════════════════════════════════════════════════════════════════════════════
 # ① USER CONFIGURATION  ←  all tuneable knobs live here
 # ══════════════════════════════════════════════════════════════════════════════
+# Load env so CENSUS_API_KEY is available when this is run as a standalone
+# script (it doesn't import src.utils.paths). Non-secret config lives in .env;
+# API keys live in .env.secrets, which may be read-denied inside a sandbox, so
+# don't crash if it's missing.
+_PROJECT_ROOT = Path(__file__).resolve().parents[2]
+load_dotenv(_PROJECT_ROOT / ".env")
+try:
+    load_dotenv(_PROJECT_ROOT / ".env.secrets")
+except OSError:
+    pass
+
 API_KEY     = os.environ.get("CENSUS_API_KEY")
-STATE       = "36"           # FIPS — 36 = New York
-START_YEAR  = 2009           # first ACS 5-yr release
+
+# FIPS codes for all 50 states + DC (the Census tract API requires querying one
+# state at a time, so we loop over these). Add "72" for Puerto Rico if you also
+# want PR tracts. Threaded through every fetch so one vintage spans the country.
+STATES = [
+    "01", "02", "04", "05", "06", "08", "09", "10", "11", "12",
+    "13", "15", "16", "17", "18", "19", "20", "21", "22", "23",
+    "24", "25", "26", "27", "28", "29", "30", "31", "32", "33",
+    "34", "35", "36", "37", "38", "39", "40", "41", "42", "44",
+    "45", "46", "47", "48", "49", "50", "51", "53", "54", "55",
+    "56",
+]
+
+START_YEAR  = 2011           # first ACS 5-yr release
 END_YEAR    = 2024           # inclusive; update as new vintages drop
 MAX_VARS    = 45             # variables per API call (Census hard-cap ~50)
 RETRY_MAX   = 1              # max retries on transient HTTP errors
@@ -83,6 +127,23 @@ CALL_SLEEP  = 0.4            # polite pause between chunk calls
 
 # Default output root — override with --outdir or OUTPUT_ROOT env var
 DEFAULT_OUT_ROOT = os.environ.get("OUTPUT_ROOT", r"/mnt/e/Datasets/US ACS 5-year Census Tract Estimates")
+
+# ── Occupant-wealth index (W_i) parameters ───────────────────────────────────
+# W_i = (1/r)*Y_i  +  per-capita net housing equity. The equity term used to be
+# per-household (alpha_i * V_i * leverage / avg_hh_size); it is now per-capita to
+# match the per-person income term. Using V_i = mean value = B25082/owner_units,
+# the per-household counts cancel and the per-capita equity term reduces to
+#   (B25082 / total_tract_population) * [freeclear_i + mortgaged_i*(1 - LTV_MACRO)].
+# LTV_MACRO is the macro loan-to-value for mortgaged owners (SCF/AHS ~0.50).
+LTV_MACRO = 0.50
+# Discount/cap-rate grid for the robustness sweep. One W_i column is produced
+# per rate; includes the Circular A-4 baseline (0.02) and spans 1%–7%.
+DISCOUNT_RATES = (0.01, 0.02, 0.03, 0.05, 0.07)
+
+
+def w_index_colname(r: float) -> str:
+    """Output column name for the W_i index at discount rate ``r`` (e.g. 0.02 -> 'W_i_r2pct')."""
+    return f"W_i_r{round(r * 100, 2):g}pct"
 
 # ══════════════════════════════════════════════════════════════════════════════
 # ② VARIABLE DEFINITIONS
@@ -113,6 +174,15 @@ RAW_VARS: dict[str, Optional[str]] = {
     "B19013_001E": "median_hh_income_usd",
     "B19301_001E": "per_capita_income_usd",
     "B19301_001M": "per_capita_income_usd_error",
+    # Occupant-wealth index components (W_i / V_i)
+    "B25082_001E": None,   # aggregate owner-occupied value ($) -> mean V_i & equity
+    "B25003_001E": None,   # tenure: total occupied housing units
+    "B25003_002E": None,   # tenure: owner-occupied units  -> alpha_i, V_i denom
+    "B25081_001E": None,   # mortgage status: total owner-occupied units
+    "B25081_002E": None,   # mortgage status: units with a mortgage
+    #   free & clear is derived as (001 - 002); the "without a mortgage" code
+    #   moved across vintages (008/009), so we never download it directly.
+    "B25010_001E": None,   # average household size (diagnostic; not in W_i now)
     # Vehicle availability (B08201)
     "B08201_001E": None,   # total households
     "B08201_002E": None,   # no vehicle
@@ -139,7 +209,7 @@ RAW_VARS: dict[str, Optional[str]] = {
     **{code: None for code in AGE_MALE_VARS},
     **{code: None for code in AGE_FEMALE_VARS},
 }
- 
+
 # Final column selection/rename map (raw or derived -> output name)
 FINAL_COLS: dict[str, str] = {
     "GEOID":               "geoid",
@@ -153,6 +223,7 @@ FINAL_COLS: dict[str, str] = {
     "B19301_001E":         "per_capita_income_usd",
     "B19301_001M":         "per_capita_income_usd_error",
     "B08135_001E":         "mean_commute_unadjusted_min",
+    "B01001_001E":         "total_population",
     # Derived
     "pct_no_vehicle":      "pct_hh_no_vehicle",
     "pct_overcrowded":     "pct_overcrowded_housing",
@@ -164,11 +235,33 @@ FINAL_COLS: dict[str, str] = {
     "pct_edu_bach_plus":   "pct_edu_bach_plus",
     "mean_age":            "mean_age_years",
 }
- 
+
+# Occupant-wealth outputs. V_i is now the MEAN owner-occupied value
+# (B25082 / owner-occupied units); each W_i column is the capitalized-income +
+# per-capita-equity index at one discount rate (see DISCOUNT_RATES). Added here
+# so the grid lives in one place. aggregate_owner_value_usd (B25082) is exported
+# as a diagnostic since it is the numerator of both V_i and the equity term.
+FINAL_COLS["B25082_001E"] = "aggregate_owner_value_usd"
+for _col in ("V_i", "homeownership_rate", "pct_owner_with_mortgage",
+             "pct_owner_free_clear", "avg_household_size"):
+    FINAL_COLS[_col] = _col
+for _r in DISCOUNT_RATES:
+    FINAL_COLS[w_index_colname(_r)] = w_index_colname(_r)
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # ③ API HELPERS
 # ══════════════════════════════════════════════════════════════════════════════
+
+class CensusAPIError(RuntimeError):
+    """Fatal Census API problem (e.g. missing/invalid key).
+
+    Deliberately *not* a subclass of ValueError so it is never mistaken for the
+    'variable absent in this vintage' case, which is signalled with ValueError
+    and handled by per-variable probing. A CensusAPIError affects every request,
+    so it propagates up and aborts the run instead of being probed or skipped.
+    """
+
 
 def chunked(iterable, size: int):
     it = iter(iterable)
@@ -180,25 +273,49 @@ def fetch_chunk_with_retry(
     year: int,
     var_codes: list[str],
     base_url: str,
+    state: str,
 ) -> pd.DataFrame:
     """Fetch one chunk with exponential-backoff retries on transient errors."""
     params = {
         "get": "NAME," + ",".join(var_codes),
         "for": "tract:*",
         # Only 2009 requires the list-based 'in' parameter formatting
-        "in":  [f"state:{STATE}", "county:*"] if year == 2009 else f"state:{STATE} county:*",
+        "in":  [f"state:{state}", "county:*"] if year == 2009 else f"state:{state} county:*",
         "key": API_KEY,
     }
     sleep = RETRY_SLEEP
     for attempt in range(1, RETRY_MAX + 1):
         try:
             resp = requests.get(base_url, params=params, timeout=90)
+
+            # The Census API serves an HTML error page (usually HTTP 200) when
+            # the key is missing or invalid — e.g. <title>Missing Key</title> /
+            # <title>Invalid Key</title>. Detect those explicitly so an auth
+            # failure is reported clearly instead of being misread, after a
+            # failed resp.json(), as every variable being "absent" in the vintage.
+            head = resp.text[:512]
+            if "Missing Key" in head or "Invalid Key" in head:
+                kind = "missing" if "Missing Key" in head else "invalid"
+                raise CensusAPIError(
+                    f"Census API rejected the request — API key is {kind}. "
+                    f"Set CENSUS_API_KEY (in .env.secrets or your environment) "
+                    f"or pass --key. The API returned an HTML '{kind.title()} Key' page."
+                )
+
             if resp.status_code == 400:
                 raise ValueError(
                     f"HTTP 400 for year {year} — variable(s) likely absent in this vintage."
                 )
             resp.raise_for_status()
-            data = resp.json()
+            try:
+                data = resp.json()
+            except ValueError as exc:
+                raise CensusAPIError(
+                    f"Census API returned non-JSON (HTTP {resp.status_code}, "
+                    f"Content-Type {resp.headers.get('Content-Type')!r}). This "
+                    f"usually means the key is missing/invalid or the service is "
+                    f"down. Body began: {head!r}"
+                ) from exc
             return pd.DataFrame(data[1:], columns=data[0])
         except (requests.RequestException, ValueError) as exc:
             if attempt == RETRY_MAX:
@@ -214,41 +331,38 @@ def _safe_fetch_chunk(
     base_url: str,
     chunk_idx: int,
     total_chunks: int,
+    state: str,
 ) -> pd.DataFrame | None:
     """
     Fetch one chunk. On HTTP 400, probe each variable individually to find
     the culprit(s), drop them, fill with NaN, then fetch the rest normally.
     """
-    print(f"    Chunk {chunk_idx:>2}/{total_chunks}  ({len(chunk)} vars) … ", end="", flush=True)
     try:
-        df = fetch_chunk_with_retry(year, chunk, base_url)
-        print("ok")
+        df = fetch_chunk_with_retry(year, chunk, base_url, state)
         return df
     except ValueError:
-        print("400 — Testing individual variables query …")
         good: list[str] = []
         bad:  list[str] = []
         for code in chunk:
             try:
-                fetch_chunk_with_retry(year, [code], base_url)
+                fetch_chunk_with_retry(year, [code], base_url, state)
                 good.append(code)
             except Exception:
                 bad.append(code)
         if bad:
-            print(f"    ! Codes absent in {year} (NaN): {bad}")
+            print(f"    ! Codes absent in {year} for state {state} (NaN): {bad}")
         if not good:
             return None
-        df = fetch_chunk_with_retry(year, good, base_url)
+        df = fetch_chunk_with_retry(year, good, base_url, state)
         for code in bad:
             df[code] = np.nan
-        print(f"    ok  ({len(good)} fetched, {len(bad)} set to NaN)")
         return df
 
 
-def fetch_all_for_year(year: int) -> pd.DataFrame:
+def fetch_state_for_year(year: int, state: str) -> pd.DataFrame:
     """
-    Pull every variable for *year* in MAX_VARS-sized chunks and merge into
-    one wide DataFrame with numeric dtypes; Census sentinels become NaN.
+    Pull every variable for one *state* in *year* in MAX_VARS-sized chunks and
+    merge into one wide (still string-typed) DataFrame keyed on GEOID.
     """
     if year <= 2009:
         # The API endpoint structure changed after 2009; older vintages use a different URL pattern
@@ -260,7 +374,7 @@ def fetch_all_for_year(year: int) -> pd.DataFrame:
     frames:  list[pd.DataFrame] = []
 
     for idx, chunk in enumerate(chunks, 1):
-        df = _safe_fetch_chunk(year, chunk, base_url, idx, len(chunks))
+        df = _safe_fetch_chunk(year, chunk, base_url, idx, len(chunks), state)
         if df is None:
             continue
 
@@ -276,11 +390,45 @@ def fetch_all_for_year(year: int) -> pd.DataFrame:
         time.sleep(CALL_SLEEP)
 
     if not frames:
-        raise RuntimeError(f"No data retrieved for {year}")
+        raise RuntimeError(f"No data retrieved for state {state} in {year}")
 
     merged = frames[0]
     for frame in frames[1:]:
         merged = merged.merge(frame, on="GEOID", how="outer")
+
+    return merged
+
+
+def fetch_all_for_year(year: int, states: list[str]) -> pd.DataFrame:
+    """
+    Pull every variable for every state in *states* and stack them into one
+    nationwide DataFrame with numeric dtypes; Census sentinels become NaN.
+
+    A state that fails entirely is logged and skipped so one bad state does not
+    abort the whole vintage.
+    """
+    codes = list(RAW_VARS.keys())
+    state_frames: list[pd.DataFrame] = []
+
+    for state in progress(states, desc=f"{year} states", unit="st", leave=False):
+        print(f"  |   State {state} … ", end="", flush=True)
+        try:
+            sdf = fetch_state_for_year(year, state)
+        except CensusAPIError:
+            # Affects every request — don't mask it as a per-state skip.
+            print("FAILED (Census API key error)")
+            raise
+        except Exception as exc:
+            print(f"FAILED ({exc}) — skipping state")
+            continue
+        print(f"{len(sdf):,} tracts")
+        state_frames.append(sdf)
+
+    if not state_frames:
+        raise RuntimeError(f"No data retrieved for any state in {year}")
+
+    # Stack states; pandas aligns columns by name and NaN-fills any gaps.
+    merged = pd.concat(state_frames, ignore_index=True)
 
     # Guarantee every expected code column exists (may have been fully absent)
     for code in codes:
@@ -294,22 +442,20 @@ def fetch_all_for_year(year: int) -> pd.DataFrame:
 
     return merged
 
-def fetch_geometries(year: int) -> gpd.GeoDataFrame:
-    """Fetch Census tract geometries for a specific year using pygris."""
-    print(f"  |   Fetching TIGER geometries for {year} ... ", end="", flush=True)
-    
+
+def _fetch_state_geometry(year: int, state: str) -> gpd.GeoDataFrame:
+    """Fetch Census tract geometries for a single state/year using pygris."""
     try:
         # Attempt to get the Cartographic Boundary file (water clipped out)
-        geo_df = tracts(state=STATE, year=year, cb=True, cache=True)
-    except Exception as e:
-        # Fallback: If the cb=True file is missing (2009, 2011) or the cache is corrupted (2012), 
-        # fallback to the raw TIGER/Line boundaries (cb=False)
-        print(f"\n  |   cb=True failed (likely missing for {year}), falling back to cb=False ... ", end="", flush=True)
-        geo_df = tracts(state=STATE, year=year, cb=False, cache=True)
-    
+        geo_df = tracts(state=state, year=year, cb=True, cache=True)
+    except Exception:
+        # Fallback: if the cb=True file is missing (2009, 2011) or the cache is
+        # corrupted (2012), fall back to raw TIGER/Line boundaries (cb=False)
+        geo_df = tracts(state=state, year=year, cb=False, cache=True)
+
     # Census shapefiles change their ID column names (e.g., GEOID, GEOID10, GEOID20)
     # We find whatever column starts with "GEOID" and standardize it to "geoid"
-    id_col = next((col for col in geo_df.columns if col.replace("_", "").startswith("GEOID")), None) 
+    id_col = next((col for col in geo_df.columns if col.replace("_", "").startswith("GEOID")), None)
 
     # Fallback for older formats where it might be named CTIDFP00
     if not id_col:
@@ -317,13 +463,34 @@ def fetch_geometries(year: int) -> gpd.GeoDataFrame:
             id_col = "CTIDFP00"
         else:
             raise ValueError(f"Could not locate a GEOID column in the {year} spatial data. Available: {list(geo_df.columns)}")
-    
-    
-    # Clear IDS (in 2010-2023 they have a "1400000US", and in 2009 they have a "14000US" 
+
+    # Clear IDS (in 2010-2023 they have a "1400000US", and in 2009 they have a "14000US"
     #   prefix which we don't need)
     geo_df[id_col] = geo_df[id_col].astype(str).str.replace(r"^14000(00)?US", "", regex=True)
-    print("ok")
     return geo_df[[id_col, "geometry"]].rename(columns={id_col: "geoid"})
+
+
+def fetch_geometries(year: int, states: list[str]) -> gpd.GeoDataFrame:
+    """Fetch and stack Census tract geometries for every state in *states*."""
+    print(f"  |   Fetching TIGER geometries for {year} ({len(states)} states) ... ", end="", flush=True)
+
+    geo_frames: list[gpd.GeoDataFrame] = []
+    for state in progress(states, desc=f"{year} geoms", unit="st", leave=False):
+        try:
+            geo_frames.append(_fetch_state_geometry(year, state))
+        except Exception as exc:
+            print(f"\n  |   ! geometry for state {state} {year} failed ({exc}) — skipping")
+
+    if not geo_frames:
+        raise RuntimeError(f"No geometries retrieved for any state in {year}")
+
+    # All states share the same CRS within a vintage, so the concat is safe.
+    crs = geo_frames[0].crs
+    combined = gpd.GeoDataFrame(
+        pd.concat(geo_frames, ignore_index=True), geometry="geometry", crs=crs
+    )
+    print(f"ok ({len(combined):,} tracts)")
+    return combined
 
 # ══════════════════════════════════════════════════════════════════════════════
 # ④ DERIVED INDICATOR CALCULATIONS
@@ -385,6 +552,56 @@ def compute_derived(df: pd.DataFrame, year: int) -> pd.DataFrame:
     )
     d["mean_age"] = w_sum / age_denom
 
+    # --- Occupant-wealth index (V_i, W_i) ----------------------------------
+    # V_i: MEAN owner-occupied home value = aggregate value (B25082) / number of
+    # owner-occupied units (B25003_002E). The mean (not the median B25077) is the
+    # right aggregator for a stock quantity. Tracts with no aggregate value
+    # published (suppressed / no owner units) get V_i = 0.
+    agg_owner_value = d["B25082_001E"]
+    owner_occupied  = d["B25003_002E"]
+    d["V_i"] = (agg_owner_value / owner_occupied.replace(0, np.nan)).fillna(0.0)
+
+    # alpha_i: homeownership rate = owner-occupied / total occupied households.
+    d["homeownership_rate"] = d["B25003_002E"] / d["B25003_001E"].replace(0, np.nan)
+
+    # Mortgage-status shares among owner-occupied units (B25081). Free-and-clear
+    # is derived as (total - with_mortgage) so it is robust to the across-vintage
+    # renumbering of the "without a mortgage" line (008 vs 009).
+    owner_units = d["B25081_001E"].replace(0, np.nan)
+    d["pct_owner_with_mortgage"] = d["B25081_002E"] / owner_units
+    d["pct_owner_free_clear"]    = (d["B25081_001E"] - d["B25081_002E"]) / owner_units
+
+    # Average household size (persons/household). No longer enters W_i — kept as a
+    # diagnostic. The per-capita equity term uses total tract population instead,
+    # so its denominator matches per-capita income (B19301) exactly.
+    d["avg_household_size"] = d["B25010_001E"].replace(0, np.nan)
+
+    # Leverage bracket (net-equity fraction of home value): free-and-clear owners
+    # hold 100% equity; mortgaged owners hold (1 - LTV_MACRO). Unchanged.
+    equity_fraction = (
+        d["pct_owner_free_clear"] * 1.0
+        + d["pct_owner_with_mortgage"] * (1.0 - LTV_MACRO)
+    )
+    # Per-capita net housing equity. The per-household form
+    #   alpha_i * V_bar_i * equity_fraction / n_bar_i
+    # collapses algebraically (owner-unit and occupied-unit counts cancel) to
+    #   (B25082 / total_tract_population) * equity_fraction.
+    # Total tract population (B01001_001E) is used so this term and the per-capita
+    # income term share a denominator. The renter-zeroing of alpha_i is preserved
+    # implicitly: B25082 = 0 where there are no owner units -> equity = 0.
+    total_population = d["B01001_001E"].replace(0, np.nan)
+    equity_per_capita = (agg_owner_value / total_population) * equity_fraction
+    # Tracts with no aggregate owner value published (suppressed / fully renter)
+    # contribute zero housing equity rather than NaN, so W_i stays defined
+    # (= capitalized income) there.
+    equity_per_capita = equity_per_capita.where(agg_owner_value > 0, 0.0)
+
+    # W_i(r) = (1/r) * per-capita income + per-capita net housing equity.
+    # One column per discount rate for the robustness sweep.
+    y_pc = d["B19301_001E"]
+    for r in DISCOUNT_RATES:
+        d[w_index_colname(r)] = y_pc / r + equity_per_capita
+
     return d
 
 
@@ -392,10 +609,10 @@ def compute_derived(df: pd.DataFrame, year: int) -> pd.DataFrame:
 # ⑤ PER-YEAR PIPELINE
 # ══════════════════════════════════════════════════════════════════════════════
 
-def process_year(year: int, out_root: Path, skip_existing: bool = True) -> dict:
-    """Full pipeline for one ACS vintage. Returns a status dict."""
+def process_year(year: int, out_root: Path, states: list[str], skip_existing: bool = True) -> dict:
+    """Full pipeline for one ACS vintage (all states). Returns a status dict."""
     out_dir  = out_root / str(year)
-    out_path = out_dir / f"ny_tracts_acs5_{year}.feather"
+    out_path = out_dir / f"us_tracts_acs5_{year}.feather"
 
     # --- Skip if already done ----------------------------------------------
     if skip_existing and out_path.exists():
@@ -406,7 +623,7 @@ def process_year(year: int, out_root: Path, skip_existing: bool = True) -> dict:
 
     print(f"\n  +-- {year}  ({year-4}-{year} ACS 5-year) " + "-" * 32)
     try:
-        raw_df = fetch_all_for_year(year)
+        raw_df = fetch_all_for_year(year, states)
         print(f"  |   Raw: {len(raw_df):,} tracts  {raw_df.shape[1]} columns")
 
         derived_df = compute_derived(raw_df, year)
@@ -419,8 +636,8 @@ def process_year(year: int, out_root: Path, skip_existing: bool = True) -> dict:
         out_df  = derived_df[list(present.keys())].rename(columns=present)
 
         # --- Spatial Merge -----------------------------------------------------
-        # Fetch the shapefiles for this specific year
-        geo_df = fetch_geometries(year)
+        # Fetch the shapefiles for this specific year (all states)
+        geo_df = fetch_geometries(year, states)
         print(f"  |   Geometries: {len(geo_df):,} tracts")
         # Merge the tabular ACS data into the geometries (right join ensures we keep all tabular rows)
         final_gdf = geo_df.merge(out_df, on="geoid", how="right")
@@ -429,7 +646,6 @@ def process_year(year: int, out_root: Path, skip_existing: bool = True) -> dict:
 
         # --- Save to Disk ------------------------------------------------------
         out_dir.mkdir(parents=True, exist_ok=True)
-        geo_df.to_csv(out_path.with_suffix(".csv"), index=False)
         final_gdf.to_feather(out_path, index=False)
 
         size_kb = out_path.stat().st_size // 1024
@@ -439,6 +655,9 @@ def process_year(year: int, out_root: Path, skip_existing: bool = True) -> dict:
         return {"year": year, "status": "ok", "rows": len(out_df),
                 "path": out_path, "error": None}
 
+    except CensusAPIError:
+        # Fatal and run-wide — bubble up to main() for a clean exit.
+        raise
     except Exception as exc:
         print(f"  +-- FAILED  {year}: {exc}")
         traceback.print_exc()
@@ -452,25 +671,28 @@ def process_year(year: int, out_root: Path, skip_existing: bool = True) -> dict:
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
-        description="Download ACS 5-year tract estimates for NY State (2009-2024).",
+        description="Download ACS 5-year tract estimates for the U.S. (all states + DC, 2009-2024).",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples
 --------
-  # Use all defaults  ->  ./acs_ny_tracts/2009/ ... ./acs_ny_tracts/2024/
-  python nyc_acs_tract_collector.py
+  # Use all defaults (every state + DC, 2009-2024)
+  python download_acs.py
 
   # Custom output folder
-  python nyc_acs_tract_collector.py --outdir /data/acs
+  python download_acs.py --outdir /data/acs
 
   # Only 2015-2022
-  python nyc_acs_tract_collector.py --start 2015 --end 2022
+  python download_acs.py --start 2015 --end 2022
+
+  # Only a few states (e.g. NY, NJ, CT) -- handy for testing
+  python download_acs.py --states 36,34,09
 
   # Re-download even if Feather files already exist
-  python nyc_acs_tract_collector.py --force
+  python download_acs.py --force
 
   # Inline API key (overrides env var)
-  python nyc_acs_tract_collector.py --key abc123def456
+  python download_acs.py --key abc123def456
         """,
     )
     p.add_argument("--outdir",  default=DEFAULT_OUT_ROOT, metavar="PATH",
@@ -479,6 +701,9 @@ Examples
                    help=f"First vintage year inclusive (default: {START_YEAR})")
     p.add_argument("--end",     default=END_YEAR,   type=int,
                    help=f"Last  vintage year inclusive (default: {END_YEAR})")
+    p.add_argument("--states",  default=None, metavar="FIPS",
+                   help="Comma-separated state FIPS codes (e.g. 36,34,09). "
+                        "Default: all 50 states + DC.")
     p.add_argument("--key",     default=None,
                    help="Census API key (overrides CENSUS_API_KEY env var)")
     p.add_argument("--force",   action="store_true",
@@ -493,13 +718,14 @@ def main() -> None:
     global API_KEY
     if args.key:
         API_KEY = args.key
-    if API_KEY == "YOUR_API_KEY_HERE":
+    if not API_KEY or API_KEY == "YOUR_API_KEY_HERE":
         sys.exit(
             "\nERROR: No Census API key found.\n"
+            "  Looked for CENSUS_API_KEY in the environment and in .env.secrets.\n"
             "  Three options:\n"
-            "    1. export CENSUS_API_KEY='your_key'\n"
-            "    2. python script.py --key your_key\n"
-            "    3. Edit API_KEY at the top of this script.\n"
+            "    1. Add CENSUS_API_KEY='your_key' to .env.secrets\n"
+            "    2. export CENSUS_API_KEY='your_key'\n"
+            "    3. python download_acs.py --key your_key\n"
             "  Free key: https://api.census.gov/data/key_signup.html\n"
         )
 
@@ -514,11 +740,18 @@ def main() -> None:
     years     = list(range(args.start, args.end + 1))
     skip_flag = not args.force
 
+    # --- Resolve states ----------------------------------------------------
+    if args.states:
+        states = [s.strip().zfill(2) for s in args.states.split(",") if s.strip()]
+    else:
+        states = STATES
+
     # --- Header ------------------------------------------------------------
     W = 66
     print(f"\n{'='*W}")
-    print(f"  ACS 5-Year Estimates — NY State Census Tracts")
+    print(f"  ACS 5-Year Estimates — U.S. Census Tracts")
     print(f"  Vintages : {args.start} to {args.end}  ({len(years)} years)")
+    print(f"  States   : {len(states)} (50 states + DC by default)")
     print(f"  Output   : {out_root}")
     print(f"  Mode     : {'resume (skip existing)' if skip_flag else 'force (overwrite all)'}")
     print(f"{'='*W}\n")
@@ -528,7 +761,10 @@ def main() -> None:
     t_start = time.time()
 
     for year in progress(years, desc="Vintages", unit="yr", leave=False):
-        result = process_year(year, out_root, skip_existing=skip_flag)
+        try:
+            result = process_year(year, out_root, states, skip_existing=skip_flag)
+        except CensusAPIError as exc:
+            sys.exit(f"\nERROR: {exc}\n")
         results.append(result)
         time.sleep(1.0)   # brief cooldown between vintages
 
