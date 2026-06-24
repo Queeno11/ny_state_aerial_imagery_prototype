@@ -23,6 +23,7 @@
         "/home/abbatenicolas/outputs",
         "/mnt/c/Working Papers/NY State Aerial Imagery Prototype/ny_state_aerial_imagery_prototype/src",
         "/mnt/c/Working Papers/NY State Aerial Imagery Prototype/ny_state_aerial_imagery_prototype/paper",
+        "/mnt/c/Working Papers/NY State Aerial Imagery Prototype/ny_state_aerial_imagery_prototype/.claude",
         "/mnt/c/Working Papers/NY State Aerial Imagery Prototype/ny_state_aerial_imagery_prototype/CLAUDE.md"
       ],
       "denyWrite": [
@@ -38,6 +39,7 @@
     },
     "network": {
       "allowedDomains": [
+        "www2.census.gov",
         "planetarycomputer.microsoft.com",
         "*.blob.core.windows.net",
         "api.census.gov",
