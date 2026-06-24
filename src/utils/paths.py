@@ -5,6 +5,14 @@ from dotenv import load_dotenv
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 load_dotenv(PROJECT_ROOT / ".env")
+# Secrets (API keys) live in a separate .env.secrets so the sandbox can deny
+# reading them without hiding the non-secret path vars above. When that file is
+# absent or read-denied (e.g. inside the sandbox), run without secrets rather
+# than crashing on import.
+try:
+    load_dotenv(PROJECT_ROOT / ".env.secrets")
+except OSError:
+    pass
 
 # Data
 DATA_DIR = PROJECT_ROOT / "data"
