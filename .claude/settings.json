@@ -16,25 +16,27 @@
   },
   "sandbox": {
     "enabled": true,
+    "failIfUnavailable": true,
     "autoAllowBashIfSandboxed": true,
+    "allowUnsandboxedCommands": false,
     "filesystem": {
       "allowWrite": [
         "/home/abbatenicolas/data/cache",
         "/home/abbatenicolas/outputs",
-        "/mnt/c/Working Papers/NY State Aerial Imagery Prototype/ny_state_aerial_imagery_prototype/src",
-        "/mnt/c/Working Papers/NY State Aerial Imagery Prototype/ny_state_aerial_imagery_prototype/paper",
-        "/mnt/c/Working Papers/NY State Aerial Imagery Prototype/ny_state_aerial_imagery_prototype/.claude",
-        "/mnt/c/Working Papers/NY State Aerial Imagery Prototype/ny_state_aerial_imagery_prototype/CLAUDE.md"
+        ".../src",
+        ".../paper",
+        ".../CLAUDE.md",
+        ".../.claude/plans"
       ],
       "denyWrite": [
-        "/mnt/c/Working Papers/NY State Aerial Imagery Prototype/ny_state_aerial_imagery_prototype/data",
-        "/mnt/c/Working Papers/NY State Aerial Imagery Prototype/ny_state_aerial_imagery_prototype/logs",
-        "/mnt/c/Working Papers/NY State Aerial Imagery Prototype/ny_state_aerial_imagery_prototype/pretrained",
-        "/mnt/c/Working Papers/NY State Aerial Imagery Prototype/ny_state_aerial_imagery_prototype/results",
-        "/mnt/c/Working Papers/NY State Aerial Imagery Prototype/ny_state_aerial_imagery_prototype/docs",
-        "/mnt/c/Working Papers/NY State Aerial Imagery Prototype/ny_state_aerial_imagery_prototype/models",
-        "/mnt/c/Working Papers/NY State Aerial Imagery Prototype/ny_state_aerial_imagery_prototype/wandb",
-        "/mnt/c/Working Papers/NY State Aerial Imagery Prototype/ny_state_aerial_imagery_prototype/.git"
+        ".../.claude/settings.json",
+        ".../.claude/settings.local.json",
+        ".../.claude/hooks",
+        "/home/abbatenicolas/.claude/settings.json",
+        "/home/abbatenicolas/.claude/hooks",
+        ".../data", ".../logs", ".../pretrained",
+        ".../results", ".../docs", ".../models",
+        ".../wandb", ".../.git"
       ]
     },
     "network": {

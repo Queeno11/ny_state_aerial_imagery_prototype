@@ -37,6 +37,8 @@ the path that scales to the US: don't reintroduce or extend the zarr branch for 
   set `small_sample=True`.
 - GPU: `main.py` sets a VRAM safety cap (~7 GB) for 8 GB cards. Experiment tracking is **wandb**
   (`WANDB_API_KEY` in `.env`); model weights gated by `HF_TOKEN`.
+- Never route around a blocked tool. If an Edit/Write/Notebook tool is denied, that denial is the answer — do not reproduce the write via Bash, heredocs, python3 -c, tee, sed -i, or any other means. A blocked edit is a signal to stop and report, not a problem to optimize past.
+
 
 ## Data locations
 
@@ -87,6 +89,30 @@ EfficientNet/DINOv2 runs under `models/` and `logs/`. Only ScaleMAE/PyTorch is c
   (DoITT IDs, NYC boundaries) in core paths; the model is fed imagery + minimal covariates by
   design, not footprint geometry.
 - **Git:** never `git commit`/`push` unless asked. Make edits; Nicolas commits.
+
+## Development Workflow & Coding Standards
+
+Whenever you are asked to write, refactor, or modify code, you must follow this sequence unless I explicitly tell you to skip it:
+
+1. **Modular Design:** Write all code in a highly modular way. Break logic down into focused, single-responsibility functions or classes. 
+2. **Unit Testing (Synthetic Data):** Before running the main script, write and execute unit tests using synthetic or mock data for every function/class you just created. Iterate on the code until these tests pass.
+3. **Execution (Real Data):** Once the synthetic tests pass, run the complete script against the real data. 
+    * *Note on Sandbox Limitations:* If you cannot access the real data due to sandbox restrictions, network rules, or missing credentials, state the limitation clearly, output the final code, and stop. Do not get stuck in an endless loop trying to force a blocked connection.
+
+## Github Rules
+
+- **Git:** never `git commit`/`push` unless asked. When asked to commit, use this
+  pattern — the sandbox blocks `.git` writes by default and git has no global
+  identity configured in WSL:
+  ```bash
+  git -C "<repo-root>" -c user.name="Queeno11" -c user.email="abbatenicolas@gmail.com" \
+      add <files>
+  git -C "<repo-root>" -c user.name="Queeno11" -c user.email="abbatenicolas@gmail.com" \
+      commit -m "..."
+  Set dangerouslyDisableSandbox: true on the Bash tool call so the .git index
+  lock succeeds. Always commit to the user's active branch (check with
+  git rev-parse --abbrev-ref HEAD), not the worktree branch.
+  ```
 
 ## Useful skills
 

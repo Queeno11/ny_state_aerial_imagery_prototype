@@ -1,3 +1,6 @@
+# Claude
+.claude
+
 # Data (paper-friendly choice: raw & processed ignored)
 data/raw/
 data/processed/
