@@ -1,0 +1,156 @@
+% =====================================================================
+%  Target label: capitalized net occupant wealth (W). Standalone Data
+%  subsection -- \input inside Section \ref{sec:acs}. Self-contained:
+%  needs only the abstract, introduction, and the methodology cross-
+%  references. Notation matches the rest of the paper: Z (relative
+%  score), \tilde{SE} (relative SE), S (structural-break statistic).
+%
+%  Bib keys: poterba1984, himmelberg2005, jorda2019rate,
+%  ahlfeldt2015economics (entries at end of file; the last is already in
+%  references.bib).
+% =====================================================================
+
+\subsection{Target Label: Capitalized Net Occupant Wealth}
+\label{sec:wealth}
+
+The label that supervises the model is the \emph{permanent wealth} capitalized into a
+tract's built environment, not a single year's income flow. This follows directly from the
+spatial-equilibrium logic of Section~\ref{sec:methodology}: the physical housing stock
+reflects the expected present value of the marginal occupant's human capital and accumulated
+assets, so the object the imagery encodes is a stock, not a flow. We measure that stock with
+a tract-level \textbf{net occupant-wealth index} $W_{i,t}$ that capitalizes the three
+components a sorting model identifies---human capital, financial assets, and net housing
+equity. Two features of household balance sheets make this index a sharper signal than a
+contemporaneous income measure. Tracts with equal income but different ownership rates hold
+very different wealth, and two equally valued housing stocks represent very different owner
+wealth when one is mortgaged and the other owned free and clear. The index addresses both.
+
+\paragraph{Construction.}
+Let $\mathrm{pop}_{i,t}$ denote tract population (ACS B01001). Each component is expressed per
+capita, so the index compares tracts of different tenure composition on equal footing.
+
+\emph{(i) Human capital.} Per-capita labor earnings (B20003: wages and self-employment
+income, which exclude interest, dividends, and rent, and so do not double-count the asset and
+housing terms) are capitalized over a finite working horizon as an ordinary annuity,
+\begin{equation}
+\mathrm{HC}_{i,t}(r) \;=\; \frac{\mathrm{earn}_{i,t}}{\mathrm{pop}_{i,t}}
+\;\times\; a(r, N_{i,t}),
+\qquad
+a(r,N) \;=\; \frac{1-(1+r)^{-N}}{r},
+\label{eq:hc}
+\end{equation}
+where $r$ is the real discount rate and $N_{i,t}$ is the tract's expected remaining working
+years, the population-weighted distance to age 65 across the $16$--$64$ brackets of B01001. A
+finite horizon, rather than an infinite annuity, reflects that labor income ends at
+retirement: a retiree-heavy tract earns a short horizon and leans on its assets.
+
+\emph{(ii) Financial assets.} Per-capita capital income (B19064: interest, dividends, and net
+rental income) is capitalized as a perpetuity at the gross asset yield $r_k$, since financial
+wealth does not expire at retirement,
+\begin{equation}
+\mathrm{CAP}_{i,t}(r_k) \;=\; \frac{1}{r_k}\,\frac{\mathrm{capinc}_{i,t}}{\mathrm{pop}_{i,t}}.
+\label{eq:cap}
+\end{equation}
+
+\emph{(iii) Net housing equity.} Per-capita aggregate owner-occupied home value (B25082) is
+de-levered by the mortgaged share $m_{i,t}$ of owners (B25081) at the prevailing
+loan-to-value ratio,
+\begin{equation}
+\mathrm{EQ}_{i,t} \;=\; \frac{\mathrm{ownval}_{i,t}}{\mathrm{pop}_{i,t}}
+\;\big(\underbrace{1 - m_{i,t}\,\mathrm{LTV}_t}_{\text{free-clear}\cdot 1\,+\,\text{mortgaged}\cdot(1-\mathrm{LTV}_t)}\big).
+\label{eq:eq}
+\end{equation}
+The aggregate ratio $\mathrm{LTV}_t = 1 - s_t$ uses the Federal Reserve Financial Accounts
+series for owners' equity as a share $s_t$ of household real estate (FRED \texttt{HOEREPHRE}),
+averaged over the five-year window of each ACS vintage, so the leverage adjustment moves with
+the housing cycle. The index sums the three terms,
+\begin{equation}
+W_{i,t}(r,r_k) \;=\; \mathrm{HC}_{i,t}(r) \;+\; \mathrm{CAP}_{i,t}(r_k) \;+\; \mathrm{EQ}_{i,t}.
+\label{eq:w2}
+\end{equation}
+
+\paragraph{Rate parameters.}
+We set the real discount rate to $r=0.05$ and the gross asset yield to $r_k=0.045$. A real
+capitalization rate near five percent is the standard convention in the user-cost-of-housing
+literature, where a durable structure is priced as the discounted stream of its service flow
+\citep{poterba1984,himmelberg2005}, and it is the rate at which durable locational amenities
+capitalize into the built environment in the quantitative spatial-equilibrium models that
+motivate our design \citep{ahlfeldt2015economics}. The gross asset yield $r_k=0.045$ sits
+within the long-run real-return range for a diversified portfolio of risky and safe assets
+documented over more than a century of cross-country data \citep{jorda2019rate}. Neither
+choice meaningfully affects the labels the model trains on. Across the grid
+$r\in\{0.02,0.03,0.05,0.07\}$ the relative score defined below is at least $0.995$
+Spearman-correlated with its $r=0.05$ counterpart, and across $r_k\in\{0.040,0.045,0.050\}$
+the ranking is invariant to three decimal places (Appendix~\ref{app:label-robustness}). We
+therefore fix one configuration rather than tuning the rates.
+
+\paragraph{Relative cross-sectional score.}
+We strip out each city's level and dispersion by standardizing the logged index within city
+and year. Let $\mu^{W}_{c,t}$ and $\sigma^{W}_{c,t}$ be the mean and standard deviation of
+$\ln W_{i,t}$ across tracts in city (CBSA) $c$ in year $t$. The label fed to the Spatial
+Margin Ranking loss is
+\begin{equation}
+L_{i,t} \;=\; Z^{W}_{i,t} \;=\; \frac{\ln W_{i,t} - \mu^{W}_{c(i),t}}{\sigma^{W}_{c(i),t}}.
+\label{eq:zw}
+\end{equation}
+This normalization makes the label invariant to city-wide nominal drift---inflation and
+aggregate housing appreciation---so the model learns only relative structural position.
+
+\paragraph{Standard errors and structural change, 2014--2024.}
+$W_{i,t}$ combines several ACS tables whose sampling errors are correlated, so the delta
+method understates its variance and an independent Monte-Carlo propagation would ignore the
+cross-table covariance. We use the Census Bureau's Variance Replicate Estimate (VRE) tables,
+which provide $R=80$ successive-difference replicates of each component. We recompute the full
+index \eqref{eq:w2} and its within-city $z$-score \eqref{eq:zw} on every replicate $\rho$ and
+take the successive-difference variance of the relative score,
+\begin{equation}
+\widetilde{\mathrm{SE}}_{i,t}
+\;=\; \sqrt{\;\frac{4}{R}\sum_{\rho=1}^{R}\big(Z^{W,(\rho)}_{i,t} - Z^{W,(0)}_{i,t}\big)^{2}\,},
+\label{eq:sdr}
+\end{equation}
+where $Z^{W,(0)}_{i,t}$ is the point estimate. Re-evaluating the same nonlinear index on each
+replicate carries the correlation among tables through to the final standard error. The VRE
+tables begin in 2014, so the wealth label's standard errors---and its structural-change
+test---span 2014 to 2024.
+
+To separate true structural change from sampling noise we apply a two-tailed $z$-test of the
+first against the last covered year,
+\begin{equation}
+S_{i,(2024,2014)} \;=\; \frac{\big|Z^{W}_{i,2024} - Z^{W}_{i,2014}\big|}
+{\sqrt{\widetilde{\mathrm{SE}}_{i,2024}^{2} + \widetilde{\mathrm{SE}}_{i,2014}^{2}}},
+\label{eq:sbreak-w}
+\end{equation}
+and flag a significant move with $I^{\,\mathrm{valid}}_{i}=\mathbb{1}\{p(S_{i,(2024,2014)})<0.05\}$.
+The classification is robust to the discount rate: it agrees across all four values of $r$ for
+$95.1\%$ of tracts (Appendix~\ref{app:label-robustness}).
+
+\paragraph{Relation to the deployment target.}
+The wealth label is tightly rank-aligned with per-capita income---Spearman $\rho = 0.97$ at
+$r=0.05$, pooled across the $5.4\times10^{4}$ tracts of all large U.S.\ metros. This alignment
+is what lets the deployment step quantile-map predicted ranks onto a target city's income
+distribution (Section~\ref{sec:methodology}), where income is the one wealth proxy available
+in every city, with negligible reordering---while the supervision itself keeps the
+permanent-wealth interpretation the theory requires.
+
+% ---------------------------------------------------------------------
+% Bib entries (move to references.bib; ahlfeldt2015economics already present):
+%
+% @article{poterba1984,
+%   author  = {Poterba, James M.},
+%   title   = {Tax Subsidies to Owner-Occupied Housing: An Asset-Market Approach},
+%   journal = {The Quarterly Journal of Economics}, volume = {99}, number = {4},
+%   pages   = {729--752}, year = {1984}}
+%
+% @article{himmelberg2005,
+%   author  = {Himmelberg, Charles and Mayer, Christopher and Sinai, Todd},
+%   title   = {Assessing High House Prices: Bubbles, Fundamentals and Misperceptions},
+%   journal = {Journal of Economic Perspectives}, volume = {19}, number = {4},
+%   pages   = {67--92}, year = {2005}}
+%
+% @article{jorda2019rate,
+%   author  = {Jord\`a, \`Oscar and Knoll, Katharina and Kuvshinov, Dmitry and
+%              Schularick, Moritz and Taylor, Alan M.},
+%   title   = {The Rate of Return on Everything, 1870--2015},
+%   journal = {The Quarterly Journal of Economics}, volume = {134}, number = {3},
+%   pages   = {1225--1298}, year = {2019}}
+% ---------------------------------------------------------------------

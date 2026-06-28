@@ -1,0 +1,81 @@
+% =====================================================================
+%  Appendix: robustness of the wealth label to its rate parameters.
+%  Standalone -- \input after \appendix. Self-contained: refers only to
+%  Section \ref{sec:wealth} and its equations. booktabs + natbib are
+%  loaded by main.tex. Numbers come from the 2011--2023 U.S.-metros
+%  panel (54,519--55,061 tracts, all CBSAs > 500k population).
+% =====================================================================
+
+\section{Robustness of the Wealth Label to the Discount and Yield Rates}
+\label{app:label-robustness}
+
+The occupant-wealth index $W_{i,t}$ of Section~\ref{sec:wealth} depends on two rates: the
+real discount rate $r$ that capitalizes the human-capital annuity [Eq.~\eqref{eq:hc}] and the
+gross asset yield $r_k$ that capitalizes the financial-asset perpetuity [Eq.~\eqref{eq:cap}].
+The main text fixes $r=0.05$ and $r_k=0.045$. This appendix shows that the label the model
+trains on---the within-city relative score $Z^{W}_{i,t}$ of Eq.~\eqref{eq:zw}---barely moves
+across plausible values of either rate, so the two rates are not free parameters to be tuned.
+
+\paragraph{The label is a near-invariant of the discount rate.}
+Because $Z^{W}_{i,t}$ standardizes $\ln W_{i,t}$ within city and year, any rate change that
+rescales the index roughly monotonically washes out of the $z$-score. We recompute the label
+for each $r$ in $\{0.02, 0.03, 0.05, 0.07\}$ and correlate the resulting label sets across the
+full panel. Table~\ref{tab:rate-robust} reports the pairwise Spearman rank correlations.
+Across all six rate pairs the rankings never fall below $\rho = 0.988$, with a median of
+$\rho = 0.997$; the $r=0.05$ label is at least $\rho = 0.995$ correlated with the label at
+every other rate. The pattern holds in the first, middle, and last panel years.
+
+\begin{table}[ht]
+\centering
+\caption{Pairwise Spearman rank correlation of the relative wealth label $Z^{W}_{i,t}$ across
+the discount-rate grid $r\in\{0.02,0.03,0.05,0.07\}$, by year. Pooled over all tracts in all
+CBSAs $>500$k population ($n\approx 5.5\times10^{4}$). Each cell summarizes the six pairwise
+correlations among the four rate-specific labels.}
+\label{tab:rate-robust}
+\begin{tabular}{lcccc}
+\toprule
+Year & Min $\rho$ & Median $\rho$ & Max $\rho$ & vs.\ $r=0.05$, min $\rho$ \\
+\midrule
+2014 & 0.991 & 0.997 & 0.999 & 0.996 \\
+2019 & 0.990 & 0.997 & 0.999 & 0.996 \\
+2023 & 0.988 & 0.997 & 0.999 & 0.995 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{The asset yield does not change the ordering.}
+The financial-asset term \eqref{eq:cap} enters \eqref{eq:w2} additively and is small relative
+to the human-capital and equity terms, so $r_k$ rescales a minor component without reordering
+tracts. Varying $r_k$ over $\{0.040, 0.045, 0.050\}$ changes the Spearman correlation between
+$W_{i,t}$ and per-capita income by at most $0.003$ at any discount rate, and by $0.002$ at the
+headline $r=0.05$ (Table~\ref{tab:rk-robust}).
+
+\begin{table}[ht]
+\centering
+\caption{Sensitivity of the wealth index to the gross asset yield $r_k$. Entries are the
+spread (max $-$ min) in the Spearman correlation between $W_{i,t}$ and per-capita income as
+$r_k$ ranges over $\{0.040,0.045,0.050\}$, by discount rate, 2023.}
+\label{tab:rk-robust}
+\begin{tabular}{lcccc}
+\toprule
+Discount rate $r$ & 0.02 & 0.03 & 0.05 & 0.07 \\
+\midrule
+$\rho(W,\text{income})$ spread over $r_k$ & 0.003 & 0.003 & 0.002 & 0.001 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{The structural-change classification is robust.}
+The rate could in principle matter for the longitudinal test of Eq.~\eqref{eq:sbreak-w},
+which flags tracts whose relative wealth moved significantly between 2014 and 2024. It does
+not. Running the test separately for each $r$, the indicator $I^{\,\mathrm{valid}}_{i}$ agrees
+across all four rates for $95.1\%$ of tracts. The share of tracts flagged ranges from $11.1\%$
+at $r=0.02$ to $14.1\%$ at $r=0.07$---a higher rate front-loads the human-capital annuity and
+so registers earnings changes a little more readily---with $r=0.05$ at $12.8\%$. No conclusion
+of the event study turns on this margin.
+
+\paragraph{Implication.}
+The candidate labels are $\rho \geq 0.988$ identical, a gap smaller than the ACS margin of
+error embedded in the labels and well below the rank fidelity the vision model can resolve. A
+search over $(r,r_k)$ would select among indistinguishable targets. We therefore adopt the
+single configuration $(r,r_k)=(0.05,0.045)$ and report the grid here as a robustness check.

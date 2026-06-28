@@ -13,39 +13,30 @@ per vintage — containing all states — inside a user-defined folder tree:
   │   …
   └── 2024/   ← 2020-2024 estimates  →  us_tracts_acs5_2024.feather
 
-Variables collected
+Scope — STRICTLY a fetch + persist layer
+────────────────────────────────────────
+This module downloads ACS estimates and saves them RAW. It performs NO indicator
+generation: every derived quantity (demographic ratios, weighted mean age, and the
+V_i / W_i occupant-wealth index) is computed downstream in
+src/data/process_acs.py (compute_acs_indicators) from the columns persisted here.
+
+Variables persisted
 ───────────────────
-  DIRECT
-    • Median Home Value           B25077_001E
-    • Median Gross Rent           B25064_001E
-    • Median Household Income     B19013_001E
-    • Per Capita Income           B19301_001E
+  HEADLINE ESTIMATES (saved under friendly names)
+    • Median Home Value           B25077_001E -> median_home_value_usd
+    • Median Gross Rent           B25064_001E -> median_gross_rent_usd
+    • Median Household Income     B19013_001E -> median_hh_income_usd
+    • Per Capita Income           B19301_001E -> per_capita_income_usd (+ _error)
+    • Aggregate Labor Earnings    B20003_001E -> aggregate_earnings_usd
+    • Aggregate Owner Value       B25082_001E -> aggregate_owner_value_usd
+    • Total Population            B01001_001E -> total_population
 
-  DERIVED  (ratio / weighted-mean from raw counts)
-    • % HH with No Vehicle        B08201
-    • % Overcrowded Housing       B25014   (> 1.00 occ / room)
-    • Mean Commute Time (min)     B08136 / (B08301 - WFH workers)
-    • % Below Poverty Line        B17001
-    • Education shares            B15003   (< HS / HS+GED / Some col / Bach+)
-    • Weighted Mean Age           B01001
-
-  OCCUPANT-WEALTH INDEX  (for the W_i target diagnostic)
-    • V_i  = MEAN owner-occupied home value = B25082 / owner-occupied units.
-        The mean is the correct aggregator for a stock quantity: the median
-        (B25077) understates the value stock non-uniformly, compressing exactly
-        the high-value tracts we want to discriminate.
-    • W_i(r) = (1/r)*PerCapInc + per-capita net housing equity. Both terms are
-        now dollar stocks PER CAPITA. The per-capita equity term collapses
-        algebraically (the owner-unit and occupied-unit counts cancel) to
-          (B25082 / total tract population) * [freeclear_i + mortgaged_i*(1-LTV)]
-        aggregate owner value       B25082 (Aggregate Value by Mortgage Status)
-        owner-occupied units        B25003 (Tenure)  -> alpha_i and V_i denom
-        mortgage status shares      B25081 (Mortgage Status) -> leverage bracket
-        total tract population      B01001_001E -> shared per-capita denominator
-      Total tract population (not B25010 household population) is used so the
-      equity term and the per-capita income term share a denominator definition.
-      Tracts with no B25082 (suppressed / no owner units) get V_i=0, equity=0.
-      One column per discount rate in DISCOUNT_RATES (robustness sweep).
+  RAW COMPONENT COUNTS (saved under their B-codes, for downstream derivation)
+    • Tenure / mortgage status    B25003, B25081      -> V_i, equity (process_acs)
+    • Vehicles / overcrowding     B08201, B25014
+    • Commute                     B08135, B08301
+    • Poverty                     B17001
+    • Education / age bins        B15003, B01001_xxx
 
 Resilience features
 ───────────────────
@@ -128,22 +119,10 @@ CALL_SLEEP  = 0.4            # polite pause between chunk calls
 # Default output root — override with --outdir or OUTPUT_ROOT env var
 DEFAULT_OUT_ROOT = os.environ.get("OUTPUT_ROOT", r"/mnt/e/Datasets/US ACS 5-year Census Tract Estimates")
 
-# ── Occupant-wealth index (W_i) parameters ───────────────────────────────────
-# W_i = (1/r)*Y_i  +  per-capita net housing equity. The equity term used to be
-# per-household (alpha_i * V_i * leverage / avg_hh_size); it is now per-capita to
-# match the per-person income term. Using V_i = mean value = B25082/owner_units,
-# the per-household counts cancel and the per-capita equity term reduces to
-#   (B25082 / total_tract_population) * [freeclear_i + mortgaged_i*(1 - LTV_MACRO)].
-# LTV_MACRO is the macro loan-to-value for mortgaged owners (SCF/AHS ~0.50).
-LTV_MACRO = 0.50
-# Discount/cap-rate grid for the robustness sweep. One W_i column is produced
-# per rate; includes the Circular A-4 baseline (0.02) and spans 1%–7%.
-DISCOUNT_RATES = (0.01, 0.02, 0.03, 0.05, 0.07)
-
-
-def w_index_colname(r: float) -> str:
-    """Output column name for the W_i index at discount rate ``r`` (e.g. 0.02 -> 'W_i_r2pct')."""
-    return f"W_i_r{round(r * 100, 2):g}pct"
+# NOTE: the occupant-wealth index (V_i, W_i) and every demographic indicator are
+# no longer built here. download_acs.py is strictly a fetch + persist layer; the
+# discount-rate grid, LTV assumption, human-capital horizon, and all derivation
+# now live in src/data/process_acs.py (compute_acs_indicators).
 
 # ══════════════════════════════════════════════════════════════════════════════
 # ② VARIABLE DEFINITIONS
@@ -174,14 +153,36 @@ RAW_VARS: dict[str, Optional[str]] = {
     "B19013_001E": "median_hh_income_usd",
     "B19301_001E": "per_capita_income_usd",
     "B19301_001M": "per_capita_income_usd_error",
+    # Aggregate LABOR earnings (wages/salary + self-employment), population 16+.
+    # process_acs.py divides this by total population for a pure human-capital flow,
+    # excluding the capital & transfer income that per-capita income (B19301) mixes in.
+    "B20003_001E": "aggregate_earnings_usd",
+    # Aggregate CAPITAL income (interest + dividends + net rental) for households.
+    # process_acs.py capitalizes this per capita as a perpetuity (1/r_k) -- the
+    # non-housing / investment-property wealth term of the W2/W3 indexes. ACS income
+    # excludes the owner-occupied housing return, so this flow is disjoint from owner
+    # home equity (B25082) and is added without double-counting.
+    "B19064_001E": "aggregate_capital_income_usd",
     # Occupant-wealth index components (W_i / V_i)
-    "B25082_001E": None,   # aggregate owner-occupied value ($) -> mean V_i & equity
+    "B25082_001E": "aggregate_owner_value_usd",   # aggregate owner value ($) -> V_i & equity (derived downstream)
     "B25003_001E": None,   # tenure: total occupied housing units
     "B25003_002E": None,   # tenure: owner-occupied units  -> alpha_i, V_i denom
     "B25081_001E": None,   # mortgage status: total owner-occupied units
     "B25081_002E": None,   # mortgage status: units with a mortgage
     #   free & clear is derived as (001 - 002); the "without a mortgage" code
     #   moved across vintages (008/009), so we never download it directly.
+    # Year householder moved in (B25038) -- OWNER brackets only -> W3 median tenure.
+    # 002 = owner-occupied total; 003-008 = owner move-in periods (most-recent ->
+    # earliest). Bracket year ranges shift across vintages; process_acs.py maps each
+    # vintage's brackets to [lo, hi] year bounds for the grouped-median move-in year.
+    "B25038_001E": None,   # total occupied units
+    "B25038_002E": None,   # owner-occupied total (tenure denominator)
+    "B25038_003E": None,   # owner: moved in (most recent bracket)
+    "B25038_004E": None,   # owner: next bracket
+    "B25038_005E": None,   # owner: next bracket
+    "B25038_006E": None,   # owner: next bracket
+    "B25038_007E": None,   # owner: next bracket
+    "B25038_008E": None,   # owner: earliest bracket
     "B25010_001E": None,   # average household size (diagnostic; not in W_i now)
     # Vehicle availability (B08201)
     "B08201_001E": None,   # total households
@@ -205,48 +206,28 @@ RAW_VARS: dict[str, Optional[str]] = {
     "B15003_001E": None,   # total pop 25+ (denominator)
     **{v: None for v in EDU_LT_HS + EDU_HS_GED + EDU_SOME + EDU_BACH},
     # Age (B01001)
-    "B01001_001E": None,   # total population (denominator)
+    "B01001_001E": "total_population",   # total population (denominator; per-capita base)
     **{code: None for code in AGE_MALE_VARS},
     **{code: None for code in AGE_FEMALE_VARS},
 }
 
-# Final column selection/rename map (raw or derived -> output name)
+# Final column selection/rename map. download_acs.py is now STRICTLY a fetch +
+# persist layer: it saves the identifiers plus every RAW ACS estimate it pulls --
+# headline direct estimates under friendly names, component counts under their raw
+# B-codes. ALL indicator/index generation (demographic ratios, weighted mean age,
+# and the V_i / W_i occupant-wealth index) now lives in src/data/process_acs.py
+# (compute_acs_indicators), which derives them from these raw columns. The map is
+# built programmatically so nothing is dropped at save time.
 FINAL_COLS: dict[str, str] = {
-    "GEOID":               "geoid",
-    "NAME":                "name",
-    "acs_year":            "acs_year",
-    "acs_span":            "acs_span",
-    # Direct
-    "B25077_001E":         "median_home_value_usd",
-    "B25064_001E":         "median_gross_rent_usd",
-    "B19013_001E":         "median_hh_income_usd",
-    "B19301_001E":         "per_capita_income_usd",
-    "B19301_001M":         "per_capita_income_usd_error",
-    "B08135_001E":         "mean_commute_unadjusted_min",
-    "B01001_001E":         "total_population",
-    # Derived
-    "pct_no_vehicle":      "pct_hh_no_vehicle",
-    "pct_overcrowded":     "pct_overcrowded_housing",
-    "mean_commute_min":    "mean_commute_min",
-    "pct_below_poverty":   "pct_below_poverty",
-    "pct_edu_lt_hs":       "pct_edu_lt_hs",
-    "pct_edu_hs_ged":      "pct_edu_hs_ged",
-    "pct_edu_some_col":    "pct_edu_some_college",
-    "pct_edu_bach_plus":   "pct_edu_bach_plus",
-    "mean_age":            "mean_age_years",
+    "GEOID":    "geoid",
+    "NAME":     "name",
+    "acs_year": "acs_year",
+    "acs_span": "acs_span",
 }
-
-# Occupant-wealth outputs. V_i is now the MEAN owner-occupied value
-# (B25082 / owner-occupied units); each W_i column is the capitalized-income +
-# per-capita-equity index at one discount rate (see DISCOUNT_RATES). Added here
-# so the grid lives in one place. aggregate_owner_value_usd (B25082) is exported
-# as a diagnostic since it is the numerator of both V_i and the equity term.
-FINAL_COLS["B25082_001E"] = "aggregate_owner_value_usd"
-for _col in ("V_i", "homeownership_rate", "pct_owner_with_mortgage",
-             "pct_owner_free_clear", "avg_household_size"):
-    FINAL_COLS[_col] = _col
-for _r in DISCOUNT_RATES:
-    FINAL_COLS[w_index_colname(_r)] = w_index_colname(_r)
+for _code, _label in RAW_VARS.items():
+    # Friendly name where RAW_VARS defines one; otherwise keep the raw B-code so the
+    # component count survives into the feather for downstream derivation.
+    FINAL_COLS[_code] = _label if _label else _code
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -497,111 +478,17 @@ def fetch_geometries(year: int, states: list[str]) -> gpd.GeoDataFrame:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def compute_derived(df: pd.DataFrame, year: int) -> pd.DataFrame:
-    d = df.copy()
+    """Attach vintage metadata only.
 
-    # Vintage metadata columns
+    download_acs.py is strictly a fetch + persist layer and no longer computes any
+    indicators. The demographic ratios, weighted mean age, and the V_i / W_i
+    occupant-wealth index are all generated downstream in
+    src/data/process_acs.py (compute_acs_indicators) from the raw ACS columns this
+    module persists. Only the vintage tags are added here.
+    """
+    d = df.copy()
     d["acs_year"] = year
     d["acs_span"] = f"{year - 4}-{year}"
-
-    # --- % HH no vehicle ---------------------------------------------------
-    d["pct_no_vehicle"] = (
-        d["B08201_002E"] / d["B08201_001E"].replace(0, np.nan) * 100
-    )
-
-    # --- % Overcrowded housing (> 1.00 occ / room) -------------------------
-    oc_cols = [
-        "B25014_005E", "B25014_006E", "B25014_007E",
-        "B25014_011E", "B25014_012E", "B25014_013E",
-    ]
-    present_oc = [c for c in oc_cols if c in d.columns]
-    if present_oc:
-        d["_n_overcrowded"] = d[present_oc].sum(axis=1)
-        d["pct_overcrowded"] = d["_n_overcrowded"] / d["B25014_001E"].replace(0, np.nan) * 100
-    else:
-        d["pct_overcrowded"] = np.nan
-
-    # # --- Mean commute time (min) -------------------------------------------
-    #   aggregate_minutes / (total_workers - work_from_home_workers)
-    wfh = d["B08301_021E"].fillna(0) if "B08301_021E" in d.columns else 0
-    commuter_base = (d["B08301_001E"] - wfh).replace(0, np.nan)
-    d["mean_commute_min"] = d["B08135_001E"] / commuter_base
-
-    # --- % Below poverty ---------------------------------------------------
-    d["pct_below_poverty"] = (
-        d["B17001_002E"] / d["B17001_001E"].replace(0, np.nan) * 100
-    )
-
-    # --- Education shares --------------------------------------------------
-    edu_denom = d["B15003_001E"].replace(0, np.nan)
-    for derived_col, raw_list in [
-        ("pct_edu_lt_hs",     EDU_LT_HS),
-        ("pct_edu_hs_ged",    EDU_HS_GED),
-        ("pct_edu_some_col",  EDU_SOME),
-        ("pct_edu_bach_plus", EDU_BACH),
-    ]:
-        present = [c for c in raw_list if c in d.columns]
-        d[derived_col] = (d[present].sum(axis=1) / edu_denom * 100) if present else np.nan
-
-    # --- Weighted mean age -------------------------------------------------
-    all_age  = {**AGE_MALE_VARS, **AGE_FEMALE_VARS}
-    age_denom = d["B01001_001E"].replace(0, np.nan)
-    w_sum = sum(
-        d[code].fillna(0) * mp
-        for code, mp in all_age.items()
-        if code in d.columns
-    )
-    d["mean_age"] = w_sum / age_denom
-
-    # --- Occupant-wealth index (V_i, W_i) ----------------------------------
-    # V_i: MEAN owner-occupied home value = aggregate value (B25082) / number of
-    # owner-occupied units (B25003_002E). The mean (not the median B25077) is the
-    # right aggregator for a stock quantity. Tracts with no aggregate value
-    # published (suppressed / no owner units) get V_i = 0.
-    agg_owner_value = d["B25082_001E"]
-    owner_occupied  = d["B25003_002E"]
-    d["V_i"] = (agg_owner_value / owner_occupied.replace(0, np.nan)).fillna(0.0)
-
-    # alpha_i: homeownership rate = owner-occupied / total occupied households.
-    d["homeownership_rate"] = d["B25003_002E"] / d["B25003_001E"].replace(0, np.nan)
-
-    # Mortgage-status shares among owner-occupied units (B25081). Free-and-clear
-    # is derived as (total - with_mortgage) so it is robust to the across-vintage
-    # renumbering of the "without a mortgage" line (008 vs 009).
-    owner_units = d["B25081_001E"].replace(0, np.nan)
-    d["pct_owner_with_mortgage"] = d["B25081_002E"] / owner_units
-    d["pct_owner_free_clear"]    = (d["B25081_001E"] - d["B25081_002E"]) / owner_units
-
-    # Average household size (persons/household). No longer enters W_i — kept as a
-    # diagnostic. The per-capita equity term uses total tract population instead,
-    # so its denominator matches per-capita income (B19301) exactly.
-    d["avg_household_size"] = d["B25010_001E"].replace(0, np.nan)
-
-    # Leverage bracket (net-equity fraction of home value): free-and-clear owners
-    # hold 100% equity; mortgaged owners hold (1 - LTV_MACRO). Unchanged.
-    equity_fraction = (
-        d["pct_owner_free_clear"] * 1.0
-        + d["pct_owner_with_mortgage"] * (1.0 - LTV_MACRO)
-    )
-    # Per-capita net housing equity. The per-household form
-    #   alpha_i * V_bar_i * equity_fraction / n_bar_i
-    # collapses algebraically (owner-unit and occupied-unit counts cancel) to
-    #   (B25082 / total_tract_population) * equity_fraction.
-    # Total tract population (B01001_001E) is used so this term and the per-capita
-    # income term share a denominator. The renter-zeroing of alpha_i is preserved
-    # implicitly: B25082 = 0 where there are no owner units -> equity = 0.
-    total_population = d["B01001_001E"].replace(0, np.nan)
-    equity_per_capita = (agg_owner_value / total_population) * equity_fraction
-    # Tracts with no aggregate owner value published (suppressed / fully renter)
-    # contribute zero housing equity rather than NaN, so W_i stays defined
-    # (= capitalized income) there.
-    equity_per_capita = equity_per_capita.where(agg_owner_value > 0, 0.0)
-
-    # W_i(r) = (1/r) * per-capita income + per-capita net housing equity.
-    # One column per discount rate for the robustness sweep.
-    y_pc = d["B19301_001E"]
-    for r in DISCOUNT_RATES:
-        d[w_index_colname(r)] = y_pc / r + equity_per_capita
-
     return d
 
 
