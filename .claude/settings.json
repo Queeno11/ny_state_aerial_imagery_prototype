@@ -2,13 +2,12 @@
   "hooks": {
     "PreToolUse": [
       {
-        "matcher": "Edit|Write|MultiEdit|NotebookEdit",
+        "matcher": "Edit|Write|MultiEdit|NotebookEdit|Bash",
         "hooks": [
           {
             "type": "command",
-            "command": "bash",
-            "args": [".claude/hooks/guard-edits.sh"],
-            "statusMessage": "Checking edit is within src/, paper/, or CLAUDE.md..."
+            "command": "bash \"$CLAUDE_PROJECT_DIR/.claude/hooks/guard-edits.sh\"",
+            "statusMessage": "Sandbox guard: checking edit paths / git ops / gh usage..."
           }
         ]
       }
@@ -23,28 +22,34 @@
       "allowWrite": [
         "/home/abbatenicolas/data/cache",
         "/home/abbatenicolas/outputs",
-        ".../src",
-        ".../paper",
-        ".../CLAUDE.md",
-        ".../.claude/plans"
+        "/mnt/c/Working Papers/NY State Aerial Imagery Prototype/ny_state_aerial_imagery_prototype/src",
+        "/mnt/c/Working Papers/NY State Aerial Imagery Prototype/ny_state_aerial_imagery_prototype/paper",
+        "/mnt/c/Working Papers/NY State Aerial Imagery Prototype/ny_state_aerial_imagery_prototype/CLAUDE.md",
+        "/mnt/c/Working Papers/NY State Aerial Imagery Prototype/ny_state_aerial_imagery_prototype/.claude/plans"
       ],
       "denyWrite": [
-        ".../.claude/settings.json",
-        ".../.claude/settings.local.json",
-        ".../.claude/hooks",
+        "/mnt/c/Working Papers/NY State Aerial Imagery Prototype/ny_state_aerial_imagery_prototype/.claude/settings.json",
+        "/mnt/c/Working Papers/NY State Aerial Imagery Prototype/ny_state_aerial_imagery_prototype/.claude/settings.local.json",
+        "/mnt/c/Working Papers/NY State Aerial Imagery Prototype/ny_state_aerial_imagery_prototype/.claude/hooks",
+        "/mnt/c/Working Papers/NY State Aerial Imagery Prototype/ny_state_aerial_imagery_prototype/.mcp.json",
         "/home/abbatenicolas/.claude/settings.json",
         "/home/abbatenicolas/.claude/hooks",
-        ".../data", ".../logs", ".../pretrained",
-        ".../results", ".../docs", ".../models",
-        ".../wandb", ".../.git"
+        "/mnt/c/Working Papers/NY State Aerial Imagery Prototype/ny_state_aerial_imagery_prototype/data",
+        "/mnt/c/Working Papers/NY State Aerial Imagery Prototype/ny_state_aerial_imagery_prototype/logs",
+        "/mnt/c/Working Papers/NY State Aerial Imagery Prototype/ny_state_aerial_imagery_prototype/pretrained",
+        "/mnt/c/Working Papers/NY State Aerial Imagery Prototype/ny_state_aerial_imagery_prototype/results",
+        "/mnt/c/Working Papers/NY State Aerial Imagery Prototype/ny_state_aerial_imagery_prototype/docs",
+        "/mnt/c/Working Papers/NY State Aerial Imagery Prototype/ny_state_aerial_imagery_prototype/models",
+        "/mnt/c/Working Papers/NY State Aerial Imagery Prototype/ny_state_aerial_imagery_prototype/wandb",
+        "/mnt/c/Working Papers/NY State Aerial Imagery Prototype/ny_state_aerial_imagery_prototype/.git"
       ]
     },
     "network": {
       "allowedDomains": [
         "www2.census.gov",
+        "api.census.gov",
         "planetarycomputer.microsoft.com",
         "*.blob.core.windows.net",
-        "api.census.gov",
         "huggingface.co",
         "*.hf.co",
         "cdn-lfs.huggingface.co",
@@ -55,12 +60,14 @@
         "repo.anaconda.com",
         "download.pytorch.org",
         "github.com",
+        "api.github.com",
         "*.githubusercontent.com"
       ]
     },
     "credentials": {
       "files": [
         { "path": "/mnt/c/Working Papers/NY State Aerial Imagery Prototype/ny_state_aerial_imagery_prototype/.env.secrets", "mode": "deny" },
+        { "path": "/mnt/c/Working Papers/NY State Aerial Imagery Prototype/ny_state_aerial_imagery_prototype/.env", "mode": "deny" },
         { "path": "/home/abbatenicolas/.claude/.credentials.json", "mode": "deny" }
       ],
       "envVars": [

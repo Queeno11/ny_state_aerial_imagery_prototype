@@ -1,9 +1,7 @@
 # CLAUDE.md
-
 Guidance for working in this repository. Read this before touching code.
 
 ## What this project is
-
 A research codebase (Nicolas Abbate, NYU PhD) that estimates **building-level relative
 wealth from high-resolution aerial imagery**. The model is a **ScaleMAE (ViT-L/16) backbone
 with LoRA adapters** and a late-fusion scalar head, trained with a **purely ordinal loss**
@@ -23,7 +21,6 @@ Current runs use `sat_data="NAIP"`, so even NYC now trains off live NAIP fetches
 the path that scales to the US: don't reintroduce or extend the zarr branch for new work.
 
 ## Environment & how to run — IMPORTANT
-
 - **Always run Python through WSL + the `torch_geo_env` conda env** (not the Windows `.venv` or
   `tf_updated`). WSL doesn't inherit the Windows cwd, so `cd` in first:
   ```bash
@@ -36,24 +33,25 @@ the path that scales to the US: don't reintroduce or extend the zarr branch for 
   subtasks to verify functions you edit: exercise a single function, run `verify_pipeline.py`, or
   set `small_sample=True`.
 - GPU: `main.py` sets a VRAM safety cap (~7 GB) for 8 GB cards. Experiment tracking is **wandb**
-  (`WANDB_API_KEY` in `.env`); model weights gated by `HF_TOKEN`.
-- Never route around a blocked tool. If an Edit/Write/Notebook tool is denied, that denial is the answer — do not reproduce the write via Bash, heredocs, python3 -c, tee, sed -i, or any other means. A blocked edit is a signal to stop and report, not a problem to optimize past.
-
+  (`WANDB_API_KEY` in `.env.secrets`); model weights gated by `HF_TOKEN`.
+- Never route around a blocked tool. If an Edit/Write/Notebook tool is denied, that denial is the
+  answer — do not reproduce the write via Bash, heredocs, python3 -c, tee, sed -i, or any other
+  means. A blocked edit is a signal to stop and report, not a problem to optimize past.
 
 ## Data locations
-
 - **Imagery**: current runs fetch NAIP on demand from Planetary Computer (see imagery-source note
   above), cached under `CACHE_DIR`. The **legacy zarr** store still lives on the **WSL filesystem**
   (`IMAGERY_ROOT` in `.env`), used only when `sat_data` is not `"NAIP"`. Neither is in the repo.
 - **ACS data**: on the **Windows** drive `E:\Datasets\US ACS 5-year Census Tract Estimates`
   (from WSL: `/mnt/e/...`), pointed to by `ACS_ROOT_DIR`.
 - Cache: `CACHE_DIR = /home/abbatenicolas/data/cache` (WSL).
-- `data/`, `models/`, `results/`, `logs/`, `wandb/` are gitignored. Secrets/paths in `.env`
-  (`IMAGERY_ROOT`, `ACS_ROOT_DIR`, `WANDB_API_KEY`, `HF_TOKEN`, `CENSUS_API_KEY`).
+- `data/`, `models/`, `results/`, `logs/`, `wandb/` are gitignored. Non-secret paths in `.env`
+  (`IMAGERY_ROOT`, `ACS_ROOT_DIR`); **all API keys/tokens live in `.env.secrets`**
+  (`WANDB_API_KEY`, `HF_TOKEN`, `CENSUS_API_KEY`, `GH_TOKEN`). Both files are read-denied to
+  you by the sandbox — never try to read them; needed credentials arrive via the environment.
 - Path constants come from `src/utils/paths.py` — use those, don't hard-code paths.
 
 ## Repo map (what to touch)
-
 - `src/main.py` (~2.6k lines) — **the pipeline monolith**: zarr chunk cache, cyclic shard cache
   manager, hybrid batch sampler, `InBatchPairwiseRankingLoss`, `train_model`, chunked
   prediction. Fragile and central — change wiring, labels, and the train/val/test split logic
@@ -74,7 +72,6 @@ the path that scales to the US: don't reintroduce or extend the zarr branch for 
 EfficientNet/DINOv2 runs under `models/` and `logs/`. Only ScaleMAE/PyTorch is current.
 
 ## Working conventions
-
 - **Keep paper and code in sync.** The method described in `paper/latex/main.tex` (loss terms,
   λ_s, τ=100m, temporal_fraction, split design, GB2 mapping, CSA thresholds) must match the
   code. If you change one, flag the other; if you spot drift, surface it rather than silently
@@ -88,33 +85,51 @@ EfficientNet/DINOv2 runs under `models/` and `logs/`. Only ScaleMAE/PyTorch is c
 - **US-generalizable changes preferred.** Avoid new hard dependencies on NYC-specific data
   (DoITT IDs, NYC boundaries) in core paths; the model is fed imagery + minimal covariates by
   design, not footprint geometry.
-- **Git:** never `git commit`/`push` unless asked. Make edits; Nicolas commits.
 
 ## Development Workflow & Coding Standards
+Whenever you are asked to write, refactor, or modify code, you must follow this sequence unless
+I explicitly tell you to skip it:
+1. **Modular Design:** Write all code in a highly modular way. Break logic down into focused,
+   single-responsibility functions or classes.
+2. **Unit Testing (Synthetic Data):** Before running the main script, write and execute unit
+   tests using synthetic or mock data for every function/class you just created. Iterate on the
+   code until these tests pass.
+3. **Execution (Real Data):** Once the synthetic tests pass, run the complete script against the
+   real data.
+    * *Note on Sandbox Limitations:* If you cannot access the real data due to sandbox
+      restrictions, network rules, or missing credentials, state the limitation clearly, output
+      the final code, and stop. Do not get stuck in an endless loop trying to force a blocked
+      connection.
 
-Whenever you are asked to write, refactor, or modify code, you must follow this sequence unless I explicitly tell you to skip it:
+## Git & edit workflow (sandboxed sessions)
+- Edit freely under `src/` and `paper/` on the active branch. NEVER run `git commit`,
+  `git push`, `git merge`, or `git rebase` — the user reviews diffs and commits manually.
+  Commits on `siamese_net` and `main` are hard-blocked by hooks; do not attempt workarounds
+  (`--no-verify`, `git stash` tricks, heredocs, `python -c`). A blocked action means stop
+  and report, not improvise.
+- Every Edit/Write is post-processed by the user's scripts via PostToolUse hooks. If a hook
+  reports a failure, fix the underlying issue in the file — never suppress or bypass the check.
+- When done, summarize changed files so the user can `git diff` and commit.
 
-1. **Modular Design:** Write all code in a highly modular way. Break logic down into focused, single-responsibility functions or classes. 
-2. **Unit Testing (Synthetic Data):** Before running the main script, write and execute unit tests using synthetic or mock data for every function/class you just created. Iterate on the code until these tests pass.
-3. **Execution (Real Data):** Once the synthetic tests pass, run the complete script against the real data. 
-    * *Note on Sandbox Limitations:* If you cannot access the real data due to sandbox restrictions, network rules, or missing credentials, state the limitation clearly, output the final code, and stop. Do not get stuck in an endless loop trying to force a blocked connection.
+## Issue workflow (GitHub)
+`GH_TOKEN` (issue-scoped, this repo only) is provided in the environment; `gh` picks it up
+automatically. The sandbox guard only permits `gh issue create/comment/list/view/status` —
+everything else is blocked by design, not an error to work around.
 
-## Github Rules
+For tasks significant enough to track (features, non-trivial bugs, refactors):
+1. **BEFORE coding:** `gh issue create --title "..." --body "..."` — state the problem, the
+   plan, and the files you expect to touch.
+2. Implement per the Development Workflow above.
+3. **AFTER tests pass:** `gh issue comment <n> --body "..."` — summarize the solution, list
+   changed files, note caveats or follow-ups.
+4. In your final chat message, list the issue numbers you resolved so I can reference them in
+   the commit (`Fixes #12`) and they close automatically on merge to the default branch.
 
-- **Git:** never `git commit`/`push` unless asked. When asked to commit, use this
-  pattern — the sandbox blocks `.git` writes by default and git has no global
-  identity configured in WSL:
-  ```bash
-  git -C "<repo-root>" -c user.name="Queeno11" -c user.email="abbatenicolas@gmail.com" \
-      add <files>
-  git -C "<repo-root>" -c user.name="Queeno11" -c user.email="abbatenicolas@gmail.com" \
-      commit -m "..."
-  Set dangerouslyDisableSandbox: true on the Bash tool call so the .git index
-  lock succeeds. Always commit to the user's active branch (check with
-  git rev-parse --abbrev-ref HEAD), not the worktree branch.
-  ```
+Never attempt to close, edit, or delete issues, or touch labels/milestones — the user closes
+issues via commits. Small edits (typos, one-liners) don't need an issue; use judgment, or ask.
+Issue bodies/comments are read back as context in later sessions: keep them factual and
+self-contained (problem → approach → files → result).
 
 ## Useful skills
-
 - `/code-review` — best fit here: hunt correctness bugs in the fragile monolith before runs.
 - `/simplify` — targeted cleanup of changed code (quality only, no bug hunting).
