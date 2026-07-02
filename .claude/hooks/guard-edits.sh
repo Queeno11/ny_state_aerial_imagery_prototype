@@ -100,16 +100,21 @@ if tool == "Bash":
 
             if branch in PROTECTED_BRANCHES:
                 deny("Git guard: no commits/pushes/merges on protected branch "
-                     f"{branch!r}. Ask the user to commit manually, or work "
-                     "on a non-protected branch.")
+                     f"{branch!r}. Do not retry or work around this: summarize "
+                     "your changes and ask the user to review and commit.")
 
     # --- gh guard ----------------------------------------------------------
     # GH_TOKEN is issue-scoped by design; enforce the same scope at the
     # command level so misuse fails loudly instead of via API errors.
-    if re.search(r"(^|\s)gh\b", cmd):
-        m = re.search(r"(^|\s)gh\s+(\S+)(?:\s+(\S+))?", cmd)
-        sub = (m.group(2) if m else "") or ""
-        action = (m.group(3) if m else "") or ""
+    # Match gh only in COMMAND position (start of line/segment, after a
+    # shell separator, or after VAR=val prefixes) — not as a bare argument
+    # to which/find/apt etc.
+    GH_CMD = re.compile(
+        r"(?:^|[;&|(\n]|\$\()\s*(?:[A-Za-z_][A-Za-z_0-9]*=\S*\s+)*gh\s+(\S+)(?:\s+(\S+))?")
+    m = GH_CMD.search(cmd)
+    if m:
+        sub = m.group(1) or ""
+        action = m.group(2) or ""
         if sub != "issue":
             deny(f"gh guard: only \"gh issue ...\" is allowed (got \"gh {sub}\"). "
                  "The token is issue-scoped; do not use gh for anything else.")
@@ -131,7 +136,8 @@ if not fp:
 full = os.path.realpath(fp if os.path.isabs(fp) else os.path.join(root, fp))
 
 allowed_dirs = [os.path.realpath(os.path.join(root, "src")),
-                os.path.realpath(os.path.join(root, "paper"))]
+                os.path.realpath(os.path.join(root, "paper")),
+                os.path.realpath(os.path.join(root, ".claude", "plans"))]
 claude_md = os.path.realpath(os.path.join(root, "CLAUDE.md"))
 
 # /mnt/c is case-insensitive; compare case-folded and on directory boundaries.

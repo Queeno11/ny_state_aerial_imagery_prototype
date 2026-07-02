@@ -22,6 +22,7 @@
       "allowWrite": [
         "/home/abbatenicolas/data/cache",
         "/home/abbatenicolas/outputs",
+        "/home/abbatenicolas/.claude/plans",
         "/mnt/c/Working Papers/NY State Aerial Imagery Prototype/ny_state_aerial_imagery_prototype/src",
         "/mnt/c/Working Papers/NY State Aerial Imagery Prototype/ny_state_aerial_imagery_prototype/paper",
         "/mnt/c/Working Papers/NY State Aerial Imagery Prototype/ny_state_aerial_imagery_prototype/CLAUDE.md",

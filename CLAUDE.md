@@ -112,9 +112,16 @@ I explicitly tell you to skip it:
 - When done, summarize changed files so the user can `git diff` and commit.
 
 ## Issue workflow (GitHub)
-`GH_TOKEN` (issue-scoped, this repo only) is provided in the environment; `gh` picks it up
-automatically. The sandbox guard only permits `gh issue create/comment/list/view/status` —
-everything else is blocked by design, not an error to work around.
+`GH_TOKEN` (issue-scoped, this repo only) is provided in the environment when Nicolas launches
+via the `claude-start.sh` wrapper; `gh` picks it up automatically. The sandbox guard only
+permits `gh issue create/comment/list/view/status` — everything else is blocked by design, not
+an error to work around.
+
+**Availability check & fallback:** at the start of any task that would use issues, run
+`gh issue list --limit 1` once. If it fails (gh not installed, no token, network), the issue
+workflow is unavailable this session: say so once, skip steps 1 and 3 below, and instead
+include the issue title + solution summary in your final chat message so Nicolas can create
+the issue manually. Do not retry, install gh yourself, or loop on the failure.
 
 For tasks significant enough to track (features, non-trivial bugs, refactors):
 1. **BEFORE coding:** `gh issue create --title "..." --body "..."` — state the problem, the
