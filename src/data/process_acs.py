@@ -1179,18 +1179,24 @@ def valid_sc_shares_table(final_gdf, cbsa_titles=None):
 
 
 def significance_level_counts_table(final_gdf, start_year, end_year,
+                                    wealth_start_year=None,
                                     wealth_vars=WEALTH_INDEX_VARS) -> pd.DataFrame:
     """Count of tracts in each confidence-level bracket, per indicator.
 
     Rows = confidence brackets (ordered low -> high). Columns = income + each wealth index
     that has a ``significance_level_*`` column in ``final_gdf``. Also adds a ``%`` column
     for each indicator (share of total tracts with non-null significance data).
+
+    The income test spans ``start_year``..``end_year``; the wealth indexes are tested over
+    ``wealth_start_year``..``end_year`` (their VRE replicate SEs only begin in 2014), so their
+    column suffix differs from income. ``wealth_start_year`` defaults to ``start_year``.
     """
+    wealth_start_year = wealth_start_year if wealth_start_year is not None else start_year
     income_col = f"significance_level_{start_year}_{end_year}"
     w_cols = {
-        var: f"significance_level_{var}_{start_year}_{end_year}"
+        var: f"significance_level_{var}_{wealth_start_year}_{end_year}"
         for var in wealth_vars
-        if f"significance_level_{var}_{start_year}_{end_year}" in final_gdf.columns
+        if f"significance_level_{var}_{wealth_start_year}_{end_year}" in final_gdf.columns
     }
 
     rows = []
@@ -1212,6 +1218,7 @@ def significance_level_counts_table(final_gdf, start_year, end_year,
 
 
 def write_significance_level_counts_csv(final_gdf, start_year, end_year,
+                                        wealth_start_year=None,
                                         wealth_vars=WEALTH_INDEX_VARS,
                                         out_dir=TABLES_DIR / "structural_change"):
     """Write the significance-level bracket count table.
@@ -1219,7 +1226,9 @@ def write_significance_level_counts_csv(final_gdf, start_year, end_year,
     -> ``structural_change/significance_level_counts_{start}_{end}.csv``
     """
     out_dir.mkdir(parents=True, exist_ok=True)
-    table = significance_level_counts_table(final_gdf, start_year, end_year, wealth_vars)
+    table = significance_level_counts_table(
+        final_gdf, start_year, end_year, wealth_start_year, wealth_vars
+    )
     out_path = out_dir / f"significance_level_counts_{start_year}_{end_year}.csv"
     table.to_csv(out_path, index=False)
     print(f"  wrote {out_path}")
@@ -1425,7 +1434,7 @@ def process_panel(years: list[int] = PANEL_YEARS, base_year: int = BASE_YEAR):
 
     # 10. Significance-level bracket counts (n tracts per confidence bin x indicator).
     print("\nWriting significance-level bracket counts...")
-    write_significance_level_counts_csv(final_gdf, start_year, end_year)
+    write_significance_level_counts_csv(final_gdf, start_year, end_year, wealth_start_year)
 
     return final_gdf
 
