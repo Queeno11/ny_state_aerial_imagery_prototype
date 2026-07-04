@@ -345,17 +345,39 @@ def test_add_wealth_structural_change_flags():
         "Rel_SE_W2_i_r3pct_2023": [0.1, 0.1],
     })
     out = pa.add_wealth_structural_change(df, 2011, 2023, wealth_vars=["W2_i_r3pct"])
-    flag = "Valid_Structural_Change_W2_i_r3pct"
+    flag = "valid_change_W2_r3"
     assert flag in out.columns
     assert bool(out[flag].iloc[0]) is True     # 2.0 shift vs SE ~0.14 -> significant
     assert bool(out[flag].iloc[1]) is False    # no shift
+
+
+def test_structural_change_gate_is_p10():
+    assert pa.STRUCTURAL_CHANGE_P == pytest.approx(0.10)
+
+
+def test_add_wealth_structural_change_borderline_p():
+    """valid_change_* gates at p<0.10 while significant_* stays at p<0.01.
+
+    Row 0: shift 0.30 with SEs 0.1/0.1 -> z~2.12, p~0.034: valid change, NOT significant.
+    Row 1: shift 0.15 -> z~1.06, p~0.29: neither.
+    """
+    df = pd.DataFrame({
+        "Rel_Score_W2_i_r3pct_2011": [0.0, 0.0],
+        "Rel_Score_W2_i_r3pct_2023": [0.30, 0.15],
+        "Rel_SE_W2_i_r3pct_2011": [0.1, 0.1],
+        "Rel_SE_W2_i_r3pct_2023": [0.1, 0.1],
+    })
+    out = pa.add_wealth_structural_change(df, 2011, 2023, wealth_vars=["W2_i_r3pct"])
+    assert bool(out["valid_change_W2_r3"].iloc[0]) is True
+    assert bool(out["significant_W2_i_r3pct_2011_2023"].iloc[0]) is False
+    assert bool(out["valid_change_W2_r3"].iloc[1]) is False
 
 
 def test_add_wealth_structural_change_skips_without_se():
     df = pd.DataFrame({"Rel_Score_W2_i_r3pct_2011": [0.0],
                        "Rel_Score_W2_i_r3pct_2023": [2.0]})   # no Rel_SE present
     out = pa.add_wealth_structural_change(df, 2011, 2023, wealth_vars=["W2_i_r3pct"])
-    assert "Valid_Structural_Change_W2_i_r3pct" not in out.columns
+    assert "valid_change_W2_r3" not in out.columns
 
 
 def test_rk_sensitivity_table_shape_and_stability():

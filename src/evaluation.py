@@ -1874,7 +1874,9 @@ def part_c(results_dir: Path, processed_dir: Path, out: Path) -> pd.DataFrame | 
 # ─── Part D ───────────────────────────────────────────────────────────────────
 
 SPLIT_GROUPS = {
-    "test":  ["test", "val_spatial_temporal", "val_spatial", "dead_zone"],
+    # "val" is the whole-city split type (#28); the others cover legacy
+    # tract_splits.feather artifacts from the old tract-cluster split.
+    "test":  ["test", "val", "val_spatial_temporal", "val_spatial", "dead_zone"],
     "train": ["train"],
 }
 

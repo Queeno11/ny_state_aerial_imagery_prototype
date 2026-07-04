@@ -9,6 +9,14 @@ from shapely import Point
 import src.build_dataset as build_dataset
 from pyproj import CRS
 
+# National metric CRS for the US-scale training pipeline: CONUS Albers Equal Area
+# (units = meters). The legacy NYC CRS (EPSG:6539, US survey feet) remains only in
+# NYC-specific evaluation/visualization code (evaluation.py, hudson_yards_interactive.py),
+# which stays tied to the DoITT footprints and the Callaway-Sant'Anna event study.
+METRIC_EPSG = 5070
+METRIC_CRS = "EPSG:5070"
+NYC_EVAL_EPSG = 6539  # legacy NYC ftUS — evaluation/visualization only
+
 def get_dataset_extent(ds, image_size=None):
     """Return a polygon with the extent of the dataset
 
@@ -199,7 +207,7 @@ def meters_to_projected_units(value_in_meters: float, epsg_code: int) -> float:
     # Meters / (Meters per Native Unit) = Native Units
     return value_in_meters / conversion_factor
 
-def calculate_exact_tau(tau_meters: float, image_size: int, crs_units_per_pixel: float = 0.5, epsg_code: int = 6539) -> tuple[float, int]:
+def calculate_exact_tau(tau_meters: float, image_size: int, crs_units_per_pixel: float = 0.5, epsg_code: int = METRIC_EPSG) -> tuple[float, int]:
     """
     Given an approximate tau_meters and target image_size, finds the integer sub-sampling step N
     that creates a raw pixel width closest to what tau_meters would give.
@@ -223,12 +231,12 @@ def calculate_exact_tau(tau_meters: float, image_size: int, crs_units_per_pixel:
     
     return exact_tau_meters, N
 
-def meters_to_pixels(meters: float, crs_units_per_pixel: float = 0.5, epsg_code: int = 6539) -> int:
+def meters_to_pixels(meters: float, crs_units_per_pixel: float = 0.5, epsg_code: int = METRIC_EPSG) -> int:
     """
     Convert a real-world distance in meters to a pixel count.
 
-    Default resolution is 0.5 US Survey Feet/pixel (EPSG:6539),
-    matching the NYC aerial zarr files.
+    Default is 0.5 CRS units/pixel in METRIC_CRS (EPSG:5070, meters).
+    Pass epsg_code=NYC_EVAL_EPSG (6539, ftUS) for the legacy NYC zarr grid.
     """
     meters_per_crs_unit = projected_units_to_meters(1.0, epsg_code=epsg_code)
     meters_per_pixel = crs_units_per_pixel * meters_per_crs_unit

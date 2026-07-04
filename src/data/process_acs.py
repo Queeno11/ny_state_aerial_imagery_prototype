@@ -12,11 +12,13 @@ Key design choices (see the plan / CLAUDE.md):
     (``total_population`` = ACS B01001_001E) within each CBSA, for ``BASE_YEAR``.
   * Relative wealth scores (``Rel_Score``) are z-scores of log per-capita income
     computed *within each CBSA* per year, to strip out city-wide macro drift.
-  * ``Valid_Structural_Change`` is a single first-vs-last (2011 vs 2023)
-    significance test (p < 0.05) -- no consecutive-pair / yo-yo macro gate.
-    The wealth-index analogues (``Valid_Structural_Change_W*``) run the SAME
-    first-vs-last test but start at ``VRE_FIRST_YEAR`` (2014 vs 2023), because the
-    Census replicate-estimate SEs those indexes need are only published from 2014.
+  * Structural-change flags are named ``valid_change_{token}`` with one column per
+    indicator token from :mod:`src.data.indicators` (``valid_change_inc`` for income,
+    ``valid_change_W2_r5`` for W2 at rho=5%, ...). Each is a single first-vs-last
+    (2011 vs 2023) significance test (p < 0.01) -- no consecutive-pair / yo-yo macro
+    gate. The wealth-index flags run the SAME first-vs-last test but start at
+    ``VRE_FIRST_YEAR`` (2014 vs 2023), because the Census replicate-estimate SEs
+    those indexes need are only published from 2014.
   * Robustness wealth variables (V_i, W_i_r{2,3,5,7}pct) are carried into the
     panel, and per-metro / global Spearman correlations between per-capita income
     and each of them are written to CSV (one file per year, raw + aligned).
@@ -31,10 +33,13 @@ import scipy.stats as stats
 from src.utils.paths import (
     EXTERNAL_DATA_DIR, PROCESSED_DATA_DIR, TABLES_DIR, ACS_ROOT_DIR,
 )
+from src.data.indicators import var_to_token, valid_change_col
 
 # ── Tunable globals ────────────────────────────────────────────────────────────
 BASE_YEAR = 2023                          # all years aligned to this tract vintage
 MIN_METRO_POP = 500_000                   # CBSA total-population threshold
+STRUCTURAL_CHANGE_P = 0.10                # training gate for valid_change_*; the stricter
+                                          # significant_* (p<0.01) is kept for reporting only
 
 # Connecticut switched from 8 traditional counties (09001–09015) to 9 Planning Regions
 # (09110–09190) for ACS tract reporting starting with the 2022 vintage. The OMB crosswalk
@@ -1021,7 +1026,9 @@ def add_wealth_structural_change(final_gdf, start_year, end_year,
 
     Expects ``Rel_Score_{var}_{start/end}`` (point) and ``Rel_SE_{var}_{start/end}`` (VRE
     replicate SE) already aligned into ``final_gdf``. Indexes lacking the replicate SE (no VRE
-    store) are skipped. Adds ``Valid_Structural_Change_{var}`` for each index that has them.
+    store) are skipped. Adds ``valid_change_{token}`` (see :mod:`src.data.indicators`)
+    for each index that has them, gated at ``p < STRUCTURAL_CHANGE_P``; the stricter
+    ``significant_*`` (p<0.01) columns are retained for reporting only.
     """
     for var in wealth_vars:
         needed = [f"Rel_Score_{var}_{start_year}", f"Rel_Score_{var}_{end_year}",
@@ -1032,8 +1039,8 @@ def add_wealth_structural_change(final_gdf, start_year, end_year,
             final_gdf, start_year, end_year,
             score_prefix=f"Rel_Score_{var}", se_prefix=f"Rel_SE_{var}", label=f"{var}_",
         )
-        final_gdf[f"Valid_Structural_Change_{var}"] = (
-            final_gdf[f"significant_{var}_{start_year}_{end_year}"]
+        final_gdf[valid_change_col(var_to_token(var))] = (
+            final_gdf[f"pvalue_{var}_{start_year}_{end_year}"] < STRUCTURAL_CHANGE_P
         )
     return final_gdf
 
@@ -1141,28 +1148,28 @@ def write_rk_sensitivity_csv(year, hpi=None, crosswalk=None, grid=CAPITAL_YIELD_
 # ══════════════════════════════════════════════════════════════════════════════
 
 def valid_sc_shares_table(final_gdf, cbsa_titles=None):
-    """Per-CBSA share of tracts flagged Valid_Structural_Change, for income and each W index.
+    """Per-CBSA share of tracts flagged valid_change, for income and each W index.
 
     Returns one row per CBSA plus a NATIONAL pooled row. Columns:
       cbsa_code | cbsa_title | n_tracts | share_income | share_{var} x 12
 
     Share denominator is all tracts in the CBSA (tracts with insufficient data to test
     are treated as non-flagged, matching the flag-is-False convention in test_significance).
-    Wealth columns are omitted when no Valid_Structural_Change_{var} exists in the panel
+    Wealth columns are omitted when no valid_change_{token} exists in the panel
     (e.g. if the VRE store was absent and those tests were skipped).
     """
     cbsa_titles = cbsa_titles or {}
-    sc_income  = "Valid_Structural_Change"
-    sc_w_cols  = [f"Valid_Structural_Change_{v}" for v in WEALTH_INDEX_VARS
-                  if f"Valid_Structural_Change_{v}" in final_gdf.columns]
+    sc_income = valid_change_col("inc")
+    w_flag_cols = {v: valid_change_col(var_to_token(v)) for v in WEALTH_INDEX_VARS}
+    sc_w_vars = [v for v, col in w_flag_cols.items() if col in final_gdf.columns]
 
     def _row(sub, code, title):
         n = len(sub)
         rec = {"cbsa_code": code, "cbsa_title": title, "n_tracts": n}
         if sc_income in sub.columns:
             rec["share_income"] = round(float(sub[sc_income].sum()) / n, 4) if n else np.nan
-        for col in sc_w_cols:
-            var = col.replace("Valid_Structural_Change_", "")
+        for var in sc_w_vars:
+            col = w_flag_cols[var]
             rec[f"share_{var}"] = round(float(sub[col].sum()) / n, 4) if n else np.nan
         return rec
 
@@ -1172,8 +1179,7 @@ def valid_sc_shares_table(final_gdf, cbsa_titles=None):
     ]
     rows.append(_row(final_gdf, "NATIONAL", "NATIONAL (all metros pooled)"))
 
-    share_w_cols = [f"share_{v}" for v in WEALTH_INDEX_VARS
-                    if f"Valid_Structural_Change_{v}" in final_gdf.columns]
+    share_w_cols = [f"share_{v}" for v in sc_w_vars]
     cols = ["cbsa_code", "cbsa_title", "n_tracts", "share_income"] + share_w_cols
     return pd.DataFrame(rows)[cols].sort_values("cbsa_code").reset_index(drop=True)
 
@@ -1385,9 +1391,12 @@ def process_panel(years: list[int] = PANEL_YEARS, base_year: int = BASE_YEAR):
         matched = align_year_to_base(base_gdf, gdfs[year], base_year, year, large_codes)
         final_gdf = final_gdf.merge(matched, on=f"geoid_{base_year}", how="left")
 
-    # 3. Valid_Structural_Change = single first-vs-last significance test (income / Y).
+    # 3. valid_change_inc = single first-vs-last significance test (income / Y),
+    #    gated at p < STRUCTURAL_CHANGE_P (significant_* keeps the stricter p<0.01).
     final_gdf = test_significance(final_gdf, start_year, end_year)
-    final_gdf["Valid_Structural_Change"] = final_gdf[f"significant_{start_year}_{end_year}"]
+    final_gdf[valid_change_col("inc")] = (
+        final_gdf[f"pvalue_{start_year}_{end_year}"] < STRUCTURAL_CHANGE_P
+    )
 
     # 3b. Same first-vs-last test for the wealth indexes W1/W2/W3, using the replicate-variance
     #     (VRE) SEs aligned in step 1. Runs over wealth_start_year..end_year (VRE >= 2014), not the
@@ -1399,7 +1408,7 @@ def process_panel(years: list[int] = PANEL_YEARS, base_year: int = BASE_YEAR):
     for year in years:
         final_gdf[f"Training_Label_{year}"] = final_gdf[f"Rel_Score_{year}"]
 
-    n_valid = int(final_gdf["Valid_Structural_Change"].sum())
+    n_valid = int(final_gdf[valid_change_col("inc")].sum())
     print(f"\nValid structural change ({start_year} vs {end_year}): "
           f"{n_valid} of {len(final_gdf)} tracts.")
 
@@ -1419,7 +1428,7 @@ def process_panel(years: list[int] = PANEL_YEARS, base_year: int = BASE_YEAR):
 
     # 7. Diagnostics on the single-period change.
     diff_col = f"diff_{start_year}_{end_year}"
-    valid_mask = final_gdf["Valid_Structural_Change"] == True  # noqa: E712
+    valid_mask = final_gdf[valid_change_col("inc")] == True  # noqa: E712
     print(f"Mean |Rel_Score change| (valid):   "
           f"{final_gdf.loc[valid_mask, diff_col].abs().mean():.4f}")
     print(f"Mean |Rel_Score change| (invalid): "

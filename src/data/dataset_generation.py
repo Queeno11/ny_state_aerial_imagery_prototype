@@ -1,3 +1,7 @@
+# LEGACY — unused near-duplicate of src/build_dataset.py; imported nowhere.
+# The live training path is src/build_dataset.py (US panel + Microsoft
+# buildings_index, EPSG:5070); the national index builder is
+# src/data/build_buildings_index.py. Kept only for reference — do not extend.
 import math
 import pandas as pd
 import geopandas as gpd

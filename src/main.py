@@ -27,6 +27,9 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import src.custom_models as custom_models
 import src.build_dataset as build_dataset
 import src.geo_utils as geo_utils
+from src.data import indicators
+from src.data import cbsa_brackets
+from src.data.process_acs import PANEL_YEARS as ACS_PANEL_YEARS
 from src.utils.paths import PROJECT_ROOT, DATA_DIR, EXTERNAL_DATA_DIR, RAW_DATA_DIR, INTERIM_DATA_DIR, PROCESSED_DATA_DIR, CACHE_DIR, RESULTS_DIR, LOGS_DIR, MODELS_DIR, IMAGERY_ROOT
 pd.set_option("display.max_columns", None)
 
@@ -55,16 +58,18 @@ os.environ['HF_TOKEN'] = os.getenv("HF_TOKEN")
 # Define a subset of the data that will comfortably fit in RAM cache
 CACHE_SIZE = 2048*4 # Around 8000k images (4 batch size)
 
-def generate_savename(
-    model_name, image_size, learning_rate, years, extra
-):
-    years_str = "-".join(map(str, years))
-    # stacked_images hardcoded to [1], so no stacking
-    savename = (
-        f"{model_name}_lr{learning_rate}_size{image_size}_y{years_str}{extra}"
-    )
+def generate_savename(run_id=None):
+    """Short run identifier: ``params["run_id"]`` if provided, else ``run_{YYYYMMDD}``.
 
-    return savename
+    The full config already lives in wandb (``config=params``), so the savename no
+    longer encodes hyperparameters. Note the couplings: wandb resumes on
+    ``id=savename`` and checkpoints/split feathers are keyed by it — to resume a
+    run started on another day (or a pre-refactor run), pass its exact string as
+    ``params["run_id"]``.
+    """
+    if run_id:
+        return str(run_id)
+    return f"run_{datetime.now().strftime('%Y%m%d')}"
 
 # ══════════════════════════════════════════════════════════════════════════════
 # ZARR CHUNK MANAGEMENT UTILITIES
@@ -194,7 +199,7 @@ def extract_image_from_chunks(row, cache, zarr_array, all_years_datasets, chunk_
     function can be called from multiple threads concurrently.
 
     Args:
-        row: dict-like row with row_start, col_start, dataset, DOITT_ID …
+        row: dict-like row with row_start, col_start, dataset, building_id …
         cache: ZarrChunkCache instance (thread-safe)
         zarr_array: unused — kept for API compatibility (resolved via all_years_datasets)
         all_years_datasets: dict of all zarr datasets
@@ -255,7 +260,7 @@ def extract_image_from_chunks(row, cache, zarr_array, all_years_datasets, chunk_
                 return tile.copy()   # copy so we don't pin the full chunk
         except Exception as e:
             logging.error(
-                f"Failed single-chunk extract for DOITT_ID {row.get('DOITT_ID', '?')}: {e}"
+                f"Failed single-chunk extract for building_id {row.get('building_id', '?')}: {e}"
             )
         return None
 
@@ -287,7 +292,7 @@ def extract_image_from_chunks(row, cache, zarr_array, all_years_datasets, chunk_
             return out
         except Exception as e:
             logging.error(
-                f"Failed multi-chunk extract for DOITT_ID {row.get('DOITT_ID', '?')}: {e}"
+                f"Failed multi-chunk extract for building_id {row.get('building_id', '?')}: {e}"
             )
         return None
 
@@ -403,44 +408,62 @@ class CyclicCacheManager:
         clear_cache=False,
         max_jitter=10,
         sat_data="aerial",
+        holdout_years=None,
     ):
         import pandas as pd
         self.df = df
         self.sat_data = sat_data
+        # {cbsa_code (int) -> temporal-holdout year} for TRAIN cities (#28).
+        # NAIP's actual-year substitution must not erode the per-city holdout:
+        # train shards reject crops landing ON the holdout year; val_temporal
+        # shards reject crops landing OFF it.
+        self.holdout_years = holdout_years or {}
 
         
         # [NEW] Group temporal twins together so they end up in the same shard
         if type == "train":
-            print("Sorting dataframe to group DOITT_IDs for temporal sampling...")
-            doitts = self.df['DOITT_ID'].unique()
-            np.random.shuffle(doitts)  # Shuffle groups to maintain randomness
-            cat_type = pd.CategoricalDtype(categories=doitts, ordered=True)
-            self.df['DOITT_ID_cat'] = self.df['DOITT_ID'].astype(cat_type)
-            self.df = self.df.sort_values(['DOITT_ID_cat', 'year']).reset_index(drop=True)
-            self.df.drop('DOITT_ID_cat', axis=1, inplace=True)
+            print("Sorting dataframe to group building_ids for temporal sampling...")
+            bids = self.df['building_id'].unique()
+            np.random.shuffle(bids)  # Shuffle groups to maintain randomness
+            cat_type = pd.CategoricalDtype(categories=bids, ordered=True)
+            self.df['building_id_cat'] = self.df['building_id'].astype(cat_type)
+            self.df = self.df.sort_values(['building_id_cat', 'year']).reset_index(drop=True)
+            self.df.drop('building_id_cat', axis=1, inplace=True)
         
         self.all_years_datasets = all_years_datasets
         self.params = params
         self.max_jitter = max_jitter
-        self.max_jitter_pixels = geo_utils.meters_to_pixels(self.max_jitter, 0.5, epsg_code=6539) # TODO: I should be able to extract this from the zarr
+        self.max_jitter_pixels = geo_utils.meters_to_pixels(self.max_jitter, 0.5, epsg_code=geo_utils.METRIC_EPSG)
         self.nbands = params["nbands"]
-        
+
         if self.sat_data == "NAIP":
             from pyproj import Transformer
-            self._to_4326 = Transformer.from_crs("EPSG:6539", "EPSG:4326", always_xy=True)
+            self._to_4326 = Transformer.from_crs(geo_utils.METRIC_CRS, "EPSG:4326", always_xy=True)
             self.crop_size_meters = params.get("tau_meters", 100) * 2
             self.params = {**params, "subsample_step": 1}
             self.image_size = params["image_size"]
 
-            # Load ACS panel mapping for actual-year substitution
-            from src.build_dataset import process_acs_panel
+            # ACS lookup for actual-year substitution, scoped to the SELECTED
+            # indicator only. (Iterating every Rel_Score_* column would also pick
+            # up the other wealth variants and mis-parse their year suffix.)
+            from src.build_dataset import process_acs_panel, PANEL_GEOID_COL
+            from src.data import indicators
+            self.indicator = params.get("indicator", indicators.DEFAULT_INDICATOR)
             panel = process_acs_panel()
+            geoids = panel[PANEL_GEOID_COL].to_numpy()
+            self.panel_years = sorted(
+                yr for yr in ACS_PANEL_YEARS
+                if indicators.score_col(self.indicator, yr) in panel.columns
+            )
             self.acs_lookup = {}
-            for _, row in panel.iterrows():
-                geoid = row["geoid_2024"]
-                for year_col in [c for c in panel.columns if c.startswith("Rel_Score_")]:
-                    yr = int(year_col.split("_")[-1])
-                    self.acs_lookup[(geoid, yr)] = row[year_col]
+            for yr in self.panel_years:
+                vals = panel[indicators.score_col(self.indicator, yr)].to_numpy()
+                self.acs_lookup.update({(g, yr): v for g, v in zip(geoids, vals)})
+            # Counters for the actual-year -> panel-year label substitution
+            # (+ crops rejected by the temporal-holdout guards)
+            self._year_sub_lock = threading.Lock()
+            self.year_sub_counts = {"exact": 0, "nearest_fallback": 0, "miss": 0,
+                                    "holdout_reject": 0}
         else:
             self.image_size = int((df["row_stop"] - df["row_start"]).min())  # Assuming all images have the same size in the raw zarr array
 
@@ -472,17 +495,17 @@ class CyclicCacheManager:
 
             # 2. Fast lookup for Temporal Pairs (by building)
             # Find buildings that exist in at least 2 different years
-            counts = self.df['DOITT_ID'].value_counts()
-            valid_doitts = counts[counts >= 2].index
+            counts = self.df['building_id'].value_counts()
+            valid_building_id_index = counts[counts >= 2].index
 
-            valid_temporal_df = self.df[self.df['DOITT_ID'].isin(valid_doitts)]
-            self.doitt_to_idxs = valid_temporal_df.groupby('DOITT_ID').groups
+            valid_temporal_df = self.df[self.df['building_id'].isin(valid_building_id_index)]
+            self.building_to_idxs = valid_temporal_df.groupby('building_id').groups
 
             # 3. Separate them into Stable (0) and Change (1) pools
-            doitt_meta = valid_temporal_df[['DOITT_ID', 'Valid_Structural_Change']].drop_duplicates('DOITT_ID')
-            self.stable_doitts = doitt_meta[doitt_meta['Valid_Structural_Change'] == 0]['DOITT_ID'].values
-            self.change_doitts = doitt_meta[doitt_meta['Valid_Structural_Change'] == 1]['DOITT_ID'].values
-            print(f"  Spatial years: {len(self.year_to_idxs)} | Stable buildings: {len(self.stable_doitts)} | Change buildings: {len(self.change_doitts)}")
+            building_meta = valid_temporal_df[['building_id', 'Valid_Structural_Change']].drop_duplicates('building_id')
+            self.stable_building_ids = building_meta[building_meta['Valid_Structural_Change'] == 0]['building_id'].values
+            self.change_building_ids = building_meta[building_meta['Valid_Structural_Change'] == 1]['building_id'].values
+            print(f"  Spatial years: {len(self.year_to_idxs)} | Stable buildings: {len(self.stable_building_ids)} | Change buildings: {len(self.change_building_ids)}")
 
     def _load_existing_shards(self):
         existing_shards = sorted(
@@ -499,21 +522,25 @@ class CyclicCacheManager:
  
     def _extract_raw_image(self, row, n_bands=None, pad=0):
         if self.sat_data == "NAIP":
-            from src.data.naip_fetcher import fetch_naip_crop
+            from src.data.naip_fetcher import fetch_naip
             cx, cy = row["centroid_x"], row["centroid_y"]
             lon, lat = self._to_4326.transform(cx, cy)
-            
+
             pad_meters = pad * 0.5 * self.params.get("subsample_step", 1)
             out_pixels = self.image_size + 2 * pad
-            
-            crop, actual_year = fetch_naip_crop(
+
+            res = fetch_naip(
                 lon=lon, lat=lat,
                 crop_size_meters=self.crop_size_meters + 2 * pad_meters,
                 nbands=n_bands or self.nbands,
                 out_pixels=out_pixels,
                 year_hint=int(row["year"]),
             )
-            return (crop, actual_year) if crop is not None else None
+            if res.crop is None:
+                return None
+            if res.nir_padded and self.params.get("reject_padded_nir", False):
+                return None
+            return (res.crop, res.actual_year)
 
         dataset_name = row.get("dataset")
         zarr_array = self.all_years_datasets[dataset_name]["value"]  # raw zarr array
@@ -537,7 +564,7 @@ class CyclicCacheManager:
                 raise ValueError(f"Extracted tile has invalid shape: {tile.shape}. Expected ({self.nbands}, {tile_size}, {tile_size}).")
             
         except Exception as e:
-            logging.error(f"Failed for DOITT_ID {row.get('DOITT_ID', '?')}: {e}")
+            logging.error(f"Failed for building_id {row.get('building_id', '?')}: {e}")
 
         return None
 
@@ -578,8 +605,15 @@ class CyclicCacheManager:
         items_to_extract = [(row, pos) for pos, (_, row) in enumerate(sampled_df.iterrows())]
 
         valid_images, valid_scores, valid_geoids = [], [], []
-        valid_years, valid_doitt_ids, valid_change = [], [], []
-        valid_metas, valid_score_bins = [], []
+        valid_years, valid_building_ids, valid_change = [], [], []
+        valid_metas, valid_score_bins, valid_cbsas = [], [], []
+
+        def _cbsa_int(r):
+            """CBSA code as int for the shard tensor (0 when absent/NaN)."""
+            try:
+                return int(r.get("cbsa_code", 0))
+            except (TypeError, ValueError):
+                return 0
 
         CHUNK_SIZE = 8
         MAX_EXTRACT_WORKERS = 16 if self.sat_data == "NAIP" else 2
@@ -592,13 +626,44 @@ class CyclicCacheManager:
             
             if self.sat_data == "NAIP":
                 raw_img, actual_year = res
+
+                # ── Temporal-holdout guards (#28) ──
+                # NAIP substitutes flight years, so the EFFECTIVE year of a crop
+                # can differ from the requested one. Keep the per-city holdout
+                # exact: train never sees holdout-year imagery of its own city,
+                # and val_temporal only contains holdout-year imagery.
+                if self.holdout_years:
+                    eff_year = int(actual_year) if actual_year is not None else int(row["year"])
+                    holdout = self.holdout_years.get(_cbsa_int(row))
+                    if holdout is not None and (
+                        (self.type == "train" and eff_year == holdout)
+                        or (self.type == "val_temporal" and eff_year != holdout)
+                    ):
+                        with self._year_sub_lock:
+                            self.year_sub_counts["holdout_reject"] += 1
+                        return None
+
                 if actual_year is not None and actual_year != int(row["year"]):
+                    # NAIP returned a different flight year than requested: relabel
+                    # with that year's ACS score, falling back to the NEAREST panel
+                    # year when the exact one is missing (never keep the requested
+                    # year's label for an image from another year).
                     geoid = row.get("GEOID", "")
-                    acs_key = (geoid, actual_year)
-                    if acs_key in self.acs_lookup:
+                    label_year = actual_year
+                    kind = "exact"
+                    if (geoid, label_year) not in self.acs_lookup:
+                        label_year = min(self.panel_years, key=lambda y: abs(y - actual_year))
+                        kind = "nearest_fallback"
+                    acs_key = (geoid, label_year)
+                    new_score = self.acs_lookup.get(acs_key)
+                    if new_score is not None and not pd.isna(new_score):
                         row = dict(row)
-                        row["Rel_Score"] = self.acs_lookup[acs_key]
+                        row["Rel_Score"] = new_score
                         row["year"] = actual_year
+                    else:
+                        kind = "miss"
+                    with self._year_sub_lock:
+                        self.year_sub_counts[kind] += 1
             else:
                 raw_img = res
 
@@ -625,10 +690,11 @@ class CyclicCacheManager:
                             valid_scores.append(r['Rel_Score'])
                             valid_geoids.append(hash(str(r.get('GEOID', ''))) % (2**31))
                             valid_years.append(r['year'])
-                            valid_doitt_ids.append(r['DOITT_ID'])
+                            valid_building_ids.append(r['building_id'])
                             valid_change.append(r.get('Valid_Structural_Change', 0)) # Save change flag!
                             valid_metas.append(r.get("dist_to_center", 0.0))
                             valid_score_bins.append(r.get("score_bin", 0))
+                            valid_cbsas.append(_cbsa_int(r))
                     raw_chunk.clear(); chunk_meta.clear()
 
             # Process remainder
@@ -640,23 +706,44 @@ class CyclicCacheManager:
                         valid_scores.append(r['Rel_Score'])
                         valid_geoids.append(hash(str(r.get('GEOID', ''))) % (2**31))
                         valid_years.append(r['year'])
-                        valid_doitt_ids.append(r['DOITT_ID'])
+                        valid_building_ids.append(r['building_id'])
                         valid_change.append(r.get('Valid_Structural_Change', 0))
                         valid_metas.append(r.get("dist_to_center", 0.0))
                         valid_score_bins.append(r.get("score_bin", 0))
+                        valid_cbsas.append(_cbsa_int(r))
 
-        # ── NAIP API failure rate check ──
+        # ── NAIP API failure rate check + observability ──
         total_attempted = len(items_to_extract)
         total_succeeded = len(valid_images)
         total_failed = total_attempted - total_succeeded
 
         if self.sat_data == "NAIP" and total_attempted > 0:
             failure_rate = total_failed / total_attempted
+            fetch_stats = {}
+            try:
+                from src.data.naip_fetcher import get_fetch_stats
+                fetch_stats = get_fetch_stats()
+            except Exception:
+                pass
+            stats_msg = (
+                f"shard {shard_id}: {total_succeeded}/{total_attempted} ok "
+                f"({failure_rate:.1%} failed) | fetcher totals: {fetch_stats} | "
+                f"year substitution: {dict(self.year_sub_counts)}"
+            )
+            print(f"[NAIP] {stats_msg}")
+            try:
+                if wandb.run is not None:
+                    wandb.log({
+                        "naip/shard_failure_rate": failure_rate,
+                        **{f"naip/fetch_{k}": v for k, v in fetch_stats.items()},
+                        **{f"naip/year_sub_{k}": v for k, v in self.year_sub_counts.items()},
+                    })
+            except Exception:
+                pass
             if failure_rate > 0.50:
                 # Option (a): Hard halt
                 raise RuntimeError(
-                    f"🚨 NAIP shard {shard_id}: {failure_rate:.0%} failure rate "
-                    f"({total_failed}/{total_attempted} failed). "
+                    f"🚨 NAIP {stats_msg}. "
                     f"Likely Planetary Computer API rate limit exhaustion. "
                     f"Halting training — restart after cooldown."
                 )
@@ -675,10 +762,11 @@ class CyclicCacheManager:
                 "scores": torch.tensor(valid_scores, dtype=torch.float32),
                 "geoids": torch.tensor(valid_geoids, dtype=torch.int64),
                 "years": torch.tensor(valid_years, dtype=torch.int64),
-                "doitt_ids": torch.tensor(valid_doitt_ids, dtype=torch.int64),
+                "building_ids": torch.tensor(valid_building_ids, dtype=torch.int64),
                 "structural_change": torch.tensor(valid_change, dtype=torch.int64), # Replaces twin/pair logic
                 "metas": torch.tensor(valid_metas, dtype=torch.float32).unsqueeze(1),
                 "score_bins": torch.tensor(valid_score_bins, dtype=torch.int64),
+                "cbsa_ids": torch.tensor(valid_cbsas, dtype=torch.int64),
             }, shard_path)
         else:
             torch.save({"images": torch.empty(0), "scores": torch.empty(0)}, shard_path)
@@ -762,7 +850,7 @@ class InBatchRankingDataset(Dataset):
     """
     Loads individual images with rich metadata from training shards.
     The HybridBatchSampler constructs valid hybrid batches at iteration time
-    using the exposed metadata (year_to_idxs, doitt_to_idxs).
+    using the exposed metadata (year_to_idxs, building_to_idxs).
     """
     def __init__(self, cache_manager: CyclicCacheManager, transform=None):
         if not cache_manager._is_initialized:
@@ -775,14 +863,16 @@ class InBatchRankingDataset(Dataset):
         self.scores = None
         self.geoids = None
         self.years = None
-        self.doitt_ids = None
+        self.building_ids = None
         self.structural_change = None
         self.metas = None
         self.score_bins = None
+        self.cbsa_ids = None
 
         # Lookups for the HybridBatchSampler (built after loading)
         self.year_to_idxs = {}
-        self.doitt_to_idxs = {}
+        self.yearcbsa_to_idxs = {}
+        self.building_to_idxs = {}
         self.refresh()
 
     def refresh(self):
@@ -795,7 +885,7 @@ class InBatchRankingDataset(Dataset):
         gc.collect()
 
         img_list, sc_list, geo_list, yr_list = [], [], [], []
-        did_list, ch_list, mt_list, sb_list = [], [], [], []
+        did_list, ch_list, mt_list, sb_list, cb_list = [], [], [], [], []
 
         for shard_path in self.cache_manager.active_shards:
             data = torch.load(shard_path, weights_only=False)
@@ -804,28 +894,35 @@ class InBatchRankingDataset(Dataset):
             sc_list.append(data["scores"])
             geo_list.append(data.get("geoids", torch.zeros(shard_len, dtype=torch.int64)))
             yr_list.append(data.get("years", torch.zeros(shard_len, dtype=torch.int64)))
-            did_list.append(data.get("doitt_ids", torch.zeros(shard_len, dtype=torch.int64)))
+            did_list.append(data.get("building_ids", torch.zeros(shard_len, dtype=torch.int64)))
             ch_list.append(data.get("structural_change", torch.zeros(shard_len, dtype=torch.int64)))
             mt_list.append(data.get("metas", torch.zeros(shard_len, 1)))
             sb_list.append(data.get("score_bins", torch.zeros(shard_len, dtype=torch.int64)))
+            # Old shards lack cbsa_ids -> zeros, which collapses to per-year pools
+            # (single-city behavior), keeping backward compatibility.
+            cb_list.append(data.get("cbsa_ids", torch.zeros(shard_len, dtype=torch.int64)))
 
         self.images           = torch.cat(img_list)
         self.scores           = torch.cat(sc_list)
         self.geoids           = torch.cat(geo_list)
         self.years            = torch.cat(yr_list)
-        self.doitt_ids        = torch.cat(did_list)
+        self.building_ids        = torch.cat(did_list)
         self.structural_change = torch.cat(ch_list)
         self.metas            = torch.cat(mt_list)
         self.score_bins       = torch.cat(sb_list)
+        self.cbsa_ids         = torch.cat(cb_list)
 
         # Build lookups for the batch sampler
         self.year_to_idxs = {}
-        self.doitt_to_idxs = {}
+        self.yearcbsa_to_idxs = {}
+        self.building_to_idxs = {}
         for i in range(len(self.images)):
             yr = self.years[i].item()
-            did = self.doitt_ids[i].item()
+            did = self.building_ids[i].item()
+            cb = self.cbsa_ids[i].item()
             self.year_to_idxs.setdefault(yr, []).append(i)
-            self.doitt_to_idxs.setdefault(did, []).append(i)
+            self.yearcbsa_to_idxs.setdefault((yr, cb), []).append(i)
+            self.building_to_idxs.setdefault(did, []).append(i)
 
         n_stable = (self.structural_change == 0).sum().item()
         n_change = (self.structural_change == 1).sum().item()
@@ -841,7 +938,7 @@ class InBatchRankingDataset(Dataset):
         if self.transform:
             img = self.transform(img)
         return (img, self.scores[idx], self.geoids[idx], self.years[idx],
-                self.doitt_ids[idx], self.structural_change[idx], self.metas[idx], self.score_bins[idx])
+                self.building_ids[idx], self.structural_change[idx], self.metas[idx], self.score_bins[idx])
 
 
 class HybridBatchSampler(torch.utils.data.Sampler):
@@ -849,42 +946,90 @@ class HybridBatchSampler(torch.utils.data.Sampler):
     Constructs valid hybrid batches for In-Batch Pairwise Ranking.
 
     Each batch contains:
-      - B_cs cross-sectional images from the SAME year (maximizes pairwise supervision)
-      - Their temporal twins (stable + change) from the loaded data
+      - B_cs cross-sectional images from the SAME (year, CBSA): per-CBSA z-scores
+        are only comparable within a metro, so cross-metro pairs would inject
+        noise into the ranking loss. Pool choice is weighted by pool size so big
+        metros are visited proportionally to their data.
+      - Their temporal twins from other years of the SAME buildings, split
+        between stable and change buildings per the temporal_fraction semantics
+        (50/50 budget, backfilled from the other side when one is short). The
+        loss gates lambda_s to stable twins; change twins carry no loss term
+        (they feed the changed-MASD validation metrics), so including them
+        never contaminates the stability penalty.
+
+    Old shards without cbsa_ids collapse to cbsa=0 pools == the previous
+    per-year (single-city) behavior.
     """
     def __init__(self, dataset: InBatchRankingDataset, batch_size_cs: int, max_temporal_per_batch: int = 32):
         self.dataset = dataset
         self.batch_size_cs = batch_size_cs
         self.max_temporal = max_temporal_per_batch
         self.num_batches = max(1, len(dataset) // batch_size_cs)
+        self._warned_fallback = False
+
+    def _pools(self):
+        """(year, cbsa) pools big enough for meaningful in-batch ranking."""
+        min_pool = max(2, self.batch_size_cs // 4)
+        pools = {k: v for k, v in self.dataset.yearcbsa_to_idxs.items()
+                 if len(v) >= min_pool}
+        # Degenerate fallback (tiny/misconfigured cache): use per-year pools.
+        if not pools:
+            pools = {(yr, 0): v for yr, v in self.dataset.year_to_idxs.items()}
+            if not self._warned_fallback and bool((self.dataset.cbsa_ids != 0).any()):
+                self._warned_fallback = True
+                print(
+                    "⚠️ [HybridBatchSampler] all (year, CBSA) pools below min size — "
+                    "falling back to per-year pools; batches may MIX CBSAs. "
+                    "Increase shard size or check cbsa_ids."
+                )
+        return pools
 
     def __iter__(self):
-        for _ in range(self.num_batches):
-            # Pick random year from loaded data
-            year = random.choice(list(self.dataset.year_to_idxs.keys()))
-            pool = self.dataset.year_to_idxs[year]
+        pools = self._pools()
+        keys = list(pools.keys())
+        weights = [len(pools[k]) for k in keys]
 
-            # Sample cross-sectional core
+        for _ in range(self.num_batches):
+            year, _cbsa = key = random.choices(keys, weights=weights, k=1)[0]
+            pool = pools[key]
+
+            # Sample cross-sectional core (single year x single CBSA)
             cs_size = min(self.batch_size_cs, len(pool))
             cs_idxs = random.sample(pool, cs_size)
 
             batch = list(cs_idxs)
 
-            # Find temporal twins for CS buildings (if they exist in loaded data)
-            temporal_added = 0
+            # Temporal twins: same building, different year. Budget split 50/50
+            # between stable and change buildings; backfill if one side is short.
+            stable_budget = self.max_temporal // 2
+            change_budget = self.max_temporal - stable_budget
+            stable_twins, change_twins = [], []
             for idx in cs_idxs:
-                if temporal_added >= self.max_temporal:
+                if len(stable_twins) + len(change_twins) >= self.max_temporal:
                     break
-                doitt = self.dataset.doitt_ids[idx].item()
-                # [PATCH] Avoid sampling changed tracts for now
+                bid = self.dataset.building_ids[idx].item()
                 twin_candidates = [
-                    i for i in self.dataset.doitt_to_idxs.get(doitt, [])
-                    if i != idx and self.dataset.years[i].item() != year and self.dataset.structural_change[i].item() == 0
+                    i for i in self.dataset.building_to_idxs.get(bid, [])
+                    if i != idx and self.dataset.years[i].item() != year
                 ]
-                if twin_candidates:
-                    twin = random.choice(twin_candidates)
-                    batch.append(twin)
-                    temporal_added += 1
+                if not twin_candidates:
+                    continue
+                twin = random.choice(twin_candidates)
+                if self.dataset.structural_change[idx].item() == 0:
+                    stable_twins.append(twin)
+                else:
+                    change_twins.append(twin)
+
+            n_stable = min(len(stable_twins), stable_budget)
+            n_change = min(len(change_twins), change_budget)
+            spare = self.max_temporal - n_stable - n_change
+            if spare > 0:   # backfill unused budget from whichever side has extras
+                extra = min(len(stable_twins) - n_stable, spare)
+                n_stable += extra
+                spare -= extra
+                n_change += min(len(change_twins) - n_change, spare)
+            batch.extend(stable_twins[:n_stable])
+            batch.extend(change_twins[:n_change])
 
             yield batch
 
@@ -907,9 +1052,10 @@ class StaticShardedDataset(Dataset):
         self.images = None
         self.scores = None
         self.metas  = None
-        self.doitt_ids = None
+        self.building_ids = None
         self.years = None
         self.structural_change = None
+        self.cbsa_ids = None
 
         if verbose:
             print(f"Loading metadata for {len(self.shard_paths)} shards to establish dataset sizes...")
@@ -936,9 +1082,10 @@ class StaticShardedDataset(Dataset):
         self.images  = data["images"]
         self.scores  = data["scores"]
         self.metas   = data.get("metas")
-        self.doitt_ids = data.get("doitt_ids")
+        self.building_ids = data.get("building_ids")
         self.years   = data.get("years")
         self.structural_change = data.get("structural_change")
+        self.cbsa_ids = data.get("cbsa_ids")   # absent in pre-US shards -> 0 per item
         self.current_shard_idx = shard_idx
 
     def __len__(self):
@@ -951,14 +1098,15 @@ class StaticShardedDataset(Dataset):
         img  = self.images[item_idx]
         lbl  = self.scores[item_idx]
         meta = self.metas[item_idx] if self.metas is not None else torch.zeros(1)
-        doitt_id = self.doitt_ids[item_idx] if self.doitt_ids is not None else 0
+        bldg_id = self.building_ids[item_idx] if self.building_ids is not None else 0
         year = self.years[item_idx] if self.years is not None else 0
         structural_change = self.structural_change[item_idx] if self.structural_change is not None else 0
+        cbsa_id = self.cbsa_ids[item_idx] if self.cbsa_ids is not None else 0
 
         if self.transform:
             img = self.transform(img)
 
-        return img, lbl, meta, doitt_id, year, structural_change
+        return img, lbl, meta, bldg_id, year, structural_change, cbsa_id
                                         
 class PhotometricAugmentation:
     def __init__(self):
@@ -984,6 +1132,24 @@ class PhotometricAugmentation:
                     return rgb
                 return torch.cat([rgb, img[3:]], dim=c_dim)
         return img
+
+def _subsample_val_buildings(df_val, n_buildings_per_tract=2, seed=825):
+    """Subsample a validation dataframe by BUILDING, keeping all years.
+
+    Picks up to ``n_buildings_per_tract`` building_ids per GEOID and keeps every
+    year-row of the chosen buildings (deterministic). Sampling whole buildings —
+    instead of 2 rows per (tract, year) as before — guarantees multi-year
+    buildings survive, so stable/changed MASD and directional accuracy are
+    computable on every val set (replaces the old val_spatial_temporal set).
+    """
+    picks = (
+        df_val[["GEOID", "building_id"]]
+        .drop_duplicates()
+        .groupby("GEOID", group_keys=False)[["GEOID", "building_id"]]
+        .apply(lambda g: g.sample(n=min(len(g), n_buildings_per_tract), random_state=seed))
+    )
+    return df_val[df_val["building_id"].isin(set(picks["building_id"]))].copy()
+
 
 def setup_dataloaders(df_train, dfs_val_dict, df_test, all_years_datasets, params, train_cache_manager=None, val_cache_manager=None):
     print("--- Initializing PyTorch Datasets ---")
@@ -1117,9 +1283,13 @@ def fill_params_defaults(params):
         "learning_rate": 0.0001,
         "sat_data": "pleiades",
         "years": [2013],
-        "test_years": [],
-        "test_column": None,
+        "naip_coverage_csv": None,  # naip_coverage_audit.py CSV for per-city holdout years (#28); None = auto-probe ~/outputs/naip_coverage.csv
         "extra": "",
+        "run_id": None,       # short custom savename; default is run_{YYYYMMDD}
+        "indicator": indicators.DEFAULT_INDICATOR,  # training label (see src/data/indicators.py)
+        "footprints_source": "ms_us",  # "ms_us" (national MS index) | "doitt_nyc" (legacy)
+        "states": None,       # optional list of state stems to subset the MS index
+        "reject_padded_nir": False,  # drop NAIP crops whose NIR band is zero-padded
         "tau_meters": 100,
         "subsample_step": 1,
         "max_jitter": 10,
@@ -1127,7 +1297,6 @@ def fill_params_defaults(params):
         "m_min": 0.1,         # Hard floor for pairwise margin (prevents collapse)
         "m_base": 1.0,        # Margin scale factor: m_kl = max(m_min, m_base * |Z_l - Z_k|)
         "lambda_s": 1.0,      # Weight for temporal stability L1 penalty
-        "lambda_c": 0.0,      # [PATCH] Weight for temporal change ranking hinge (temporarily disabled)
         "temporal_fraction": 0.20,  # Fraction of batch reserved for temporal auxiliary (split 50/50 stable/change)
     }
     validate_parameters(params, default_params)
@@ -1146,13 +1315,16 @@ def fill_params_defaults(params):
 class InBatchPairwiseRankingLoss(nn.Module):
     """In-Batch Pairwise Ranking Loss with Score-Based Margins (Ordinal Framework).
 
-    Computes three decoupled objectives from a single forward pass:
+    Computes two decoupled objectives from a single forward pass:
       1. L_cross:  Smooth logistic surrogate (RankNet) over all valid unique cross-sectional pairs
                    T = max(m_min, m_base * σ_batch) — temperature scales with score spread, NOT ACS magnitude
       2. L_stable: L1 temporal invariance for stable twins
-      3. L_change: Smooth logistic surrogate for directional rank mobility of changed twins
 
-    L_total = L_cross + lambda_s * L_stable + lambda_c * L_change
+    L_total = L_cross + lambda_s * L_stable + L_var
+
+    Change twins carry NO loss term (the directional L_change was removed, issue #30):
+    they are still sampled by HybridBatchSampler and feed the changed-MASD / directional-
+    accuracy validation metrics, but L_stable is masked to stable twins only.
 
     Key design: margins carry zero economic information. They scale with the model's own output
     distribution (σ_batch) to prevent collapse at initialization, never with ACS label magnitudes.
@@ -1160,14 +1332,13 @@ class InBatchPairwiseRankingLoss(nn.Module):
 
     Returns (loss, diagnostics_dict) so the training loop can log internals to W&B.
     """
-    def __init__(self, m_base=1.0, m_min=0.1, lambda_s=1.0, lambda_c=1.0):
+    def __init__(self, m_base=1.0, m_min=0.1, lambda_s=1.0):
         super().__init__()
         self.m_base = m_base
         self.m_min = m_min
         self.lambda_s = lambda_s
-        self.lambda_c = lambda_c
 
-    def forward(self, scores, labels, geoids, years, doitt_ids, structural_change, score_bins=None, current_epoch=None, current_step=None):
+    def forward(self, scores, labels, geoids, years, building_ids, structural_change, score_bins=None, current_epoch=None, current_step=None):
         scores = scores.squeeze(-1)
         labels = labels.float()
         
@@ -1231,33 +1402,31 @@ class InBatchPairwiseRankingLoss(nn.Module):
                     cross_hinge_active = (-delta + m_scalar > 0).float().mean().item()
 
         # ──────────────────────────────────────────────────────────
-        # 2 & 3. TEMPORAL PENALTIES (L_stable & L_change)
+        # 2. TEMPORAL PENALTY (L_stable) — masked to stable twins.
+        #    Change twins carry no loss term; they only feed val metrics (#30).
         # ──────────────────────────────────────────────────────────
         L_stable = torch.tensor(0.0, device=scores.device)
-        L_change = torch.tensor(0.0, device=scores.device)
-        n_stable, n_change, change_hinge_active = 0, 0, 0.0
+        n_stable, n_change = 0, 0
 
         if temp_mask.any():
-            temp_scores, temp_labels = scores[temp_mask], labels[temp_mask]
-            temp_doitts = doitt_ids[temp_mask]
+            temp_scores = scores[temp_mask]
+            temp_building_ids = building_ids[temp_mask]
             temp_change = structural_change[temp_mask]
-            
-            cs_doitts = doitt_ids[cs_mask]
+
+            cs_building_ids = building_ids[cs_mask]
             cs_scores_full = scores[cs_mask]
-            cs_labels_full = labels[cs_mask]
-            
-            # Vectorized dynamic pairing: match temporal doitt to cross-sectional doitt
-            matches = (temp_doitts.unsqueeze(1) == cs_doitts.unsqueeze(0))
+
+            # Vectorized dynamic pairing: match temporal building_id to cross-sectional building_id
+            matches = (temp_building_ids.unsqueeze(1) == cs_building_ids.unsqueeze(0))
             has_match, match_idx_in_cs = matches.max(dim=1)
-            
+
             # Filter to twins that successfully matched a CS anchor
             valid_temp = has_match
             if valid_temp.any():
-                v_temp_scores, v_temp_labels = temp_scores[valid_temp], temp_labels[valid_temp]
+                v_temp_scores = temp_scores[valid_temp]
                 v_temp_change = temp_change[valid_temp]
-                
+
                 v_partner_scores = cs_scores_full[match_idx_in_cs[valid_temp]]
-                v_partner_labels = cs_labels_full[match_idx_in_cs[valid_temp]]
 
                 # STABLE Penalty
                 stable_idx = (v_temp_change == 0)
@@ -1265,21 +1434,8 @@ class InBatchPairwiseRankingLoss(nn.Module):
                     L_stable = ((v_temp_scores[stable_idx] - v_partner_scores[stable_idx]) ** 2).mean()
                     n_stable = stable_idx.sum().item()
 
-                # CHANGE Ranking
-                change_idx = (v_temp_change == 1)
-                if change_idx.any():
-                    c_temp_scores = v_temp_scores[change_idx]
-                    c_partner_scores = v_partner_scores[change_idx]
-                    
-                    y_change = torch.sign(v_temp_labels[change_idx] - v_partner_labels[change_idx])
-                    
-                    m_change = self.m_base
-                    delta_change = y_change * (c_temp_scores - c_partner_scores)
-                    L_change = F.softplus(-delta_change / m_change).mean()
-                    n_change = change_idx.sum().item()
-                    with torch.no_grad():
-                        # Diagnostic: proportion of pairs that would violate a hard margin
-                        change_hinge_active = (-delta_change + m_change > 0).float().mean().item()
+                # Change twins: counted only (sampler-health diagnostic; no loss term)
+                n_change = (v_temp_change == 1).sum().item()
 
         # CS-only variance regularizer: targets the exact distribution L_cross operates on.
         # Eliminates the tug-of-war with L_stable (temporal scores are excluded).
@@ -1288,45 +1444,38 @@ class InBatchPairwiseRankingLoss(nn.Module):
         if B_cs > 1:
             variance_penalty = (cs_scores.std() - 1.0).pow(2)
             
-        loss = L_cross + self.lambda_s * L_stable + self.lambda_c * L_change + 1.0 * variance_penalty
-        
+        loss = L_cross + self.lambda_s * L_stable + 1.0 * variance_penalty
+
         # --- Compute gradient norms of each loss component w.r.t predictions ---
-        # Only compute every 10 steps to avoid 4x extra backward traversals per step
-        grad_cross, grad_stable, grad_change, grad_variance = 0.0, 0.0, 0.0, 0.0
+        # Only compute every 10 steps to avoid 3x extra backward traversals per step
+        grad_cross, grad_stable, grad_variance = 0.0, 0.0, 0.0
         compute_grad_norms = (current_step is not None and current_step % 10 == 0)
         if compute_grad_norms:
             try:
                 if L_cross.requires_grad and L_cross.item() > 0:
                     g_c = torch.autograd.grad(L_cross, scores, retain_graph=True)[0]
                     if g_c is not None: grad_cross = g_c.norm(p=2).item() * 10
-                    
+
                 if L_stable.requires_grad and L_stable.item() > 0:
                     g_s = torch.autograd.grad(self.lambda_s * L_stable, scores, retain_graph=True)[0]
                     if g_s is not None: grad_stable = g_s.norm(p=2).item() * 10
-                    
-                if L_change.requires_grad and L_change.item() > 0:
-                    g_ch = torch.autograd.grad(self.lambda_c * L_change, scores, retain_graph=True)[0]
-                    if g_ch is not None: grad_change = g_ch.norm(p=2).item() * 10
-                    
+
                 if variance_penalty.requires_grad and variance_penalty.item() > 0:
                     g_v = torch.autograd.grad(variance_penalty, scores, retain_graph=True)[0]
                     if g_v is not None: grad_variance = g_v.norm(p=2).item() * 10
             except Exception:
                 pass # Fail gracefully (e.g. if graph is disconnected or autograd anomalies)
-        
+
         # Diagnostics — all detached, zero overhead on the backward pass
         with torch.no_grad():
             diag = {
                 "loss/L_cross":              L_cross.item(),
                 "loss/L_stable":             L_stable.item(),
-                "loss/L_change":             L_change.item(),
                 "grad_norm/cross":           grad_cross,
                 "grad_norm/stable":          grad_stable,
-                "grad_norm/change":          grad_change,
                 "grad_norm/variance":        grad_variance,
                 "loss/cross_valid_pairs":    n_valid_pairs,
                 "loss/cross_hinge_active":   cross_hinge_active,
-                "loss/change_hinge_active":  change_hinge_active,
                 "loss/avg_margin":           avg_margin,
                 "loss/n_stable":             n_stable,
                 "loss/n_change":             n_change,
@@ -1342,7 +1491,7 @@ class InBatchPairwiseRankingLoss(nn.Module):
 
 def set_model_and_loss_function(
     model_name: str, kind: str, image_size: int, bands: int = 4, weights: str = None, meta_dim: int = 0,
-    m_base: float = 1.0, m_min: float = 0.1, lambda_s: float = 1.0, lambda_c: float = 1.0
+    m_base: float = 1.0, m_min: float = 0.1, lambda_s: float = 1.0
 ):
     """
     Initializes the PyTorch model and appropriate loss function.
@@ -1371,7 +1520,7 @@ def set_model_and_loss_function(
     if kind == "reg":
         # In-Batch Pairwise Ranking Loss with economic-distance-proportional margins.
         loss_fn = InBatchPairwiseRankingLoss(
-            m_base=m_base, m_min=m_min, lambda_s=lambda_s, lambda_c=lambda_c
+            m_base=m_base, m_min=m_min, lambda_s=lambda_s
         )
         
     elif kind == "cla":
@@ -1434,6 +1583,108 @@ def check_feature_importance(model):
             "weights/commute_to_image_ratio": ratio
         }, commit=False) # commit=False ties it to the next step log
 
+def compute_val_metrics(val_df, cbsa_meta=None, top_cities=None, min_city_n=50):
+    """Validation metrics for one val set (pure pandas/numpy; unit-testable).
+
+    Args:
+        val_df: DataFrame with columns building_id, year, pred, label, change,
+            and (optionally) cbsa — one row per validated image.
+        cbsa_meta: content of cbsa_splits.feather (cbsa_code, bracket,
+            population, ...) or None -> base metrics only (pre-US shards).
+        top_cities: cbsa codes to report per-city metrics for (#31 top-10),
+            wherever they have >= min_city_n predictions in this val set.
+        min_city_n: noise guard for the per-city breakdown.
+
+    Returns a flat dict: base keys (mse, spearman, stable_masd, changed_masd,
+    changed_da, pred_mean, pred_std), plus 'bracket/{name}/{metric}' and
+    'city/{cbsa}/{metric}' breakdowns. Keys with no data are omitted.
+    """
+    from scipy.stats import spearmanr
+
+    def _temporal(df):
+        # Stable/changed MASD + directional accuracy over all ordered year pairs
+        out = {}
+        counts = df["building_id"].value_counts()
+        multi = counts[counts >= 2].index
+        if not len(multi):
+            return out
+        sub = df[df["building_id"].isin(multi)].sort_values(["building_id", "year"])
+        stable_disps, changed_disps = [], []
+        da_correct, da_total = 0, 0
+        for _, grp in sub.groupby("building_id"):
+            preds_arr = grp["pred"].values
+            labels_arr = grp["label"].values
+            is_changed = grp["change"].iloc[0]
+            n = len(preds_arr)
+            for i in range(n):
+                for j in range(i + 1, n):
+                    pred_d = preds_arr[j] - preds_arr[i]
+                    label_d = labels_arr[j] - labels_arr[i]
+                    if is_changed == 0:
+                        stable_disps.append(abs(pred_d))
+                    else:
+                        changed_disps.append(abs(pred_d))
+                        if label_d != 0:  # skip tied labels
+                            da_total += 1
+                            if (pred_d > 0) == (label_d > 0):
+                                da_correct += 1
+        if stable_disps:
+            out["stable_masd"] = float(np.mean(stable_disps))
+        if changed_disps:
+            out["changed_masd"] = float(np.mean(changed_disps))
+        if da_total > 0:
+            out["changed_da"] = da_correct / da_total
+        return out
+
+    def _base(df):
+        out = {}
+        if df.empty:
+            return out
+        out["mse"] = float(np.mean((df["pred"] - df["label"]) ** 2))
+        if df["pred"].nunique() > 1 and df["label"].nunique() > 1:
+            rho, _ = spearmanr(df["pred"], df["label"])
+            if not np.isnan(rho):
+                out["spearman"] = float(rho)
+        # Predicted-score moments: the cross-city latent-drift detector (#31) —
+        # per-CBSA z-scored labels mean every city should predict ~N(0, 1).
+        out["pred_mean"] = float(df["pred"].mean())
+        out["pred_std"] = float(df["pred"].std()) if len(df) > 1 else 0.0
+        out.update(_temporal(df))
+        return out
+
+    metrics = _base(val_df)
+
+    if cbsa_meta is not None and "cbsa" in val_df.columns:
+        bracket_of = {}
+        for code, bracket in zip(cbsa_meta["cbsa_code"], cbsa_meta["bracket"]):
+            try:
+                bracket_of[int(code)] = bracket
+            except (TypeError, ValueError):
+                continue
+        df = val_df.copy()
+        df["cbsa"] = df["cbsa"].astype(int)
+        df["bracket"] = df["cbsa"].map(bracket_of)
+        for bracket, grp in df.groupby("bracket"):
+            sub = _base(grp)
+            sub["n"] = len(grp)
+            metrics.update({f"bracket/{bracket}/{k}": v for k, v in sub.items()})
+        if top_cities:
+            top_ints = set()
+            for c in top_cities:
+                try:
+                    top_ints.add(int(c))
+                except (TypeError, ValueError):
+                    continue
+            for cbsa, grp in df.groupby("cbsa"):
+                if cbsa not in top_ints or len(grp) < min_city_n:
+                    continue
+                sub = _base(grp)
+                sub["n"] = len(grp)
+                metrics.update({f"city/{cbsa}/{k}": v for k, v in sub.items()})
+
+    return metrics
+
+
 def train_model(
     model,
     train_loader,
@@ -1448,11 +1699,14 @@ def train_model(
     start_epoch=0,
     initial_best_val_loss=None,
     val_cache_managers=None,
+    cbsa_meta=None,
 ):
     print("--- Starting PyTorch Training Loop ---")
     best_val_spearman = (
         initial_best_val_loss if initial_best_val_loss is not None else float(-1)
     )
+    # Per-city split metadata for the #31 breakdowns (None -> base metrics only)
+    top_cities = cbsa_brackets.top_cbsas(cbsa_meta) if cbsa_meta is not None else None
 
     # Pointwise MSE for validation — training uses in-batch pairwise ranking but validation
     # evaluates individual predictions against their labels for interpretable tracking.
@@ -1494,7 +1748,7 @@ def train_model(
         )
 
         t_batch_start = time.perf_counter()  # start timer before first batch
-        for batch_idx, (images, scores, geoids, years, doitt_ids, structural_change, metas, score_bins) in train_bar:
+        for batch_idx, (images, scores, geoids, years, building_ids, structural_change, metas, score_bins) in train_bar:
             t_data_end = time.perf_counter()  # data is ready; measure load time
 
             # Move all to device
@@ -1506,7 +1760,7 @@ def train_model(
             scores_lbl = scores.to(device)
             geoids     = geoids.to(device)
             years      = years.to(device)
-            doitt_ids  = doitt_ids.to(device)
+            building_ids  = building_ids.to(device)
             structural_change = structural_change.to(device)
             metas      = metas.to(device)
             score_bins = score_bins.to(device)
@@ -1520,7 +1774,7 @@ def train_model(
                 
                 # In-Batch Pairwise Ranking Loss (3 decoupled objectives)
                 loss, diag = loss_fn(
-                    outputs, scores_lbl, geoids, years, doitt_ids, structural_change, 
+                    outputs, scores_lbl, geoids, years, building_ids, structural_change, 
                     score_bins=score_bins, current_epoch=epoch, current_step=batch_idx
                 )
 
@@ -1625,23 +1879,22 @@ def train_model(
         # ==========================
         val_losses = {}
         val_spearmans = {}
-        val_stable_masd = {}
-        val_changed_masd = {}
-        val_changed_da = {}
+        val_set_metrics = {}
         if len(val_loaders.values()) > 0:
             for val_name, val_loader in val_loaders.items():
                 model.eval() # Set model to eval mode (disables dropout)
                 running_val_loss = 0.0
                 all_preds = []
                 all_labels = []
-                all_doitts = []
+                all_building_ids = []
                 all_years = []
                 all_changes = []
+                all_cbsas = []
                 val_bar = tqdm(val_loader, desc=f"Epoch [{epoch+1}/{epochs}] {val_name}", leave=False)
 
                 # Disable gradient calculation for validation (saves RAM and compute)
                 with torch.no_grad():
-                    for images, labels, metas, doitt_ids, val_years, val_structural_changes in val_bar:
+                    for images, labels, metas, building_ids, val_years, val_structural_changes, val_cbsa_ids in val_bar:
                         images, labels, metas = images.to(device), labels.to(device), metas.to(device)
                         if images.dtype != torch.float32 or images.max() > 10.0:
                             raise RuntimeError(
@@ -1650,7 +1903,7 @@ def train_model(
                                 f"ScaleMAE requires float32 tensors with standard ImageNet normalization. "
                                 f"If the model receives raw 0-255 uint8 arrays, its attention layers will output pure noise and refuse to learn."
                             )
-                        
+
                         with autocast(device_type='cuda'):
                             outputs = model(images, metadata=metas)
                             if outputs.shape != labels.shape:
@@ -1658,93 +1911,53 @@ def train_model(
                             # Pointwise MSE for validation so per-image accuracy is interpretable
                             loss = val_loss_fn(outputs, labels)
                         running_val_loss += loss.item() * images.size(0)
-                        
+
                         all_preds.extend(outputs.view(-1).cpu().numpy())
                         all_labels.extend(labels.view(-1).cpu().numpy())
-                        if doitt_ids is not None:
-                            all_doitts.extend(doitt_ids.cpu().numpy())
+                        if building_ids is not None:
+                            all_building_ids.extend(building_ids.cpu().numpy())
                         if val_years is not None:
                             all_years.extend(val_years.cpu().numpy())
                         if val_structural_changes is not None:
                             all_changes.extend(val_structural_changes.cpu().numpy())
-                        
-                        val_bar.set_postfix(loss=f"{loss.item():.4f}")
-                
-                from scipy.stats import spearmanr
-                spearman_corr, _ = spearmanr(all_preds, all_labels)
-                
-                val_losses[val_name] = running_val_loss / len(val_loader.dataset)
-                # Exclude val_spatial_temporal: that spearman is inconsistent as it compares geoids across time and space!
-                if val_name != "val_spatial_temporal":
-                    val_spearmans[val_name] = spearman_corr
-                
-                # ── Temporal metrics: MASD (stable vs changed) + Directional Accuracy ──
-                if len(all_doitts) > 0 and len(all_doitts) == len(all_preds):
-                    val_df = pd.DataFrame({
-                        'DOITT_ID': all_doitts,
-                        'year': all_years,
-                        'pred': all_preds,
-                        'label': all_labels,
-                        'change': all_changes
-                    })
-                    
-                    val_counts = val_df['DOITT_ID'].value_counts()
-                    valid_doitts = val_counts[val_counts >= 2].index
-                    
-                    if len(valid_doitts) > 0:
-                        valid_df = val_df[val_df['DOITT_ID'].isin(valid_doitts)].sort_values(['DOITT_ID', 'year'])
-                        
-                        # Per-building: compute MASD and directional accuracy over all year-ordered pairs
-                        building_change_flag = valid_df.groupby('DOITT_ID')['change'].first()
-                        stable_ids = building_change_flag[building_change_flag == 0].index
-                        changed_ids = building_change_flag[building_change_flag == 1].index
-                        
-                        stable_abs_disps = []
-                        changed_abs_disps = []
-                        da_correct = 0
-                        da_total = 0
-                        
-                        for doitt_id, grp in valid_df.groupby('DOITT_ID'):
-                            preds_arr = grp['pred'].values
-                            labels_arr = grp['label'].values
-                            is_changed = grp['change'].iloc[0]
-                            n = len(preds_arr)
-                            # All ordered pairs (j > i by year)
-                            for i in range(n):
-                                for j in range(i + 1, n):
-                                    pred_d = preds_arr[j] - preds_arr[i]
-                                    label_d = labels_arr[j] - labels_arr[i]
-                                    if is_changed == 0:
-                                        stable_abs_disps.append(abs(pred_d))
-                                    else:
-                                        changed_abs_disps.append(abs(pred_d))
-                                        if label_d != 0:  # skip tied labels
-                                            da_total += 1
-                                            if (pred_d > 0) == (label_d > 0):
-                                                da_correct += 1
-                        
-                        if stable_abs_disps:
-                            val_stable_masd[val_name] = float(np.mean(stable_abs_disps))
-                        if changed_abs_disps:
-                            val_changed_masd[val_name] = float(np.mean(changed_abs_disps))
-                        if da_total > 0:
-                            val_changed_da[val_name] = da_correct / da_total
+                        if val_cbsa_ids is not None:
+                            all_cbsas.extend(val_cbsa_ids.cpu().numpy())
 
-                # Build display string (minimal: Spearman for spatial sets, MASD/DA for temporal set)
-                if val_name == "val_spatial_temporal":
-                    parts = []
-                    if val_name in val_stable_masd:
-                        parts.append(f"S-MASD: {val_stable_masd[val_name]:.4f}")
-                    if val_name in val_changed_masd:
-                        parts.append(f"C-MASD: {val_changed_masd[val_name]:.4f}")
-                    if val_name in val_changed_da:
-                        parts.append(f"C-DA: {val_changed_da[val_name]:.2%}")
-                    tqdm.write(f"{val_name} {' | '.join(parts)}")
-                else:
-                    tqdm.write(f"{val_name} Spearman: {spearman_corr:.4f}")
-            
+                        val_bar.set_postfix(loss=f"{loss.item():.4f}")
+
+                val_losses[val_name] = running_val_loss / len(val_loader.dataset)
+
+                # ── Metrics: spearman, MASD (stable vs changed), DA, pred moments,
+                #    plus per-population-bracket and top-city breakdowns (#31) ──
+                n = len(all_preds)
+                val_df = pd.DataFrame({
+                    'building_id': all_building_ids if len(all_building_ids) == n else np.arange(n),
+                    'year': all_years if len(all_years) == n else np.zeros(n, dtype=int),
+                    'pred': all_preds,
+                    'label': all_labels,
+                    'change': all_changes if len(all_changes) == n else np.zeros(n, dtype=int),
+                    'cbsa': all_cbsas if len(all_cbsas) == n else np.zeros(n, dtype=int),
+                })
+                set_metrics = compute_val_metrics(val_df, cbsa_meta=cbsa_meta,
+                                                  top_cities=top_cities)
+                val_set_metrics[val_name] = set_metrics
+                if "spearman" in set_metrics:
+                    val_spearmans[val_name] = set_metrics["spearman"]
+
+                # Display: Spearman + whatever temporal metrics this set supports
+                parts = []
+                if "spearman" in set_metrics:
+                    parts.append(f"Spearman: {set_metrics['spearman']:.4f}")
+                if "stable_masd" in set_metrics:
+                    parts.append(f"S-MASD: {set_metrics['stable_masd']:.4f}")
+                if "changed_masd" in set_metrics:
+                    parts.append(f"C-MASD: {set_metrics['changed_masd']:.4f}")
+                if "changed_da" in set_metrics:
+                    parts.append(f"C-DA: {set_metrics['changed_da']:.2%}")
+                tqdm.write(f"{val_name} {' | '.join(parts)}")
+
             # Use mean validation spearman for early stopping / best model checkpointing
-            epoch_val_spearman = sum(val_spearmans.values()) / len(val_spearmans)
+            epoch_val_spearman = sum(val_spearmans.values()) / max(len(val_spearmans), 1)
         else:
             epoch_val_spearman = float('-inf')  # No validation data
 
@@ -1758,9 +1971,9 @@ def train_model(
         # ==========================
         # 3. LOGGING & CHECKPOINTING
         # ==========================
-        val_display = " | ".join([f"{k} Spearman: {v:.4f}" for k, v in val_spearmans.items() if k != "val_spatial_temporal"])
+        val_display = " | ".join([f"{k} Spearman: {v:.4f}" for k, v in val_spearmans.items()])
         tqdm.write(f"Epoch [{epoch+1}/{epochs}] | Train Loss: {epoch_train_loss:.4f} | Train Acc: {epoch_train_acc:.4f} | {val_display}")
-        
+
         # 🎯 Log metrics directly to W&B cloud!
         log_dict = {
             "epoch": epoch + 1,
@@ -1770,23 +1983,25 @@ def train_model(
             **epoch_diag,
         }
         if len(val_loaders.values())>0:
-            for val_name, val_loader in val_loaders.items():
+            # Flat legacy-style keys for the base metrics; slash keys for the
+            # per-bracket / per-city breakdowns and predicted-score moments (#31).
+            _base_keys = ("spearman", "stable_masd", "changed_masd", "changed_da")
+            for val_name in val_loaders.keys():
                 log_dict[f"{val_name}_mse"] = val_losses[val_name]
-                if val_name in val_spearmans:
-                    log_dict[f"{val_name}_spearman"] = val_spearmans[val_name]
-                if val_name in val_stable_masd:
-                    log_dict[f"{val_name}_stable_masd"] = val_stable_masd[val_name]
-                if val_name in val_changed_masd:
-                    log_dict[f"{val_name}_changed_masd"] = val_changed_masd[val_name]
-                if val_name in val_changed_da:
-                    log_dict[f"{val_name}_changed_da"] = val_changed_da[val_name]
+                for key, value in val_set_metrics.get(val_name, {}).items():
+                    if key == "mse":
+                        continue  # already logged from the running loss
+                    if key in _base_keys:
+                        log_dict[f"{val_name}_{key}"] = value
+                    else:
+                        log_dict[f"{val_name}/{key}"] = value
 
         wandb.log(log_dict)
 
         # Model Checkpoint logic (Maximize Spearman)
         if epoch_val_spearman > best_val_spearman:
             tqdm.write(f"⭐ Val Spearman improved from {best_val_spearman:.4f} to {epoch_val_spearman:.4f}. Saving...")
-            tqdm.write(f"   📊 [Loss Components] L_cross: {epoch_diag.get('loss/L_cross', 0.0):.4f} | L_stable: {epoch_diag.get('loss/L_stable', 0.0):.4f} | L_change: {epoch_diag.get('loss/L_change', 0.0):.4f}")
+            tqdm.write(f"   📊 [Loss Components] L_cross: {epoch_diag.get('loss/L_cross', 0.0):.4f} | L_stable: {epoch_diag.get('loss/L_stable', 0.0):.4f}")
             best_val_spearman = epoch_val_spearman
             
             model_path = save_dir / f"{savename}_best.pth"
@@ -1935,7 +2150,7 @@ class FastPredictLoader:
 
                         labels_tensor = torch.tensor(label_chunk, dtype=torch.float32)
                         metas_tensor = torch.tensor(meta_chunk, dtype=torch.float32).unsqueeze(1)
-                        doitt_ids = torch.tensor([r.get("DOITT_ID", 0) for r in row_chunk])
+                        building_ids = torch.tensor([r.get("building_id", 0) for r in row_chunk])
                         geoids = [str(r.get("GEOID", "")) for r in row_chunk]
                         years_t = torch.tensor([r.get("year", 0) for r in row_chunk])
                         types = [str(r.get("type", "")) for r in row_chunk]
@@ -1943,7 +2158,7 @@ class FastPredictLoader:
                         # queue.put() blocks here if GPU is slow — this is your backpressure valve
                         self.queue.put((
                             self.eval_transform(batch), labels_tensor, metas_tensor,
-                            doitt_ids, geoids, years_t, types
+                            building_ids, geoids, years_t, types
                         ))
 
                         raw_chunk.clear(); label_chunk.clear()
@@ -1956,14 +2171,14 @@ class FastPredictLoader:
 
             labels_tensor = torch.tensor(label_chunk, dtype=torch.float32)
             metas_tensor = torch.tensor(meta_chunk, dtype=torch.float32).unsqueeze(1)
-            doitt_ids = torch.tensor([r.get("DOITT_ID", 0) for r in row_chunk])
+            building_ids = torch.tensor([r.get("building_id", 0) for r in row_chunk])
             geoids = [str(r.get("GEOID", "")) for r in row_chunk]
             years_t = torch.tensor([r.get("year", 0) for r in row_chunk])
             types = [str(r.get("type", "")) for r in row_chunk]
 
             self.queue.put((
                 self.eval_transform(batch), labels_tensor, metas_tensor,
-                doitt_ids, geoids, years_t, types
+                building_ids, geoids, years_t, types
             ))
 
         self.queue.put(None)
@@ -2119,7 +2334,7 @@ def predict_buildings_chunked(model, df, all_years_datasets, params,
             batch_tensor,
             metas_tensor,
             [r["Rel_Score"]          for r in rows],
-            [r.get("DOITT_ID", 0)    for r in rows],
+            [r.get("building_id", 0)    for r in rows],
             [str(r.get("GEOID", "")) for r in rows],
             [r.get("year", 0)        for r in rows],
             [str(r.get("type", ""))  for r in rows],
@@ -2197,7 +2412,7 @@ def predict_buildings_chunked(model, df, all_years_datasets, params,
             if item is None:
                 break   # producer finished
 
-            batch_tensor, metas_tensor, labels, doitt_ids, geoids, years, types = item
+            batch_tensor, metas_tensor, labels, building_ids, geoids, years, types = item
 
             # non_blocking=True overlaps H2D transfer with prior GPU work
             batch_tensor = batch_tensor.to(device, non_blocking=True)
@@ -2211,7 +2426,7 @@ def predict_buildings_chunked(model, df, all_years_datasets, params,
             pd.DataFrame({
                 "Rel_Score":       labels,
                 "predicted_value": preds,
-                "DOITT_ID":        doitt_ids,
+                "building_id":        building_ids,
                 "GEOID":           geoids,
                 "year":            years,
                 "type":            types,
@@ -2255,7 +2470,7 @@ def predict_buildings(model, dataloader, device, output_path, verbose=True):
         if verbose:
             iterator = tqdm(iterator, total=len(dataloader), desc="Predicting Batches")
 
-        for batch_idx, (batch_images, batch_labels, batch_metas, batch_doitt_ids, batch_geoids, batch_years, batch_types) in iterator:
+        for batch_idx, (batch_images, batch_labels, batch_metas, batch_building_ids, batch_geoids, batch_years, batch_types) in iterator:
             batch_images = batch_images.to(device)
             batch_metas = batch_metas.to(device)
 
@@ -2267,7 +2482,7 @@ def predict_buildings(model, dataloader, device, output_path, verbose=True):
             chunk_df = pd.DataFrame({
                 "Rel_Score":       batch_labels.cpu().numpy(),
                 "predicted_value": preds,
-                "DOITT_ID":        batch_doitt_ids.cpu().numpy(),
+                "building_id":        batch_building_ids.cpu().numpy(),
                 "GEOID":           batch_geoids,
                 "year":            batch_years.cpu().numpy(),
                 "type":            batch_types,
@@ -2308,9 +2523,6 @@ def run(
     learning_rate = params["learning_rate"]
     sat_data = params["sat_data"]
     years = params["years"]
-    test_years = params["test_years"]
-    test_column = params["test_column"]
-    extra = params["extra"]
     batch_size = params["batch_size"]
     tau_meters_requested = params.get("tau_meters", 100)
     max_jitter = params.get("max_jitter", 10)
@@ -2326,9 +2538,7 @@ def run(
     print(f"📐 Exact tau override: {tau_meters_requested}m → {tau_meters:.2f}m  "
           f"(subsample step N={subsample_step}, raw tile = {subsample_step * image_size}px)")
 
-    savename = generate_savename(
-        model_name, image_size, learning_rate, years, extra
-    )
+    savename = generate_savename(params.get("run_id"))
     log_dir = f"{LOGS_DIR}/{model_name}_{datetime.now().strftime('%Y%m%d-%H%M%S')}"
 
     generate_parameters_log(params, savename)
@@ -2342,8 +2552,15 @@ def run(
     if train:
 
         all_years_datasets, all_years_extents, df_train, df_vals_dict, df_test, df_dead_zone = build_dataset.generate_datasets(
-            savename, sat_data, years, test_years, test_column, small_sample, max_jitter, tau_meters
+            savename, sat_data, years, small_sample=small_sample, tau_meters=tau_meters,
+            indicator=params["indicator"], footprints_source=params["footprints_source"], states=params["states"],
+            naip_coverage_csv=params.get("naip_coverage_csv"),
         )
+
+        # Per-city split metadata (#28/#31): temporal-holdout years feed the NAIP
+        # actual-year guards below; brackets/populations feed the val metrics.
+        cbsa_meta = cbsa_brackets.load_city_split()
+        holdout_years = cbsa_brackets.holdout_year_map(cbsa_meta)
 
         #### 1. Setup resume logic for model/cache
         checkpoint_dir = MODELS_DIR / "models_by_epoch" / savename
@@ -2386,6 +2603,7 @@ def run(
             clear_cache=not resume_cache,
             max_jitter=max_jitter,
             sat_data=sat_data,
+            holdout_years=holdout_years,
         )
         train_cache_manager.build_initial_cache()
 
@@ -2393,9 +2611,10 @@ def run(
         vals_cache_manager_dict = {}
         for val_name, df_val in df_vals_dict.items():
             if df_val.shape[0] > 0:
-                # Take up to 5 buildings per shard for validation to keep RAM usage low, since we load the whole shard at once during validation
-                if val_name != "val_spatial_temporal":
-                    df_val = df_val.groupby(['GEOID', 'year'], group_keys=False)[df_val.columns].apply(lambda x: x.sample(n=min(len(x), 2)))
+                # Subsample buildings (not rows) so every kept building retains ALL
+                # its years: multi-year buildings are what make the stable/changed
+                # MASD and directional-accuracy metrics computable inside val_cities.
+                df_val = _subsample_val_buildings(df_val)
                 val_num_shards = max(1, (len(df_val) + current_shard_size - 1) // current_shard_size)
                 val_cache_manager = CyclicCacheManager(
                     df=df_val, # Or full df_val
@@ -2408,21 +2627,22 @@ def run(
                     type=val_name,
                     clear_cache=not resume_cache,
                     sat_data=sat_data,
+                    holdout_years=holdout_years,
                 )
                 val_cache_manager.build_initial_cache() # This will build and show a progress bar
                 vals_cache_manager_dict[val_name] = val_cache_manager
             else:
                 val_cache_manager = None
-       
+
         #### 2. PyTorch Data Pipeline Setup
         print("Setting up data generators...")
         train_loader, val_loaders, test_loader = setup_dataloaders(
             df_train=df_train, dfs_val_dict=df_vals_dict, df_test=df_test,
             all_years_datasets=all_years_datasets, params=params,
             train_cache_manager=train_cache_manager, val_cache_manager=vals_cache_manager_dict
-        )            
+        )
 
-        del df_train, df_test, df_val, all_years_extents
+        del df_train, df_test, all_years_extents
         gc.collect() # Force Python to free up memory from large objects we no longer need
         
         train_cache_manager.start_background_generation() # Starts generating shard 6 for Epoch 1
@@ -2441,7 +2661,6 @@ def run(
             m_base=params.get("m_base", 1.0),
             m_min=params.get("m_min", 0.1),
             lambda_s=params.get("lambda_s", 1.0),
-            lambda_c=params.get("lambda_c", 1.0),
         )
 
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -2506,7 +2725,8 @@ def run(
             cache_manager=train_cache_manager,
             start_epoch=start_epoch,
             initial_best_val_loss=initial_best_val_loss,
-            val_cache_managers=vals_cache_manager_dict
+            val_cache_managers=vals_cache_manager_dict,
+            cbsa_meta=cbsa_meta,
         )
         
         wandb.finish()
@@ -2516,7 +2736,9 @@ def run(
         print("Generando predicciones...")
 
         all_years_datasets, all_years_extents, df_train, df_vals_dict, df_test, df_dead_zone = build_dataset.generate_datasets(
-            savename, sat_data, years, test_years, test_column, small_sample, max_jitter, tau_meters
+            savename, sat_data, years, small_sample=small_sample, tau_meters=tau_meters,
+            indicator=params["indicator"], footprints_source=params["footprints_source"], states=params["states"],
+            naip_coverage_csv=params.get("naip_coverage_csv"),
         )
 
         # Combine all dataframes
@@ -2597,11 +2819,17 @@ def run(
                 print(f"No valid predictions generated for year {year}.")
                 continue
 
-            # Save georeferenced predictions
-            gdf = gpd.read_parquet(PROCESSED_DATA_DIR / f"building_geometries_years{min(years)}-{max(years)}.parquet")
-            df_result = df_result.set_index("DOITT_ID")
-            gdf = gdf.join(df_result, how="inner")
-            gdf.to_parquet(RESULTS_DIR / f"{savename}/predictions_{year}.parquet")
+            # Save georeferenced predictions. Polygon geometries only exist for the
+            # legacy DoITT source; the MS index is centroid-only (polygons live in
+            # the cold buildings_polygons store) so we skip the polygon join there.
+            df_result = df_result.set_index("building_id")
+            if params["footprints_source"] == "doitt_nyc":
+                tag = f"{params['footprints_source']}_{params['indicator']}_epsg{geo_utils.METRIC_EPSG}"
+                gdf = gpd.read_parquet(
+                    PROCESSED_DATA_DIR / f"building_geometries_{tag}_years{min(years)}-{max(years)}.parquet"
+                )
+                gdf = gdf.join(df_result, how="inner")
+                gdf.to_parquet(RESULTS_DIR / f"{savename}/predictions_{year}.parquet")
 
             # Dissolve by census tract
             df_result_tracts = df_result.groupby("GEOID").agg({
@@ -2632,14 +2860,14 @@ if __name__ == "__main__":
         "learning_rate": 0.001,
         "sat_data": "NAIP",
         "years": list(range(2010, 2025, 2)),
-        "test_years": [2016],
-        "test_column": None,
-        "extra": "_naip",
+        # US-scale data selection
+        "indicator": "W2_r5",          # W2 occupant wealth, rho=0.05 (r_k=0.045)
+        "footprints_source": "ms_us",  # Microsoft US Building Footprints index
+        "states": None,                # None = all states present in buildings_index
         # In-Batch Ranking hyperparameters
         "m_base": 1.0,
         "m_min": 0.05,
         "lambda_s": 0.3,
-        "lambda_c": 0,
         "temporal_fraction": 0.4,
     } 
 

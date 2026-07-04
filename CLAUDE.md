@@ -58,8 +58,8 @@ the path that scales to the US: don't reintroduce or extend the zarr branch for 
   carefully.
 - `src/custom_models.py` — model registry + `ScaleMAE` and `LateFusionHead`. **Canonical model
   code.**
-- `src/build_dataset.py` — dataset assembly: building footprints, ACS income labels, tract
-  train/val/test/dead-zone split, tile extraction wiring.
+- `src/build_dataset.py` — dataset assembly: building footprints, ACS labels, the whole-city
+  (CBSA) train/val/test split (with `src/data/cbsa_brackets.py`), tile extraction wiring.
 - `src/data/` — `download_acs.py`, `process_acs.py` (panel construction, MOE→SE, z-scores,
   structural-change indicator), `dataset_generation.py`, and the **US scale-up** path
   `naip_fetcher.py` / `query_naipp.py` (NAIP via Planetary Computer).
@@ -77,11 +77,14 @@ EfficientNet/DINOv2 runs under `models/` and `logs/`. Only ScaleMAE/PyTorch is c
   code. If you change one, flag the other; if you spot drift, surface it rather than silently
   picking a side.
 - **Econometric rigor matters.** Be careful with ACS standard errors (MOE/1.645, delta method),
-  the cross-sectional z-score labels, leakage/identification (the 150m dead-zone buffer and the
-  2016 temporal holdout exist to prevent spatial/temporal leakage — don't undermine them), the
+  the cross-sectional z-score labels, leakage/identification (whole-city holdouts and the
+  per-city temporal holdout year exist to prevent spatial/temporal leakage — don't undermine
+  them; the NAIP actual-year guards in `CyclicCacheManager` enforce the temporal side), the
   Callaway–Sant'Anna event study, and the GB2 quantile mapping. Don't hand-wave statistics.
-- **Don't break the split logic.** Test tracts (~5%), validation tracts (~10%), dead-zone, and
-  the 2016 temporal holdout are load-bearing for every result. Touch with care.
+- **Don't break the split logic.** Whole CBSAs are assigned to train/val/test (~50/20/30 in
+  tracts, stratified by population bracket; mega bracket 2/1/1), plus one temporal-holdout
+  year per train city (`val_temporal`). `cbsa_splits.feather` is the source of truth
+  (`src/data/cbsa_brackets.py`). Load-bearing for every result — touch with care.
 - **US-generalizable changes preferred.** Avoid new hard dependencies on NYC-specific data
   (DoITT IDs, NYC boundaries) in core paths; the model is fed imagery + minimal covariates by
   design, not footprint geometry.

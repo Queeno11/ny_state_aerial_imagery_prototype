@@ -25,13 +25,19 @@ import xarray as xr
 import shapely.geometry as sg
 import pandas as pd
 import src.geo_utils as geo_utils
+from src.data import indicators
+from src.data import cbsa_brackets
+from src.data.process_acs import BASE_YEAR as ACS_BASE_YEAR, PANEL_YEARS as ACS_PANEL_YEARS
 
 
-def open_datasets(sat_data="aerial", years=[2013, 2018, 2022], tau_meters=100):
+def open_datasets(sat_data="aerial", years=[2013, 2018, 2022], tau_meters=100,
+                  indicator=None, footprints_source="ms_us", states=None):
 
     ### Open dataframe with files and labels
     print("Reading dataset...")
-    df = load_income_dataset(years, tau_meters=tau_meters)
+    indicator = indicator if indicator is not None else indicators.DEFAULT_INDICATOR
+    df = load_income_dataset(years, tau_meters=tau_meters, indicator=indicator,
+                             footprints_source=footprints_source, states=states)
 
     year_cols = []
     if sat_data == "aerial":
@@ -94,14 +100,19 @@ def load_satellite_datasets(years,stretch=False, engine="zarr"):
 
     return datasets, extents
 
-def generate_datasets(savename, sat_data, years, test_years, test_column, small_sample=False, max_jitter=0, tau_meters=100):
-    
+def generate_datasets(savename, sat_data, years, small_sample=False, tau_meters=100,
+                      indicator=None, footprints_source="ms_us", states=None,
+                      naip_coverage_csv=None):
+
+    indicator = indicator if indicator is not None else indicators.DEFAULT_INDICATOR
     all_years_datasets, all_years_extents, df = open_datasets(
-        sat_data=sat_data, years=years, tau_meters=tau_meters
+        sat_data=sat_data, years=years, tau_meters=tau_meters,
+        indicator=indicator, footprints_source=footprints_source, states=states
     )
 
     df_train, df_vals_dict, df_test, df_dead_zone = create_train_test_dataframes(
-        df, savename, test_years=test_years, test_column=test_column, small_sample=small_sample, max_jitter=max_jitter
+        df, savename, small_sample=small_sample, indicator=indicator,
+        naip_coverage_csv=naip_coverage_csv
     )
 
     return all_years_datasets, all_years_extents, df_train, df_vals_dict, df_test, df_dead_zone
@@ -148,26 +159,38 @@ def generate_datasets(savename, sat_data, years, test_years, test_column, small_
 #     return datasets, extents
 
 
-def get_closest_acs_year(year, acs_years=[2009, 2014, 2019, 2024]):
+def get_closest_acs_year(year, acs_years=None):
     """
     Given a year and a list of panel years, return the closest panel year.
     This is used to match each building-year pair with the appropriate ACS labels.
+    The US panel is annual (2011-2023), so imagery years inside the range match
+    exactly and years outside are clamped to the nearest endpoint.
     """
+    acs_years = acs_years if acs_years is not None else ACS_PANEL_YEARS
     closest_year = min(acs_years, key=lambda y: abs(y - year))
     return closest_year
 
+# The tract key column of the US panel (base-year tract vintage), e.g. "geoid_2023".
+PANEL_GEOID_COL = f"geoid_{ACS_BASE_YEAR}"
+
 def process_acs_panel():
     print("Loading and processing ACS panel data...")
-    panel_path = Path(
-        r"/mnt/c/Working Papers/NY State Aerial Imagery Prototype/"
-        r"ny_state_aerial_imagery_prototype/data/processed/"
-        r"ny_tracts_panel_2009_2014_2019_2024.feather"
+    panel_path = (
+        PROCESSED_DATA_DIR
+        / f"us_metros_panel_{ACS_PANEL_YEARS[0]}_{ACS_PANEL_YEARS[-1]}.feather"
     )
-    panel_tract_gdf = gpd.read_feather(panel_path).to_crs(epsg=6539)
+    panel_tract_gdf = gpd.read_feather(panel_path).to_crs(geo_utils.METRIC_CRS)
     return panel_tract_gdf
 
 
 def load_building_data():
+    """NYC DoITT footprints (dated construction/demolition years).
+
+    LEGACY / NYC-EVALUATION ONLY: the training path now samples from the
+    Microsoft US Building Footprints index (see :func:`load_buildings_index`).
+    This loader remains the base for the Callaway-Sant'Anna event study and other
+    NYC evaluation code, which need verified construction/demolition dates.
+    """
     print("Loading building footprint data from GeoJSON files...")
 
     BUILDINGS_DATASET_DIR = Path(
@@ -225,100 +248,164 @@ def load_building_data():
     return buildings_nyc
 
 
-def load_income_dataset(panel_years, tau_meters=50):
-    """
-    Produces two artifacts for the Zero-Join DataLoader:
+def load_buildings_index(states=None, index_dir=None):
+    """Load the Microsoft buildings_index (training hot path).
 
-      1. temporal_data.parquet  — flat table: one row per (building, year).
-                                  Contains bbox coordinates, ACS labels, and
-                                  stratification bins. No geometry column.
-                                  This is the hot path the DataLoader reads.
+    Built offline by ``src/data/build_buildings_index.py``. Returns a plain
+    DataFrame — no polygons — with columns:
+      building_id (int64), centroid_x / centroid_y (EPSG:5070 meters),
+      GEOID (panel tract), state, CONSTRUCTION_YEAR / DEMOLITION_YEAR sentinels.
 
-      2. geometries.parquet     — geometry lookup: one row per building,
-                                  indexed by DOITT_ID. Only used offline for
-                                  visualisation and debugging; the DataLoader
-                                  never touches this file at training time.
+    Microsoft footprints are a STATIC universe (no dated construction /
+    demolition), so the sentinels (0 / 2999) make the temporal existence filter
+    a no-op: every building exists in every panel year.
     """
-    OUTPUT_DIR = Path(
-        r"/mnt/c/Working Papers/NY State Aerial Imagery Prototype/"
-        r"ny_state_aerial_imagery_prototype/data/processed/"
+    index_dir = Path(index_dir) if index_dir is not None else PROCESSED_DATA_DIR / "buildings_index"
+    filters = [("state", "in", list(states))] if states else None
+    print(f"Loading buildings index from {index_dir}"
+          + (f" (states: {list(states)})" if states else " (all states)"))
+    df = pd.read_parquet(index_dir, filters=filters)
+    df["state"] = df["state"].astype(str)
+    df = df.rename(columns={
+        "tract_id": "GEOID", "cx": "centroid_x", "cy": "centroid_y"
+    })
+    # Defensive cross-state dedupe: a border building can appear in two states'
+    # partitions with the same (deterministic) building_id and identical centroid.
+    # build_buildings_index.dedupe_index_global normally clears these on disk, but
+    # guard the training hot path in case of an incremental build that skipped it.
+    n_dup = int(df.duplicated(subset="building_id").sum())
+    if n_dup:
+        print(f"  dropping {n_dup:,} cross-state duplicate building_ids "
+              f"({100 * n_dup / len(df):.3f}%) — run `build_buildings_index "
+              f"--dedupe-only` to fix the on-disk index")
+        df = df.drop_duplicates(subset="building_id", keep="first").reset_index(drop=True)
+    df["CONSTRUCTION_YEAR"] = 0
+    df["DEMOLITION_YEAR"] = 2999
+    print(f"  {len(df):,} buildings in {df['GEOID'].nunique():,} tracts")
+    return df
+
+
+def _cbsa_centers(panel_tract_gdf):
+    """Per-CBSA center (mean of tract centroids, METRIC_CRS meters).
+
+    A cheap proxy for each metro's economic center, replacing the NYC-only NYSE
+    point; used only for the ``dist_to_center`` covariate.
+    """
+    cx = panel_tract_gdf.geometry.centroid
+    frame = pd.DataFrame({
+        "cbsa_code": panel_tract_gdf["cbsa_code"].to_numpy(),
+        "x": cx.x.to_numpy(),
+        "y": cx.y.to_numpy(),
+    })
+    return frame.groupby("cbsa_code")[["x", "y"]].mean()
+
+
+def load_income_dataset(panel_years, tau_meters=100,
+                        indicator=indicators.DEFAULT_INDICATOR,
+                        footprints_source="ms_us", states=None):
+    """
+    Produces the flat table for the Zero-Join DataLoader:
+
+      temporal_data parquet — one row per (building, year) with bbox/centroid
+      coordinates (METRIC_CRS = EPSG:5070), the selected indicator's ACS label
+      (as ``Rel_Score``), its structural-change flag (as
+      ``Valid_Structural_Change``), ``cbsa_code``, and stratification bins.
+      No geometry column: training crops are centroid + tau.
+
+    ``indicator`` is a token from :mod:`src.data.indicators` (default W2 at
+    rho=5%); the internal column names stay ``Rel_Score`` /
+    ``Valid_Structural_Change`` regardless, so the loss/sampler are agnostic.
+    ``footprints_source``: ``"ms_us"`` (Microsoft index, national) or
+    ``"doitt_nyc"`` (legacy dated NYC footprints; also writes the geometry
+    lookup parquet used by NYC evaluation).
+    """
+    OUTPUT_DIR = PROCESSED_DATA_DIR
+    # CRS + indicator + source tags keep stale artifacts (old CRS or another
+    # label) from being silently reused.
+    tag = f"{footprints_source}_{indicator}_epsg{geo_utils.METRIC_EPSG}"
+    temporal_data_path = OUTPUT_DIR / (
+        f"temporal_data_{tag}_t{tau_meters}_years{min(panel_years)}-{max(panel_years)}.parquet"
     )
-    METRIC_CRS = "EPSG:6539"
+    geometries_path = OUTPUT_DIR / (
+        f"building_geometries_{tag}_years{min(panel_years)}-{max(panel_years)}.parquet"
+    )
 
-    temporal_data_path = OUTPUT_DIR / f"temporal_data_t{tau_meters}_years{min(panel_years)}-{max(panel_years)}.parquet"
-    geometries_path = OUTPUT_DIR / f"building_geometries_years{min(panel_years)}-{max(panel_years)}.parquet"
-
-    # Check if output files already exist to avoid redundant processing
-    if temporal_data_path.exists() and geometries_path.exists():
-        print(f"Preprocessed datasets already exist.\n  Temporal data: {temporal_data_path}\n  Geometries: {geometries_path}")
+    if temporal_data_path.exists():
+        print(f"Preprocessed dataset already exists: {temporal_data_path}")
         print("Loading existing temporal dataset...")
-        temporal_data_flat = pd.read_parquet(temporal_data_path)
-        if "dist_to_center" not in temporal_data_flat.columns:
-            print("Calculating missing 'dist_to_center' column...")
-            from shapely.geometry import Point
-            centroids = gpd.GeoSeries([Point(x, y) for x, y in zip(temporal_data_flat["centroid_x"], temporal_data_flat["centroid_y"])], crs="EPSG:6539")
-            nyc_economic_center = gpd.GeoSeries.from_wkt(["POINT (-74.011267 40.706879)"], crs="EPSG:4326").to_crs("EPSG:6539").iloc[0]
-            distances = centroids.distance(nyc_economic_center)
-            temporal_data_flat["dist_to_center"] = distances.apply(lambda x: geo_utils.projected_units_to_meters(x, epsg_code=6539)) / 1000
-            temporal_data_flat.to_parquet(temporal_data_path)
-        return temporal_data_flat
+        return pd.read_parquet(temporal_data_path)
 
-    buildings_nyc = load_building_data()
     panel_tract_gdf = process_acs_panel()
+    vc_col = indicators.valid_change_col(indicator)
+    needed = [PANEL_GEOID_COL, "cbsa_code", vc_col,
+              indicators.score_col(indicator, get_closest_acs_year(min(panel_years)))]
+    missing = [c for c in needed if c not in panel_tract_gdf.columns]
+    if missing:
+        raise KeyError(
+            f"Panel is missing columns for indicator '{indicator}': {missing}. "
+            f"Regenerate the panel with process_acs.py (wealth flags need the VRE store)."
+        )
 
     # ------------------------------------------------------------------ #
-    # 1. CRS alignment                                                   #
+    # 1. Building universe -> centroids in METRIC_CRS + tract GEOID       #
     # ------------------------------------------------------------------ #
-    print("1. Preparing Spatial Data and CRS...")
-    if buildings_nyc.crs != METRIC_CRS:
-        buildings_nyc = buildings_nyc.to_crs(METRIC_CRS)
-    if panel_tract_gdf.crs != METRIC_CRS:
-        panel_tract_gdf = panel_tract_gdf.to_crs(METRIC_CRS)
+    print(f"1. Loading building universe ({footprints_source})...")
+    if footprints_source == "ms_us":
+        buildings_mapped = load_buildings_index(states=states)
+    elif footprints_source == "doitt_nyc":
+        buildings_nyc = load_building_data().to_crs(geo_utils.METRIC_CRS)
+        tracts = (
+            panel_tract_gdf[[PANEL_GEOID_COL, "geometry"]]
+            .rename(columns={PANEL_GEOID_COL: "GEOID"})
+        )
+        buildings_mapped = gpd.sjoin(
+            buildings_nyc, tracts, how="inner", predicate="intersects"
+        ).drop(columns=["index_right"])
+        centroids = buildings_mapped.centroid
+        buildings_mapped["centroid_x"] = centroids.x
+        buildings_mapped["centroid_y"] = centroids.y
+        geometries_df = buildings_mapped[["geometry"]].copy()   # index = DOITT_ID
+        geometries_df.to_parquet(geometries_path, index=True)
+        buildings_mapped = (
+            buildings_mapped.drop(columns=["geometry"])
+            .reset_index()
+            .rename(columns={"DOITT_ID": "building_id"})
+        )
+    else:
+        raise ValueError(f"Unknown footprints_source: {footprints_source!r}")
 
-    # ------------------------------------------------------------------ #
-    # 2. Assign buildings to 2024 census tracts                          #
-    # ------------------------------------------------------------------ #
-    print("2. Assigning Buildings to 2024 Census Tracts...")
-    tracts_2024 = (
-        panel_tract_gdf[["geoid_2024", "geometry"]]
-        .rename(columns={"geoid_2024": "GEOID"})
+    # Attach cbsa_code (tract -> CBSA) once, before the temporal unroll.
+    tract_cbsa = (
+        panel_tract_gdf[[PANEL_GEOID_COL, "cbsa_code"]]
+        .rename(columns={PANEL_GEOID_COL: "GEOID"})
     )
-    buildings_mapped = gpd.sjoin(
-        buildings_nyc, tracts_2024, how="inner", predicate="intersects"
-    )
-    buildings_mapped = buildings_mapped.drop(columns=["index_right"])
-
-    ## Add distance to NYC economic center in kilometers as variable (used for training)
-    #   NYSE is used as the economic center (40.70687862946312, -74.01126682079922)
-    nyc_economic_center = gpd.GeoSeries.from_wkt(["POINT (-74.011267 40.706879)"], crs="EPSG:4326").to_crs(buildings_mapped.crs).iloc[0]
-    buildings_mapped["dist_to_center"] = buildings_mapped.distance(nyc_economic_center).apply(lambda x: geo_utils.projected_units_to_meters(x, epsg_code=6539)) / 1000
+    buildings_mapped = buildings_mapped.merge(tract_cbsa, on="GEOID", how="inner")
 
     # ------------------------------------------------------------------ #
-    # 3. Apply tau buffer and extract bounding boxes                      #
+    # 2. dist_to_center: km to the building's own CBSA center             #
     # ------------------------------------------------------------------ #
-    print(f"3. Applying Context Spillover (tau = {tau_meters}m) and Extracting BBoxes (assuming zarr has 0.5 EPSG:6539 units per pixel)...")
-    
-    meters_per_crs_unit = geo_utils.projected_units_to_meters(1.0, 6539)    
-    tau_crs_units = tau_meters / meters_per_crs_unit
-    buffered_geoms = buildings_mapped.centroid.buffer(tau_crs_units)
-
-    bounds = buffered_geoms.bounds
-    buildings_mapped["bbox_minx"] = bounds["minx"]
-    buildings_mapped["bbox_miny"] = bounds["miny"]
-    buildings_mapped["bbox_maxx"] = bounds["maxx"]
-    buildings_mapped["bbox_maxy"] = bounds["maxy"]
-    buildings_mapped["centroid_x"] = buildings_mapped.centroid.x
-    buildings_mapped["centroid_y"] = buildings_mapped.centroid.y
-
-    geometries_df = buildings_mapped[["geometry"]].copy()  # index = DOITT_ID + year
-
-    # Now it's safe to drop geometry AND reset index so DOITT_ID becomes a regular column.
-    buildings_mapped = buildings_mapped.drop(columns=["geometry"]).reset_index()
+    print("2. Computing distance to CBSA centers...")
+    centers = _cbsa_centers(panel_tract_gdf)
+    ctr = centers.reindex(buildings_mapped["cbsa_code"])
+    dx = buildings_mapped["centroid_x"].to_numpy() - ctr["x"].to_numpy()
+    dy = buildings_mapped["centroid_y"].to_numpy() - ctr["y"].to_numpy()
+    meters_per_unit = geo_utils.projected_units_to_meters(1.0, geo_utils.METRIC_EPSG)
+    buildings_mapped["dist_to_center"] = np.hypot(dx, dy) * meters_per_unit / 1000.0
 
     # ------------------------------------------------------------------ #
-    # 4. Unroll to (building, year) pairs                                 #
+    # 3. Tau bbox around the centroid                                     #
     # ------------------------------------------------------------------ #
-    print("4. Unrolling Temporal Building-Year Pairs...")
+    print(f"3. Applying Context Spillover (tau = {tau_meters}m) around centroids...")
+    tau_units = geo_utils.meters_to_projected_units(tau_meters, geo_utils.METRIC_EPSG)
+    buildings_mapped["bbox_minx"] = buildings_mapped["centroid_x"] - tau_units
+    buildings_mapped["bbox_miny"] = buildings_mapped["centroid_y"] - tau_units
+    buildings_mapped["bbox_maxx"] = buildings_mapped["centroid_x"] + tau_units
+    buildings_mapped["bbox_maxy"] = buildings_mapped["centroid_y"] + tau_units
+
+    # ------------------------------------------------------------------ #
+    # 4. Unroll to (building, year) pairs with the indicator's labels     #
+    # ------------------------------------------------------------------ #
+    print(f"4. Unrolling Temporal Building-Year Pairs (indicator = {indicator})...")
     temporal_rows = []
     for year in panel_years:
         existed_mask = (
@@ -328,37 +415,40 @@ def load_income_dataset(panel_years, tau_meters=50):
         bldgs_year = buildings_mapped[existed_mask].copy()
         bldgs_year["year"] = year
         acs_year = get_closest_acs_year(year)
+        score_col = indicators.score_col(indicator, acs_year)
 
-        # Merge ACS labels for this specific year
+        # Merge the selected indicator's labels for this specific year
         tract_labels = (
-            panel_tract_gdf[["geoid_2024", "Valid_Structural_Change", f"Rel_Score_{acs_year}"]]
+            panel_tract_gdf[[PANEL_GEOID_COL, vc_col, score_col]]
             .copy()
             .rename(columns={
-                "geoid_2024": "GEOID",
-                f"Rel_Score_{acs_year}": "Rel_Score",
+                PANEL_GEOID_COL: "GEOID",
+                score_col: "Rel_Score",
+                vc_col: "Valid_Structural_Change",
             })
         )
         bldgs_year = bldgs_year.merge(tract_labels, on="GEOID", how="inner")
         temporal_rows.append(bldgs_year)
 
     temporal_df = pd.concat(temporal_rows, ignore_index=True)
-    
+
     # 🔍 DIAGNOSTIC: Check for NaN labels BEFORE dropping
     initial_count = len(temporal_df)
     nan_count_before = temporal_df["Rel_Score"].isna().sum()
     if nan_count_before > 0:
         print(f"⚠️  WARNING: Found {nan_count_before:,} NaN values in Rel_Score ({100*nan_count_before/initial_count:.1f}%)")
-    
+
     temporal_df = temporal_df.dropna(subset=["Rel_Score"])
-    
+
     # 📊 Report removal statistics
     dropped_count = initial_count - len(temporal_df)
     if dropped_count > 0:
         print(f"   → Dropped {dropped_count:,} rows with missing Rel_Score")
         print(f"   → Remaining: {len(temporal_df):,} valid rows ({100*len(temporal_df)/initial_count:.1f}%)")
-    
+
     # ------------------------------------------------------------------ #
     # 5. Stratified score bins — computed WITHIN each year               #
+    #    (scores are already z-scored within CBSA, so pooling is valid)  #
     # ------------------------------------------------------------------ #
     print("5. Calculating Year-Stratified Score Bins...")
     temporal_df["score_bin"] = (
@@ -373,9 +463,8 @@ def load_income_dataset(panel_years, tau_meters=50):
     # 6. Build the flat temporal table (DataLoader hot path)             #
     # ------------------------------------------------------------------ #
     print("6. Building Flat Temporal Table...")
-    # Because we called .reset_index() earlier, DOITT_ID is now safely a column.
     relevant_columns = [
-        "DOITT_ID", "GEOID", "year",
+        "building_id", "GEOID", "cbsa_code", "year",
         "bbox_minx", "bbox_miny", "bbox_maxx", "bbox_maxy",
         "centroid_x", "centroid_y",
         "Rel_Score", "Valid_Structural_Change", "score_bin", "dist_to_center"
@@ -387,7 +476,7 @@ def load_income_dataset(panel_years, tau_meters=50):
             f"Available columns: {list(temporal_df.columns)}"
         )
     temporal_data_flat = temporal_df[relevant_columns].copy()
-    
+
     # ------------------------------------------------------------------ #
     # 7. Save                                                             #
     # ------------------------------------------------------------------ #
@@ -395,15 +484,12 @@ def load_income_dataset(panel_years, tau_meters=50):
     temporal_data_flat.to_parquet(
         temporal_data_path, index=False
     )
-    geometries_df.to_parquet(
-        geometries_path, index=True  # Keep DOITT_ID as index for geometries
-    )
 
     print(
         f"\nDone!\n"
-        f"  temporal_data.parquet : {len(temporal_data_flat):,} rows "
-        f"({temporal_data_flat['year'].nunique()} years × buildings)\n"
-        f"  geometries.parquet    : {len(geometries_df):,} unique buildings\n"
+        f"  {temporal_data_path.name} : {len(temporal_data_flat):,} rows "
+        f"({temporal_data_flat['year'].nunique()} years × buildings, "
+        f"{temporal_data_flat['cbsa_code'].nunique()} CBSAs)\n"
         f"  Score bins computed within each of: {sorted(temporal_df['year'].unique())}"
     )
     return temporal_data_flat
@@ -470,7 +556,7 @@ def assign_datasets_to_gdf(
         gdf = gpd.GeoDataFrame(
             df,
             geometry=gpd.points_from_xy(df["centroid_x"], df["centroid_y"]),
-            crs="EPSG:6539",
+            crs=geo_utils.METRIC_CRS,
         )
         gdf.plot(markersize=1, figsize=(10, 10), alpha=0.5)
         plt.savefig(rf"{PROCESSED_DATA_DIR}/links_with_images.png")
@@ -481,387 +567,96 @@ def assign_datasets_to_gdf(
 
 
 
-def get_test_area_from_file(filename="Test_NYC_Area.parquet"):
-    """
-    Reads the test patches and extracts their exact bounding box coordinates.
-    Since the patches are rectangular, their bounds perfectly represent their area.
-    """
-    test = gpd.read_parquet(RAW_DATA_DIR / filename)
-    
-    # .bounds returns a DataFrame with columns: ['minx', 'miny', 'maxx', 'maxy']
-    # One row for each rectangular test patch.
-    test_bounds_df = test.geometry.bounds
-    
-    return test_bounds_df
+def plot_city_splits(tract_panel):
+    """Map of tracts colored by their city's split (whole-CBSA assignment, #28)."""
+    colors = {"train": "green", "val": "blue", "test": "orange"}
+    ax = tract_panel.plot(figsize=(20, 20), color='whitesmoke', edgecolor='lightgray')
 
-
-
-def create_stratified_tract_holdout(gdf, cluster_radius, stratify_cols, eval_fraction=0.05, exclude_mask=None):
-    """
-    Creates a holdout set by growing contiguous clusters of tracts.
-    Uses a spatial exclude_mask to ensure clusters do not cross into restricted territories.
-    """
-    captured_geoids = set()
-    holdout_indices = []
-
-    # Drop any tracts that fall into the restricted exclusion zone
-    if exclude_mask is not None:
-        available_gdf = gdf[~exclude_mask].copy()
-    else:
-        available_gdf = gdf.copy()
-        
-    groups = available_gdf.groupby(stratify_cols, dropna=False)
-    
-    print(f"Stratifying across {len(groups)} unique groups...")
-
-    for name, group in groups:
-        unique_group_geoids = set(group['GEOID'].unique())
-        target_count = math.ceil(len(unique_group_geoids) * eval_fraction)
-        
-        if target_count == 0: continue
-            
-        group_captured = len(unique_group_geoids.intersection(captured_geoids))
-        
-        while group_captured < target_count:
-            # 1. Sample a random seed tract from this group
-            areas = group.geometry.area
-            if areas.sum() == 0: break
-            
-            # np.random.choice uses the global numpy random seed
-            seed_idx = np.random.choice(group.index, p=areas / areas.sum())
-            seed_geom = group.loc[seed_idx].geometry
-            
-            # 2. Capture all tracts within the radius to form a contiguous cluster
-            cluster_mask = available_gdf.geometry.intersects(seed_geom.buffer(cluster_radius))
-            cluster_tracts = available_gdf[cluster_mask]
-            
-            if cluster_tracts.empty: continue
-            
-            # 3. Update tracking variables
-            current_geoids = set(cluster_tracts['GEOID'].unique())
-            captured_geoids.update(current_geoids)
-            holdout_indices.extend(cluster_tracts.index.tolist())
-            
-            group_captured = len(unique_group_geoids.intersection(captured_geoids))
-            
-    print(f"Success! Captured {len(captured_geoids)} GEOIDs for this split.")
-    
-    # SORT the list so that Python's hash randomization doesn't alter the output row order
-    deterministic_indices = sorted(list(set(holdout_indices)))
-    return gdf.loc[deterministic_indices].copy()
-
-def assign_tracts_train_val_test(gdf, test_tracts, val_tracts, dead_zone_buffer):
-    """
-    Assigns the final splits and calculates the exact dead zone needed to prevent spatial leakage.
-    """
-    gdf['type'] = 'train' # Default to train
-    
-    # 1. Combine all holdout tracts to calculate a unified dead zone
-    holdouts = pd.concat([test_tracts, val_tracts])
-    
-    # 2. Buffer the exact, irregular boundaries of the holdout tracts by tau
-    dead_zone_geom = holdouts.geometry.union_all().buffer(dead_zone_buffer)
-    
-    # 3. Find any tract that touches this buffer
-    in_dead_zone = gdf.geometry.intersects(dead_zone_geom)
-    
-    # 4. Apply assignment hierarchy (Holdouts override Dead Zone override Train)
-    gdf.loc[in_dead_zone, 'type'] = 'dead_zone'
-    
-    if not val_tracts.empty:
-        gdf.loc[gdf.index.isin(val_tracts.index), 'type'] = 'val'
-    if not test_tracts.empty:
-        gdf.loc[gdf.index.isin(test_tracts.index), 'type'] = 'test'
-        
-    return gdf, gpd.GeoDataFrame(geometry=[dead_zone_geom], crs=gdf.crs)
-
-def plot_tracts_splits(gdf, dead_zone_gdf):
-    ax = gdf.plot(figsize=(20, 20), color='whitesmoke', edgecolor='lightgray')
-    
-    if not dead_zone_gdf.empty:
-        dead_zone_gdf.plot(ax=ax, color="gray", alpha=0.5)
-    
-    train_gdf = gdf[gdf["type"] == "train"]
-    val_gdf = gdf[gdf["type"] == "val"]
-    test_gdf = gdf[gdf["type"] == "test"]
-    dead_gdf = gdf[gdf["type"] == "dead_zone"]
-
-    if not train_gdf.empty: train_gdf.plot(ax=ax, color="green")
-    if not val_gdf.empty: val_gdf.plot(ax=ax, color="blue")
-    if not test_gdf.empty: test_gdf.plot(ax=ax, color="orange")
-    if not dead_gdf.empty: dead_gdf.plot(ax=ax, color="red")
-    
     import matplotlib.patches as mpatches
-    legend_handles = [
-        mpatches.Patch(color='gray', alpha=0.5, label='Dead Zone (Buffer)'),
-        mpatches.Patch(color='green', label='Train'),
-        mpatches.Patch(color='blue', label='Validation'),
-        mpatches.Patch(color='orange', label='Test'),
-        mpatches.Patch(color='red', label='Dead Zone (Discarded Tracts)')
-    ]
+    legend_handles = []
+    for split, color in colors.items():
+        sub = tract_panel[tract_panel["type"] == split]
+        if not sub.empty:
+            sub.plot(ax=ax, color=color)
+        legend_handles.append(mpatches.Patch(color=color, label=split.capitalize()))
     ax.legend(handles=legend_handles)
-    
-    plt.title("Tract-Centric Train/Val/Test Split with Dead Zones")
-    plt.savefig(FIGURES_DIR / "tract_splits_with_dead_zone.png")
 
-    print("\n--- Tract Assignments ---")
-    print(gdf['type'].value_counts().to_string())
+    plt.title("Whole-City (CBSA) Train/Val/Test Split")
+    plt.savefig(FIGURES_DIR / "city_splits.png")
+
+    print("\n--- Tract Assignments (by city split) ---")
+    print(tract_panel['type'].value_counts().to_string())
     print("-" * 25)
 
-def assign_buildings_train_test_val(
-    df: pd.DataFrame, 
-    val_polygon: shapely.geometry.Polygon = None,
-    test_polygon: shapely.geometry.Polygon = None,
-    test_years: List[int] = None,
-    test_column: str = "None",
-    jitter_buffer: float = 0.0
-) -> tuple[pd.Series, pd.Series, pd.Series]:
-    """
-    Splits a flat dataset into train and test sets using pure numerical bounding box comparisons
-    against multiple test patches.
-    
+def assign_buildings_by_city(df: pd.DataFrame, city_split_df: pd.DataFrame):
+    """Whole-city split (#28): every building inherits its CBSA's split.
+
+    Train-city rows in that city's temporal-holdout year go to ``val_temporal``;
+    val cities contribute ALL years to ``val_cities``; test cities contribute
+    all years to test. No dead zone: train and holdout cities are different
+    metros, so there is no spatial adjacency to buffer (the returned dead-zone
+    mask is all-False, kept for return-arity compatibility).
+
     Args:
-        df: Pandas DataFrame containing the building bbox coordinates.
-        test_polygon: Optional shapely (Multi)Polygon representing the test area.
-        val_polygon: Optional shapely (Multi)Polygon representing the validation area.
-        test_years: Optional list of years to assign to the test set (if doing a temporal split in addition to spatial).
-        test_column: Optional boolean column name in df to use for another splitting (e.g., df["Boston"]==True). If provided, 
-            this column will be used to assign rows to the test set regardless of spatial location.
-        jitter_buffer: Distance to expand the train building bboxes to avoid issues with the jitter in the imagery query augmentation. 
-            This is the max jitter distance the DataLoader will use when expanding building bboxes during training. To be safe, we 
-            exclude from the train set any building whose original bbox is within this distance of a test patch, to prevent any chance
-            of jitter overlap between train and test sets. 
-                          
+        df: flat buildings table (needs ``cbsa_code`` and ``year``).
+        city_split_df: output of ``cbsa_brackets.build_city_split`` +
+            ``attach_holdout_years`` (columns cbsa_code, split, holdout_year).
+
     Returns:
-        A tuple of three boolean Series: (train_mask, test_mask, val_mask), each indexed the same as df.
-         - train_mask: True for rows assigned to the training set
-         - test_mask: True for rows assigned to the test set
-         - val_mask: True for rows assigned to the validation set (if val_bounds_df provided; otherwise all False)
+        (train_mask, test_mask, val_masks_dict, dead_zone_mask) boolean Series
+        indexed like ``df``; also sets ``df["type"]``.
     """
+    print("\nAssigning buildings to whole-city train/test/val splits...")
 
-    print("\nAssigning buildings to train/test/val splits...")
-
-    if test_years is None:
-        test_years = []
-
-    ###############################
-    ##### SPATIAL SPLIT LOGIC #####
-    ###############################
-    # NOTE: We process in chunks to prevent GEOS C library stack overflow
-    # ("stack smashing detected") when creating millions of geometries at once.
-    CHUNK_SIZE = 50_000
-
-    # Pre-extract building arrays with Jitter Buffer applied to BBOX
-    jitter_buffer_crs = geo_utils.meters_to_projected_units(jitter_buffer, epsg_code=6539)
-    b_minx = df['bbox_minx'].values - jitter_buffer_crs
-    b_miny = df['bbox_miny'].values - jitter_buffer_crs
-    b_maxx = df['bbox_maxx'].values + jitter_buffer_crs
-    b_maxy = df['bbox_maxy'].values + jitter_buffer_crs
-
-    # Initialize boolean masks as NumPy arrays (default False)
-    spatial_test_mask = np.zeros(len(df), dtype=bool)
-    spatial_val_mask = np.zeros(len(df), dtype=bool)
-    train_drop_mask = np.zeros(len(df), dtype=bool) 
-
-    # Prepare STRtrees for hyper-fast spatial predicates
-    test_tree = None
-    if test_polygon is not None:
-        test_geoms = np.asarray(test_polygon) if hasattr(test_polygon, '__len__') else np.array([test_polygon])
-        test_tree = shapely.STRtree(test_geoms)
-
-    val_tree = None
-    if val_polygon is not None:
-        val_geoms = np.asarray(val_polygon) if hasattr(val_polygon, '__len__') else np.array([val_polygon])
-        val_tree = shapely.STRtree(val_geoms)
-
-    ## Assignment logic (chunked to avoid GEOS stack overflow + STRtree for speed):
-    n_rows = len(df)
-    cx = df['centroid_x'].values
-    cy = df['centroid_y'].values
-
-    bboxes_list = []
-
-    for start in tqdm(range(0, n_rows, CHUNK_SIZE), desc="Building bboxes", total=(n_rows // CHUNK_SIZE)):
-        end = min(start + CHUNK_SIZE, n_rows)
-        sl = slice(start, end)
-        
-        # 1. Build and collect bbox geometries
-        chunk_bboxes = shapely.box(b_minx[sl], b_miny[sl], b_maxx[sl], b_maxy[sl])
-        bboxes_list.append(chunk_bboxes)
-        
-        # 2. Build centroid points
-        chunk_centroids = shapely.points(cx[sl], cy[sl])
-
-        # 3. Query STRtrees for centroids (within) and bboxes (intersects)
-        if test_tree is not None:
-            # query() returns [indices_of_chunk, indices_of_tree]
-            test_within_idx = test_tree.query(chunk_centroids, predicate='within')[0]
-            # Advanced indexing assignment is local to the slice if we do it in two steps:
-            # But it's easier to just create a local mask for the slice and apply it
-            local_mask = np.zeros(end - start, dtype=bool)
-            local_mask[test_within_idx] = True
-            spatial_test_mask[sl] = local_mask
-            
-            test_intersects_idx = test_tree.query(chunk_bboxes, predicate='intersects')[0]
-            local_mask_drop = np.zeros(end - start, dtype=bool)
-            local_mask_drop[test_intersects_idx] = True
-            train_drop_mask[sl] |= local_mask_drop
-            
-        if val_tree is not None:
-            val_within_idx = val_tree.query(chunk_centroids, predicate='within')[0]
-            local_mask_val = np.zeros(end - start, dtype=bool)
-            local_mask_val[val_within_idx] = True
-            spatial_val_mask[sl] = local_mask_val
-            
-            val_intersects_idx = val_tree.query(chunk_bboxes, predicate='intersects')[0]
-            local_mask_drop = np.zeros(end - start, dtype=bool)
-            local_mask_drop[val_intersects_idx] = True
-            train_drop_mask[sl] |= local_mask_drop
-
-    bboxes = gpd.GeoSeries(np.concatenate(bboxes_list), crs="EPSG:6539", index=df.index)
-
-    print(f"  Spatial assignment complete ({n_rows:,} buildings in {(n_rows - 1) // CHUNK_SIZE + 1} chunks)")
-
-
-    ###############################    
-    #####   TIME SPLIT LOGIC  #####
-    ###############################
-
-    time_mask_np = np.zeros(len(df), dtype=bool)
-    time_mask_val_np = np.zeros(len(df), dtype=bool)
-    for test_year in test_years:
-        time_mask_np |= (df["year"].values == test_year)
-        time_mask_val_np |= (df["year"].values == test_year)  # If you want val to also include these years, otherwise keep as False 
-
-    ###############################
-    #####  OTHER SPLIT LOGIC  #####
-    ###############################
-
-    other_mask_np = np.zeros(len(df), dtype=bool)
-    if test_column in df.columns:
-        other_mask_np = (df[test_column].values == True)
-
-    ###################################
-    ##### FINAL COMBINATION LOGIC #####
-    ###################################
-    # 1. val_time captures the val tracts at the year of test
-    final_val_time_mask_np = time_mask_val_np & spatial_val_mask
-
-    # 2. val_spatial captures all other val tracts NOT in the year of test
-    final_val_spatial_mask_np = spatial_val_mask & ~time_mask_val_np
-    
-    # 3. test captures the whole test year (and other test patches), but removes those val tracts
-    final_test_mask_np = (spatial_test_mask | time_mask_np | other_mask_np) & ~spatial_val_mask
-
-    # Train set is everything NOT inside test, val, or the dropped expansion zones
-    final_train_mask_np = (~train_drop_mask) & (~final_test_mask_np) & (~final_val_spatial_mask_np) & (~final_val_time_mask_np)
-
-
-    # Convert back to Pandas Series with original index
-    final_train_mask = pd.Series(final_train_mask_np, index=df.index)
-    final_test_mask = pd.Series(final_test_mask_np, index=df.index)
-    final_val_spatial_mask = pd.Series(final_val_spatial_mask_np, index=df.index)
-    final_val_time_mask = pd.Series(final_val_time_mask_np, index=df.index)
-    total_val_mask = final_val_spatial_mask | final_val_time_mask
-
-    final_dead_zone_mask_np = (~final_test_mask_np) & (~final_val_spatial_mask_np) & (~final_val_time_mask_np)
-    final_dead_zone_mask = pd.Series(final_dead_zone_mask_np, index=df.index)
-
-    # Create dict of masks
-    final_val_masks = {
-        "val_spatial": final_val_spatial_mask,
+    codes = city_split_df["cbsa_code"].astype(str)
+    split_map = dict(zip(codes, city_split_df["split"]))
+    holdout_map = {
+        code: int(year)
+        for code, year, split in zip(codes, city_split_df["holdout_year"], city_split_df["split"])
+        if split == "train" and pd.notna(year)
     }
-    if test_years:  # Only add temporal val key if test_years were provided; avoids IndexError
-        final_val_masks[f"val_{test_years[0]}"] = final_val_time_mask
-        
-    # Samples all years of 1 building over 30% of all the tracts in val
-    val_tracts_unique = df[total_val_mask]['GEOID'].unique()
-    num_sampled_tracts = int(0.3 * len(val_tracts_unique))
-    final_val_spatial_temporal_mask = pd.Series(np.zeros(len(df), dtype=bool), index=df.index)
-    if num_sampled_tracts > 0:
-        sampled_tracts = np.random.choice(val_tracts_unique, size=num_sampled_tracts, replace=False)
-        val_buildings_in_sampled = df[total_val_mask & df['GEOID'].isin(sampled_tracts)][['GEOID', 'DOITT_ID']].drop_duplicates()
-        if not val_buildings_in_sampled.empty:
-            sampled_buildings = val_buildings_in_sampled.groupby('GEOID', group_keys=False).apply(lambda x: x.sample(n=1))
-            final_val_spatial_temporal_mask_np = df['DOITT_ID'].isin(sampled_buildings['DOITT_ID']).values & total_val_mask.values
-            final_val_spatial_temporal_mask = pd.Series(final_val_spatial_temporal_mask_np, index=df.index)
-    final_val_masks["val_spatial_temporal"] = final_val_spatial_temporal_mask
-    
-    # Compute logs
-    overlaps = (spatial_test_mask & time_mask_np).sum() + (spatial_test_mask & other_mask_np).sum() + (time_mask_np & other_mask_np).sum()
-    dropped = len(df) - final_test_mask.sum() - final_val_spatial_mask.sum() - final_val_time_mask.sum() - final_train_mask.sum()
 
-    assert not (final_test_mask & total_val_mask).any(), "Error: Some buildings are assigned to both test and val sets!"
-    assert not (final_test_mask & final_train_mask).any(), "Error: Some buildings are assigned to both test and train sets!"
-    assert not (total_val_mask & final_train_mask).any(), "Error: Some buildings are assigned to both val and train sets!"
-    assert not (final_val_time_mask & final_val_spatial_mask).any(), "Error: Some buildings are assigned to both val by time criteria and val by spatial criteria!"
-    
-    df.loc[final_train_mask, "type"] = "train"
-    df.loc[final_test_mask, "type"] = "test"
-    df.loc[final_val_spatial_mask, "type"] = "val_spatial"
-    df.loc[final_val_time_mask, "type"] = "val_time"
-    df.loc[final_val_spatial_temporal_mask, "type"] = "val_spatial_temporal"
-    df.loc[final_dead_zone_mask, "type"] = "dead_zone"
+    building_cbsa = df["cbsa_code"].astype(str)
+    city_split = building_cbsa.map(split_map)
+    unassigned = city_split.isna()
+    if unassigned.any():
+        print(f"⚠️ {unassigned.sum():,} building-rows belong to CBSAs outside the city split "
+              f"(below MIN_METRO_POP or missing crosswalk) — excluded from every split.")
 
-    train_tracts = df[final_train_mask].drop_duplicates("GEOID").shape[0]
-    test_tracts = df[final_test_mask].drop_duplicates("GEOID").shape[0]
-    val_tracts = df[total_val_mask].drop_duplicates("GEOID").shape[0]
+    test_mask = city_split == "test"
+    val_cities_mask = city_split == "val"
+    is_train_city = city_split == "train"
+    holdout_year_of = building_cbsa.map(holdout_map)
+    val_temporal_mask = is_train_city & (df["year"] == holdout_year_of)
+    train_mask = is_train_city & ~val_temporal_mask
+    dead_zone_mask = pd.Series(False, index=df.index)
 
-    # Logging
-    print("\n--- Final Dataset Assignment ---")
-    print(f"Total buildings evaluated: {len(df):,}")
-    print(f"Assigned to Test Set (strictly inside patches/criteria): {final_test_mask.sum():,} ({test_tracts} tracts)")
-    print(f"     - of which assigned by spatial split: {spatial_test_mask.sum():,}")
-    print(f"     - of which assigned by temporal split: {time_mask_np.sum():,}")
-    print(f"     - of which assigned by other split ({test_column}): {other_mask_np.sum():,}")
-    print(f"     - Overlaps between criteria: {overlaps:,}")
-    print(f"Assigned to Validation Set: {total_val_mask.sum():,} ({val_tracts} tracts)")
-    print(f"     - of which assigned by spatial split: {final_val_spatial_mask.sum():,}")
-    print(f"     - of which assigned by temporal split: {final_val_time_mask.sum():,}")
-    print(f"Assigned to Train Set: {final_train_mask.sum():,} ({train_tracts} tracts)")
-    print(f"Dropped (spatial moat/buffer zone): {dropped:,}")
+    assert not (test_mask & (val_cities_mask | val_temporal_mask)).any(), "test/val overlap!"
+    assert not (train_mask & (test_mask | val_cities_mask | val_temporal_mask)).any(), "train/holdout overlap!"
+    assert not (val_cities_mask & val_temporal_mask).any(), "val_cities/val_temporal overlap!"
+
+    df["type"] = "unassigned"
+    df.loc[train_mask, "type"] = "train"
+    df.loc[test_mask, "type"] = "test"
+    df.loc[val_cities_mask, "type"] = "val_cities"
+    df.loc[val_temporal_mask, "type"] = "val_temporal"
+
+    val_masks = {"val_cities": val_cities_mask, "val_temporal": val_temporal_mask}
+
+    print("\n--- Final Dataset Assignment (whole-city split) ---")
+    print(f"Total building-rows evaluated: {len(df):,}")
+    for name, mask in [("Train", train_mask),
+                       ("Test (whole cities)", test_mask),
+                       ("Val (whole cities)", val_cities_mask),
+                       ("Val (temporal holdout year)", val_temporal_mask)]:
+        n_tracts = df.loc[mask, "GEOID"].nunique()
+        print(f"{name}: {mask.sum():,} rows ({n_tracts:,} tracts)")
     print("-" * 30)
-    # Export gdf with bboxes and assigned datasets for visualization and debugging
-    gdf = gpd.GeoDataFrame(
-        df,
-        geometry=bboxes, # Use the jitter-buffered bboxes for visualization to see the actual exclusion zones
-        crs="EPSG:6539",
+
+    df[["building_id", "year", "cbsa_code", "type"]].reset_index(drop=True).to_feather(
+        PROCESSED_DATA_DIR / "building_splits.feather"
     )
-    gdf[["DOITT_ID", "year", "type", "geometry"]].to_feather(PROCESSED_DATA_DIR / "building_splits.feather")
-    return final_train_mask, final_test_mask, final_val_masks, final_dead_zone_mask    
-
-def assert_train_test_datapoint(bounds, test_polygon, wanted_type="train", buffer=500):
-    """
-    Returns True if the datapoint (defined by bounds) matches the wanted_type 
-    relative to the test_polygon.
-    
-    Parameters:
-    - bounds: A tuple/list of (min_x, min_y, max_x, max_y)
-    - test_polygon: The Shapely polygon defining the test area.
-    - wanted_type: "train" or "test"
-    - buffer: The safety buffer distance (must match what you used in splitting).
-    """
-    
-    # 1. Convert the bounds tuple into a Shapely geometry object
-    #    The * unpacks the tuple (minx, miny, maxx, maxy)
-    datapoint_geom = box(*bounds)
-    
-    # 2. Determine the actual type of this datapoint
-    actual_type = None
-
-    # CHECK TEST: Must be strictly inside the test polygon
-    if datapoint_geom.within(test_polygon):
-        actual_type = "test"
-        
-    # CHECK TRAIN: Must be strictly outside the (test polygon + buffer)
-    # We apply the buffer here to ensure we respect the exclusion zone
-    elif datapoint_geom.disjoint(test_polygon.buffer(buffer)):
-        actual_type = "train"
-        
-    # (If it's neither, actual_type remains None, representing the buffer zone)
-
-    # 3. Assert
-    return actual_type == wanted_type
+    return train_mask, test_mask, val_masks, dead_zone_mask
 
 
 def get_dataset_for_gdf(gdf, datasets, link, year=2013, id_var="GEOID"):
@@ -1362,69 +1157,70 @@ def generate_matrix_of_datasets(datasets):
             matrix += [rows_ds]
     return matrix
 
-def create_train_test_dataframes(buildings_df, savename, test_years=[], test_column=None, small_sample=False, max_jitter=10):
-    """Create train and test dataframes with the IDs and xr.datasets names to use for training and testing
+def create_train_test_dataframes(buildings_df, savename, small_sample=False,
+                                 indicator=None, naip_coverage_csv=None,
+                                 split_seed=cbsa_brackets.SPLIT_SEED):
+    """Whole-city (CBSA) train/val/test split (#28), Khachiyan et al. (2022)-style.
 
-    Split the census tracts into train and test. The train and test dataframes contain the links and xr.datasets to use for training and
-    testing.
+    Cities (CBSAs) are the split atoms: each is assigned wholesale to
+    train/val/test (~50/20/30 in tract count, stratified by population bracket;
+    the mega bracket is fixed 2 train / 1 val / 1 test), and every TRAIN city
+    additionally holds out ONE year (nearest the middle of its state's NAIP
+    coverage) as ``val_temporal``. There is no dead zone and no jitter buffer:
+    holdout cities are entire, disjoint metros. Persists ``cbsa_splits.feather``
+    (consumed by the per-bracket validation metrics, #31) and a tract-level
+    ``tract_splits.feather`` (type in train/val/test) for evaluation.py.
     """
     if small_sample:
         buildings_df = buildings_df.sample(1000, random_state=825).reset_index(drop=True)
 
+    indicator = indicator if indicator is not None else indicators.DEFAULT_INDICATOR
+
     tract_panel = process_acs_panel()
-    tract_panel["income_quintile"] = pd.qcut(tract_panel["Rel_Score_2024"], q=5, labels=False)
-    tract_panel = tract_panel.rename(columns={"geoid_2024": "GEOID"})
-    tract_panel = tract_panel.dropna(subset=["income_quintile"]).reset_index(drop=True)
+    tract_panel = tract_panel.rename(columns={PANEL_GEOID_COL: "GEOID"})
+    tract_panel["GEOID"] = tract_panel["GEOID"].astype(str)
+    tract_panel["cbsa_code"] = tract_panel["cbsa_code"].astype(str)
+    # Keep the split universe aligned with the buildings actually loaded (e.g. a
+    # states subset): holding out cities with zero buildings wastes holdout budget.
+    tract_panel = tract_panel[tract_panel["GEOID"].isin(set(buildings_df["GEOID"].astype(str)))].reset_index(drop=True)
 
-    ###### Split census tracts 
-    cluster_radius = geo_utils.meters_to_projected_units(300, epsg_code=6539) 
-    dead_zone_buffer = geo_utils.meters_to_projected_units(100, epsg_code=6539) # Your tau parameter
+    ###### Split whole cities (CBSAs)
+    tract_counts = tract_panel.groupby("cbsa_code")["GEOID"].nunique()
+    pop_df = cbsa_brackets.cbsa_populations(panel=tract_panel)
+    city_split_df = cbsa_brackets.build_city_split(tract_counts, pop_df, seed=split_seed)
 
-    # 1. Generate TEST Holdout (5%)
-
-    test_tracts = create_stratified_tract_holdout(
-        tract_panel, 
-        cluster_radius=cluster_radius, 
-        stratify_cols=["income_quintile"], 
-        eval_fraction=0.06
+    # Temporal holdout year per TRAIN city: imagery year nearest the middle of
+    # the state's NAIP coverage window (interpolation, never extrapolation).
+    years = sorted(int(y) for y in buildings_df["year"].unique())
+    coverage_df = cbsa_brackets.load_naip_coverage(naip_coverage_csv)
+    state_of_cbsa = (
+        tract_panel.assign(state_fips=tract_panel["GEOID"].str[:2])
+        .groupby("cbsa_code")["state_fips"]
+        .agg(lambda s: s.mode().iloc[0])
+        .map(cbsa_brackets.FIPS_TO_STATE)
+        .to_dict()
     )
-
-    # 2. CREATE A STRICT QUARANTINE ZONE AROUND THE TEST SET
-    test_restricted_geom = test_tracts.geometry.union_all().buffer(dead_zone_buffer)
-    invalid_val_candidates_mask = tract_panel.geometry.intersects(test_restricted_geom)
-
-    # 3. Generate VALIDATION Holdout (5%) 
-    val_tracts = create_stratified_tract_holdout(
-        tract_panel, 
-        cluster_radius=cluster_radius, 
-        stratify_cols=["income_quintile"], 
-        eval_fraction=0.06, 
-        exclude_mask=invalid_val_candidates_mask
+    city_split_df = cbsa_brackets.attach_holdout_years(
+        city_split_df, state_of_cbsa, years, coverage_df
     )
+    cbsa_brackets.save_city_split(city_split_df, path=PROCESSED_DATA_DIR / "cbsa_splits.feather")
 
-    # 4. Assign labels and compute the final combined dead zones for the Train set
-    assigned_tracts, dead_zone_geom_gdf = assign_tracts_train_val_test(
-        tract_panel, 
-        test_tracts, 
-        val_tracts, 
-        dead_zone_buffer
+    # --- Plot and persist the tract-level split view (evaluation.py reads it) ---
+    tract_panel["type"] = tract_panel["cbsa_code"].map(
+        dict(zip(city_split_df["cbsa_code"].astype(str), city_split_df["split"]))
     )
-
-    # --- Plot and Verify ---
-    plot_tracts_splits(tract_panel, dead_zone_geom_gdf)
-    assigned_tracts[["GEOID", "geometry", "type"]].to_feather(PROCESSED_DATA_DIR / "tract_splits.feather", index=False)
+    plot_city_splits(tract_panel)
+    tract_panel[["GEOID", "geometry", "type"]].to_feather(PROCESSED_DATA_DIR / "tract_splits.feather", index=False)
     print(f"Created file: {PROCESSED_DATA_DIR / 'tract_splits.feather'}")
 
     ###### Split Buildings
-    val_area = assigned_tracts[assigned_tracts["type"] == "val"].geometry.values
-    test_area = assigned_tracts[assigned_tracts["type"] == "test"].geometry.values
-    # val_bounds = get_test_area_from_file(filename="Test_NYC_Area.parquet")
-
-    train_mask, test_mask, val_masks_dict, dead_zone_mask = assign_buildings_train_test_val(buildings_df, val_area, test_area, test_years=test_years, test_column=test_column, jitter_buffer=max_jitter)
+    train_mask, test_mask, val_masks_dict, dead_zone_mask = assign_buildings_by_city(
+        buildings_df, city_split_df
+    )
 
     # Keep only relevant columns for the DataLoader
     relevant_columns = [
-        "DOITT_ID", "GEOID", "year", "type",
+        "building_id", "GEOID", "cbsa_code", "year", "type",
         "Rel_Score", "Valid_Structural_Change", "score_bin",
         "dataset", "bbox_minx", "bbox_miny", "bbox_maxx", "bbox_maxy",
         "row_start", "row_stop", "col_start", "col_stop", "dist_to_center",
@@ -1439,8 +1235,10 @@ def create_train_test_dataframes(buildings_df, savename, test_years=[], test_col
     df_vals_dict = {}
     for val_name, val_mask in val_masks_dict.items():
         df_vals_dict[val_name] = buildings_df[val_mask].copy()
-        assert df_vals_dict[val_name].shape[0] > 0, f"Empty val dataset for {val_name}!"
-    
+        if df_vals_dict[val_name].shape[0] == 0:
+            # e.g. small_sample subsets may miss every train city's holdout year
+            print(f"⚠️ Empty val dataset for {val_name} — downstream loaders will skip it.")
+
     assert df_test.shape[0] > 0, f"Empty test dataset!"
     assert df_train.shape[0] > 0, f"Empty train dataset!"
 
