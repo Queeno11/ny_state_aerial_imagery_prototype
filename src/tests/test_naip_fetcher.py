@@ -70,25 +70,31 @@ _SLIVER_BBOX = [-100.1, 39.9, -100.0, 40.1]
 
 def test_no_items_failure(monkeypatch):
     nf.reset_fetch_stats()
-    monkeypatch.setattr(nf, "get_catalog", lambda: _FakeCatalog(items=[]))
+    monkeypatch.setattr(nf, "get_catalog", lambda signed=True: _FakeCatalog(items=[]))
     res = nf.fetch_naip(-100.0, 40.0, 200.0)
     assert res.crop is None
     assert res.failure == "no_items"
     assert nf.get_fetch_stats()["no_items"] == 1
 
 
-def test_search_error_counts_read_error(monkeypatch):
+def test_search_error_counted_separately_from_read_error(monkeypatch):
+    # Search failures used to be lumped into read_error, which hid the STAC
+    # rate-limiting behind blob-read noise. They are now their own mode, and
+    # the search retries (backoff zeroed here) before giving up.
     nf.reset_fetch_stats()
-    monkeypatch.setattr(nf, "get_catalog", lambda: _FakeCatalog(raise_search=True))
+    monkeypatch.setattr(nf, "SEARCH_BACKOFF_S", 0.0)
+    monkeypatch.setattr(nf, "get_catalog", lambda signed=True: _FakeCatalog(raise_search=True))
     res = nf.fetch_naip(-100.0, 40.0, 200.0)
     assert res.crop is None
-    assert res.failure == "read_error"
+    assert res.failure == "search_error"
+    stats = nf.get_fetch_stats()
+    assert stats["search_error"] == 1 and stats["read_error"] == 0
 
 
 def test_asset_missing(monkeypatch):
     nf.reset_fetch_stats()
     item = _FakeItem(2020, assets={})
-    monkeypatch.setattr(nf, "get_catalog", lambda: _FakeCatalog(items=[item]))
+    monkeypatch.setattr(nf, "get_catalog", lambda signed=True: _FakeCatalog(items=[item]))
     res = nf.fetch_naip(-100.0, 40.0, 200.0)
     assert res.crop is None
     assert res.failure == "asset_missing"
@@ -97,14 +103,14 @@ def test_asset_missing(monkeypatch):
 
 def test_year_hint_picks_closest(monkeypatch):
     items = [_FakeItem(2012, "a"), _FakeItem(2018, "b"), _FakeItem(2021, "c")]
-    monkeypatch.setattr(nf, "get_catalog", lambda: _FakeCatalog(items=items))
+    monkeypatch.setattr(nf, "get_catalog", lambda signed=True: _FakeCatalog(items=items))
     res = nf.fetch_naip(-100.0, 40.0, 200.0, year_hint=2017)
     assert res.actual_year == 2018   # asset missing, but year selection ran first
 
 
 def test_no_year_hint_is_deterministic_newest_first(monkeypatch):
     items = [_FakeItem(2012, "z"), _FakeItem(2021, "b"), _FakeItem(2021, "a")]
-    monkeypatch.setattr(nf, "get_catalog", lambda: _FakeCatalog(items=items))
+    monkeypatch.setattr(nf, "get_catalog", lambda signed=True: _FakeCatalog(items=items))
     res1 = nf.fetch_naip(-100.0, 40.0, 200.0)
     res2 = nf.fetch_naip(-100.0, 40.0, 200.0)
     assert res1.actual_year == res2.actual_year == 2021
@@ -124,7 +130,7 @@ def test_containing_item_beats_closer_year_sliver(monkeypatch):
     # 2013 tile only covers a sliver of the window; 2012 neighbor covers it all.
     items = [_FakeItem(2013, "sliver", bbox=_SLIVER_BBOX),
              _FakeItem(2012, "full", bbox=_FULL_BBOX)]
-    monkeypatch.setattr(nf, "get_catalog", lambda: _FakeCatalog(items=items))
+    monkeypatch.setattr(nf, "get_catalog", lambda signed=True: _FakeCatalog(items=items))
     res = nf.fetch_naip(-100.0, 40.0, 200.0, year_hint=2013)
     assert res.actual_year == 2012   # coverage outranks year proximity
 
@@ -132,7 +138,7 @@ def test_containing_item_beats_closer_year_sliver(monkeypatch):
 def test_same_year_tie_broken_by_containment(monkeypatch):
     items = [_FakeItem(2013, "a_sliver", bbox=_SLIVER_BBOX),
              _FakeItem(2013, "b_full", bbox=_FULL_BBOX)]
-    monkeypatch.setattr(nf, "get_catalog", lambda: _FakeCatalog(items=items))
+    monkeypatch.setattr(nf, "get_catalog", lambda signed=True: _FakeCatalog(items=items))
     res = nf.fetch_naip(-100.0, 40.0, 200.0, year_hint=2013)
     assert res.actual_year == 2013
     # asset lookup ran on the full-coverage item (both fail, but stats prove order)
@@ -142,7 +148,7 @@ def test_same_year_tie_broken_by_containment(monkeypatch):
 def test_no_year_hint_prefers_containing_over_newer(monkeypatch):
     items = [_FakeItem(2022, "new_sliver", bbox=_SLIVER_BBOX),
              _FakeItem(2018, "old_full", bbox=_FULL_BBOX)]
-    monkeypatch.setattr(nf, "get_catalog", lambda: _FakeCatalog(items=items))
+    monkeypatch.setattr(nf, "get_catalog", lambda signed=True: _FakeCatalog(items=items))
     res = nf.fetch_naip(-100.0, 40.0, 200.0)
     assert res.actual_year == 2018
 
@@ -167,7 +173,7 @@ def test_window_exceeds_raster():
 
 
 def test_backward_compatible_wrapper(monkeypatch):
-    monkeypatch.setattr(nf, "get_catalog", lambda: _FakeCatalog(items=[]))
+    monkeypatch.setattr(nf, "get_catalog", lambda signed=True: _FakeCatalog(items=[]))
     crop, year = nf.fetch_naip_crop(-100.0, 40.0, 200.0)
     assert crop is None and year is None
 

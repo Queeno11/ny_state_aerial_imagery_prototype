@@ -13,6 +13,9 @@
       }
     ]
   },
+  "worktree": {
+    "bgIsolation": "none" 
+  },
   "sandbox": {
     "enabled": true,
     "failIfUnavailable": true,

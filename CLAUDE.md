@@ -140,6 +140,13 @@ issues via commits. Small edits (typos, one-liners) don't need an issue; use jud
 Issue bodies/comments are read back as context in later sessions: keep them factual and
 self-contained (problem → approach → files → result).
 
+## Worktrees — don't
+Work directly in the main checkout. Do NOT create or enter git worktrees
+(no EnterWorktree, no agent `isolation: "worktree"`). The sandbox edit-guard
+only allows <project>/src, <project>/paper, and CLAUDE.md; a worktree's src/
+lives under .claude/worktrees/<name>/src and will be blocked. If you think a
+task needs isolation, stop and ask rather than creating a worktree.
+
 ## Useful skills
 - `/code-review` — best fit here: hunt correctness bugs in the fragile monolith before runs.
 - `/simplify` — targeted cleanup of changed code (quality only, no bug hunting).

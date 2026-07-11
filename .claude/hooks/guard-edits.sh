@@ -137,7 +137,8 @@ full = os.path.realpath(fp if os.path.isabs(fp) else os.path.join(root, fp))
 
 allowed_dirs = [os.path.realpath(os.path.join(root, "src")),
                 os.path.realpath(os.path.join(root, "paper")),
-                os.path.realpath(os.path.join(root, ".claude", "plans"))]
+                os.path.realpath(os.path.join(root, ".claude", "plans")),
+                os.path.realpath(os.path.expanduser("~/.claude/plans"))]
 claude_md = os.path.realpath(os.path.join(root, "CLAUDE.md"))
 
 # /mnt/c is case-insensitive; compare case-folded and on directory boundaries.

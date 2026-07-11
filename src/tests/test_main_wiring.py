@@ -102,9 +102,95 @@ def test_nearest_panel_year_selection(manager):
                                        "miss": 0, "holdout_reject": 0}
 
 
-def test_stable_change_pools(manager):
-    assert set(manager.stable_building_ids) == {1}
-    assert set(manager.change_building_ids) == {2}
+def test_naip_manager_owns_tract_search_cache(manager):
+    from src.data.naip_fetcher import TractSearchCache
+    assert isinstance(manager._naip_search_cache, TractSearchCache)
+
+
+def test_extract_raw_image_passes_tract_cache(manager, monkeypatch):
+    """_extract_raw_image must route fetches through the manager's shared
+    TractSearchCache, keyed on the row's GEOID (and disable the cache for
+    rows without one)."""
+    import src.data.naip_fetcher as nf
+
+    seen = []
+
+    def fake_fetch(lon, lat, crop_size_meters, nbands=4, out_pixels=250,
+                   year_hint=None, search_cache=None, cache_key=None):
+        seen.append({"search_cache": search_cache, "cache_key": cache_key,
+                     "year_hint": year_hint})
+        return nf.NaipFetchResult(None, None, failure="no_items")
+
+    monkeypatch.setattr(nf, "fetch_naip", fake_fetch)
+
+    row = manager.df.iloc[0]
+    assert manager._extract_raw_image(row, n_bands=4) is None
+    assert seen[0]["search_cache"] is manager._naip_search_cache
+    assert seen[0]["cache_key"] == "10003000100"
+    assert seen[0]["year_hint"] == 2014
+
+    # No GEOID → cache disabled for that row, never a bogus key.
+    row_no_geoid = dict(row)
+    row_no_geoid["GEOID"] = None
+    manager._extract_raw_image(row_no_geoid, n_bands=4)
+    assert seen[1]["cache_key"] is None
+    assert seen[1]["search_cache"] is manager._naip_search_cache
+
+
+# NOTE: the manager-level stable/change building pools were removed with the
+# normalization refactor — they were write-only (the sampler uses the
+# shard-level dicts from InBatchRankingDataset.refresh()) and cost many GB at
+# 71.8M buildings.
+
+
+# ── CyclicCacheManager × LazyPairTable (normalized ms_us path) ───────────────
+
+def _tiny_pair_table():
+    from src.data.pair_table import LazyPairTable
+    buildings = pd.DataFrame({
+        "building_id": [1, 2],
+        "GEOID": pd.Categorical(["10003000100"] * 2),
+        "cbsa_code": pd.Categorical(["37980"] * 2),
+        "centroid_x": np.float32([1.7e6, 1.7e6 + 50]),
+        "centroid_y": np.float32([2.0e6, 2.0e6 + 50]),
+        "dist_to_center": np.float32([1.0, 2.0]),
+    })
+    labels = pd.DataFrame({
+        "GEOID": ["10003000100"] * 2,
+        "year": [2014, 2018],
+        "Rel_Score": np.float32([0.1, 0.2]),
+        "Valid_Structural_Change": np.int8([0, 0]),
+        "score_bin": np.int8([0, 0]),
+    })
+    return LazyPairTable(buildings, labels, [2014, 2018], tau_meters=100,
+                         split_type="train")
+
+
+def test_lazy_manager_init_and_slice(tmp_path, monkeypatch):
+    monkeypatch.setattr(bd, "process_acs_panel", lambda: _fake_panel())
+    table = _tiny_pair_table()
+    mgr = main.CyclicCacheManager(
+        df=table, all_years_datasets=None,
+        params={"nbands": 4, "image_size": 64, "tau_meters": 100,
+                "subsample_step": 1, "indicator": "W2_r5"},
+        cache_dir=tmp_path, type="train", clear_cache=True, sat_data="NAIP",
+    )
+    assert mgr._is_lazy and len(mgr.df) == 4
+    # The shard generator's slice call: cyclic materialization works
+    sliced = mgr.df.materialize(2, 6)
+    assert len(sliced) == 4
+    assert list(sliced["building_id"]) == [2, 2, 1, 1]   # wraps around
+
+
+def test_lazy_manager_requires_naip(tmp_path, monkeypatch):
+    monkeypatch.setattr(bd, "process_acs_panel", lambda: _fake_panel())
+    with pytest.raises(NotImplementedError, match="NAIP"):
+        main.CyclicCacheManager(
+            df=_tiny_pair_table(), all_years_datasets=None,
+            params={"nbands": 4, "image_size": 64, "tau_meters": 100,
+                    "subsample_step": 1, "indicator": "W2_r5"},
+            cache_dir=tmp_path, type="train", clear_cache=True, sat_data="aerial",
+        )
 
 
 # ── _subsample_val_buildings (val cache subsampling, #28/#31) ────────────────
@@ -126,3 +212,90 @@ def test_subsample_val_buildings_keeps_all_years_of_chosen_buildings():
     # deterministic
     out2 = main._subsample_val_buildings(df_val, n_buildings_per_tract=2, seed=0)
     pd.testing.assert_frame_equal(out, out2)
+
+
+def test_subsample_val_buildings_default_one_per_tract():
+    df_val = pd.DataFrame({
+        "GEOID": ["A"] * 8 + ["B"] * 2,
+        "building_id": [1, 1, 2, 2, 3, 3, 4, 4, 5, 5],
+        "year": [2014, 2018] * 5,
+    })
+    out = main._subsample_val_buildings(df_val)
+    per_tract = out.drop_duplicates("building_id").groupby("GEOID").size()
+    assert (per_tract == 1).all()
+    # all years of each kept building survive
+    assert (out.groupby("building_id")["year"].nunique() == 2).all()
+
+
+def test_subsample_val_buildings_shuffles_at_building_level():
+    n = 200
+    df_val = pd.DataFrame({
+        "GEOID": [f"T{i}" for i in range(n) for _ in (0, 1)],
+        "building_id": [i for i in range(n) for _ in (0, 1)],
+        "year": [2014, 2018] * n,
+    })
+    out = main._subsample_val_buildings(df_val, seed=825)
+    # building rows stay contiguous with years sorted...
+    bids = out["building_id"].to_numpy()
+    assert all(bids[i] == bids[i + 1] for i in range(0, len(bids), 2))
+    assert (out.groupby("building_id", sort=False)["year"].apply(
+        lambda s: s.is_monotonic_increasing)).all()
+    # ...but building ORDER is shuffled (not the input head-first order),
+    # so shard-cap truncation takes a random sample, not the first tracts.
+    assert list(out["building_id"].drop_duplicates()) != list(range(n))
+    # idempotent: re-applying (as happens to pre-sampled lazy vals) is a no-op
+    out2 = main._subsample_val_buildings(out, seed=825)
+    pd.testing.assert_frame_equal(
+        out.sort_values(["building_id", "year"]).reset_index(drop=True),
+        out2.sort_values(["building_id", "year"]).reset_index(drop=True),
+    )
+
+
+# ── wandb init fallback (deleted/tombstoned run ids) ─────────────────────────
+
+def test_wandb_id_unusable_detection():
+    CommError = main.wandb.errors.CommError
+    # direct 409 message from the server
+    assert main._wandb_id_is_unusable(
+        CommError("run run_x was previously created and deleted; try a new id"))
+    # same condition surfacing as an init timeout after wandb's internal retries
+    assert main._wandb_id_is_unusable(
+        CommError("Run initialization has timed out after 90.0 sec."))
+    # unrelated comm failures must still propagate
+    assert not main._wandb_id_is_unusable(CommError("permission denied"))
+
+
+def test_init_wandb_run_falls_back_on_timeout(monkeypatch):
+    CommError = main.wandb.errors.CommError
+    calls = []
+
+    def fake_init(**kwargs):
+        calls.append(kwargs)
+        if len(calls) == 1:
+            raise CommError("Run initialization has timed out after 90.0 sec.")
+        return "run-handle"
+
+    monkeypatch.setattr(main.wandb, "init", fake_init)
+    out = main.init_wandb_run("run_x", {"p": 1}, wandb_resuming=True)
+    assert out == "run-handle"
+    assert calls[0]["id"] == "run_x"
+    assert calls[1]["id"].startswith("run_x_") and calls[1]["id"].endswith("_retry")
+
+
+def test_init_wandb_run_reraises_other_commerror(monkeypatch):
+    CommError = main.wandb.errors.CommError
+
+    def fake_init(**kwargs):
+        raise CommError("permission denied")
+
+    monkeypatch.setattr(main.wandb, "init", fake_init)
+    with pytest.raises(CommError, match="permission denied"):
+        main.init_wandb_run("run_x", {}, wandb_resuming=True)
+
+
+def test_init_wandb_run_fresh_run_gets_suffixed_id(monkeypatch):
+    calls = []
+    monkeypatch.setattr(main.wandb, "init", lambda **kw: calls.append(kw) or "h")
+    main.init_wandb_run("run_x", {}, wandb_resuming=False)
+    assert calls[0]["id"] != "run_x"
+    assert calls[0]["id"].startswith("run_x_")

@@ -27,6 +27,7 @@ import pandas as pd
 import src.geo_utils as geo_utils
 from src.data import indicators
 from src.data import cbsa_brackets
+from src.data.pair_table import LazyPairTable, FLAT_COLUMNS, weighted_qcut
 from src.data.process_acs import BASE_YEAR as ACS_BASE_YEAR, PANEL_YEARS as ACS_PANEL_YEARS
 
 
@@ -40,6 +41,11 @@ def open_datasets(sat_data="aerial", years=[2013, 2018, 2022], tau_meters=100,
                              footprints_source=footprints_source, states=states)
 
     year_cols = []
+    if isinstance(df, LazyPairTable) and sat_data != "NAIP":
+        raise NotImplementedError(
+            f"footprints_source='ms_us' (lazy pair table) only supports sat_data='NAIP', "
+            f"got {sat_data!r}. Use footprints_source='doitt_nyc' for the legacy zarr path."
+        )
     if sat_data == "aerial":
         datasets_all_years, extents_all_years = load_satellite_datasets(
             years=years
@@ -48,11 +54,13 @@ def open_datasets(sat_data="aerial", years=[2013, 2018, 2022], tau_meters=100,
     elif sat_data == "NAIP":
         datasets_all_years = None
         extents_all_years = None
-        df["dataset"] = "NAIP"
-        df["row_start"] = 0
-        df["row_stop"] = 0
-        df["col_start"] = 0
-        df["col_stop"] = 0
+        if not isinstance(df, LazyPairTable):
+            df["dataset"] = "NAIP"
+            df["row_start"] = 0
+            df["row_stop"] = 0
+            df["col_start"] = 0
+            df["col_stop"] = 0
+        # LazyPairTable emits these constants in every materialized slice.
     elif sat_data == "landsat":
         raise NotImplementedError("Landsat support not implemented yet.")
         sat_imgs_datasets, extents = load_landsat_datasets()
@@ -300,6 +308,261 @@ def _cbsa_centers(panel_tract_gdf):
     return frame.groupby("cbsa_code")[["x", "y"]].mean()
 
 
+# --------------------------------------------------------------------------- #
+# Normalized (lazy) dataset path — ms_us / US scale                            #
+#                                                                              #
+# The legacy flat table is buildings × years materialized row-by-row; at US    #
+# scale that is ~575M rows (150+ GB) and OOM-kills a 32 GB box. The ms_us      #
+# universe is static and labels vary only at (tract, year), so we persist two  #
+# small artifacts instead and let LazyPairTable synthesize flat slices on      #
+# demand (see src/data/pair_table.py).                                         #
+# --------------------------------------------------------------------------- #
+
+def _states_tag(states):
+    """Short deterministic tag for a states subset (artifact cache key)."""
+    if not states:
+        return "all"
+    import hashlib
+    key = "|".join(sorted(str(s) for s in states))
+    return f"{len(states)}st_{hashlib.md5(key.encode()).hexdigest()[:8]}"
+
+
+def _load_ms_buildings_slim(states=None, index_dir=None):
+    """Slim-dtype load of the Microsoft buildings index (lazy path).
+
+    Same source and dedupe semantics as :func:`load_buildings_index`, but
+    GEOID arrives as a string category and coordinates as float32 — the
+    object-string load alone was ~10 GB at 71.8M buildings. The static-universe
+    sentinels are omitted entirely (existence is unconditional).
+    """
+    index_dir = Path(index_dir) if index_dir is not None else PROCESSED_DATA_DIR / "buildings_index"
+    filters = [("state", "in", list(states))] if states else None
+    print(f"Loading buildings index (slim) from {index_dir}"
+          + (f" (states: {list(states)})" if states else " (all states)"))
+    # No dtype_backend="pyarrow": we want numpy numerics + object strings so we
+    # never hold an Arrow copy AND a str copy of the 71.8M-row columns at once.
+    # pop() frees each source column the moment it is converted, keeping the
+    # transient build footprint down (the whole point of the normalized path).
+    df = pd.read_parquet(
+        index_dir, filters=filters,
+        columns=["building_id", "cx", "cy", "tract_id"],
+    )
+    out = pd.DataFrame({
+        "building_id": df.pop("building_id").to_numpy(dtype="int64"),
+        "centroid_x": df.pop("cx").to_numpy(dtype="float32"),
+        "centroid_y": df.pop("cy").to_numpy(dtype="float32"),
+    })
+    # tract_id is already an object-string column here; astype("category")
+    # factorizes it in place without a second full-width copy.
+    out["GEOID"] = df.pop("tract_id").astype("category")
+    del df
+    n_dup = int(out.duplicated(subset="building_id").sum())
+    if n_dup:
+        print(f"  dropping {n_dup:,} cross-state duplicate building_ids "
+              f"({100 * n_dup / len(out):.3f}%) — run `build_buildings_index "
+              f"--dedupe-only` to fix the on-disk index")
+        out = out.drop_duplicates(subset="building_id", keep="first").reset_index(drop=True)
+    print(f"  {len(out):,} buildings in {out['GEOID'].nunique():,} tracts")
+    return out
+
+
+def _build_buildings_frame(panel_tract_gdf, states=None, index_dir=None):
+    """Static per-building frame: id, GEOID, cbsa_code, centroid, dist_to_center.
+
+    Category-code ``.map`` is used for every tract-level attach — merging on a
+    71.8M-row string key would transiently convert it to objects (~5 GB).
+    """
+    buildings = _load_ms_buildings_slim(states=states, index_dir=index_dir)
+
+    panel_geoid = panel_tract_gdf[PANEL_GEOID_COL].astype(str)
+    cbsa_map = pd.Series(
+        panel_tract_gdf["cbsa_code"].astype(str).to_numpy(), index=panel_geoid.to_numpy()
+    )
+    cbsa_map = cbsa_map[~cbsa_map.index.duplicated()]
+
+    print("2. Computing distance to CBSA centers...")
+    buildings["cbsa_code"] = buildings["GEOID"].map(cbsa_map).astype("category")
+    in_panel = buildings["cbsa_code"].notna().to_numpy()
+    if not in_panel.all():
+        print(f"  dropping {(~in_panel).sum():,} buildings in tracts outside the ACS panel")
+        buildings = buildings[in_panel].reset_index(drop=True)
+
+    centers = _cbsa_centers(panel_tract_gdf)
+    centers.index = centers.index.astype(str)
+    dx = buildings["centroid_x"].to_numpy(dtype="float64")
+    dx -= buildings["cbsa_code"].map(centers["x"]).to_numpy(dtype="float64")
+    dy = buildings["centroid_y"].to_numpy(dtype="float64")
+    dy -= buildings["cbsa_code"].map(centers["y"]).to_numpy(dtype="float64")
+    meters_per_unit = geo_utils.projected_units_to_meters(1.0, geo_utils.METRIC_EPSG)
+    buildings["dist_to_center"] = (np.hypot(dx, dy) * meters_per_unit / 1000.0).astype("float32")
+    del dx, dy
+    import gc
+    gc.collect()
+    return buildings
+
+
+def _build_labels_frame(panel_tract_gdf, panel_years, indicator, building_counts):
+    """(tract, year) label frame: Rel_Score, Valid_Structural_Change, score_bin.
+
+    ``score_bin`` uses building-count-weighted within-year quantiles — the
+    exact equivalent of the legacy ``pd.qcut`` over building-year rows (all
+    rows of a tract share its score, so row quantiles ARE weighted tract
+    quantiles). ``building_counts``: Series {GEOID str -> n buildings}.
+    """
+    vc_col = indicators.valid_change_col(indicator)
+    geoids = panel_tract_gdf[PANEL_GEOID_COL].astype(str)
+
+    frames = []
+    for year in panel_years:
+        acs_year = get_closest_acs_year(year)
+        sc_col = indicators.score_col(indicator, acs_year)
+        sub = pd.DataFrame({
+            "GEOID": geoids.to_numpy(),
+            "year": np.int64(year),
+            "Rel_Score": panel_tract_gdf[sc_col].to_numpy(dtype="float32"),
+            "Valid_Structural_Change": (
+                pd.to_numeric(panel_tract_gdf[vc_col], errors="coerce")
+                .fillna(0).to_numpy(dtype="int8")
+            ),
+        })
+        sub = sub.drop_duplicates(subset="GEOID")
+        counts = building_counts.reindex(sub["GEOID"]).fillna(0).to_numpy(dtype="int64")
+        has_bldgs = counts > 0
+        sub = sub[has_bldgs].reset_index(drop=True)
+        sub["score_bin"] = weighted_qcut(
+            sub["Rel_Score"].to_numpy(), counts[has_bldgs], q=5
+        )
+        frames.append(sub)
+    return pd.concat(frames, ignore_index=True)
+
+
+# Regions/tracts with no valid NAIP imagery (coverage gaps / corruption).
+# Auto-consumed by the ms_us path when present so those pairs are dropped before
+# any fetch. Produced by src/tests/test_naip_coverage.py.
+NAIP_UNAVAILABLE_FILENAME = "naip_unavailable.feather"
+_NAIP_UNAVAILABLE_COLUMNS = ["level", "key", "year"]
+
+
+def naip_unavailable_path(path=None):
+    """Default path of the NAIP-unavailable artifact (override with ``path``)."""
+    return Path(path) if path is not None else PROCESSED_DATA_DIR / NAIP_UNAVAILABLE_FILENAME
+
+
+def load_naip_unavailable(path=None):
+    """Load the NAIP-unavailable table, or None if it doesn't exist.
+
+    Returns a DataFrame with columns ``level`` ("cbsa" | "tract"), ``key``
+    (cbsa_code or GEOID, str), ``year`` (int). ``.feather`` or ``.csv``.
+    """
+    p = naip_unavailable_path(path)
+    if not p.exists():
+        return None
+    df = pd.read_feather(p) if p.suffix == ".feather" else pd.read_csv(p)
+    missing = [c for c in _NAIP_UNAVAILABLE_COLUMNS if c not in df.columns]
+    if missing:
+        raise KeyError(f"{p.name} missing columns {missing}; expected {_NAIP_UNAVAILABLE_COLUMNS}")
+    df = df[_NAIP_UNAVAILABLE_COLUMNS].copy()
+    df["level"] = df["level"].astype(str)
+    df["key"] = df["key"].astype(str)
+    df["year"] = df["year"].astype(int)
+    return df.drop_duplicates().reset_index(drop=True)
+
+
+def write_naip_unavailable(gaps, path=None, merge=True):
+    """Persist (and by default union with any existing) NAIP-unavailable rows.
+
+    ``gaps``: DataFrame or iterable of dicts/tuples with (level, key, year).
+    Returns the path written. Used by the coverage sweep to emit the artifact
+    the ms_us pipeline auto-consumes.
+    """
+    new = pd.DataFrame(list(gaps), columns=_NAIP_UNAVAILABLE_COLUMNS) \
+        if not isinstance(gaps, pd.DataFrame) else gaps[_NAIP_UNAVAILABLE_COLUMNS].copy()
+    new["level"] = new["level"].astype(str)
+    new["key"] = new["key"].astype(str)
+    new["year"] = new["year"].astype(int)
+    p = naip_unavailable_path(path)
+    if merge:
+        existing = load_naip_unavailable(p)
+        if existing is not None:
+            new = pd.concat([existing, new], ignore_index=True)
+    out = new.drop_duplicates().sort_values(_NAIP_UNAVAILABLE_COLUMNS).reset_index(drop=True)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    if p.suffix == ".csv":
+        out.to_csv(p, index=False)
+    else:
+        out.to_feather(p)
+    return p
+
+
+def _load_income_pair_table(panel_years, tau_meters=100,
+                            indicator=indicators.DEFAULT_INDICATOR, states=None,
+                            unavailable_path=None):
+    """LazyPairTable over the full ms_us universe (no split, no holdouts).
+
+    Persists/reuses two parquets (vs the legacy 575M-row flat parquet):
+      pair_buildings_*  — static per-building attributes (slim dtypes)
+      pair_labels_*     — (tract, year) labels + weighted score_bin
+    ``tau_meters`` only affects materialization, so it is not in the cache key.
+
+    If a NAIP-unavailable artifact exists (default location, or
+    ``naip_unavailable_path``), its (region, year) gaps are attached so those
+    pairs materialize with NaN labels and are skipped before any fetch.
+    """
+    stag = _states_tag(states)
+    yrs = f"years{min(panel_years)}-{max(panel_years)}"
+    bpath = PROCESSED_DATA_DIR / f"pair_buildings_ms_us_epsg{geo_utils.METRIC_EPSG}_{stag}.parquet"
+    lpath = PROCESSED_DATA_DIR / f"pair_labels_ms_us_{indicator}_{yrs}_{stag}.parquet"
+
+    if bpath.exists() and lpath.exists():
+        print(f"Loading normalized pair artifacts:\n  {bpath.name}\n  {lpath.name}")
+        buildings = pd.read_parquet(bpath)
+        labels = pd.read_parquet(lpath)
+    else:
+        panel_tract_gdf = process_acs_panel()
+        vc_col = indicators.valid_change_col(indicator)
+        needed = [PANEL_GEOID_COL, "cbsa_code", vc_col,
+                  indicators.score_col(indicator, get_closest_acs_year(min(panel_years)))]
+        missing = [c for c in needed if c not in panel_tract_gdf.columns]
+        if missing:
+            raise KeyError(
+                f"Panel is missing columns for indicator '{indicator}': {missing}. "
+                f"Regenerate the panel with process_acs.py (wealth flags need the VRE store)."
+            )
+
+        print("1. Building universe (ms_us, normalized)...")
+        buildings = _build_buildings_frame(panel_tract_gdf, states=states)
+
+        print(f"3. Building (tract, year) labels (indicator = {indicator})...")
+        building_counts = buildings["GEOID"].value_counts()
+        building_counts.index = building_counts.index.astype(str)
+        labels = _build_labels_frame(
+            panel_tract_gdf, panel_years, indicator, building_counts
+        )
+
+        buildings.to_parquet(bpath, index=False)
+        labels.to_parquet(lpath, index=False)
+        print(f"Saved normalized pair artifacts:\n  {bpath.name} ({len(buildings):,} buildings)"
+              f"\n  {lpath.name} ({len(labels):,} tract-years)")
+
+    # Parquet round-trips can degrade categories to plain strings — re-slim.
+    for col in ("GEOID", "cbsa_code"):
+        if not isinstance(buildings[col].dtype, pd.CategoricalDtype):
+            buildings[col] = buildings[col].astype(str).astype("category")
+    labels["GEOID"] = labels["GEOID"].astype(str)
+
+    unavailable = load_naip_unavailable(unavailable_path)
+    if unavailable is not None:
+        print(f"  NAIP-unavailable artifact: masking {len(unavailable):,} "
+              f"(region, year) gaps ({naip_unavailable_path(unavailable_path).name})")
+
+    table = LazyPairTable(
+        buildings, labels, panel_years, tau_meters, split_type="all",
+        unavailable=unavailable,
+    )
+    print(f"  {table!r}")
+    return table
+
+
 def load_income_dataset(panel_years, tau_meters=100,
                         indicator=indicators.DEFAULT_INDICATOR,
                         footprints_source="ms_us", states=None):
@@ -318,7 +581,16 @@ def load_income_dataset(panel_years, tau_meters=100,
     ``footprints_source``: ``"ms_us"`` (Microsoft index, national) or
     ``"doitt_nyc"`` (legacy dated NYC footprints; also writes the geometry
     lookup parquet used by NYC evaluation).
+
+    ms_us returns a :class:`LazyPairTable` (the building×year cross product is
+    never materialized — 575M rows at US scale); doitt_nyc keeps returning the
+    legacy flat DataFrame.
     """
+    if footprints_source == "ms_us":
+        return _load_income_pair_table(
+            panel_years, tau_meters=tau_meters, indicator=indicator, states=states
+        )
+
     OUTPUT_DIR = PROCESSED_DATA_DIR
     # CRS + indicator + source tags keep stale artifacts (old CRS or another
     # label) from being silently reused.
@@ -1157,41 +1429,32 @@ def generate_matrix_of_datasets(datasets):
             matrix += [rows_ds]
     return matrix
 
-def create_train_test_dataframes(buildings_df, savename, small_sample=False,
-                                 indicator=None, naip_coverage_csv=None,
-                                 split_seed=cbsa_brackets.SPLIT_SEED):
-    """Whole-city (CBSA) train/val/test split (#28), Khachiyan et al. (2022)-style.
+def _restricted_tract_panel(covered_geoids):
+    """ACS tract panel renamed to GEOID/str keys, restricted to covered tracts.
 
-    Cities (CBSAs) are the split atoms: each is assigned wholesale to
-    train/val/test (~50/20/30 in tract count, stratified by population bracket;
-    the mega bracket is fixed 2 train / 1 val / 1 test), and every TRAIN city
-    additionally holds out ONE year (nearest the middle of its state's NAIP
-    coverage) as ``val_temporal``. There is no dead zone and no jitter buffer:
-    holdout cities are entire, disjoint metros. Persists ``cbsa_splits.feather``
-    (consumed by the per-bracket validation metrics, #31) and a tract-level
-    ``tract_splits.feather`` (type in train/val/test) for evaluation.py.
+    Keeps the split universe aligned with the buildings actually loaded (e.g. a
+    states subset): holding out cities with zero buildings wastes holdout budget.
     """
-    if small_sample:
-        buildings_df = buildings_df.sample(1000, random_state=825).reset_index(drop=True)
-
-    indicator = indicator if indicator is not None else indicators.DEFAULT_INDICATOR
-
     tract_panel = process_acs_panel()
     tract_panel = tract_panel.rename(columns={PANEL_GEOID_COL: "GEOID"})
     tract_panel["GEOID"] = tract_panel["GEOID"].astype(str)
     tract_panel["cbsa_code"] = tract_panel["cbsa_code"].astype(str)
-    # Keep the split universe aligned with the buildings actually loaded (e.g. a
-    # states subset): holding out cities with zero buildings wastes holdout budget.
-    tract_panel = tract_panel[tract_panel["GEOID"].isin(set(buildings_df["GEOID"].astype(str)))].reset_index(drop=True)
+    return tract_panel[tract_panel["GEOID"].isin(covered_geoids)].reset_index(drop=True)
 
-    ###### Split whole cities (CBSAs)
+
+def _city_split_and_artifacts(tract_panel, years, naip_coverage_csv, split_seed):
+    """Whole-city split frame + persisted artifacts (shared legacy/lazy).
+
+    Builds the stratified CBSA split, attaches the per-train-city temporal
+    holdout year, saves ``cbsa_splits.feather`` and the tract-level
+    ``tract_splits.feather`` (read by evaluation.py), and plots the split map.
+    """
     tract_counts = tract_panel.groupby("cbsa_code")["GEOID"].nunique()
     pop_df = cbsa_brackets.cbsa_populations(panel=tract_panel)
     city_split_df = cbsa_brackets.build_city_split(tract_counts, pop_df, seed=split_seed)
 
     # Temporal holdout year per TRAIN city: imagery year nearest the middle of
     # the state's NAIP coverage window (interpolation, never extrapolation).
-    years = sorted(int(y) for y in buildings_df["year"].unique())
     coverage_df = cbsa_brackets.load_naip_coverage(naip_coverage_csv)
     state_of_cbsa = (
         tract_panel.assign(state_fips=tract_panel["GEOID"].str[:2])
@@ -1212,6 +1475,140 @@ def create_train_test_dataframes(buildings_df, savename, small_sample=False,
     plot_city_splits(tract_panel)
     tract_panel[["GEOID", "geometry", "type"]].to_feather(PROCESSED_DATA_DIR / "tract_splits.feather", index=False)
     print(f"Created file: {PROCESSED_DATA_DIR / 'tract_splits.feather'}")
+    return city_split_df
+
+
+def _create_split_lazy(pair_table, savename, naip_coverage_csv, split_seed):
+    """Whole-city split over a LazyPairTable — buildings level, no pair unroll.
+
+    Same split semantics as :func:`assign_buildings_by_city`, expressed on the
+    static buildings frame: split membership is per city, so it is a
+    building-level property; the train table excludes its city's holdout-year
+    pairs at materialization (NaN label), and val_temporal is materialized
+    directly at ≤1 building/tract (matching main._subsample_val_buildings;
+    labels are tract-level, so tract coverage — not buildings/tract — drives
+    val-metric precision).
+
+    Regions with NO valid NAIP in ANY requested year (per the unavailable
+    artifact) are dropped from the split universe entirely — they never occupy a
+    train/val/test slot — and the ~50/20/30 stratified split is computed over the
+    survivors. Partially-flagged regions stay (their bad years stay NaN-masked).
+    """
+    covered = set(str(g) for g in pair_table.buildings["GEOID"].cat.categories)
+
+    # Drop fully-dead regions from the split universe (issue: zero-coverage
+    # metros like Honolulu were still consuming a val slot).
+    dead_cbsas, dead_tracts = pair_table.fully_unavailable()
+    if dead_tracts:
+        covered -= dead_tracts
+    tract_panel = _restricted_tract_panel(covered)
+    if dead_cbsas:
+        n_before = tract_panel["cbsa_code"].nunique()
+        tract_panel = tract_panel[
+            ~tract_panel["cbsa_code"].isin(dead_cbsas)
+        ].reset_index(drop=True)
+        print(f"🚫 Excluding {len(dead_cbsas)} zero-coverage CBSA(s) from the split "
+              f"({n_before}→{tract_panel['cbsa_code'].nunique()} CBSAs): "
+              f"{sorted(dead_cbsas)}")
+    if dead_tracts:
+        print(f"🚫 Excluding {len(dead_tracts):,} zero-coverage tract(s) from the split.")
+
+    city_split_df = _city_split_and_artifacts(
+        tract_panel, pair_table.years, naip_coverage_csv, split_seed
+    )
+    split_map = dict(zip(city_split_df["cbsa_code"].astype(str), city_split_df["split"]))
+    holdout_map = cbsa_brackets.holdout_year_map(city_split_df)
+
+    print("\nAssigning buildings to whole-city train/test/val splits (lazy)...")
+    city_split = pair_table.buildings["cbsa_code"].map(split_map)
+    unassigned = city_split.isna().to_numpy()
+    if unassigned.any():
+        print(f"⚠️ {unassigned.sum():,} buildings belong to CBSAs outside the city split "
+              f"(below MIN_METRO_POP, missing crosswalk, or zero NAIP coverage) — "
+              f"excluded from every split.")
+
+    train_city_mask = (city_split == "train").to_numpy()
+    val_city_mask = (city_split == "val").to_numpy()
+    test_mask = (city_split == "test").to_numpy()
+    assert test_mask.any(), "Empty test dataset!"
+    assert train_city_mask.any(), "Empty train dataset!"
+
+    print("\n--- Final Dataset Assignment (whole-city split, lazy) ---")
+    print(f"Total buildings evaluated: {pair_table.n_buildings:,}")
+    for name, mask in [("Train cities", train_city_mask),
+                       ("Test (whole cities)", test_mask),
+                       ("Val (whole cities)", val_city_mask)]:
+        n_tracts = pair_table.buildings.loc[mask, "GEOID"].nunique()
+        print(f"{name}: {mask.sum():,} buildings ({n_tracts:,} tracts)")
+    print("-" * 30)
+
+    df_train = pair_table.subset(
+        train_city_mask, split_type="train", holdout_map=holdout_map
+    ).shuffle_buildings(seed=825)
+    df_test = pair_table.subset(test_mask, split_type="test", holdout_map={})
+
+    df_vals_dict = {}
+    df_vals_dict["val_cities"] = (
+        pair_table.subset(val_city_mask, split_type="val_cities", holdout_map={})
+        .sample_buildings_per_tract(1, seed=825)
+        if val_city_mask.any() else pd.DataFrame(columns=FLAT_COLUMNS)
+    )
+    df_vals_dict["val_temporal"] = (
+        pair_table.subset(train_city_mask, split_type="val_temporal", holdout_map={})
+        .materialize_holdout_years(holdout_map, n_buildings_per_tract=1, seed=825)
+    )
+    for val_name, df_val in df_vals_dict.items():
+        if df_val.shape[0] == 0:
+            print(f"⚠️ Empty val dataset for {val_name} — downstream loaders will skip it.")
+
+    val_dataframe_path = PROCESSED_DATA_DIR / "val_datasets"
+    val_dataframe_path.mkdir(parents=True, exist_ok=True)
+    for val_name, df_val in df_vals_dict.items():
+        df_val.reset_index(drop=True).to_feather(
+            val_dataframe_path / f"{savename}_{val_name}_val_dataframe.feather"
+        )
+        print(f"Created val dataset: {val_dataframe_path}")
+    print("Lazy path: skipping train/test/dead-zone/building_splits feathers "
+          "(575M-row equivalents; the split lives in cbsa_splits/tract_splits).")
+
+    df_dead_zone = pd.DataFrame(columns=FLAT_COLUMNS)
+    print(f"Train: {df_train!r}\nTest:  {df_test!r}")
+    return df_train, df_vals_dict, df_test, df_dead_zone
+
+
+def create_train_test_dataframes(buildings_df, savename, small_sample=False,
+                                 indicator=None, naip_coverage_csv=None,
+                                 split_seed=cbsa_brackets.SPLIT_SEED):
+    """Whole-city (CBSA) train/val/test split (#28), Khachiyan et al. (2022)-style.
+
+    Cities (CBSAs) are the split atoms: each is assigned wholesale to
+    train/val/test (~50/20/30 in tract count, stratified by population bracket;
+    the mega bracket is fixed 2 train / 1 val / 1 test), and every TRAIN city
+    additionally holds out ONE year (nearest the middle of its state's NAIP
+    coverage) as ``val_temporal``. There is no dead zone and no jitter buffer:
+    holdout cities are entire, disjoint metros. Persists ``cbsa_splits.feather``
+    (consumed by the per-bracket validation metrics, #31) and a tract-level
+    ``tract_splits.feather`` (type in train/val/test) for evaluation.py.
+    """
+    if isinstance(buildings_df, LazyPairTable):
+        if small_sample:
+            # Materialize a tiny flat frame and reuse the legacy row-level path.
+            buildings_df = buildings_df.sample_pairs(1000, seed=825)
+        else:
+            return _create_split_lazy(buildings_df, savename, naip_coverage_csv, split_seed)
+
+    if small_sample:
+        buildings_df = buildings_df.sample(min(1000, len(buildings_df)), random_state=825).reset_index(drop=True)
+
+    indicator = indicator if indicator is not None else indicators.DEFAULT_INDICATOR
+
+    tract_panel = _restricted_tract_panel(set(buildings_df["GEOID"].astype(str)))
+
+    ###### Split whole cities (CBSAs)
+    years = sorted(int(y) for y in buildings_df["year"].unique())
+    city_split_df = _city_split_and_artifacts(
+        tract_panel, years, naip_coverage_csv, split_seed
+    )
 
     ###### Split Buildings
     train_mask, test_mask, val_masks_dict, dead_zone_mask = assign_buildings_by_city(

@@ -17,6 +17,7 @@ import pandas as pd
 import seaborn as sns
 import geopandas as gpd
 from datetime import datetime
+from pathlib import Path
 import matplotlib.pyplot as plt
 import numpy as np
 from typing import List, Dict
@@ -29,6 +30,8 @@ import src.build_dataset as build_dataset
 import src.geo_utils as geo_utils
 from src.data import indicators
 from src.data import cbsa_brackets
+from src.data.pair_table import LazyPairTable
+from src.debug_batch_dump import BatchImageDumper
 from src.data.process_acs import PANEL_YEARS as ACS_PANEL_YEARS
 from src.utils.paths import PROJECT_ROOT, DATA_DIR, EXTERNAL_DATA_DIR, RAW_DATA_DIR, INTERIM_DATA_DIR, PROCESSED_DATA_DIR, CACHE_DIR, RESULTS_DIR, LOGS_DIR, MODELS_DIR, IMAGERY_ROOT
 pd.set_option("display.max_columns", None)
@@ -70,6 +73,84 @@ def generate_savename(run_id=None):
     if run_id:
         return str(run_id)
     return f"run_{datetime.now().strftime('%Y%m%d')}"
+
+
+def _cache_marker_path(cache_dir=None):
+    """Path of the marker recording which run (savename) built the shard caches."""
+    return Path(cache_dir or CACHE_DIR) / "cache_run_marker.json"
+
+
+def read_cache_marker(cache_dir=None):
+    """Savename recorded by the last cache-building run, or None if absent/unreadable."""
+    try:
+        return json.loads(_cache_marker_path(cache_dir).read_text()).get("savename")
+    except (OSError, ValueError):
+        return None
+
+
+def write_cache_marker(savename, cache_dir=None):
+    """Record which run owns the shard caches (read back to allow crash-resume)."""
+    path = _cache_marker_path(cache_dir)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"savename": savename,
+                                "written_at": datetime.now().isoformat()}))
+
+
+def _wandb_id_is_unusable(exc):
+    """True if wandb.init failed because the requested run id can't be reused.
+
+    wandb permanently retires a run id once it's been deleted from the web UI —
+    resume="allow" can't revive it. Depending on timing this surfaces either as
+    the HTTP 409 message itself ("previously created and deleted") or, because
+    wandb retries the 409 internally with backoff, as an init timeout after
+    init_timeout seconds. Both mean the same thing for us: pick a fresh id.
+    """
+    msg = str(exc)
+    return "previously created and deleted" in msg or "timed out" in msg
+
+
+def override_optimizer_lr(optimizer, lr):
+    """Force ``lr`` on every optimizer param group; no-op when ``lr`` is None.
+
+    Used to decay the learning rate across a resume: loading the optimizer
+    state restores the checkpoint's lr, so params["learning_rate"] alone has no
+    effect on resumed runs. Only the lr is touched — momenta, weight-decay and
+    step counts stay intact, so training continues without a reset.
+    """
+    if lr is None:
+        return
+    old = sorted({pg.get("lr") for pg in optimizer.param_groups})
+    for pg in optimizer.param_groups:
+        pg["lr"] = lr
+    print(f"⚙️ Resume lr override: {old} -> {lr} on {len(optimizer.param_groups)} param group(s).")
+
+
+def init_wandb_run(savename, params, wandb_resuming):
+    """wandb.init keyed to savename, falling back to a fresh id if it's unusable.
+
+    Resuming runs reuse ``id=savename`` so the chart continues; fresh runs get a
+    timestamp-suffixed id so they never collide with a previously deleted one.
+    savename itself still governs checkpoints/cache, so falling back to a new
+    wandb id never affects local resume logic.
+    """
+    wandb_id = savename if wandb_resuming else f"{savename}_{datetime.now().strftime('%H%M%S')}"
+    try:
+        return wandb.init(
+            project="urban-income-prediction",
+            name=savename, config=params,
+            id=wandb_id, resume="allow"
+        )
+    except wandb.errors.CommError as e:
+        if not _wandb_id_is_unusable(e):
+            raise
+        fallback_id = f"{savename}_{datetime.now().strftime('%H%M%S')}_retry"
+        print(f"⚠️ wandb run '{wandb_id}' is unusable ({e}); "
+              f"starting a new wandb run '{fallback_id}' instead (local checkpoints/cache unaffected).")
+        return wandb.init(
+            project="urban-income-prediction",
+            name=savename, config=params,
+            id=fallback_id, resume="allow"
+        )
 
 # ══════════════════════════════════════════════════════════════════════════════
 # ZARR CHUNK MANAGEMENT UTILITIES
@@ -419,9 +500,13 @@ class CyclicCacheManager:
         # shards reject crops landing OFF it.
         self.holdout_years = holdout_years or {}
 
-        
-        # [NEW] Group temporal twins together so they end up in the same shard
-        if type == "train":
+        self._is_lazy = isinstance(df, LazyPairTable)
+
+        # Group temporal twins together so they end up in the same shard.
+        # LazyPairTable is already building-major (shuffled at split time), so
+        # only materialized DataFrames need the sort; the old categorical trick
+        # is O(n_buildings) memory and impossible at 71.8M buildings anyway.
+        if type == "train" and not self._is_lazy:
             print("Sorting dataframe to group building_ids for temporal sampling...")
             bids = self.df['building_id'].unique()
             np.random.shuffle(bids)  # Shuffle groups to maintain randomness
@@ -429,7 +514,7 @@ class CyclicCacheManager:
             self.df['building_id_cat'] = self.df['building_id'].astype(cat_type)
             self.df = self.df.sort_values(['building_id_cat', 'year']).reset_index(drop=True)
             self.df.drop('building_id_cat', axis=1, inplace=True)
-        
+
         self.all_years_datasets = all_years_datasets
         self.params = params
         self.max_jitter = max_jitter
@@ -464,7 +549,18 @@ class CyclicCacheManager:
             self._year_sub_lock = threading.Lock()
             self.year_sub_counts = {"exact": 0, "nearest_fallback": 0, "miss": 0,
                                     "holdout_reject": 0}
+            # One STAC search per tract instead of per crop — Planetary
+            # Computer throttles the search endpoint under per-crop load
+            # (~23% dropped fetches in training). Shared across the extract
+            # workers; thread-safe.
+            from src.data.naip_fetcher import TractSearchCache
+            self._naip_search_cache = TractSearchCache()
         else:
+            if self._is_lazy:
+                raise NotImplementedError(
+                    "LazyPairTable (ms_us) requires sat_data='NAIP'; the zarr "
+                    "path needs a materialized dataframe with row/col indices."
+                )
             self.image_size = int((df["row_stop"] - df["row_start"]).min())  # Assuming all images have the same size in the raw zarr array
 
 
@@ -478,34 +574,31 @@ class CyclicCacheManager:
         self.next_shard_idx = 0
         self.bg_thread = None
         self._pending_k = 0
+        self._bg_error = None       # (shard_id, exception) captured off the bg thread
+        self._bg_completed = []     # shard ids fully written by the in-flight batch
+        self._bg_start_idx = 0      # first shard id of the in-flight batch
+        self._bg_started_at = None  # wall-clock start of the in-flight batch
+        self._bg_stall_steps = 0    # consecutive step() calls with the thread still alive
+        self.last_swap_count = 0    # shards swapped in by the latest step()
         self._is_initialized = False
         self.progress = 0.0
  
         self.cache_dir.mkdir(parents=True, exist_ok=True)
+        # Stale .pt.tmp files are partial writes from a crashed run — never valid.
+        for f in self.cache_dir.glob("*.pt.tmp"):
+            f.unlink()
         if self.clear_cache:
             for f in self.cache_dir.glob("*.pt"):
                 f.unlink()
         else:
             self._load_existing_shards()
 
+        # NOTE: the old df-level year/building groupby indices were removed —
+        # they were write-only (HybridBatchSampler uses the SHARD-level dicts
+        # rebuilt in InBatchRankingDataset.refresh()) and cost many GB at
+        # 71.8M buildings.
         if self.type == "train":
-            print("Pre-computing indices for fast pairwise sampling...")
-            # 1. Fast lookup for Spatial Pairs (by year)
-            self.year_to_idxs = self.df.groupby('year').groups
-
-            # 2. Fast lookup for Temporal Pairs (by building)
-            # Find buildings that exist in at least 2 different years
-            counts = self.df['building_id'].value_counts()
-            valid_building_id_index = counts[counts >= 2].index
-
-            valid_temporal_df = self.df[self.df['building_id'].isin(valid_building_id_index)]
-            self.building_to_idxs = valid_temporal_df.groupby('building_id').groups
-
-            # 3. Separate them into Stable (0) and Change (1) pools
-            building_meta = valid_temporal_df[['building_id', 'Valid_Structural_Change']].drop_duplicates('building_id')
-            self.stable_building_ids = building_meta[building_meta['Valid_Structural_Change'] == 0]['building_id'].values
-            self.change_building_ids = building_meta[building_meta['Valid_Structural_Change'] == 1]['building_id'].values
-            print(f"  Spatial years: {len(self.year_to_idxs)} | Stable buildings: {len(self.stable_building_ids)} | Change buildings: {len(self.change_building_ids)}")
+            print(f"Train pair universe: {len(self.df):,} building-year rows")
 
     def _load_existing_shards(self):
         existing_shards = sorted(
@@ -529,12 +622,20 @@ class CyclicCacheManager:
             pad_meters = pad * 0.5 * self.params.get("subsample_step", 1)
             out_pixels = self.image_size + 2 * pad
 
+            # Tract-keyed STAC search cache: rows without a GEOID fall back
+            # to the direct per-crop search (cache_key=None disables it).
+            geoid = row.get("GEOID")
+            cache_key = str(geoid) if geoid is not None and not pd.isna(geoid) \
+                and str(geoid) != "" else None
+
             res = fetch_naip(
                 lon=lon, lat=lat,
                 crop_size_meters=self.crop_size_meters + 2 * pad_meters,
                 nbands=n_bands or self.nbands,
                 out_pixels=out_pixels,
                 year_hint=int(row["year"]),
+                search_cache=self._naip_search_cache,
+                cache_key=cache_key,
             )
             if res.crop is None:
                 return None
@@ -590,12 +691,20 @@ class CyclicCacheManager:
 
     def _worker_generate(self, shard_id, show_progress=False):
         step = self.params["subsample_step"]
+        # Snapshot the (cumulative) holdout-reject counter so this shard's rejects
+        # can be excluded from its API failure rate below.
+        holdout_rejects_before = (
+            self.year_sub_counts["holdout_reject"] if self.sat_data == "NAIP" else 0
+        )
         jitter_pad = math.ceil(self.max_jitter_pixels / step) * step if self.type == "train" else 0
 
         # Grab sequential chunk (twins are naturally adjacent now)
         start_idx = (shard_id * self.shard_size) % len(self.df)
         end_idx = start_idx + self.shard_size
-        if end_idx > len(self.df):
+        if self._is_lazy:
+            # LazyPairTable synthesizes the flat slice on demand (cyclic).
+            sampled_df = self.df.materialize(start_idx, end_idx)
+        elif end_idx > len(self.df):
             sampled_df = pd.concat([self.df.iloc[start_idx:], self.df.iloc[:end_idx % len(self.df)]])
         else:
             sampled_df = self.df.iloc[start_idx:end_idx]
@@ -718,7 +827,13 @@ class CyclicCacheManager:
         total_failed = total_attempted - total_succeeded
 
         if self.sat_data == "NAIP" and total_attempted > 0:
-            failure_rate = total_failed / total_attempted
+            # Holdout-guard rejects are deliberate filtering (train/val_temporal
+            # discard crops on the wrong effective year), NOT fetch failures:
+            # exclude them from the rate or a val_temporal shard where most
+            # flight years miss the holdout year trips the rate-limit halt.
+            holdout_rejects = self.year_sub_counts["holdout_reject"] - holdout_rejects_before
+            api_attempted = max(total_attempted - holdout_rejects, 1)
+            failure_rate = (total_failed - holdout_rejects) / api_attempted
             fetch_stats = {}
             try:
                 from src.data.naip_fetcher import get_fetch_stats
@@ -727,7 +842,8 @@ class CyclicCacheManager:
                 pass
             stats_msg = (
                 f"shard {shard_id}: {total_succeeded}/{total_attempted} ok "
-                f"({failure_rate:.1%} failed) | fetcher totals: {fetch_stats} | "
+                f"({failure_rate:.1%} failed of {api_attempted} non-holdout-rejected, "
+                f"{holdout_rejects} holdout rejects) | fetcher totals: {fetch_stats} | "
                 f"year substitution: {dict(self.year_sub_counts)}"
             )
             print(f"[NAIP] {stats_msg}")
@@ -755,7 +871,10 @@ class CyclicCacheManager:
                 # return self._worker_generate(shard_id, show_progress)
 
 
+        # Write to a .tmp then atomically rename: a crash mid-save can never leave
+        # a truncated shard_*.pt that a resumed run would pick up as valid.
         shard_path = self.cache_dir / f"shard_{shard_id}.pt"
+        tmp_path = shard_path.with_suffix(".pt.tmp")
         if valid_images:
             torch.save({
                 "images": torch.stack(valid_images),
@@ -767,42 +886,76 @@ class CyclicCacheManager:
                 "metas": torch.tensor(valid_metas, dtype=torch.float32).unsqueeze(1),
                 "score_bins": torch.tensor(valid_score_bins, dtype=torch.int64),
                 "cbsa_ids": torch.tensor(valid_cbsas, dtype=torch.int64),
-            }, shard_path)
+            }, tmp_path)
         else:
-            torch.save({"images": torch.empty(0), "scores": torch.empty(0)}, shard_path)
+            torch.save({"images": torch.empty(0), "scores": torch.empty(0)}, tmp_path)
+        os.replace(tmp_path, shard_path)
 
     def build_initial_cache(self):
-        """Synchronously generates the initial num_shards shards. Call once before training."""
-        if self.active_shards and not self.clear_cache:
-            print(
-                f"Using existing {len(self.active_shards)} pre-built cache shard(s) in {self.cache_dir}"
-            )
-            self._is_initialized = True
-            return
+        """Synchronously generates the initial num_shards shards. Call once before training.
 
-        print(f"Building initial {self.num_shards} cache shards...")
-        for i in range(self.num_shards):
+        Resume-aware: pre-existing shards (clear_cache=False) are kept and only the
+        missing ones are generated, so a run that crashed mid-build doesn't refetch
+        the NAIP tiles already on disk.
+        """
+        if self.active_shards and not self.clear_cache:
+            if len(self.active_shards) >= self.num_shards:
+                print(
+                    f"Using existing {len(self.active_shards)} pre-built cache shard(s) in {self.cache_dir}"
+                )
+                self._is_initialized = True
+                return
+            print(
+                f"Resuming partial cache: {len(self.active_shards)}/{self.num_shards} "
+                f"shard(s) already in {self.cache_dir}, generating the rest..."
+            )
+        else:
+            print(f"Building initial {self.num_shards} cache shards...")
+
+        while len(self.active_shards) < self.num_shards:
             # True: Show progress bar during initial blocking setup
-            self._worker_generate(self.next_shard_idx, show_progress=True) 
+            self._worker_generate(self.next_shard_idx, show_progress=True)
             self.active_shards.append(self.cache_dir / f"shard_{self.next_shard_idx}.pt")
             self.next_shard_idx += 1
         self._is_initialized = True
         print("Initial cache ready.")
  
     def _worker_generate_k(self, start_idx, k, show_progress=False):
-        """Generates k consecutive shards sequentially in a background thread."""
+        """Generates k consecutive shards sequentially in a background thread.
+
+        Progress is recorded in ``self._bg_completed`` and any exception is
+        captured in ``self._bg_error``: a daemon thread dies silently
+        otherwise, and step() would then swap in shards that were never
+        written (deleting good ones in the process).
+        """
         for i in range(k):
-            self._worker_generate(start_idx + i, show_progress)
- 
+            shard_id = start_idx + i
+            try:
+                self._worker_generate(shard_id, show_progress)
+            except Exception as e:
+                self._bg_error = (shard_id, e)
+                print(f"❌ Background generation of shard {shard_id} failed: {e!r}")
+                return
+            self._bg_completed.append(shard_id)
+
+    def _launch_background(self, k):
+        """(Re)start the background thread for the next k shards."""
+        self._bg_completed = []
+        self._bg_error = None
+        self._bg_start_idx = self.next_shard_idx
+        self._bg_started_at = time.time()
+        self._bg_stall_steps = 0
+        self._pending_k = k
+        self.bg_thread = threading.Thread(
+            target=self._worker_generate_k, args=(self.next_shard_idx, k, False), daemon=True
+        )
+        self.bg_thread.start()
+
     def start_background_generation(self, k=2):
         """Kicks off generation of the next k shards on a background thread before training begins."""
         if not self._is_initialized:
             raise RuntimeError("Call build_initial_cache() before starting background generation.")
-        self.bg_thread = threading.Thread(
-            target=self._worker_generate_k, args=(self.next_shard_idx, k, False), daemon=True
-        )
-        self._pending_k = k
-        self.bg_thread.start()
+        self._launch_background(k)
 
     def step(self, k=2, progress=0.0):
         """Non-blocking cache rotation. Background generates next k shards, then swaps them safely on completion."""
@@ -813,37 +966,71 @@ class CyclicCacheManager:
         if self.single_shard_mode:
             return False 
 
+        self.last_swap_count = 0
+
         if self.bg_thread is None:
             # Kick off the very first background generation
-            self.bg_thread = threading.Thread(
-                target=self._worker_generate_k, args=(self.next_shard_idx, k, False), daemon=True
-            )
-            self._pending_k = k
-            self.bg_thread.start()
+            self._launch_background(k)
             return False
-            
-        else:
-            if self.bg_thread.is_alive():
-                return False  # Still generating in background
-                
-            # Background thread FINISHED: Swap the shards securely!
-            for _ in range(self._pending_k):
-                oldest_shard = self.active_shards.pop(0)
-                try: oldest_shard.unlink() 
-                except FileNotFoundError: pass
-        
-                self.active_shards.append(self.cache_dir / f"shard_{self.next_shard_idx}.pt")
-                self.next_shard_idx += 1
-    
-            # Immediately kick off the next batch cycle
-            self.bg_thread = threading.Thread(
-                target=self._worker_generate_k, args=(self.next_shard_idx, k, False), daemon=True
+
+        if self.bg_thread.is_alive():
+            # Still generating. Every network call is now bounded (see
+            # naip_fetcher.GDAL_ENV / STAC_TIMEOUT_S), so staying alive for
+            # several epochs means generation is outpaced or wedged — say so
+            # loudly instead of silently training on stale shards forever.
+            self._bg_stall_steps += 1
+            if self._bg_stall_steps >= 2:
+                mins = (time.time() - self._bg_started_at) / 60.0
+                print(
+                    f"⚠️ Cache rotation stalled: background batch (shards "
+                    f"{self._bg_start_idx}..{self._bg_start_idx + self._pending_k - 1}) "
+                    f"still running after {self._bg_stall_steps} epochs "
+                    f"({mins:.0f} min, {len(self._bg_completed)}/{self._pending_k} done). "
+                    f"Training is reusing stale shards."
+                )
+                try:
+                    if wandb.run is not None:
+                        wandb.log({"naip/cache_stall_epochs": self._bg_stall_steps})
+                except Exception:
+                    pass
+            return False
+
+        # Thread FINISHED (normally or after an error): swap in ONLY the
+        # shards that were actually written to disk.
+        if self._bg_error is not None:
+            shard_id, err = self._bg_error
+            print(
+                f"❌ Background shard generation died at shard {shard_id}: {err!r}. "
+                f"Swapping in the {len(self._bg_completed)} completed shard(s) "
+                f"and retrying from shard {shard_id}."
             )
-            self._pending_k = k
-            self.bg_thread.start()
-            
-            return True 
-        return False
+            try:
+                if wandb.run is not None:
+                    wandb.log({"naip/bg_generation_errors": 1})
+            except Exception:
+                pass
+
+        swapped = 0
+        for shard_id in self._bg_completed:
+            new_shard = self.cache_dir / f"shard_{shard_id}.pt"
+            if not new_shard.exists():
+                print(f"⚠️ Completed shard {shard_id} missing on disk; not swapping it in.")
+                continue
+            oldest_shard = self.active_shards.pop(0)
+            try: oldest_shard.unlink()
+            except FileNotFoundError: pass
+            self.active_shards.append(new_shard)
+            swapped += 1
+        self.last_swap_count = swapped
+
+        # Resume AFTER the last completed shard: on error the failed shard id
+        # (same pair-table slice) is retried instead of silently skipped.
+        self.next_shard_idx = self._bg_start_idx + len(self._bg_completed)
+
+        # Immediately kick off the next batch cycle
+        self._launch_background(k)
+
+        return swapped > 0
  
 
 class InBatchRankingDataset(Dataset):
@@ -960,12 +1147,16 @@ class HybridBatchSampler(torch.utils.data.Sampler):
     Old shards without cbsa_ids collapse to cbsa=0 pools == the previous
     per-year (single-city) behavior.
     """
-    def __init__(self, dataset: InBatchRankingDataset, batch_size_cs: int, max_temporal_per_batch: int = 32):
+    def __init__(self, dataset: InBatchRankingDataset, batch_size_cs: int, max_temporal_per_batch: int = 32,
+                 batch_dumper=None):
         self.dataset = dataset
         self.batch_size_cs = batch_size_cs
         self.max_temporal = max_temporal_per_batch
         self.num_batches = max(1, len(dataset) // batch_size_cs)
         self._warned_fallback = False
+        # Optional BatchImageDumper (fresh runs only): persists the first N yielded
+        # batches for the visual QA notebook. None on resumed runs.
+        self.batch_dumper = batch_dumper
 
     def _pools(self):
         """(year, cbsa) pools big enough for meaningful in-batch ranking."""
@@ -1030,6 +1221,12 @@ class HybridBatchSampler(torch.utils.data.Sampler):
                 n_change += min(len(change_twins) - n_change, spare)
             batch.extend(stable_twins[:n_stable])
             batch.extend(change_twins[:n_change])
+
+            if self.batch_dumper is not None and not self.batch_dumper.finished:
+                self.batch_dumper.dump_batch(
+                    self.dataset, batch, cs_size=cs_size,
+                    anchor_year=year, anchor_cbsa=_cbsa,
+                )
 
             yield batch
 
@@ -1133,14 +1330,21 @@ class PhotometricAugmentation:
                 return torch.cat([rgb, img[3:]], dim=c_dim)
         return img
 
-def _subsample_val_buildings(df_val, n_buildings_per_tract=2, seed=825):
+def _subsample_val_buildings(df_val, n_buildings_per_tract=1, seed=825):
     """Subsample a validation dataframe by BUILDING, keeping all years.
 
     Picks up to ``n_buildings_per_tract`` building_ids per GEOID and keeps every
     year-row of the chosen buildings (deterministic). Sampling whole buildings —
-    instead of 2 rows per (tract, year) as before — guarantees multi-year
+    instead of rows per (tract, year) as before — guarantees multi-year
     buildings survive, so stable/changed MASD and directional accuracy are
     computable on every val set (replaces the old val_spatial_temporal set).
+    Default is 1 building/tract: labels are tract-level, so extra buildings in
+    a tract add near-zero metric information — tract coverage is what matters.
+
+    The result is shuffled at BUILDING level (rows of each building stay
+    contiguous, year-sorted) so the MAX_VAL_SHARDS truncation downstream keeps
+    a random cross-city sample of buildings instead of the head of the input
+    order (which could concentrate on a few cities).
     """
     picks = (
         df_val[["GEOID", "building_id"]]
@@ -1148,10 +1352,20 @@ def _subsample_val_buildings(df_val, n_buildings_per_tract=2, seed=825):
         .groupby("GEOID", group_keys=False)[["GEOID", "building_id"]]
         .apply(lambda g: g.sample(n=min(len(g), n_buildings_per_tract), random_state=seed))
     )
-    return df_val[df_val["building_id"].isin(set(picks["building_id"]))].copy()
+    out = df_val[df_val["building_id"].isin(set(picks["building_id"]))].copy()
+    # Building-level shuffle: random building order, all years of a building
+    # kept adjacent so no building straddles the shard-cap cutoff.
+    shuffled_bids = (
+        out["building_id"].drop_duplicates().sample(frac=1, random_state=seed)
+    )
+    codes = pd.Categorical(
+        out["building_id"], categories=shuffled_bids, ordered=True
+    ).codes
+    order = np.lexsort((out["year"].to_numpy(), codes)) if "year" in out.columns else np.argsort(codes, kind="stable")
+    return out.iloc[order].reset_index(drop=True)
 
 
-def setup_dataloaders(df_train, dfs_val_dict, df_test, all_years_datasets, params, train_cache_manager=None, val_cache_manager=None):
+def setup_dataloaders(df_train, dfs_val_dict, df_test, all_years_datasets, params, train_cache_manager=None, val_cache_manager=None, batch_dumper=None):
     print("--- Initializing PyTorch Datasets ---")
     string_val_lengths = "| ".join([f"{name}: {len(df)}" for name, df in dfs_val_dict.items()])
     print(f"Train: Cyclical Cache | {string_val_lengths} | Test: {len(df_test)}")
@@ -1193,6 +1407,7 @@ def setup_dataloaders(df_train, dfs_val_dict, df_test, all_years_datasets, param
         dataset=train_dataset,
         batch_size_cs=batch_size,
         max_temporal_per_batch=max(1, int(batch_size * params.get("temporal_fraction", 0.20))),
+        batch_dumper=batch_dumper,
     )
     train_loader = DataLoader(train_dataset, batch_sampler=hybrid_sampler, num_workers=0)
     train_loader.gpu_transform = train_transform_gpu
@@ -1286,6 +1501,7 @@ def fill_params_defaults(params):
         "naip_coverage_csv": None,  # naip_coverage_audit.py CSV for per-city holdout years (#28); None = auto-probe ~/outputs/naip_coverage.csv
         "extra": "",
         "run_id": None,       # short custom savename; default is run_{YYYYMMDD}
+        "resume_lr_override": None,  # force this lr after restoring optimizer state on resume (None = keep checkpoint lr)
         "indicator": indicators.DEFAULT_INDICATOR,  # training label (see src/data/indicators.py)
         "footprints_source": "ms_us",  # "ms_us" (national MS index) | "doitt_nyc" (legacy)
         "states": None,       # optional list of state stems to subset the MS index
@@ -1297,6 +1513,7 @@ def fill_params_defaults(params):
         "m_min": 0.1,         # Hard floor for pairwise margin (prevents collapse)
         "m_base": 1.0,        # Margin scale factor: m_kl = max(m_min, m_base * |Z_l - Z_k|)
         "lambda_s": 1.0,      # Weight for temporal stability L1 penalty
+        "lambda_var": 1.0,    # Weight for cross-sectional variance regularizer (prevents collapse)      
         "temporal_fraction": 0.20,  # Fraction of batch reserved for temporal auxiliary (split 50/50 stable/change)
     }
     validate_parameters(params, default_params)
@@ -1332,11 +1549,12 @@ class InBatchPairwiseRankingLoss(nn.Module):
 
     Returns (loss, diagnostics_dict) so the training loop can log internals to W&B.
     """
-    def __init__(self, m_base=1.0, m_min=0.1, lambda_s=1.0):
+    def __init__(self, m_base=1.0, m_min=0.1, lambda_s=1.0, lambda_var=1.0):
         super().__init__()
         self.m_base = m_base
         self.m_min = m_min
         self.lambda_s = lambda_s
+        self.lambda_var = lambda_var  # CS-only variance regularizer weight
 
     def forward(self, scores, labels, geoids, years, building_ids, structural_change, score_bins=None, current_epoch=None, current_step=None):
         scores = scores.squeeze(-1)
@@ -1444,7 +1662,7 @@ class InBatchPairwiseRankingLoss(nn.Module):
         if B_cs > 1:
             variance_penalty = (cs_scores.std() - 1.0).pow(2)
             
-        loss = L_cross + self.lambda_s * L_stable + 1.0 * variance_penalty
+        loss = L_cross + self.lambda_s * L_stable + self.lambda_var * variance_penalty
 
         # --- Compute gradient norms of each loss component w.r.t predictions ---
         # Only compute every 10 steps to avoid 3x extra backward traversals per step
@@ -1491,7 +1709,7 @@ class InBatchPairwiseRankingLoss(nn.Module):
 
 def set_model_and_loss_function(
     model_name: str, kind: str, image_size: int, bands: int = 4, weights: str = None, meta_dim: int = 0,
-    m_base: float = 1.0, m_min: float = 0.1, lambda_s: float = 1.0
+    m_base: float = 1.0, m_min: float = 0.1, lambda_s: float = 1.0, lambda_var: float = 1.0
 ):
     """
     Initializes the PyTorch model and appropriate loss function.
@@ -1520,7 +1738,7 @@ def set_model_and_loss_function(
     if kind == "reg":
         # In-Batch Pairwise Ranking Loss with economic-distance-proportional margins.
         loss_fn = InBatchPairwiseRankingLoss(
-            m_base=m_base, m_min=m_min, lambda_s=lambda_s
+            m_base=m_base, m_min=m_min, lambda_s=lambda_s, lambda_var=lambda_var
         )
         
     elif kind == "cla":
@@ -1792,6 +2010,14 @@ def train_model(
             
             # Only step the optimizer every `accumulation_steps`
             if (batch_idx + 1) % accumulation_steps == 0 or (batch_idx + 1) == len(train_loader):
+                # Unscale first so the clip threshold applies to TRUE grads,
+                # then cap them: the variance penalty's std() gradient blows
+                # up as scores collapse to a constant (std -> 0), which NaN'd
+                # the weights within a few epochs on run_20260710.
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(
+                    (p for g in optimizer.param_groups for p in g["params"]), max_norm=1.0
+                )
                 scaler.step(optimizer)
                 scaler.update()
                 optimizer.zero_grad(set_to_none=True)
@@ -2033,12 +2259,13 @@ def train_model(
             progress = epoch / max(1, epochs)
             cache_updated = cache_manager.step(k=k, progress=progress)
             if cache_updated:
-                if cache_manager._pending_k != k:
-                    tqdm.write(f"⚠️ The cache is falling behind the GPU! {cache_manager._pending_k} new train background shard(s) ready, but {cache_manager._pending_k / k * 100}% of the cache is stale. Consider increasing k.")
+                swapped = cache_manager.last_swap_count
+                if swapped < k:
+                    tqdm.write(f"⚠️ Cache rotation degraded: only {swapped}/{k} new train shard(s) swapped in this epoch (generation error or slow fetches — see ❌/[NAIP] lines above).")
                 else:
-                    tqdm.write(f"🔄 {cache_manager._pending_k} new train background shard(s) ready! Reloading pre-packaged pairs from disk...")
-                    # InBatchRankingDataset.refresh() reloads flat images + metadata tensors from disk
-                    train_loader.dataset.refresh()
+                    tqdm.write(f"🔄 {swapped} new train background shard(s) ready! Reloading pre-packaged pairs from disk...")
+                # InBatchRankingDataset.refresh() reloads flat images + metadata tensors from disk
+                train_loader.dataset.refresh()
 
         if val_cache_managers:
             for val_name, v_manager in val_cache_managers.items():
@@ -2582,6 +2809,18 @@ def run(
         else:
             print(f"{checkpoint_dir} does not exist. Starting fresh training run.")
 
+        # Cache-only resume: a previous run with the SAME savename may have crashed
+        # while still building the NAIP shard caches, i.e. before any model
+        # checkpoint existed. The marker records which run owns the shards on disk;
+        # if it matches, keep them and let build_initial_cache() top up the missing
+        # ones instead of refetching everything. retrain=True still forces a full
+        # rebuild, and a different savename (new run_id / split) clears as before.
+        if not retrain and not resume_cache and read_cache_marker() == savename:
+            resume_cache = True
+            print(f"🟡 No model checkpoint, but cache marker matches '{savename}': "
+                  f"resuming partial shard cache instead of rebuilding.")
+        write_cache_marker(savename)
+
         print("Building Initial Cache...")
         if small_sample:
             num_shards = 1
@@ -2614,8 +2853,18 @@ def run(
                 # Subsample buildings (not rows) so every kept building retains ALL
                 # its years: multi-year buildings are what make the stable/changed
                 # MASD and directional-accuracy metrics computable inside val_cities.
+                # (Lazy ms_us vals arrive pre-sampled at 1/tract, so the per-tract
+                # pick is a no-op there; the building-level shuffle still applies.)
                 df_val = _subsample_val_buildings(df_val)
+                # Cap the static val cache at MAX_VAL_SHARDS shards: full coverage
+                # would need ceil(len/shard_size) shards — far more val imagery than
+                # the metrics need. df_val arrives building-shuffled, so truncation
+                # to MAX_VAL_SHARDS * shard_size rows is a random building sample.
+                # 3 shards ≈ 60k rows ≈ 3.8k tracts → per-year Spearman CI ≈ ±0.03,
+                # tighter on the multi-year composite — enough for epoch tracking.
+                MAX_VAL_SHARDS = 3
                 val_num_shards = max(1, (len(df_val) + current_shard_size - 1) // current_shard_size)
+                val_num_shards = min(val_num_shards, MAX_VAL_SHARDS)
                 val_cache_manager = CyclicCacheManager(
                     df=df_val, # Or full df_val
                     all_years_datasets=all_years_datasets,
@@ -2636,10 +2885,24 @@ def run(
 
         #### 2. PyTorch Data Pipeline Setup
         print("Setting up data generators...")
+
+        # Fresh runs only: dump the first 30 training batches (raw shard images +
+        # metadata) for visual QA of the ingested data. Inspect the dump with
+        # src/notebooks/visualize_debug_batches.ipynb.
+        batch_dumper = None
+        if resume_model_checkpoint is None:
+            batch_dumper = BatchImageDumper(RESULTS_DIR / savename / "debug_batches")
+            batch_dumper.write_run_info(params, savename)
+            ref_source = (df_train.building_reference()
+                          if isinstance(df_train, LazyPairTable) else df_train)
+            batch_dumper.write_building_reference(ref_source, cbsa_meta=cbsa_meta)
+            print(f"📸 Fresh run: dumping first {batch_dumper.max_batches} training batches to {batch_dumper.out_dir}")
+
         train_loader, val_loaders, test_loader = setup_dataloaders(
             df_train=df_train, dfs_val_dict=df_vals_dict, df_test=df_test,
             all_years_datasets=all_years_datasets, params=params,
-            train_cache_manager=train_cache_manager, val_cache_manager=vals_cache_manager_dict
+            train_cache_manager=train_cache_manager, val_cache_manager=vals_cache_manager_dict,
+            batch_dumper=batch_dumper,
         )
 
         del df_train, df_test, all_years_extents
@@ -2650,25 +2913,29 @@ def run(
         print("Data Pipeline Ready!")
 
         #### 3. Model Initialization
-        # meta_dim=1 for the 'dist_to_center' covariate
+        # meta_dim=0: dist_to_center disabled. With meta_dim=1 the ordinal loss +
+        # variance regularizer were minimizable through the time-invariant scalar
+        # covariate alone, and weight decay ground the image pathway to zero
+        # (frozen val spearman, stable MASD == 0). Force the model to rank from pixels.
         model, loss_fn = set_model_and_loss_function(
-            model_name=model_name, 
+            model_name=model_name,
             kind=kind,
-            bands=nbands, 
-            image_size=image_size, 
+            bands=nbands,
+            image_size=image_size,
             weights=weights,
-            meta_dim=1,
+            meta_dim=0,
             m_base=params.get("m_base", 1.0),
             m_min=params.get("m_min", 0.1),
             lambda_s=params.get("lambda_s", 1.0),
+            lambda_var=params.get("lambda_var", 1.0)
         )
 
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=0.05)
-        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer, mode='max', factor=0.5, patience=30, min_lr=learning_rate/20
-        )
-
+        # scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        #     optimizer, mode='max', factor=0.5, patience=30, min_lr=learning_rate/20
+        # )
+        scheduler = None
         # If we found a saved checkpoint from a previous run, resume from it
         start_epoch = 0
         initial_best_val_loss = None
@@ -2682,19 +2949,16 @@ def run(
                 model.load_state_dict(checkpoint["model_state_dict"])
                 if "optimizer_state_dict" in checkpoint:
                     optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+                    # The checkpoint restores the old lr; apply the explicit decay
+                    # (params["resume_lr_override"]) without touching moments/epoch.
+                    override_optimizer_lr(optimizer, params.get("resume_lr_override"))
                 if scheduler and checkpoint.get("scheduler_state_dict"):
                     scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
-                    
+
                     # Reset patience counter to wait a full 20 epochs in the new run before reducing LR
                     if isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
                         scheduler.num_bad_epochs = 0
                         print("Reset ReduceLROnPlateau num_bad_epochs to 0 for the new run.")
-
-                    # Force learning rate override to 0.000064 on resume
-                    override_lr = 0.000025
-                    print(f"Forcing learning rate override to {override_lr}...")
-                    for param_group in optimizer.param_groups:
-                        param_group['lr'] = override_lr
 
                 start_epoch = checkpoint.get("epoch", 0)
                 initial_best_val_loss = checkpoint.get("best_val_spearman")
@@ -2711,11 +2975,13 @@ def run(
                 initial_best_val_loss = None
             print(f"✅ Resumed at epoch {start_epoch+1} with best_val_loss={initial_best_val_loss}...")
 
-        wandb.init(
-            project="urban-income-prediction", 
-            name=savename, config=params,
-            id=savename, resume="allow"
-        )
+        # Only ask wandb to resume a specific run id when we're actually resuming a
+        # model checkpoint. Otherwise there's nothing to resume on the wandb side,
+        # and passing id=savename risks colliding with a run id that was deleted on
+        # the web UI — wandb then retries the resulting HTTP 409 internally with
+        # backoff for minutes before giving up, which just hangs a fresh run.
+        wandb_resuming = not retrain and resume_model_checkpoint is not None and resume_model_checkpoint.exists()
+        init_wandb_run(savename, params, wandb_resuming)
 
         #### 4. Run PyTorch Model
         model = train_model(
@@ -2735,18 +3001,37 @@ def run(
     if generate_predictions:
         print("Generando predicciones...")
 
-        all_years_datasets, all_years_extents, df_train, df_vals_dict, df_test, df_dead_zone = build_dataset.generate_datasets(
-            savename, sat_data, years, small_sample=small_sample, tau_meters=tau_meters,
-            indicator=params["indicator"], footprints_source=params["footprints_source"], states=params["states"],
-            naip_coverage_csv=params.get("naip_coverage_csv"),
-        )
+        pred_pair_table = None
+        pred_split_map = None
+        if params["footprints_source"] == "ms_us" and not small_sample:
+            # Normalized path: ONE lazy table over the full universe; per-year
+            # frames are materialized inside the year loop below (the legacy
+            # all-splits concat is ~575M rows at US scale and OOMs).
+            pred_pair_table = build_dataset.load_income_dataset(
+                years, tau_meters=tau_meters, indicator=params["indicator"],
+                footprints_source="ms_us", states=params["states"],
+            )
+            all_years_datasets = None  # NAIP-only path
+            try:
+                city_split = cbsa_brackets.load_city_split()
+                pred_split_map = dict(zip(
+                    city_split["cbsa_code"].astype(str), city_split["split"]
+                ))
+            except FileNotFoundError:
+                print("⚠️ cbsa_splits.feather not found — prediction 'type' column will be 'all'.")
+        else:
+            all_years_datasets, all_years_extents, df_train, df_vals_dict, df_test, df_dead_zone = build_dataset.generate_datasets(
+                savename, sat_data, years, small_sample=small_sample, tau_meters=tau_meters,
+                indicator=params["indicator"], footprints_source=params["footprints_source"], states=params["states"],
+                naip_coverage_csv=params.get("naip_coverage_csv"),
+            )
 
-        # Combine all dataframes
-        val_dfs = list(df_vals_dict.values())
-        df_all = pd.concat([df_train, df_test, df_dead_zone] + val_dfs, ignore_index=True)
-        # df_all = pd.concat(val_dfs, ignore_index=True)
-        del df_train, df_test, df_dead_zone, val_dfs, df_vals_dict
-        gc.collect()
+            # Combine all dataframes
+            val_dfs = list(df_vals_dict.values())
+            df_all = pd.concat([df_train, df_test, df_dead_zone] + val_dfs, ignore_index=True)
+            # df_all = pd.concat(val_dfs, ignore_index=True)
+            del df_train, df_test, df_dead_zone, val_dfs, df_vals_dict
+            gc.collect()
 
         # 1. Load the Best PyTorch Model
         model, _ = set_model_and_loss_function(
@@ -2754,7 +3039,7 @@ def run(
             kind=kind,
             bands=nbands, 
             image_size=image_size,
-            meta_dim=1,  # Set back to 1 for dist_to_center
+            meta_dim=0,  # Must match training (dist_to_center covariate disabled)
         )
         
         best_model_path = MODELS_DIR / "models_by_epoch" / savename / f"{savename}_best.pth"
@@ -2792,7 +3077,14 @@ def run(
             print(f"🚀 Processing Predictions for Year: {year}")
             print(f"{'='*80}")
             
-            df_year = df_all[(df_all["year"] == year)].copy()
+            if pred_pair_table is not None:
+                df_year = pred_pair_table.materialize_year(year)
+                if len(df_year) and pred_split_map is not None:
+                    df_year["type"] = (
+                        df_year["cbsa_code"].map(pred_split_map).fillna("unassigned")
+                    )
+            else:
+                df_year = df_all[(df_all["year"] == year)].copy()
             if df_year.empty:
                 print(f"No data for year {year}, skipping.")
                 continue
@@ -2857,7 +3149,7 @@ if __name__ == "__main__":
         "batch_size": 8,
         "small_sample": False,
         "n_epochs": 700,
-        "learning_rate": 0.001,
+        "learning_rate": 0.0001,
         "sat_data": "NAIP",
         "years": list(range(2010, 2025, 2)),
         # US-scale data selection
@@ -2868,8 +3160,11 @@ if __name__ == "__main__":
         "m_base": 1.0,
         "m_min": 0.05,
         "lambda_s": 0.3,
+        "lambda_var": 1.5,
         "temporal_fraction": 0.4,
-    } 
+        "run_id": "run_20260710",  # default run_{YYYYMMDD}: same-day restarts share a savename and resume the shard cache
+        "resume_lr_override": 3e-5,  # lr decay on resume (plateau since ~ep 175 at 1e-4); optimizer state otherwise untouched
+    }
 
     # Run full pipeline
     run(params, train=True, retrain=False, compute_loss=False, generate_predictions=True)

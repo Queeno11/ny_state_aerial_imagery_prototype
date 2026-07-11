@@ -120,7 +120,7 @@ class LateFusionHead(nn.Module):
             nn.Linear(embed_dim, 64),
             nn.GELU(),
             nn.LayerNorm(64),
-            nn.Dropout(0.4)
+            nn.Dropout(0.1)
         )
         # 2. Fuse with metadata, then map straight to output
         fuse_dim = 64 + meta_dim
