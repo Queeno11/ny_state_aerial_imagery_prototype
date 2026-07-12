@@ -299,3 +299,50 @@ def test_init_wandb_run_fresh_run_gets_suffixed_id(monkeypatch):
     main.init_wandb_run("run_x", {}, wandb_resuming=False)
     assert calls[0]["id"] != "run_x"
     assert calls[0]["id"].startswith("run_x_")
+
+
+# ── resume lr override (decay lr across a resume without resetting training) ─
+
+def _tiny_adamw():
+    import torch
+    model = torch.nn.Linear(4, 1)
+    opt = torch.optim.AdamW(model.parameters(), lr=1e-4)
+    # one real step so exp_avg/exp_avg_sq/step exist in the state
+    model(torch.randn(2, 4)).sum().backward()
+    opt.step()
+    return model, opt
+
+
+def test_override_optimizer_lr_none_is_noop():
+    _, opt = _tiny_adamw()
+    main.override_optimizer_lr(opt, None)
+    assert all(pg["lr"] == 1e-4 for pg in opt.param_groups)
+
+
+def test_override_optimizer_lr_survives_state_dict_roundtrip():
+    import torch
+    model, opt = _tiny_adamw()
+    saved = opt.state_dict()
+
+    fresh = torch.optim.AdamW(model.parameters(), lr=999.0)  # params say one thing...
+    fresh.load_state_dict(saved)                             # ...checkpoint restores 1e-4
+    assert fresh.param_groups[0]["lr"] == 1e-4
+
+    main.override_optimizer_lr(fresh, 3e-5)
+    assert all(pg["lr"] == 3e-5 for pg in fresh.param_groups)
+    # only lr changed: moments and step counts from the checkpoint are intact
+    old_state = saved["state"][0]
+    new_state = fresh.state_dict()["state"][0]
+    assert torch.equal(old_state["exp_avg"], new_state["exp_avg"])
+    assert torch.equal(old_state["exp_avg_sq"], new_state["exp_avg_sq"])
+    assert old_state["step"] == new_state["step"]
+    assert fresh.param_groups[0]["weight_decay"] == saved["param_groups"][0]["weight_decay"]
+
+
+def test_resume_lr_override_is_a_known_param():
+    base = {"model_name": "scalemae", "kind": "reg", "sat_data": "NAIP",
+            "years": [2022], "nbands": 3, "image_size": 224, "weights": None}
+    merged = main.fill_params_defaults({**base, "resume_lr_override": 3e-5})
+    assert merged["resume_lr_override"] == 3e-5
+    # and defaults to None (no override) when not supplied
+    assert main.fill_params_defaults(dict(base))["resume_lr_override"] is None

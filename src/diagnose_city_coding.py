@@ -75,17 +75,31 @@ def per_city_stats(df: pd.DataFrame, min_n: int = 20) -> pd.DataFrame:
 
     Cities with fewer than ``min_n`` rows keep their moments but get rho = NaN
     (too few tracts for a stable rank correlation).
+
+    ``n`` counts ROWS (building x year images) — the same building appears once
+    per year, so rows are not independent. When a ``building_id`` column exists,
+    ``n_bld`` reports the unique buildings (~tracts, the effective cross-
+    sectional sample) and ``rho_bld`` the Spearman over per-building mean pred
+    vs mean label — one observation per building, the honest cross-sectional
+    statistic (NaN below 5 buildings).
     """
+    has_bld = "building_id" in df.columns
     rows = []
     for city, g in df.groupby(CITY_COL):
-        rows.append({
+        row = {
             CITY_COL: city,
             "n": len(g),
             "pred_mean": g[PRED_COL].mean(),
             "pred_std": g[PRED_COL].std(),
             "label_mean": g[LABEL_COL].mean(),
             "rho": _spearman(g[PRED_COL], g[LABEL_COL]) if len(g) >= min_n else float("nan"),
-        })
+        }
+        if has_bld:
+            by_bld = g.groupby("building_id")[[PRED_COL, LABEL_COL]].mean()
+            row["n_bld"] = len(by_bld)
+            row["rho_bld"] = (_spearman(by_bld[PRED_COL], by_bld[LABEL_COL])
+                              if len(by_bld) >= 5 else float("nan"))
+        rows.append(row)
     return pd.DataFrame(rows).sort_values("pred_mean").reset_index(drop=True)
 
 
