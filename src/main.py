@@ -1502,6 +1502,7 @@ def fill_params_defaults(params):
         "extra": "",
         "run_id": None,       # short custom savename; default is run_{YYYYMMDD}
         "resume_lr_override": None,  # force this lr after restoring optimizer state on resume (None = keep checkpoint lr)
+        "selection_metric": "within",  # "within" (mean per-city-year spearman, honest) | "pooled" (legacy set-level)
         "indicator": indicators.DEFAULT_INDICATOR,  # training label (see src/data/indicators.py)
         "footprints_source": "ms_us",  # "ms_us" (national MS index) | "doitt_nyc" (legacy)
         "states": None,       # optional list of state stems to subset the MS index
@@ -1801,6 +1802,77 @@ def check_feature_importance(model):
             "weights/commute_to_image_ratio": ratio
         }, commit=False) # commit=False ties it to the next step log
 
+def _within_city_cells(val_df, min_bld=5):
+    """Per-(cbsa, year) Spearman cells — the within-city cross-sectional metric.
+
+    Each cell holds one row per building (a building appears at most once per
+    year), so cell Spearmans are free of the repeated-building inflation that
+    affects the pooled set-level Spearman. Cells with fewer than ``min_bld``
+    buildings, or without label/pred variation, are dropped (they are noise).
+
+    Returns a DataFrame [cbsa, year, n, rho]; empty if no usable cell.
+    """
+    from scipy.stats import spearmanr
+
+    rows = []
+    for (cbsa, year), g in val_df.groupby(["cbsa", "year"]):
+        if len(g) < min_bld or g["pred"].nunique() < 2 or g["label"].nunique() < 2:
+            continue
+        rho, _ = spearmanr(g["pred"], g["label"])
+        if not np.isnan(rho):
+            rows.append({"cbsa": cbsa, "year": year, "n": len(g), "rho": float(rho)})
+    return pd.DataFrame(rows, columns=["cbsa", "year", "n", "rho"])
+
+
+def _rank_autocorrelation(val_df, min_common=5):
+    """Cross-year rank stability of STABLE buildings, per city, n-weighted.
+
+    For each city, picks the year pair with the most stable buildings observed
+    in both years (ties -> widest span, mirroring the paper's 2016<->2024 pair)
+    and computes Spearman(rank_t, rank_t') for predictions AND for labels over
+    those common buildings. Both are comparisons of two within-year rankings —
+    never of score levels across years — so per-year z-scoring of the labels
+    does not affect them. The label autocorrelation is the genuine-reshuffling
+    benchmark: the pred-minus-label gap is model-induced instability.
+
+    Returns {} when no city has >= min_common common stable buildings.
+    """
+    from scipy.stats import spearmanr
+
+    stable = val_df[val_df["change"] == 0]
+    per_city = []
+    for cbsa, g in stable.groupby("cbsa"):
+        piv_p = g.pivot_table(index="building_id", columns="year", values="pred")
+        piv_l = g.pivot_table(index="building_id", columns="year", values="label")
+        years = sorted(piv_p.columns)
+        best = None  # (n_common, span, t1, t2)
+        for i in range(len(years)):
+            for j in range(i + 1, len(years)):
+                t1, t2 = years[i], years[j]
+                n_common = int(piv_p[[t1, t2]].dropna().shape[0])
+                key = (n_common, t2 - t1)
+                if n_common >= min_common and (best is None or key > best[:2]):
+                    best = (n_common, t2 - t1, t1, t2)
+        if best is None:
+            continue
+        _, _, t1, t2 = best
+        pp = piv_p[[t1, t2]].dropna()
+        ll = piv_l.loc[pp.index, [t1, t2]]
+        rho_p, _ = spearmanr(pp[t1], pp[t2])
+        rho_l, _ = spearmanr(ll[t1], ll[t2])
+        if np.isnan(rho_p) or np.isnan(rho_l):
+            continue
+        per_city.append({"n": len(pp), "rho_p": float(rho_p), "rho_l": float(rho_l)})
+    if not per_city:
+        return {}
+    ns = np.array([c["n"] for c in per_city], dtype=float)
+    return {
+        "rank_autocorr_pred": float(np.average([c["rho_p"] for c in per_city], weights=ns)),
+        "rank_autocorr_label": float(np.average([c["rho_l"] for c in per_city], weights=ns)),
+        "rank_autocorr_n": int(ns.sum()),
+    }
+
+
 def compute_val_metrics(val_df, cbsa_meta=None, top_cities=None, min_city_n=50):
     """Validation metrics for one val set (pure pandas/numpy; unit-testable).
 
@@ -1814,10 +1886,25 @@ def compute_val_metrics(val_df, cbsa_meta=None, top_cities=None, min_city_n=50):
         min_city_n: noise guard for the per-city breakdown.
 
     Returns a flat dict: base keys (mse, spearman, stable_masd, changed_masd,
-    changed_da, pred_mean, pred_std), plus 'bracket/{name}/{metric}' and
-    'city/{cbsa}/{metric}' breakdowns. Keys with no data are omitted.
+    changed_da, pred_mean, pred_std), the goal-aligned metrics
+    (within_spearman/within_cells/within_n, rank_autocorr_pred/label/n,
+    masd_ratio, city_offset_sd — see _within_city_cells/_rank_autocorrelation),
+    plus 'bracket/{name}/{metric}' and 'city/{cbsa}/{metric}' breakdowns.
+    Keys with no data are omitted. NOTE: 'spearman' and 'n' pool building x year
+    image rows (repeated buildings inflate them); 'within_spearman' is the
+    honest per-cell quantity and drives checkpointing when
+    params["selection_metric"] == "within".
     """
     from scipy.stats import spearmanr
+
+    # Under autocast the val loop hands us float16 preds; pandas' unstack
+    # (pivot_table in _rank_autocorrelation) has no float16 kernel and raises
+    # "TypeError: No matching signature found". Normalize once, up front.
+    if not val_df.empty:
+        val_df = val_df.copy()
+        for _c in ("pred", "label"):
+            if _c in val_df.columns:
+                val_df[_c] = val_df[_c].astype(np.float64)
 
     def _temporal(df):
         # Stable/changed MASD + directional accuracy over all ordered year pairs
@@ -1872,6 +1959,28 @@ def compute_val_metrics(val_df, cbsa_meta=None, top_cities=None, min_city_n=50):
 
     metrics = _base(val_df)
 
+    # ── Headline within-city metrics + diagnostics (goal-aligned, additive) ──
+    # within_spearman: n-weighted mean of per-(city, year) cell Spearmans — one
+    #   observation per building per cell, so no repeated-building inflation.
+    # rank_autocorr_pred/label: cross-year rank stability of stable buildings
+    #   (label variant = genuine-reshuffling benchmark). Diagnostics only.
+    # masd_ratio: changed vs stable displacement (>1 = moves where reality moved).
+    # city_offset_sd: dispersion of per-city prediction means (~0 under the
+    #   per-CBSA z labels) — the cross-city latent-drift guardrail.
+    if {"cbsa", "year"}.issubset(val_df.columns) and not val_df.empty:
+        cells = _within_city_cells(val_df)
+        if len(cells):
+            metrics["within_spearman"] = float(np.average(cells["rho"], weights=cells["n"]))
+            metrics["within_cells"] = int(len(cells))
+            metrics["within_n"] = int(cells["n"].sum())
+        metrics.update(_rank_autocorrelation(val_df))
+        if metrics.get("stable_masd", 0) > 0 and "changed_masd" in metrics:
+            metrics["masd_ratio"] = metrics["changed_masd"] / metrics["stable_masd"]
+        offsets = val_df.groupby("cbsa")["pred"].agg(["mean", "size"])
+        offsets = offsets[offsets["size"] >= 5]
+        if len(offsets) >= 2:
+            metrics["city_offset_sd"] = float(offsets["mean"].std(ddof=0))
+
     if cbsa_meta is not None and "cbsa" in val_df.columns:
         bracket_of = {}
         for code, bracket in zip(cbsa_meta["cbsa_code"], cbsa_meta["bracket"]):
@@ -1885,6 +1994,9 @@ def compute_val_metrics(val_df, cbsa_meta=None, top_cities=None, min_city_n=50):
         for bracket, grp in df.groupby("bracket"):
             sub = _base(grp)
             sub["n"] = len(grp)
+            bcells = _within_city_cells(grp)
+            if len(bcells):
+                sub["within_spearman"] = float(np.average(bcells["rho"], weights=bcells["n"]))
             metrics.update({f"bracket/{bracket}/{k}": v for k, v in sub.items()})
         if top_cities:
             top_ints = set()
@@ -1898,6 +2010,9 @@ def compute_val_metrics(val_df, cbsa_meta=None, top_cities=None, min_city_n=50):
                     continue
                 sub = _base(grp)
                 sub["n"] = len(grp)
+                ccells = _within_city_cells(grp)
+                if len(ccells):
+                    sub["within_spearman"] = float(np.average(ccells["rho"], weights=ccells["n"]))
                 metrics.update({f"city/{cbsa}/{k}": v for k, v in sub.items()})
 
     return metrics
@@ -1918,8 +2033,13 @@ def train_model(
     initial_best_val_loss=None,
     val_cache_managers=None,
     cbsa_meta=None,
+    selection_metric="within",
 ):
     print("--- Starting PyTorch Training Loop ---")
+    # "within": checkpoint on the mean per-(city, year) within-city Spearman —
+    # the quantity the ordinal loss actually optimizes. "pooled": legacy
+    # set-level pooled Spearman (kept for continuity with pre-US runs).
+    sel_key = "within_spearman" if selection_metric == "within" else "spearman"
     best_val_spearman = (
         initial_best_val_loss if initial_best_val_loss is not None else float(-1)
     )
@@ -2167,13 +2287,21 @@ def train_model(
                 set_metrics = compute_val_metrics(val_df, cbsa_meta=cbsa_meta,
                                                   top_cities=top_cities)
                 val_set_metrics[val_name] = set_metrics
-                if "spearman" in set_metrics:
+                if sel_key in set_metrics:
+                    val_spearmans[val_name] = set_metrics[sel_key]
+                elif "spearman" in set_metrics:
+                    # selection metric unavailable (e.g. every within cell < 5
+                    # buildings) — fall back to pooled rather than skip the set
+                    tqdm.write(f"⚠️ {val_name}: '{sel_key}' unavailable, "
+                               f"using pooled spearman for selection this epoch.")
                     val_spearmans[val_name] = set_metrics["spearman"]
 
                 # Display: Spearman + whatever temporal metrics this set supports
                 parts = []
                 if "spearman" in set_metrics:
                     parts.append(f"Spearman: {set_metrics['spearman']:.4f}")
+                if "within_spearman" in set_metrics:
+                    parts.append(f"Within-ρ: {set_metrics['within_spearman']:.4f}")
                 if "stable_masd" in set_metrics:
                     parts.append(f"S-MASD: {set_metrics['stable_masd']:.4f}")
                 if "changed_masd" in set_metrics:
@@ -2281,6 +2409,9 @@ def train_model(
             "optimizer_state_dict": optimizer.state_dict(),
             "scheduler_state_dict": scheduler.state_dict() if scheduler is not None else None,
             "best_val_spearman": best_val_spearman,
+            # currency of best_val_spearman: a resume under a different
+            # selection metric must reset the tracker (values not comparable)
+            "selection_metric": selection_metric,
         }
         torch.save(checkpoint, save_dir / f"{savename}_last.pth")
 
@@ -2962,6 +3093,15 @@ def run(
 
                 start_epoch = checkpoint.get("epoch", 0)
                 initial_best_val_loss = checkpoint.get("best_val_spearman")
+                # best_val_spearman is denominated in the checkpoint's selection
+                # metric; if the metric changed (e.g. pooled -> within), the old
+                # best is not comparable — reset so _best.pth saving restarts.
+                ckpt_sel = checkpoint.get("selection_metric", "pooled")
+                if ckpt_sel != params["selection_metric"] and initial_best_val_loss is not None:
+                    print(f"🔁 Selection metric changed ('{ckpt_sel}' -> "
+                          f"'{params['selection_metric']}'): resetting best-Spearman tracker "
+                          f"(was {initial_best_val_loss:.4f}).")
+                    initial_best_val_loss = None
 
             else:
                 # Best-model checkpoint (_best.pth): head weights only; load LoRA adapter separately
@@ -2993,6 +3133,7 @@ def run(
             initial_best_val_loss=initial_best_val_loss,
             val_cache_managers=vals_cache_manager_dict,
             cbsa_meta=cbsa_meta,
+            selection_metric=params["selection_metric"],
         )
         
         wandb.finish()
@@ -3164,6 +3305,7 @@ if __name__ == "__main__":
         "temporal_fraction": 0.4,
         "run_id": "run_20260710",  # default run_{YYYYMMDD}: same-day restarts share a savename and resume the shard cache
         "resume_lr_override": 3e-5,  # lr decay on resume (plateau since ~ep 175 at 1e-4); optimizer state otherwise untouched
+        "selection_metric": "within",  # checkpoint on mean within-city (CBSA x year) spearman; resets best tracker on first resume
     }
 
     # Run full pipeline

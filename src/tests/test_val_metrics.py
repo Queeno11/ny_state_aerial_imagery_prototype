@@ -106,3 +106,131 @@ def test_old_shards_cbsa_zero_no_crash():
     # cbsa 0 maps to no bracket -> only base metrics, no breakdown keys
     assert "mse" in m
     assert not any(k.startswith(("bracket/", "city/")) for k in m)
+
+
+# ── goal-aligned metrics: within-city cells, rank autocorr, drift guardrails ─
+
+from src.main import _rank_autocorrelation, _within_city_cells
+
+
+def _cell_df(cbsa, year, n, offset=0.0, seed=3, change=0, bid_base=0):
+    """One (city, year) cell: pred = label + offset (perfect within-cell rank)."""
+    rng = np.random.default_rng(seed + cbsa + year)
+    lbl = rng.standard_normal(n)
+    return pd.DataFrame({
+        "building_id": bid_base + np.arange(n), "year": year,
+        "pred": lbl + offset, "label": lbl, "change": change, "cbsa": cbsa,
+    })
+
+
+def test_within_spearman_immune_to_city_offsets():
+    # perfect rank within each city, but offsets scramble the pooled ranking
+    df = pd.concat([_cell_df(101, 2016, 8, offset=+2.0, bid_base=0),
+                    _cell_df(102, 2016, 8, offset=-2.0, bid_base=100)])
+    m = compute_val_metrics(df)
+    assert m["within_spearman"] == pytest.approx(1.0)
+    assert m["within_cells"] == 2 and m["within_n"] == 16
+    assert m["spearman"] < 0.6  # the pooled metric is fooled by the offsets
+
+
+def test_within_cells_drop_small_and_degenerate_cells():
+    ok = _cell_df(101, 2016, 6)
+    small = _cell_df(102, 2016, 4, bid_base=100)              # < 5 buildings
+    flat = _cell_df(103, 2016, 6, bid_base=200).assign(pred=1.0)  # no pred variation
+    cells = _within_city_cells(pd.concat([ok, small, flat]))
+    assert len(cells) == 1
+    assert cells.iloc[0]["cbsa"] == 101 and cells.iloc[0]["n"] == 6
+
+
+def _autocorr_df(n=6, years=(2014, 2020), reversed_years=(), change=0, cbsa=101):
+    rows = []
+    for y in years:
+        for i in range(n):
+            pred = float(n - 1 - i) if y in reversed_years else float(i)
+            rows.append({"building_id": i, "year": y, "pred": pred,
+                         "label": float(i), "change": change, "cbsa": cbsa})
+    return pd.DataFrame(rows)
+
+
+def test_rank_autocorr_consistent_ranks_and_change_exclusion():
+    stable = _autocorr_df(n=6)
+    # changed buildings with reversed ranks must NOT contaminate the metric
+    changed = _autocorr_df(n=6, reversed_years=(2020,), change=1)
+    changed["building_id"] += 100
+    out = _rank_autocorrelation(pd.concat([stable, changed]))
+    assert out["rank_autocorr_pred"] == pytest.approx(1.0)
+    assert out["rank_autocorr_label"] == pytest.approx(1.0)
+    assert out["rank_autocorr_n"] == 6
+
+
+def test_rank_autocorr_prefers_widest_span_on_ties():
+    # all three years share the same 6 buildings (tie on n): the (2014, 2020)
+    # pair must win, where predictions are rank-REVERSED
+    df = _autocorr_df(n=6, years=(2014, 2016, 2020), reversed_years=(2020,))
+    out = _rank_autocorrelation(df)
+    assert out["rank_autocorr_pred"] == pytest.approx(-1.0)
+    assert out["rank_autocorr_label"] == pytest.approx(1.0)  # labels never reversed
+
+
+def test_rank_autocorr_requires_min_common_buildings():
+    assert _rank_autocorrelation(_autocorr_df(n=4)) == {}
+    # single-year set (val_temporal): no year pair at all
+    assert _rank_autocorrelation(_autocorr_df(n=8, years=(2016,))) == {}
+
+
+def test_masd_ratio_and_city_offset_sd():
+    # city 101: 5 stable buildings over two years (disp 0.2) + 1 changed (disp 1.0)
+    a = pd.concat([
+        pd.DataFrame({"building_id": np.arange(5), "year": 2014,
+                      "pred": np.linspace(0, 1, 5) + 0.4, "label": np.linspace(0, 1, 5),
+                      "change": 0, "cbsa": 101}),
+        pd.DataFrame({"building_id": np.arange(5), "year": 2018,
+                      "pred": np.linspace(0, 1, 5) + 0.6, "label": np.linspace(0, 1, 5),
+                      "change": 0, "cbsa": 101}),
+        pd.DataFrame({"building_id": [50, 50], "year": [2014, 2018],
+                      "pred": [0.0, 1.0], "label": [-1.0, 1.0],
+                      "change": 1, "cbsa": 101}),
+    ])
+    # city 102: 6 single-year rows whose pred mean sits exactly 1.0 below 101's
+    b = _cell_df(102, 2016, 6, bid_base=100)
+    b["pred"] = b["label"] + (a[a["cbsa"] == 101]["pred"].mean() - 1.0 - b["label"].mean())
+    m = compute_val_metrics(pd.concat([a, b]))
+    assert m["masd_ratio"] == pytest.approx(1.0 / 0.2)
+    assert m["city_offset_sd"] == pytest.approx(0.5)
+
+
+def test_bracket_and_city_within_spearman_keys():
+    df = pd.concat([_cell_df(101, 2016, 8, offset=+2.0),
+                    _cell_df(102, 2016, 8, offset=-2.0, bid_base=100),
+                    _cell_df(201, 2016, 8, offset=0.0, bid_base=200)])
+    m = compute_val_metrics(df, cbsa_meta=_meta(), top_cities=["101"], min_city_n=5)
+    assert m["bracket/mega/within_spearman"] == pytest.approx(1.0)
+    assert m["bracket/small/within_spearman"] == pytest.approx(1.0)
+    assert m["city/101/within_spearman"] == pytest.approx(1.0)
+    # pooled bracket spearman for mega is still the offset-contaminated one
+    assert m["bracket/mega/spearman"] < 0.6
+
+
+def test_within_metrics_survive_nyc_legacy_cbsa_zero():
+    # legacy zarr shards: cbsa == 0 everywhere -> one "city", cells = years,
+    # so the within metric degrades gracefully to NYC per-year spearman
+    df = pd.concat([_cell_df(0, 2016, 8), _cell_df(0, 2018, 8, bid_base=0)])
+    m = compute_val_metrics(df)
+    assert m["within_spearman"] == pytest.approx(1.0)
+    assert m["within_cells"] == 2
+
+
+def test_float16_preds_from_autocast_do_not_crash():
+    """Regression: the val loop yields float16 preds under autocast; pandas'
+    MASKED unstack (pivot_table with a missing building x year cell) has no
+    float16 kernel and raises 'No matching signature found' — crashed
+    _rank_autocorrelation at epoch 493 of run_20260710. A complete grid does
+    NOT trigger it, so the missing cell below is load-bearing."""
+    df = _autocorr_df(n=7)
+    df = df.drop(df[(df["building_id"] == 6) & (df["year"] == 2020)].index)
+    df["pred"] = df["pred"].astype(np.float16)
+    df["label"] = df["label"].astype(np.float16)
+    m = compute_val_metrics(df)
+    assert m["rank_autocorr_pred"] == pytest.approx(1.0)
+    assert m["rank_autocorr_n"] == 6      # the dropped building cannot pair
+    assert m["within_spearman"] == pytest.approx(1.0)
