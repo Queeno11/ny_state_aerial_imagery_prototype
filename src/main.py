@@ -32,6 +32,7 @@ import src.geo_utils as geo_utils
 from src.data import indicators
 from src.data import cbsa_brackets
 from src.data.pair_table import LazyPairTable
+from src.data.tract_sampling import GradientHardnessRegistry, stable_geoid_hash
 from src.debug_batch_dump import BatchImageDumper
 from src.data.process_acs import PANEL_YEARS as ACS_PANEL_YEARS
 from src.utils.paths import PROJECT_ROOT, DATA_DIR, EXTERNAL_DATA_DIR, RAW_DATA_DIR, INTERIM_DATA_DIR, PROCESSED_DATA_DIR, CACHE_DIR, RESULTS_DIR, LOGS_DIR, MODELS_DIR, IMAGERY_ROOT
@@ -491,10 +492,15 @@ class CyclicCacheManager:
         max_jitter=10,
         sat_data="aerial",
         holdout_years=None,
+        hardness_registry=None,
     ):
         import pandas as pd
         self.df = df
         self.sat_data = sat_data
+        # Gradient hard-tract mining (train + lazy path only): supplies the
+        # per-tract sampling weights for materialize_tract_sample. None or
+        # tract_sampling=False keeps the legacy cyclic building traversal.
+        self.hardness_registry = hardness_registry
         # {cbsa_code (int) -> temporal-holdout year} for TRAIN cities (#28).
         # NAIP's actual-year substitution must not erode the per-city holdout:
         # train shards reject crops landing ON the holdout year; val_temporal
@@ -690,6 +696,35 @@ class CyclicCacheManager:
 
         return list(subsampled)  # list of (C, H//step, W//step) uint8 tensors
 
+    def _shard_source_df(self, shard_id):
+        """Rows feeding one shard.
+
+        Train + lazy ms_us path with ``tract_sampling`` on: a fresh tract-first
+        draw per shard (uniform over tracts ~ population-weighted), optionally
+        importance-weighted by the gradient-hardness registry — sampling by
+        per-example gradient norm (Katharopoulos & Fleuret 2018), lambdas per
+        Burges (2010); see src/data/tract_sampling.py. Otherwise: the legacy
+        cyclic building-major slice (building-count-weighted by construction).
+        """
+        start_idx = (shard_id * self.shard_size) % len(self.df)
+        end_idx = start_idx + self.shard_size
+        if self._is_lazy and self.type == "train" and self.params.get("tract_sampling", False):
+            weight_lookup = (
+                self.hardness_registry.weights_for
+                if self.hardness_registry is not None else None
+            )
+            return self.df.materialize_tract_sample(
+                self.shard_size,
+                seed=(int(self.params.get("sampling_seed", 825)), int(shard_id)),
+                weight_lookup=weight_lookup,
+            )
+        if self._is_lazy:
+            # LazyPairTable synthesizes the flat slice on demand (cyclic).
+            return self.df.materialize(start_idx, end_idx)
+        if end_idx > len(self.df):
+            return pd.concat([self.df.iloc[start_idx:], self.df.iloc[:end_idx % len(self.df)]])
+        return self.df.iloc[start_idx:end_idx]
+
     def _worker_generate(self, shard_id, show_progress=False):
         step = self.params["subsample_step"]
         # Snapshot the (cumulative) holdout-reject counter so this shard's rejects
@@ -699,16 +734,7 @@ class CyclicCacheManager:
         )
         jitter_pad = math.ceil(self.max_jitter_pixels / step) * step if self.type == "train" else 0
 
-        # Grab sequential chunk (twins are naturally adjacent now)
-        start_idx = (shard_id * self.shard_size) % len(self.df)
-        end_idx = start_idx + self.shard_size
-        if self._is_lazy:
-            # LazyPairTable synthesizes the flat slice on demand (cyclic).
-            sampled_df = self.df.materialize(start_idx, end_idx)
-        elif end_idx > len(self.df):
-            sampled_df = pd.concat([self.df.iloc[start_idx:], self.df.iloc[:end_idx % len(self.df)]])
-        else:
-            sampled_df = self.df.iloc[start_idx:end_idx]
+        sampled_df = self._shard_source_df(shard_id)
 
         if sampled_df.empty: return
 
@@ -798,7 +824,10 @@ class CyclicCacheManager:
                         if img_tensor.max() > 0:
                             valid_images.append(img_tensor)
                             valid_scores.append(r['Rel_Score'])
-                            valid_geoids.append(hash(str(r.get('GEOID', ''))) % (2**31))
+                            # stable_geoid_hash (not builtin hash): process-salt-
+                            # free, so the loss's per-tract lambdas key back to
+                            # the same tract at shard generation and on resume.
+                            valid_geoids.append(stable_geoid_hash(r.get('GEOID', '')))
                             valid_years.append(r['year'])
                             valid_building_ids.append(r['building_id'])
                             valid_change.append(r.get('Valid_Structural_Change', 0)) # Save change flag!
@@ -814,7 +843,7 @@ class CyclicCacheManager:
                     if img_tensor.max() > 0:
                         valid_images.append(img_tensor)
                         valid_scores.append(r['Rel_Score'])
-                        valid_geoids.append(hash(str(r.get('GEOID', ''))) % (2**31))
+                        valid_geoids.append(stable_geoid_hash(r.get('GEOID', '')))
                         valid_years.append(r['year'])
                         valid_building_ids.append(r['building_id'])
                         valid_change.append(r.get('Valid_Structural_Change', 0))
@@ -1580,8 +1609,15 @@ def fill_params_defaults(params):
         "m_min": 0.1,         # Hard floor for pairwise margin (prevents collapse)
         "m_base": 1.0,        # Margin scale factor: m_kl = max(m_min, m_base * |Z_l - Z_k|)
         "lambda_s": 1.0,      # Weight for temporal stability L1 penalty
-        "lambda_var": 1.0,    # Weight for cross-sectional variance regularizer (prevents collapse)      
+        "lambda_var": 1.0,    # Weight for cross-sectional variance regularizer (prevents collapse)
         "temporal_fraction": 0.20,  # Fraction of batch reserved for temporal auxiliary (split 50/50 stable/change)
+        # Tract-first shard sampling + gradient hard-tract mining (train, lazy
+        # ms_us path only; see src/data/tract_sampling.py for rationale + refs)
+        "tract_sampling": False,     # sample tracts (~population-weighted), not buildings; False = legacy cyclic building traversal
+        "grad_mining_alpha": 0.0,    # hardness mixture weight in tract weights: (1-a) + a*min(ema/mean, cap); 0 = uniform tract sampling
+        "grad_mining_beta": 0.9,     # per-tract |lambda| EMA decay (stale hardness fades as the model improves)
+        "grad_mining_cap": 10.0,     # hardness ratio cap: irreducibly-hard tracts can't monopolize shards
+        "sampling_seed": 825,        # base seed for per-shard tract draws (combined with shard_id)
     }
     validate_parameters(params, default_params)
 
@@ -1616,12 +1652,21 @@ class InBatchPairwiseRankingLoss(nn.Module):
 
     Returns (loss, diagnostics_dict) so the training loop can log internals to W&B.
     """
-    def __init__(self, m_base=1.0, m_min=0.1, lambda_s=1.0, lambda_var=1.0):
+    def __init__(self, m_base=1.0, m_min=0.1, lambda_s=1.0, lambda_var=1.0,
+                 hardness_registry=None):
         super().__init__()
         self.m_base = m_base
         self.m_min = m_min
         self.lambda_s = lambda_s
         self.lambda_var = lambda_var  # CS-only variance regularizer weight
+        # Optional GradientHardnessRegistry: forward() harvests the per-sample
+        # ranking gradients lambda_i = m * dL_cross/ds_i (LambdaRank's lambdas,
+        # Burges 2010) and folds tract-level |lambda| EMAs into it, driving
+        # hard-tract importance sampling at shard generation (Katharopoulos &
+        # Fleuret 2018). Harvested AFTER the MOE pair filter, so hardness only
+        # accumulates where the label sign is statistically reliable (noise
+        # guard in the spirit of RHO-loss, Mindermann et al. 2022).
+        self.hardness_registry = hardness_registry
 
     def forward(self, scores, labels, geoids, years, building_ids, structural_change, score_bins=None, current_epoch=None, current_step=None, se_values=None):
         scores = scores.squeeze(-1)
@@ -1693,6 +1738,28 @@ class InBatchPairwiseRankingLoss(nn.Module):
                 with torch.no_grad():
                     # Diagnostic: proportion of pairs that would violate a hard margin
                     cross_hinge_active = (-delta + m_scalar > 0).float().mean().item()
+
+                    # ── Gradient hard-tract mining: harvest per-sample lambdas ──
+                    # Per valid pair, |grad| of its RankNet term w.r.t. either
+                    # score is sigma(-delta/m)/m; signed accumulation gives
+                    # lambda_i = m * dL_cross_sum/ds_i for free (no extra
+                    # backward). |lambda|/degree in [0, 1] is the per-sample
+                    # hardness; tract aggregation happens in the registry.
+                    if self.hardness_registry is not None and n_valid_pairs > 0:
+                        contrib = torch.sigmoid(-delta / m_scalar) * y_kl
+                        lam = torch.zeros(B_cs, device=scores.device)
+                        lam.index_add_(0, idx_k, contrib)
+                        lam.index_add_(0, idx_l, -contrib)
+                        deg = torch.zeros(B_cs, device=scores.device)
+                        ones = torch.ones_like(contrib)
+                        deg.index_add_(0, idx_k, ones)
+                        deg.index_add_(0, idx_l, ones)
+                        in_pairs = deg > 0
+                        hardness = lam[in_pairs].abs() / deg[in_pairs]
+                        self.hardness_registry.update(
+                            cs_geoids[in_pairs].cpu().numpy(),
+                            hardness.cpu().numpy(),
+                        )
 
         # ──────────────────────────────────────────────────────────
         # 2. TEMPORAL PENALTY (L_stable) — masked to stable twins.
@@ -1778,13 +1845,16 @@ class InBatchPairwiseRankingLoss(nn.Module):
                 "loss/score_min":            scores.min().item(),
                 "loss/score_max":            scores.max().item(),
             }
+            if self.hardness_registry is not None:
+                diag.update(self.hardness_registry.stats())
 
         return loss, diag
 
 
 def set_model_and_loss_function(
     model_name: str, kind: str, image_size: int, bands: int = 4, weights: str = None, meta_dim: int = 0,
-    m_base: float = 1.0, m_min: float = 0.1, lambda_s: float = 1.0, lambda_var: float = 1.0
+    m_base: float = 1.0, m_min: float = 0.1, lambda_s: float = 1.0, lambda_var: float = 1.0,
+    hardness_registry=None,
 ):
     """
     Initializes the PyTorch model and appropriate loss function.
@@ -1813,7 +1883,8 @@ def set_model_and_loss_function(
     if kind == "reg":
         # In-Batch Pairwise Ranking Loss with economic-distance-proportional margins.
         loss_fn = InBatchPairwiseRankingLoss(
-            m_base=m_base, m_min=m_min, lambda_s=lambda_s, lambda_var=lambda_var
+            m_base=m_base, m_min=m_min, lambda_s=lambda_s, lambda_var=lambda_var,
+            hardness_registry=hardness_registry,
         )
         
     elif kind == "cla":
@@ -2283,6 +2354,12 @@ def train_model(
         }
         torch.save(checkpoint, save_dir / f"{savename}_last.pth")
 
+        # Persist the hard-tract mining state next to the checkpoint so a
+        # resumed run keeps its learned tract weights (cold registry = uniform).
+        registry = getattr(loss_fn, "hardness_registry", None)
+        if registry is not None and len(registry) > 0:
+            registry.save(save_dir / f"{savename}_hardness.json")
+
     # Return model for caller chaining (especially if we loaded/checkpointed externally)
     return model
 
@@ -2656,6 +2733,22 @@ def run(
             num_shards = 10
             current_shard_size = CACHE_SIZE // 10 # E.g., 20,480 images per shard
 
+        # Gradient hard-tract mining registry (see src/data/tract_sampling.py):
+        # written by the loss (per-tract |lambda| EMAs), read by the train
+        # shard generator as tract sampling weights. Requires tract_sampling;
+        # alpha=0 disables the bias (registry still logs hardness diagnostics).
+        hardness_registry = None
+        if params.get("tract_sampling", False):
+            hardness_registry = GradientHardnessRegistry(
+                alpha=params.get("grad_mining_alpha", 0.0),
+                beta=params.get("grad_mining_beta", 0.9),
+                cap=params.get("grad_mining_cap", 10.0),
+            )
+            hardness_path = checkpoint_dir / f"{savename}_hardness.json"
+            if resume_model_checkpoint is not None and hardness_registry.load(hardness_path):
+                print(f"🟢 Restored hardness registry ({len(hardness_registry):,} tracts) "
+                      f"from {hardness_path}")
+
         print("\n[TRAIN] Building cyclic training cache...")
         train_cache_manager = CyclicCacheManager(
             df=df_train,
@@ -2670,6 +2763,7 @@ def run(
             max_jitter=max_jitter,
             sat_data=sat_data,
             holdout_years=holdout_years,
+            hardness_registry=hardness_registry,
         )
         train_cache_manager.build_initial_cache()
 
@@ -2754,7 +2848,8 @@ def run(
             m_base=params.get("m_base", 1.0),
             m_min=params.get("m_min", 0.1),
             lambda_s=params.get("lambda_s", 1.0),
-            lambda_var=params.get("lambda_var", 1.0)
+            lambda_var=params.get("lambda_var", 1.0),
+            hardness_registry=hardness_registry,
         )
 
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -3106,6 +3201,11 @@ if __name__ == "__main__":
         "lambda_s": 0.3,
         "lambda_var": 1.5,
         "temporal_fraction": 0.4,
+        # Tract-first shards + gradient hard-tract mining (NYC-collapse fix:
+        # building-weighted sampling starved intra-city pairs — boroughs are
+        # 47% of NYC-metro tracts but 13% of buildings, Manhattan 0.17%).
+        "tract_sampling": True,
+        "grad_mining_alpha": 0.3,
         "run_id": "run_20260710",  # default run_{YYYYMMDD}: same-day restarts share a savename and resume the shard cache
         "resume_lr_override": 3e-5,  # lr decay on resume (plateau since ~ep 175 at 1e-4); optimizer state otherwise untouched
         "selection_metric": "within",  # checkpoint on mean within-city (CBSA x year) spearman; resets best tracker on first resume

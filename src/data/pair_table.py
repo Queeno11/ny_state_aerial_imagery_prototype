@@ -346,6 +346,73 @@ class LazyPairTable:
             as_str_keys=True,
         )
 
+    def _ensure_tract_index(self):
+        """Lazy per-tract index over the buildings frame (built once).
+
+        ``_tract_order`` is the row order sorted by GEOID code, ``_tract_bounds``
+        the [start, stop) slice of each observed tract inside it, and
+        ``_tract_geoids`` / ``_tract_hashes`` the tract identities (str +
+        :func:`src.data.tract_sampling.stable_geoid_hash`) aligned with the
+        bounds. Cost: one int argsort of n_buildings — cheap next to a shard's
+        NAIP fetches; only the train table ever builds it.
+        """
+        if getattr(self, "_tract_order", None) is not None:
+            return
+        from src.data.tract_sampling import hash_geoids
+        codes = self.buildings["GEOID"].cat.codes.to_numpy()
+        order = np.argsort(codes, kind="stable")
+        sorted_codes = codes[order]
+        uniq_codes, starts = np.unique(sorted_codes, return_index=True)
+        stops = np.append(starts[1:], len(sorted_codes))
+        self._tract_order = order
+        self._tract_bounds = (starts, stops)
+        cats = self.buildings["GEOID"].cat.categories
+        self._tract_geoids = np.asarray(cats[uniq_codes].astype(str))
+        self._tract_hashes = hash_geoids(self._tract_geoids)
+
+    def materialize_tract_sample(self, n_rows, seed=825, weight_lookup=None):
+        """Flat shard frame sampled tract-first instead of building-cyclic.
+
+        Draws ``max(1, n_rows // n_years)`` tracts — uniformly, or with the
+        sampling weights returned by ``weight_lookup(tract_hashes)`` (gradient
+        hard-tract mining; see :mod:`src.data.tract_sampling` for rationale and
+        references) — then ONE random building per drawn tract, emitting all
+        years of each building adjacently (temporal twins stay in-shard, same
+        contract as :meth:`materialize`). Building-count weighting is gone: a
+        tract's shard probability no longer depends on how many structures it
+        contains, only on (uniform | hardness) weight.
+
+        ``seed`` may be an int or a tuple (e.g. ``(base_seed, shard_id)``) so
+        every shard draws a fresh, reproducible sample.
+        """
+        if n_rows <= 0:
+            raise ValueError(f"materialize_tract_sample: n_rows={n_rows}")
+        self._ensure_tract_index()
+        starts, stops = self._tract_bounds
+        n_tracts = len(starts)
+        n_pick = min(max(1, int(n_rows) // self.n_years), n_tracts)
+
+        rng = np.random.default_rng(seed)
+        p = None
+        if weight_lookup is not None:
+            w = np.asarray(weight_lookup(self._tract_hashes), dtype=np.float64)
+            if w.shape != (n_tracts,) or not np.isfinite(w).all() or (w < 0).any():
+                raise ValueError("materialize_tract_sample: bad weights from weight_lookup")
+            total = w.sum()
+            if total > 0:
+                p = w / total
+        chosen = rng.choice(n_tracts, size=n_pick, replace=False, p=p)
+
+        # One uniform building inside each chosen tract's [start, stop) slice.
+        pick_pos = rng.integers(starts[chosen], stops[chosen])
+        b_rows = self._tract_order[pick_pos]
+
+        return self._flat_from(
+            self.buildings.take(np.repeat(b_rows, self.n_years)),
+            np.tile(self._years_arr, n_pick),
+            as_str_keys=True,
+        )
+
     def sample_buildings_per_tract(self, n_buildings_per_tract=2, seed=825):
         """Small flat frame keeping ALL years of ≤n buildings per tract.
 

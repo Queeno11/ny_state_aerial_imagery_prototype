@@ -133,7 +133,7 @@ class BatchImageDumper:
                 "anchor_cbsa": int(anchor_cbsa),
                 "images": dataset.images[idx].clone(),        # uint8 raw shard tiles (pre-augmentation)
                 "scores": dataset.scores[idx].clone(),        # Rel_Score labels (per-CBSA z-scores)
-                "geoid_hashes": dataset.geoids[idx].clone(),  # salted hash — same-tract grouping only
+                "geoid_hashes": dataset.geoids[idx].clone(),  # stable_geoid_hash (crc32) of GEOID
                 "years": dataset.years[idx].clone(),
                 "building_ids": dataset.building_ids[idx].clone(),
                 "structural_change": dataset.structural_change[idx].clone(),

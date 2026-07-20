@@ -182,6 +182,41 @@ def test_lazy_manager_init_and_slice(tmp_path, monkeypatch):
     assert list(sliced["building_id"]) == [2, 2, 1, 1]   # wraps around
 
 
+def test_lazy_manager_tract_sampling_branch(tmp_path, monkeypatch):
+    """tract_sampling=True routes shard sourcing through materialize_tract_sample
+    (one building per drawn tract, all years adjacent) instead of the cyclic
+    building-major slice; without the flag, the legacy slice is unchanged."""
+    from src.data.tract_sampling import GradientHardnessRegistry
+
+    monkeypatch.setattr(bd, "process_acs_panel", lambda: _fake_panel())
+    base_params = {"nbands": 4, "image_size": 64, "tau_meters": 100,
+                   "subsample_step": 1, "indicator": "W2_r5"}
+
+    mgr = main.CyclicCacheManager(
+        df=_tiny_pair_table(), all_years_datasets=None,
+        params={**base_params, "tract_sampling": True, "sampling_seed": 3},
+        cache_dir=tmp_path, type="train", clear_cache=True, sat_data="NAIP",
+        shard_size=4, hardness_registry=GradientHardnessRegistry(alpha=0.3),
+    )
+    out = mgr._shard_source_df(0)
+    # 1 tract in the table -> 1 building x both years, regardless of the
+    # tract's 2 buildings (building-count weighting is gone)
+    assert len(out) == 2
+    assert out["building_id"].nunique() == 1
+    assert sorted(out["year"]) == [2014, 2018]
+    # deterministic per shard_id
+    pd.testing.assert_frame_equal(out, mgr._shard_source_df(0))
+
+    legacy = main.CyclicCacheManager(
+        df=_tiny_pair_table(), all_years_datasets=None,
+        params=base_params, cache_dir=tmp_path, type="train",
+        clear_cache=True, sat_data="NAIP", shard_size=4,
+    )
+    out = legacy._shard_source_df(0)
+    assert len(out) == 4                      # cyclic slice: both buildings
+    assert out["building_id"].nunique() == 2
+
+
 def test_lazy_manager_requires_naip(tmp_path, monkeypatch):
     monkeypatch.setattr(bd, "process_acs_panel", lambda: _fake_panel())
     with pytest.raises(NotImplementedError, match="NAIP"):
