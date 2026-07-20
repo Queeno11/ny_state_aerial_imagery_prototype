@@ -220,15 +220,6 @@ INPUT C:\Users\abbat\AppData\Local\Programs\MiKTeX\tex\latex\psnfss\ot1pcr.fd
 INPUT C:\Users\abbat\AppData\Local\Programs\MiKTeX\fonts\tfm\adobe\courier\pcrr7t.tfm
 INPUT C:\Users\abbat\AppData\Local\Programs\MiKTeX\fonts\vf\adobe\courier\pcrr7t.vf
 INPUT C:\Users\abbat\AppData\Local\Programs\MiKTeX\fonts\tfm\adobe\courier\pcrr8r.tfm
-INPUT .\Figures\tract_splits_with_dead_zone.png
-INPUT .\Figures\tract_splits_with_dead_zone.png
-INPUT .\Figures\tract_splits_with_dead_zone.png
-INPUT .\Figures\tract_splits_with_dead_zone.png
-INPUT .\Figures\tract_splits_with_dead_zone.png
-INPUT .\Figures\tract_splits_with_dead_zone.png
-INPUT .\Figures\tract_splits_with_dead_zone.png
-INPUT C:\Users\abbat\AppData\Local\Programs\MiKTeX\fonts\vf\adobe\times\ptmbi7t.vf
-INPUT C:\Users\abbat\AppData\Local\Programs\MiKTeX\fonts\tfm\adobe\times\ptmbi8r.tfm
 INPUT C:\Users\abbat\AppData\Local\Programs\MiKTeX\fonts\tfm\public\cm\cmbx10.tfm
 INPUT C:\Users\abbat\AppData\Local\Programs\MiKTeX\fonts\tfm\public\cm\cmbx7.tfm
 INPUT C:\Users\abbat\AppData\Local\Programs\MiKTeX\fonts\tfm\public\cm\cmbx5.tfm
@@ -239,6 +230,8 @@ INPUT .\Figures\Batch example (Chat GPT).png
 INPUT .\Figures\Batch example (Chat GPT).png
 INPUT .\Figures\Batch example (Chat GPT).png
 INPUT .\Figures\Batch example (Chat GPT).png
+INPUT C:\Users\abbat\AppData\Local\Programs\MiKTeX\fonts\vf\adobe\times\ptmbi7t.vf
+INPUT C:\Users\abbat\AppData\Local\Programs\MiKTeX\fonts\tfm\adobe\times\ptmbi8r.tfm
 INPUT C:\Users\abbat\AppData\Local\Programs\MiKTeX\fonts\tfm\public\cm\cmr8.tfm
 INPUT C:\Users\abbat\AppData\Local\Programs\MiKTeX\fonts\tfm\public\cm\cmr6.tfm
 INPUT C:\Users\abbat\AppData\Local\Programs\MiKTeX\fonts\tfm\public\cm\cmmi8.tfm
@@ -288,22 +281,22 @@ INPUT .\Figures\C_CSA_total.tex
 INPUT .\Figures\C_CSA_total.tex
 INPUT .\Figures\C_CSA_total.tex
 INPUT Figures\C_CSA_total.tex
-INPUT .\Figures\C_city_avg_trajectory.pdf
-INPUT .\Figures\C_city_avg_trajectory.pdf
-INPUT .\Figures\C_city_avg_trajectory.pdf
-INPUT .\Figures\C_city_avg_trajectory.pdf
-INPUT .\Figures\C_city_avg_trajectory.pdf
-INPUT .\Figures\C_city_avg_trajectory.pdf
-INPUT .\Figures\C_long_diff_gb2_map.pdf
-INPUT .\Figures\C_long_diff_gb2_map.pdf
-INPUT .\Figures\C_long_diff_gb2_map.pdf
-INPUT .\Figures\C_long_diff_gb2_map.pdf
-INPUT .\Figures\C_long_diff_gb2_map.pdf
-INPUT .\Figures\C_long_diff_gb2_map.pdf
 INPUT C:\Users\abbat\AppData\Local\Programs\MiKTeX\fonts\vf\adobe\times\ptmb7t.vf
 INPUT C:\Users\abbat\AppData\Local\Programs\MiKTeX\fonts\tfm\adobe\times\ptmb8r.tfm
 INPUT C:\Users\abbat\AppData\Local\Programs\MiKTeX\fonts\vf\adobe\times\ptmri7t.vf
 INPUT C:\Users\abbat\AppData\Local\Programs\MiKTeX\fonts\tfm\adobe\times\ptmri8r.tfm
+INPUT .\Figures\C_city_avg_trajectory.pdf
+INPUT .\Figures\C_city_avg_trajectory.pdf
+INPUT .\Figures\C_city_avg_trajectory.pdf
+INPUT .\Figures\C_city_avg_trajectory.pdf
+INPUT .\Figures\C_city_avg_trajectory.pdf
+INPUT .\Figures\C_city_avg_trajectory.pdf
+INPUT .\Figures\C_long_diff_gb2_map.pdf
+INPUT .\Figures\C_long_diff_gb2_map.pdf
+INPUT .\Figures\C_long_diff_gb2_map.pdf
+INPUT .\Figures\C_long_diff_gb2_map.pdf
+INPUT .\Figures\C_long_diff_gb2_map.pdf
+INPUT .\Figures\C_long_diff_gb2_map.pdf
 INPUT .\Figures\D_hudson_yards_grid.pdf
 INPUT .\Figures\D_hudson_yards_grid.pdf
 INPUT .\Figures\D_hudson_yards_grid.pdf

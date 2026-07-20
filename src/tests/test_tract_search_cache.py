@@ -163,17 +163,21 @@ def test_cache_expands_when_crop_falls_outside(monkeypatch):
     assert stats["search_cache_hit"] == 2
 
 
-def test_cache_never_caches_failures(monkeypatch):
+def test_cache_failure_not_cached_and_trips_circuit_breaker(monkeypatch):
     item = _Item("doqq", [-74.1, 40.6, -73.9, 40.8], 2018)
     calls = _install_fake_search(monkeypatch, items=[item], fail_times=1)
     cache = nf.TractSearchCache()
     crop = _bbox_around(-74.0, 40.7, 0.0005)
 
-    with pytest.raises(RuntimeError):
+    # The search fails and is NOT cached (no poisoned entry).
+    with pytest.raises(RuntimeError, match="rate limit"):
         cache.get_items("g", crop)
-    # The failure was not cached: the next request searches again and succeeds.
-    assert cache.get_items("g", crop) == [item]
-    assert len(calls) == 2
+    # The cell trips the circuit breaker: an immediate retry short-circuits
+    # (no second STAC search) instead of hammering a failing endpoint — this is
+    # what stops the wedged-search pile-up from freezing a chunk.
+    with pytest.raises(RuntimeError, match="circuit breaker"):
+        cache.get_items("g", crop)
+    assert len(calls) == 1
 
 
 def test_cache_lru_eviction(monkeypatch):
@@ -210,6 +214,56 @@ def test_cache_single_flight_under_concurrency(monkeypatch):
     for t in threads:
         t.join()
     assert len(calls) == 1   # cold tract, 8 workers, exactly one search
+
+
+# ── disk persistence ─────────────────────────────────────────────────────────
+
+def _real_pystac_item(item_id="doqq", bbox=(-74.1, 40.6, -73.9, 40.8), year=2018):
+    """A genuine pystac.Item so to_dict()/from_dict() round-trips through disk."""
+    import datetime as _dt
+    import pystac
+    it = pystac.Item(
+        id=item_id,
+        geometry={"type": "Polygon", "coordinates": [[
+            [bbox[0], bbox[1]], [bbox[0], bbox[3]], [bbox[2], bbox[3]],
+            [bbox[2], bbox[1]], [bbox[0], bbox[1]]]]},
+        bbox=list(bbox), datetime=_dt.datetime(year, 6, 1), properties={})
+    it.add_asset("image", pystac.Asset(href=f"https://example.com/{item_id}.tif"))
+    return it
+
+
+def test_cache_persists_to_disk_and_reloads_in_new_instance(monkeypatch, tmp_path):
+    """A rerun (fresh cache, same cache_dir) reuses the persisted search instead
+    of re-hitting STAC — the whole point of disk persistence."""
+    calls = _install_fake_search(monkeypatch, items=[_real_pystac_item()])
+    crop = _bbox_around(-74.0, 40.7, 0.0005)
+
+    c1 = nf.TractSearchCache(cache_dir=tmp_path)
+    items = c1.get_items("g", crop)
+    assert len(calls) == 1 and items[0].id == "doqq"      # cold: one search
+    assert (tmp_path / "g.json").exists()                 # persisted
+
+    # Fresh instance (simulates a new process/rerun), same directory.
+    c2 = nf.TractSearchCache(cache_dir=tmp_path)
+    before = nf.get_fetch_stats()["search_cache_disk_hit"]
+    items2 = c2.get_items("g", crop)
+    assert len(calls) == 1                                 # NO new STAC search
+    assert items2[0].id == "doqq"                          # reloaded correctly
+    assert nf.get_fetch_stats()["search_cache_disk_hit"] == before + 1
+
+
+def test_disk_cache_expands_when_crop_outside_persisted_bbox(monkeypatch, tmp_path):
+    """A persisted entry that doesn't cover a new crop expands (re-searches) from
+    the persisted bbox, not from cold — same self-correcting rule as memory."""
+    calls = _install_fake_search(monkeypatch, items=[_real_pystac_item()])
+    c1 = nf.TractSearchCache(cache_dir=tmp_path)
+    c1.get_items("g", _bbox_around(-74.0, 40.7, 0.0005))
+    assert len(calls) == 1
+
+    c2 = nf.TractSearchCache(cache_dir=tmp_path)
+    c2.get_items("g", _bbox_around(-74.5, 40.7, 0.0005))   # far crop → expand
+    assert len(calls) == 2
+    assert nf.get_fetch_stats()["search_cache_expand"] == 1
 
 
 # ── _search_items retry ──────────────────────────────────────────────────────
@@ -249,6 +303,71 @@ def test_search_items_raises_after_exhausting_retries(monkeypatch):
     with pytest.raises(ConnectionError):
         nf._search_items([0, 0, 1, 1], retries=3, backoff_s=0.0)
     assert catalog.calls == 3
+
+
+def test_invalidate_catalog_clears_thread_local(monkeypatch):
+    nf._local.catalog = object()
+    nf._local.catalog_unsigned = object()
+    nf._invalidate_catalog()
+    assert not hasattr(nf._local, "catalog")
+    assert not hasattr(nf._local, "catalog_unsigned")
+
+
+def test_search_items_rebuilds_client_on_failure(monkeypatch):
+    # Each failed attempt must rebuild the (possibly stale) client, so a wedged
+    # connection can't poison every retry.
+    built = []
+
+    class _Bad:
+        def search(self, **kw):
+            raise ConnectionError("stale socket")
+
+    def fake_get(signed=True):
+        built.append(1)
+        return _Bad()
+
+    monkeypatch.setattr(nf, "get_catalog", fake_get)
+    invalidations = []
+    monkeypatch.setattr(nf, "_invalidate_catalog",
+                        lambda: invalidations.append(1))
+    with pytest.raises(ConnectionError):
+        nf._search_items([0, 0, 1, 1], retries=3, backoff_s=0.0)
+    assert len(built) == 3 and len(invalidations) == 3   # fresh client + reset each try
+
+
+def test_search_items_hard_timeout_recovers_on_next_attempt(monkeypatch):
+    # A wedged first search (never returns within timeout_s) must not hang the
+    # call: the watchdog fires, the client is rebuilt, and a healthy retry wins.
+    release = threading.Event()
+    state = {"n": 0}
+
+    class _Client:
+        def __init__(self, hang):
+            self.hang = hang
+
+        def search(self, **kw):
+            hang = self.hang
+            outer = self
+
+            class _S:
+                def items(self):
+                    if hang:
+                        release.wait(timeout=5)   # "wedged" until released
+                    return [_Item("ok", [0, 0, 1, 1], 2020)]
+            return _S()
+
+    def fake_get(signed=True):
+        state["n"] += 1
+        return _Client(hang=(state["n"] == 1))   # only the first client wedges
+
+    monkeypatch.setattr(nf, "get_catalog", fake_get)
+    try:
+        items = nf._search_items([0, 0, 1, 1], retries=3, backoff_s=0.0,
+                                 timeout_s=0.2)
+        assert [it.id for it in items] == ["ok"]   # recovered via retry
+        assert state["n"] >= 2                       # client was rebuilt
+    finally:
+        release.set()   # let the leaked watchdog worker exit promptly
 
 
 # ── fetch_naip failure modes + cache path (no network: local GeoTIFF) ────────

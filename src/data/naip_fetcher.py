@@ -50,21 +50,29 @@ resampled so meters/pixel = crop_size_meters / out_pixels — the *effective*
 resolution is constant by construction; the native GSD only affects sharpness.
 """
 
+import json
+import os
 import random
 import threading
 import time
 from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from dataclasses import dataclass
+from math import ceil, floor
+from pathlib import Path
 
 import numpy as np
 import planetary_computer
+import pystac
 import pystac_client
 import rasterio
-from pyproj import Geod
+from pyproj import Geod, Transformer
 from rasterio.crs import CRS
 from rasterio.enums import Resampling
+from rasterio.io import MemoryFile
 from rasterio.warp import transform_bounds
-from rasterio.windows import from_bounds
+from rasterio.windows import Window, from_bounds
 
 _local = threading.local()
 _GEOD = Geod(ellps="WGS84")
@@ -81,6 +89,19 @@ GDAL_ENV = dict(
     GDAL_HTTP_TIMEOUT="60",            # seconds for the whole request
     GDAL_HTTP_LOW_SPEED_LIMIT="1024",  # abort if throughput < 1 KiB/s ...
     GDAL_HTTP_LOW_SPEED_TIME="30",     # ... for 30 consecutive seconds
+    # A mosaic read pulls all the COG blocks covering a tract's window. Left to
+    # one range request per block, that's dozens of sequential HTTP round-trips —
+    # the latency-bound ceiling on a dense chunk. Merge the (mostly consecutive)
+    # block requests into few multi-range HTTP calls instead.
+    GDAL_HTTP_MULTIRANGE="YES",
+    GDAL_HTTP_MERGE_CONSECUTIVE_RANGES="YES",
+    # Decoded-block cache (process-wide, shared across open datasets). The
+    # mosaic read (:func:`open_naip_mosaic`) pulls a whole tract's covering
+    # window in one shot; a roomy cache also lets the per-window fallback reuse
+    # overlapping COG blocks instead of re-downloading them. NOTE: rasterio.Env
+    # takes this as an int number of BYTES (its own docs pass 128000000), not
+    # the megabyte string GDAL's raw env var uses — a str raises TypeError.
+    GDAL_CACHEMAX=512 * 1024 * 1024,   # 512 MiB
 )
 
 # pystac-client defaults to NO request timeout: a dead connection hangs the
@@ -94,12 +115,56 @@ STAC_TIMEOUT_S = 30
 SEARCH_RETRIES = 3
 SEARCH_BACKOFF_S = 2.0
 
+# Hard wall-clock ceiling on ONE search, covering all its pagination. The
+# per-request read timeout (STAC_TIMEOUT_S) bounds a single HTTP round-trip but
+# NOT total pagination, and a stale pooled socket (e.g. after the host sleeps or
+# a network blip) can wedge a search far longer — which, under the search
+# cache's single-flight lock, freezes an entire chunk (observed: a run stuck for
+# hours with 2 wedged searches while 46 workers waited). The search runs under
+# this watchdog so it always returns or raises; on a raise the client is rebuilt.
+SEARCH_HARD_TIMEOUT_S = 120.0
+
+
+def _invalidate_catalog() -> None:
+    """Drop this thread's cached STAC clients so the next call reconnects.
+
+    A client whose pooled sockets went stale reuses dead connections until it is
+    rebuilt; the thread-local cache in :func:`get_catalog` otherwise never
+    refreshes them. Called after every search failure so a wedged connection
+    can't poison this thread's remaining work."""
+    for attr in ("catalog", "catalog_unsigned"):
+        if hasattr(_local, attr):
+            delattr(_local, attr)
+
+# Failure-mode classes for callers that retry at a coarser granularity than
+# the per-search backoff above. Retryable modes are the rate-limit signature
+# (throttled search endpoint, dropped COG reads); permanent modes mean no
+# imagery exists for the window (or, under ``exact_year``, none from the
+# requested flight year) — retrying them loops forever.
+RETRYABLE_FAILURES = frozenset({"search_error", "read_error"})
+PERMANENT_FAILURES = frozenset({"no_items", "no_year_match", "asset_missing"})
+
+
+def backoff_sleep(attempt: int, base_s: float = 30.0, cap_s: float = 900.0,
+                  sleep_fn=time.sleep) -> float:
+    """Jittered exponential cooldown for Planetary Computer exhaustion.
+
+    Sleeps ``min(cap_s, base_s * 2**attempt) * U(0.75, 1.25)`` seconds
+    (``attempt`` is 0-based) and returns the duration slept. ``sleep_fn`` is
+    injectable so tests never actually sleep.
+    """
+    delay = min(cap_s, base_s * (2 ** attempt)) * (0.75 + 0.5 * random.random())
+    sleep_fn(delay)
+    return delay
+
 # Process-wide fetch statistics (thread-safe). Reset with reset_fetch_stats().
 _STATS_LOCK = threading.Lock()
-_FETCH_STATS = {"ok": 0, "no_items": 0, "asset_missing": 0, "read_error": 0,
+_FETCH_STATS = {"ok": 0, "no_items": 0, "no_year_match": 0, "asset_missing": 0,
+                "read_error": 0,
                 "search_error": 0, "nir_padded": 0, "partial_coverage": 0,
                 "search_cache_hit": 0, "search_cache_miss": 0,
-                "search_cache_expand": 0}
+                "search_cache_expand": 0, "search_cache_disk_hit": 0,
+                "search_cache_circuit_breaker": 0}
 
 
 def get_fetch_stats() -> dict:
@@ -119,6 +184,17 @@ def _count(key: str) -> None:
         _FETCH_STATS[key] += 1
 
 
+def record_failure(mode: str) -> None:
+    """Public shim to increment a fetch-outcome counter.
+
+    Used by the grouped predictor (:mod:`src.prediction`) when a COG *open*
+    fails before any per-window read — that path bypasses
+    :func:`read_naip_crop_from_src`, so the ``read_error`` must be counted here
+    to keep process-wide stats consistent with the per-crop ``fetch_naip``.
+    """
+    _count(mode)
+
+
 @dataclass
 class NaipFetchResult:
     """Outcome of one fetch: crop (or None) + provenance/diagnostics."""
@@ -127,8 +203,31 @@ class NaipFetchResult:
     nir_padded: bool = False         # True when NIR was zero-padded (visual asset)
     partial_coverage: bool = False   # True when the item didn't cover the full
                                      # window (missing margin is zero-filled)
-    failure: str | None = None       # None | no_items | asset_missing |
-                                     # search_error | read_error
+    failure: str | None = None       # None | no_items | no_year_match |
+                                     # asset_missing | search_error | read_error
+
+
+@dataclass
+class NaipItemRef:
+    """The chosen DOQQ for a crop, resolved *without* reading pixels.
+
+    Splitting search+selection (this) from the raster read
+    (:func:`read_naip_crop_from_src`) lets a caller open one COG once and read
+    every crop in that DOQQ from the same handle — the per-crop
+    ``rasterio.open`` (header/overview range requests) is the dominant cost at
+    prediction scale, and consecutive buildings in a tract share a DOQQ.
+
+    ``href`` is unsigned when the item came from a :class:`TractSearchCache`
+    (SAS tokens expire; sign at read time) and already signed otherwise;
+    ``use_cache`` records which, so the opener signs iff needed.
+    """
+    item_id: str | None              # STAC item id (grouping key), None on failure
+    href: str | None                 # asset href (unsigned if use_cache else signed)
+    use_cache: bool                  # True ⇒ href must be signed before reading
+    actual_year: int | None          # flight year of the chosen item
+    bbox: list[float] | None         # EPSG:4326 crop window
+    failure: str | None = None       # None | search_error | no_items |
+                                     # no_year_match | asset_missing
 
 
 def get_catalog(signed: bool = True) -> pystac_client.Client:
@@ -150,13 +249,24 @@ def get_catalog(signed: bool = True) -> pystac_client.Client:
             client = pystac_client.Client.open(
                 "https://planetarycomputer.microsoft.com/api/stac/v1", **kwargs,
             )
+            
+        # Force request-level timeout on pagination calls which ignore the
+        # constructor timeout and would otherwise hang indefinitely.
+        if hasattr(client, "_stac_io") and hasattr(client._stac_io, "session"):
+            orig_req = client._stac_io.session.request
+            def timeout_req(*args, **kw):
+                kw.setdefault("timeout", STAC_TIMEOUT_S)
+                return orig_req(*args, **kw)
+            client._stac_io.session.request = timeout_req
+            
         setattr(_local, attr, client)
     return getattr(_local, attr)
 
 
 def _search_items(bbox: list[float], max_items: int | None = None,
                   signed: bool = True, retries: int | None = None,
-                  backoff_s: float | None = None) -> list:
+                  backoff_s: float | None = None,
+                  timeout_s: float | None = None) -> list:
     """All NAIP items intersecting ``bbox``, with retry on search failure.
 
     ``max_items=None`` paginates the search fully — required for tract-level
@@ -164,19 +274,35 @@ def _search_items(bbox: list[float], max_items: int | None = None,
     bias which panel years survive for that tract. Raises the last exception
     when every attempt fails (callers count ``search_error``).
 
-    ``retries``/``backoff_s`` default to the module-level SEARCH_RETRIES /
-    SEARCH_BACKOFF_S, resolved at call time so tests can monkeypatch them.
+    Each attempt runs under a hard ``timeout_s`` wall-clock watchdog (a wedged
+    connection otherwise hangs the whole chunk via the cache's single-flight
+    lock); on timeout or error the thread's STAC client is rebuilt so the retry
+    reconnects. The client is fetched in THIS thread (reusing the thread-local
+    cache) and handed to the watchdog worker, so a timed-out search leaks only
+    its own worker while this thread recovers with a fresh client.
+
+    ``retries``/``backoff_s``/``timeout_s`` default to the module-level
+    SEARCH_RETRIES / SEARCH_BACKOFF_S / SEARCH_HARD_TIMEOUT_S, resolved at call
+    time so tests can monkeypatch them.
     """
     retries = SEARCH_RETRIES if retries is None else retries
     backoff_s = SEARCH_BACKOFF_S if backoff_s is None else backoff_s
+    timeout_s = SEARCH_HARD_TIMEOUT_S if timeout_s is None else timeout_s
     for attempt in range(retries):
+        client = get_catalog(signed=signed)  # this thread's cached client
+        pool = ThreadPoolExecutor(max_workers=1)
         try:
-            return list(get_catalog(signed=signed).search(
-                collections=["naip"],
-                bbox=bbox,
-                max_items=max_items,
-            ).items())
+            fut = pool.submit(lambda: list(client.search(
+                collections=["naip"], bbox=bbox, max_items=max_items).items()))
+            result = fut.result(timeout=timeout_s)
+            pool.shutdown(wait=False)
+            return result
         except Exception:
+            # Timeout (FutureTimeout) or a real search error: abandon the
+            # possibly-wedged worker without waiting, and rebuild the client so
+            # the next attempt uses a fresh connection.
+            pool.shutdown(wait=False, cancel_futures=True)
+            _invalidate_catalog()
             if attempt == retries - 1:
                 raise
             time.sleep(backoff_s * (2 ** attempt) * (0.5 + random.random()))
@@ -247,13 +373,15 @@ def bbox_contains(outer: list[float], inner: list[float]) -> bool:
 
 
 class TractSearchCache:
-    """Per-tract (GEOID-keyed) cache of unsigned STAC item lists.
+    """Cache of unsigned STAC item lists keyed by an opaque spatial key.
 
-    One STAC search per tract instead of one per crop: the shard generator
-    draws many buildings per tract, and NAIP DOQQs (~6x7.5 km) dwarf the
-    ~100 m crops, so consecutive fetches keep re-asking Planetary Computer
-    the same question — the direct cause of the search-endpoint throttling
-    observed in training.
+    One STAC search per spatial unit instead of one per crop: the caller picks
+    the key granularity — a tract GEOID in training (the shard sampler draws many
+    buildings per tract), or a coarse ~20 km grid cell in prediction (one search
+    then serves every tract in the cell, cutting hundreds of per-tract searches
+    per chunk to a handful). NAIP DOQQs (~6x7.5 km) dwarf the ~100 m crops, so
+    per-crop searches re-ask Planetary Computer the same question — the direct
+    cause of the search-endpoint throttling observed in training.
 
     Correctness invariant: the entry's ``searched_bbox`` always contains every
     crop bbox it has served. STAC bbox search returns items *intersecting* the
@@ -262,22 +390,31 @@ class TractSearchCache:
     :func:`item_intersects_bbox` (done by the caller) reproduces the per-crop
     search exactly. When a crop falls outside, the entry is re-searched over
     the union of the old bbox and the buffered crop bbox — self-correcting,
-    so no precomputed tract geometry is needed.
+    so no precomputed geometry is needed.
 
-    Thread-safe. Per-key single-flight: a cold tract triggers exactly one
-    search even with all extract workers asking at once. Failed searches
-    propagate and are never cached (a cached failure would delete an entire
-    tract — the label unit — from every shard until eviction). LRU-bounded;
-    shard slices are sequential over a spatially ordered pair table, so a few
-    hundred entries give near-perfect hit rates.
+    Optional ``cache_dir`` persists each key's (searched_bbox, items) to disk as
+    JSON, so a *rerun* reuses prior searches instead of re-hitting the STAC
+    endpoint — NAIP item lists for a fixed grid cell are stable, so after the
+    first pass the search cost is essentially zero. The persisted hrefs are
+    unsigned (SAS tokens expire), matching the in-memory contract.
+
+    Thread-safe. Per-key single-flight: a cold key triggers exactly one search
+    even with all workers asking at once. Failed searches propagate and are
+    never cached (a cached failure would drop an entire cell from every shard
+    until eviction). The in-memory tier is LRU-bounded; disk is unbounded.
     """
 
-    def __init__(self, buffer_meters: float = 1500.0, max_entries: int = 512):
+    def __init__(self, buffer_meters: float = 1500.0, max_entries: int = 512,
+                 cache_dir: "str | os.PathLike | None" = None):
         self.buffer_meters = buffer_meters
         self.max_entries = max_entries
-        self._lock = threading.Lock()                 # guards _entries/_key_locks
+        self._lock = threading.Lock()                 # guards _entries/_key_locks/_failures
         self._entries: OrderedDict[str, tuple[list[float], list]] = OrderedDict()
+        self._failures: dict[str, float] = {}         # key -> timestamp
         self._key_locks: dict[str, threading.Lock] = {}
+        self._cache_dir = Path(cache_dir) if cache_dir is not None else None
+        if self._cache_dir is not None:
+            self._cache_dir.mkdir(parents=True, exist_ok=True)
 
     def _get_key_lock(self, key: str) -> threading.Lock:
         with self._lock:
@@ -291,6 +428,39 @@ class TractSearchCache:
                 self._entries.move_to_end(key)
                 return entry
         return None
+
+    def _put_memory(self, key: str, searched_bbox: list[float], items: list) -> None:
+        with self._lock:
+            self._entries[key] = (searched_bbox, items)
+            self._entries.move_to_end(key)
+            while len(self._entries) > self.max_entries:
+                evicted, _ = self._entries.popitem(last=False)
+                self._key_locks.pop(evicted, None)
+                self._failures.pop(evicted, None)
+
+    def _disk_path(self, key: str) -> Path:
+        return self._cache_dir / f"{key}.json"
+
+    def _load_disk(self, key: str):
+        """(searched_bbox, items) persisted for ``key``, or None. Never raises."""
+        try:
+            payload = json.loads(self._disk_path(key).read_text())
+            items = [pystac.Item.from_dict(d) for d in payload["items"]]
+            return payload["searched_bbox"], items
+        except Exception:
+            return None
+
+    def _store_disk(self, key: str, searched_bbox: list[float], items: list) -> None:
+        try:
+            payload = {"searched_bbox": list(searched_bbox),
+                       "items": [it.to_dict() for it in items]}
+            path = self._disk_path(key)
+            tmp = path.with_name(f"{path.name}.tmp.{os.getpid()}.{threading.get_ident()}")
+            tmp.write_text(json.dumps(payload))
+            os.replace(tmp, path)
+        except Exception as e:
+            print(f"Warning: failed to persist STAC cache to disk for {key}: {e}")
+            pass  # persistence is best-effort; the in-memory tier still serves
 
     def get_items(self, key: str, crop_bbox: list[float]) -> list:
         """Unsigned STAC items whose search bbox covers ``crop_bbox``.
@@ -309,9 +479,24 @@ class TractSearchCache:
             if entry is not None:
                 _count("search_cache_hit")
                 return entry[1]
+                
+            with self._lock:
+                last_fail = self._failures.get(key, 0)
+            if time.time() - last_fail < 60:
+                _count("search_cache_circuit_breaker")
+                raise RuntimeError("STAC search circuit breaker open for this cell (Planetary Computer is returning errors)")
+
+            # Disk tier: a prior run may have persisted this key's search.
+            disk = self._load_disk(key) if self._cache_dir is not None else None
+            if disk is not None and bbox_contains(disk[0], crop_bbox):
+                self._put_memory(key, disk[0], disk[1])
+                _count("search_cache_disk_hit")
+                return disk[1]
 
             with self._lock:
                 stale = self._entries.get(key)
+            if stale is None:
+                stale = disk  # expand from the persisted bbox rather than re-search cold
             if stale is None:
                 search_bbox = buffer_bbox(crop_bbox, self.buffer_meters)
                 _count("search_cache_miss")
@@ -321,14 +506,16 @@ class TractSearchCache:
                     stale[0], buffer_bbox(crop_bbox, self.buffer_meters))
                 _count("search_cache_expand")
 
-            items = _search_items(search_bbox, max_items=None, signed=False)
+            try:
+                items = _search_items(search_bbox, max_items=None, signed=False)
+            except Exception:
+                with self._lock:
+                    self._failures[key] = time.time()
+                raise
 
-            with self._lock:
-                self._entries[key] = (search_bbox, items)
-                self._entries.move_to_end(key)
-                while len(self._entries) > self.max_entries:
-                    evicted, _ = self._entries.popitem(last=False)
-                    self._key_locks.pop(evicted, None)
+            self._put_memory(key, search_bbox, items)
+            if self._cache_dir is not None:
+                self._store_disk(key, search_bbox, items)
             return items
 
 
@@ -346,18 +533,29 @@ def window_exceeds_raster(window, width: int, height: int, tol: float = 1e-3) ->
     )
 
 
-def _select_item(items: list, bbox: list[float], year_hint: int | None):
+def _select_item(items: list, bbox: list[float], year_hint: int | None,
+                 exact_year: bool = False):
     """Pick the item to read for ``bbox`` from candidate ``items`` (or None).
 
     Full-window coverage first: an intersecting-but-not-containing DOQQ yields
     a sliver crop (see module docstring). Adjacent DOQQs overlap, so a fully
     covering same-year tile almost always exists; when it doesn't, a fully
     covering off-year tile beats a same-year sliver.
+
+    ``exact_year`` restricts candidates to items whose flight year equals
+    ``year_hint`` BEFORE the coverage preference, so a same-year partial tile
+    (boundless read, flagged) still wins over rejection — off-year imagery is
+    never selected. Returns None when no same-year item exists (the caller
+    records ``no_year_match``).
     """
+    if exact_year and year_hint is not None:
+        items = [item for item in items if item.datetime.year == year_hint]
     if not items:
         return None
     if year_hint is not None:
-        # Then closest flight year to the requested panel year (stable id tiebreak).
+        # Then closest flight year to the requested panel year (stable id
+        # tiebreak); under exact_year every candidate is same-year and this
+        # reduces to (coverage, id).
         return min(items, key=lambda item: (not item_contains_bbox(item, bbox),
                                             abs(item.datetime.year - year_hint), item.id))
     # Then deterministic default: newest first (STAC order is not guaranteed).
@@ -365,26 +563,26 @@ def _select_item(items: list, bbox: list[float], year_hint: int | None):
                                         -item.datetime.year, item.id))
 
 
-def fetch_naip(
+def resolve_naip_item(
     lon: float, lat: float,
     crop_size_meters: float,
-    nbands: int = 4,
-    out_pixels: int = 250,
     year_hint: int | None = None,
     search_cache: "TractSearchCache | None" = None,
     cache_key: str | None = None,
-) -> NaipFetchResult:
-    """Fetch a single NAIP crop from Planetary Computer.
+    exact_year: bool = False,
+) -> NaipItemRef:
+    """Search + select the DOQQ to read for a crop, WITHOUT reading pixels.
 
-    Returns a :class:`NaipFetchResult`; ``result.crop`` is (C, H, W) uint8 or
-    None with ``result.failure`` set to the failure mode.
+    The search half of :func:`fetch_naip`, split out so a caller can group crops
+    by :attr:`NaipItemRef.item_id` and read each DOQQ from a single open handle.
+    Counts exactly one of ``search_error`` / ``no_items`` / ``no_year_match`` /
+    ``asset_missing`` on failure and nothing on success (``ok`` is counted by
+    the read). Item choice is identical to :func:`fetch_naip`.
 
-    ``search_cache`` + ``cache_key`` (typically the tract GEOID) route the STAC
-    search through a :class:`TractSearchCache`: one search serves every crop in
-    the tract, and item choice is provably identical to a per-crop search (the
-    cached list, filtered to items intersecting this crop's bbox, is exactly
-    what the per-crop search would return). Cached items are unsigned, so the
-    asset href is signed at read time. Either argument None ⇒ direct search.
+    ``exact_year`` forbids flight-year substitution: only items flown in
+    ``year_hint`` are eligible, and a window with imagery but none from that
+    year fails permanently as ``no_year_match`` (the prediction path maps this
+    to a NaN prediction rather than silently reading a neighboring year).
     """
     bbox = lonlat_bbox(lon, lat, crop_size_meters)
     use_cache = search_cache is not None and cache_key is not None
@@ -397,65 +595,240 @@ def fetch_naip(
             items = _search_items(bbox, max_items=50, signed=True)
     except Exception:
         _count("search_error")
-        return NaipFetchResult(None, None, failure="search_error")
+        return NaipItemRef(None, None, use_cache, None, bbox, "search_error")
 
     if not items:
         _count("no_items")
-        return NaipFetchResult(None, None, failure="no_items")
+        return NaipItemRef(None, None, use_cache, None, bbox, "no_items")
 
-    item = _select_item(items, bbox, year_hint)
+    item = _select_item(items, bbox, year_hint, exact_year)
+    if item is None:
+        # Imagery exists for the window, just none flown in year_hint.
+        _count("no_year_match")
+        return NaipItemRef(None, None, use_cache, None, bbox, "no_year_match")
     actual_year = item.datetime.year
 
     asset = item.assets.get("image") or item.assets.get("visual")
     if not asset:
         _count("asset_missing")
-        return NaipFetchResult(None, actual_year, failure="asset_missing")
+        return NaipItemRef(item.id, None, use_cache, actual_year, bbox, "asset_missing")
 
+    return NaipItemRef(item.id, asset.href, use_cache, actual_year, bbox, None)
+
+
+@contextmanager
+def open_naip_src(href: str, use_cache: bool):
+    """Open a NAIP COG for reading, signing the href iff it came from the cache.
+
+    A context manager so one handle can serve many :func:`read_naip_crop_from_src`
+    calls (the point of the split). Cached items carry unsigned hrefs (SAS tokens
+    would expire); sign here, at read time — the token is cached client-side by
+    ``planetary_computer``, so this is not an extra round-trip.
+    """
+    signed = planetary_computer.sign(href) if use_cache else href
+    with rasterio.Env(**GDAL_ENV):
+        with rasterio.open(signed) as src:
+            yield src
+
+
+def _bbox_to_native(bbox: list[float], dst_crs) -> tuple:
+    """EPSG:4326 ``bbox`` -> ``dst_crs`` envelope, via a thread-local cached
+    Transformer.
+
+    ``rasterio.transform_bounds`` builds a fresh PROJ transformer on every call
+    (~6 ms) — the single largest per-crop cost at prediction scale, and it
+    serializes across threads. pyproj Transformers are thread-affine, so cache
+    one per (thread, dst_crs) and reuse it. Transforming the four corners and
+    taking the envelope matches ``transform_bounds`` (densify_pts) to far under a
+    pixel for the ~200 m crop window, so crops stay byte-identical.
+    """
+    cache = getattr(_local, "bbox_tf", None)
+    if cache is None:
+        cache = _local.bbox_tf = {}
+    key = dst_crs.to_wkt()
+    tf = cache.get(key)
+    if tf is None:
+        tf = cache[key] = Transformer.from_crs("EPSG:4326", key, always_xy=True)
+    xs, ys = tf.transform([bbox[0], bbox[2], bbox[0], bbox[2]],
+                          [bbox[1], bbox[1], bbox[3], bbox[3]])
+    return min(xs), min(ys), max(xs), max(ys)
+
+
+def read_naip_crop_from_src(src, bbox: list[float], nbands: int, out_pixels: int):
+    """Read one crop window from an already-open rasterio dataset.
+
+    The raster-read half of :func:`fetch_naip`. Returns
+    ``(crop, nir_padded, partial, failure)`` — crop is (C, H, W) uint8 or None.
+    Counts ``ok`` (plus ``partial_coverage`` / ``nir_padded`` flags) on success,
+    ``read_error`` on failure. ``src`` lifecycle is the caller's, so a whole
+    DOQQ's crops can be read from a single open handle.
+    """
     try:
-        # Cached items carry unsigned hrefs (cached SAS tokens would expire);
-        # sign here, at read time. The token itself is cached client-side by
-        # planetary_computer, so this is not an extra API round-trip.
-        href = planetary_computer.sign(asset.href) if use_cache else asset.href
-        with rasterio.Env(**GDAL_ENV):
-            with rasterio.open(href) as src:
-                native_bb = transform_bounds(CRS.from_epsg(4326), src.crs, *bbox)
-                window = from_bounds(*native_bb, transform=src.transform)
+        native_bb = _bbox_to_native(bbox, src.crs)
+        window = from_bounds(*native_bb, transform=src.transform)
 
-                # If the window sticks out of the raster, a plain read would
-                # clip it and stretch the remainder to out_pixels square. Read
-                # boundless instead: geometry stays correct, missing margin is
-                # zero-filled, and the crop is flagged as partial.
-                partial = window_exceeds_raster(window, src.width, src.height)
-                if partial:
-                    _count("partial_coverage")
+        # If the window sticks out of the raster, a plain read would clip it
+        # and stretch the remainder to out_pixels square. Read boundless
+        # instead: geometry stays correct, missing margin is zero-filled, and
+        # the crop is flagged as partial.
+        partial = window_exceeds_raster(window, src.width, src.height)
+        if partial:
+            _count("partial_coverage")
 
-                # Request out_shape with out_pixels size
-                # And only the required number of bands
-                channels = min(nbands, src.count)
-                crop = src.read(
-                    indexes=list(range(1, channels + 1)),
-                    window=window,
-                    out_shape=(channels, out_pixels, out_pixels),
-                    resampling=Resampling.bilinear,
-                    boundless=partial,
-                    fill_value=0,
-                )
+        # Request out_shape with out_pixels size, only the required bands.
+        channels = min(nbands, src.count)
+        crop = src.read(
+            indexes=list(range(1, channels + 1)),
+            window=window,
+            out_shape=(channels, out_pixels, out_pixels),
+            resampling=Resampling.bilinear,
+            boundless=partial,
+            fill_value=0,
+        )
 
-                # If requested more bands than available (3-band visual asset),
-                # pad with zeros and FLAG it — synthetic NIR must be trackable.
-                nir_padded = channels < nbands
-                if nir_padded:
-                    padded_crop = np.zeros((nbands, out_pixels, out_pixels), dtype=crop.dtype)
-                    padded_crop[:channels] = crop
-                    crop = padded_crop
-                    _count("nir_padded")
+        # If requested more bands than available (3-band visual asset), pad
+        # with zeros and FLAG it — synthetic NIR must be trackable.
+        nir_padded = channels < nbands
+        if nir_padded:
+            padded_crop = np.zeros((nbands, out_pixels, out_pixels), dtype=crop.dtype)
+            padded_crop[:channels] = crop
+            crop = padded_crop
+            _count("nir_padded")
 
-                _count("ok")
-                return NaipFetchResult(crop, actual_year, nir_padded=nir_padded,
-                                       partial_coverage=partial)
+        _count("ok")
+        return crop, nir_padded, partial, None
     except Exception:
         _count("read_error")
-        return NaipFetchResult(None, actual_year, failure="read_error")
+        return None, False, False, "read_error"
+
+
+# Cap on the pixel area of one mosaic union window. A tract's crops share a
+# ~6x7.5 km DOQQ but span only the tract (~1-2 km), so their union is small;
+# this guards the pathological case (a rural mega-tract, or a tract straddling
+# a shard split so its crops scatter) where materializing the union would cost
+# hundreds of MB — those groups fall back to per-window reads instead. 4096^2
+# uint8 x 4 bands is ~256 MB worst case.
+MOSAIC_MAX_UNION_PIXELS = 4096 * 4096
+
+
+def _prepare_mosaic(src, bboxes, nbands, max_union_pixels):
+    """Read the native-resolution union of ``bboxes`` from ``src`` (or None).
+
+    Returns ``(array, profile)`` for an in-memory GeoTIFF that is an exact
+    native-pixel subset of ``src`` covering every bbox, or ``None`` when the
+    union is empty, exceeds ``max_union_pixels``, or the read/geometry fails
+    (a fake or broken ``src`` lands here too, so the caller cleanly falls back
+    to per-window reads). The union window is clipped to the raster, so a crop
+    that overruns the DOQQ overruns the mosaic identically — its
+    partial-coverage flag and zero-filled margin are preserved bit-for-bit.
+    """
+    if not bboxes:
+        return None
+    try:
+        crs = src.crs
+        transform = src.transform
+        native = [transform_bounds(CRS.from_epsg(4326), crs, *bb) for bb in bboxes]
+        min_x = min(n[0] for n in native)
+        min_y = min(n[1] for n in native)
+        max_x = max(n[2] for n in native)
+        max_y = max(n[3] for n in native)
+        win = from_bounds(min_x, min_y, max_x, max_y, transform=transform)
+        # Integer-align outward, then clip to the raster: the mosaic is an exact
+        # pixel subset of the DOQQ, never extending past its edge (see docstring).
+        col0 = max(0, floor(win.col_off))
+        row0 = max(0, floor(win.row_off))
+        col1 = min(src.width, ceil(win.col_off + win.width))
+        row1 = min(src.height, ceil(win.row_off + win.height))
+        width, height = col1 - col0, row1 - row0
+        if width <= 0 or height <= 0 or width * height > max_union_pixels:
+            return None
+        window = Window(col0, row0, width, height)
+        channels = min(nbands, src.count)
+        arr = src.read(indexes=list(range(1, channels + 1)), window=window)
+        profile = dict(driver="GTiff", height=height, width=width,
+                       count=channels, dtype=arr.dtype, crs=crs,
+                       transform=src.window_transform(window))
+        return arr, profile
+    except Exception:
+        return None
+
+
+@contextmanager
+def open_naip_mosaic(src, bboxes, nbands: int,
+                     max_union_pixels: int = MOSAIC_MAX_UNION_PIXELS):
+    """Materialize the pixel-union of ``bboxes`` from ``src`` as one in-RAM raster.
+
+    The key to killing redundant tile downloads: buildings in a tract sit inside
+    overlapping ~200 m windows on the same DOQQ, so per-building reads re-fetch
+    the same COG blocks many times. This reads the single window covering the
+    whole group *once*, at native resolution, then yields an in-memory rasterio
+    dataset the caller crops locally with :func:`read_naip_crop_from_src` — the
+    crop is a superset-window read at the same native grid, so pixels, NIR
+    padding, and the partial-coverage flag are identical to reading straight
+    from ``src`` (the union is clipped to the DOQQ; see :func:`_prepare_mosaic`).
+
+    Yields ``None`` (caller falls back to per-window reads on ``src``) when the
+    union is too large or the read fails — never raises for those, so one
+    oversized or unreadable group can't sink the shard.
+    """
+    prepared = _prepare_mosaic(src, bboxes, nbands, max_union_pixels)
+    if prepared is None:
+        yield None
+        return
+    arr, profile = prepared
+    with MemoryFile() as memfile:
+        with memfile.open(**profile) as dst:
+            dst.write(arr)
+        with memfile.open() as mem_src:
+            yield mem_src
+
+
+def fetch_naip(
+    lon: float, lat: float,
+    crop_size_meters: float,
+    nbands: int = 4,
+    out_pixels: int = 250,
+    year_hint: int | None = None,
+    search_cache: "TractSearchCache | None" = None,
+    cache_key: str | None = None,
+    exact_year: bool = False,
+) -> NaipFetchResult:
+    """Fetch a single NAIP crop from Planetary Computer.
+
+    Returns a :class:`NaipFetchResult`; ``result.crop`` is (C, H, W) uint8 or
+    None with ``result.failure`` set to the failure mode. Composes
+    :func:`resolve_naip_item` + :func:`open_naip_src` +
+    :func:`read_naip_crop_from_src`; the grouped predictor calls those directly
+    to open each DOQQ once instead of once per building.
+
+    ``search_cache`` + ``cache_key`` (typically the tract GEOID) route the STAC
+    search through a :class:`TractSearchCache`: one search serves every crop in
+    the tract, and item choice is provably identical to a per-crop search (the
+    cached list, filtered to items intersecting this crop's bbox, is exactly
+    what the per-crop search would return). Cached items are unsigned, so the
+    asset href is signed at read time. Either argument None ⇒ direct search.
+
+    ``exact_year`` forbids flight-year substitution (see
+    :func:`resolve_naip_item`): no same-year item ⇒ ``no_year_match`` failure.
+    """
+    ref = resolve_naip_item(lon, lat, crop_size_meters, year_hint,
+                            search_cache, cache_key, exact_year)
+    if ref.failure is not None:
+        return NaipFetchResult(None, ref.actual_year, failure=ref.failure)
+
+    try:
+        with open_naip_src(ref.href, ref.use_cache) as src:
+            crop, nir_padded, partial, failure = read_naip_crop_from_src(
+                src, ref.bbox, nbands, out_pixels)
+    except Exception:
+        # Open itself failed (before any per-window read counted read_error).
+        _count("read_error")
+        return NaipFetchResult(None, ref.actual_year, failure="read_error")
+
+    if failure is not None:
+        return NaipFetchResult(None, ref.actual_year, failure=failure)
+    return NaipFetchResult(crop, ref.actual_year, nir_padded=nir_padded,
+                           partial_coverage=partial)
 
 
 def fetch_naip_crop(

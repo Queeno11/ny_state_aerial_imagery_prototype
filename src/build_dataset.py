@@ -494,6 +494,17 @@ def write_naip_unavailable(gaps, path=None, merge=True):
     return p
 
 
+def pair_years_tag(panel_years) -> str:
+    """Cache tag identifying a label parquet's year SET, not just its span.
+
+    ``n{count}`` disambiguates different sets with the same endpoints — e.g.
+    the legacy 8 even years 2010-2024 vs all 15 years 2010-2024 — which under
+    a span-only tag would silently share one cache file, serving frames with
+    missing years.
+    """
+    return f"years{min(panel_years)}-{max(panel_years)}n{len(set(panel_years))}"
+
+
 def _load_income_pair_table(panel_years, tau_meters=100,
                             indicator=indicators.DEFAULT_INDICATOR, states=None,
                             unavailable_path=None):
@@ -509,7 +520,7 @@ def _load_income_pair_table(panel_years, tau_meters=100,
     pairs materialize with NaN labels and are skipped before any fetch.
     """
     stag = _states_tag(states)
-    yrs = f"years{min(panel_years)}-{max(panel_years)}"
+    yrs = pair_years_tag(panel_years)
     bpath = PROCESSED_DATA_DIR / f"pair_buildings_ms_us_epsg{geo_utils.METRIC_EPSG}_{stag}.parquet"
     lpath = PROCESSED_DATA_DIR / f"pair_labels_ms_us_{indicator}_{yrs}_{stag}.parquet"
 
@@ -1442,6 +1453,44 @@ def _restricted_tract_panel(covered_geoids):
     return tract_panel[tract_panel["GEOID"].isin(covered_geoids)].reset_index(drop=True)
 
 
+def zero_population_geoids(tract_panel, years=ACS_PANEL_YEARS):
+    """GEOIDs with zero ACS population in EVERY panel year (str set).
+
+    These are structurally unpopulated special-use tracts (water, airports,
+    industrial parks — typically 98xx/99xx GEOID suffixes): per-capita income
+    is undefined there, so they can never produce a valid label. A tract that
+    is populated in even one panel year is kept — its populated years carry
+    real signal. ``tract_panel`` needs ``GEOID`` plus ``total_population_*``
+    columns (the :func:`_restricted_tract_panel` layout); NaN counts as zero.
+    """
+    cols = [c for c in (f"total_population_{y}" for y in years)
+            if c in tract_panel.columns]
+    if not cols:
+        raise KeyError(
+            f"tract_panel has no total_population_* columns for years {list(years)}"
+        )
+    pop = tract_panel[cols]
+    dead = (pop.isna() | (pop == 0)).all(axis=1)
+    return set(tract_panel.loc[dead, "GEOID"].astype(str))
+
+
+def drop_zero_population_tracts(pair_table, zero_geoids):
+    """LazyPairTable without the buildings of ``zero_geoids`` tracts.
+
+    The mask is built through categorical codes — never a 71.8M-row str
+    conversion. Returns ``(filtered_table, n_buildings_dropped)``; the input
+    table is returned untouched when nothing matches.
+    """
+    if not zero_geoids:
+        return pair_table, 0
+    geoid = pair_table.buildings["GEOID"]
+    dead_cat = geoid.cat.categories.astype(str).isin(zero_geoids)
+    dead = dead_cat[geoid.cat.codes.to_numpy()]
+    if not dead.any():
+        return pair_table, 0
+    return pair_table.subset(~dead), int(dead.sum())
+
+
 def _city_split_and_artifacts(tract_panel, years, naip_coverage_csv, split_seed):
     """Whole-city split frame + persisted artifacts (shared legacy/lazy).
 
@@ -1512,6 +1561,19 @@ def _create_split_lazy(pair_table, savename, naip_coverage_csv, split_seed):
               f"{sorted(dead_cbsas)}")
     if dead_tracts:
         print(f"🚫 Excluding {len(dead_tracts):,} zero-coverage tract(s) from the split.")
+
+    # Drop buildings in tracts with zero ACS population in EVERY panel year
+    # (water/airport/industrial special-use tracts): they can never carry a
+    # valid label, so their pairs only waste shard traversal, NAIP fetches and
+    # per-tract val sampling slots. Only the BUILDINGS are dropped — the CBSA
+    # split universe below stays unchanged, so whole-city train/val/test
+    # assignments are identical with or without this filter (removing ~0.5% of
+    # tracts from the stratified counts could otherwise reshuffle cities).
+    zero_pop = zero_population_geoids(tract_panel)
+    pair_table, n_zero_bldgs = drop_zero_population_tracts(pair_table, zero_pop)
+    if n_zero_bldgs:
+        print(f"🚫 Excluding {len(zero_pop):,} zero-population tract(s) "
+              f"({n_zero_bldgs:,} buildings) from train/val/test.")
 
     city_split_df = _city_split_and_artifacts(
         tract_panel, pair_table.years, naip_coverage_csv, split_seed

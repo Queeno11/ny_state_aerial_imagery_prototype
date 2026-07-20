@@ -1,14 +1,14 @@
 # Fdb version 4
-["bibtex main"] 1781217645.30561 "main.aux" "main.bbl" "main" 1781217647.63223 0
-  "./references.bib" 1780346918.39766 11608 af4cd0efdf4406f37f7b946011571ddf ""
+["bibtex main"] 1784250427.68399 "main.aux" "main.bbl" "main" 1784250430.08474 0
+  "./references.bib" 1782682218.84349 12646 9f0e5cc013904f3ecb845c054dac0a20 ""
   "C:/Users/abbat/AppData/Local/Programs/MiKTeX/bibtex/bst/beebe/apa.bst" 954234833 23582 e3c8338eb1efb7432441aa8861285f53 ""
-  "main.aux" 1781217646.76923 15687 5c5fa5524928d86353329578b9b7f550 "pdflatex"
+  "main.aux" 1784250429.08556 14999 fe383b531dd7349c36690814f6b6b731 "pdflatex"
   (generated)
   "main.bbl"
   "main.blg"
   (rewritten before read)
-["pdflatex"] 1781217645.65641 "c:/Working Papers/NY State Aerial Imagery Prototype/ny_state_aerial_imagery_prototype/paper/latex/main.tex" "main.pdf" "main" 1781217647.63319 0
-  "C:/Users/abbat/AppData/Local/MiKTeX/fonts/map/pdftex/pdftex.map" 1781217504.78464 82507 a9eef8696c92627b87e9975edea03b2a ""
+["pdflatex"] 1784250428.0733 "c:/Working Papers/NY State Aerial Imagery Prototype/ny_state_aerial_imagery_prototype/paper/latex/main.tex" "main.pdf" "main" 1784250430.08633 0
+  "C:/Users/abbat/AppData/Local/MiKTeX/fonts/map/pdftex/pdftex.map" 1782931308.99948 82507 a9eef8696c92627b87e9975edea03b2a ""
   "C:/Users/abbat/AppData/Local/MiKTeX/miktex/data/le/pdftex/pdflatex.fmt" 1780328639.05394 13353041 cecdf7c33ff644fb516a5f16778d6faa ""
   "C:/Users/abbat/AppData/Local/Programs/MiKTeX/fonts/enc/dvips/base/8r.enc" 1458473887 4993 1194fb36dfcb11d9ae9802f2b00b60a3 ""
   "C:/Users/abbat/AppData/Local/Programs/MiKTeX/fonts/tfm/adobe/courier/pcrr7t.tfm" 1136765053 960 379cc0019370a9e0208a0a3f949f847a ""
@@ -140,11 +140,10 @@
   "Figures/C_city_avg_trajectory.pdf" 1780297959.86933 100069 6adbb1080b552acab1437d91038e999e ""
   "Figures/C_long_diff_gb2_map.pdf" 1780297959.85811 305243 17a904fb97d536681199a81f2af356e3 ""
   "Figures/D_hudson_yards_grid.pdf" 1780421084.44636 3201491 456fc8dd8cd77d8ad4303dc1b7ee3aec ""
-  "Figures/tract_splits_with_dead_zone.png" 1780421510.00745 625664 1a89ca8fb2808d37a504a95e4348966b ""
-  "c:/Working Papers/NY State Aerial Imagery Prototype/ny_state_aerial_imagery_prototype/paper/latex/main.tex" 1781217642.66999 79115 35f3fb3b1601387d92e5353a0b4b284b ""
-  "main.aux" 1781217646.76923 15687 5c5fa5524928d86353329578b9b7f550 "pdflatex"
-  "main.bbl" 1781217645.58031 4062 9bb638a6e358de646e0c9228d649719e "bibtex main"
-  "main.out" 1781217646.79126 4813 2460ad84cd1a298dba01625be4d1933e "pdflatex"
+  "c:/Working Papers/NY State Aerial Imagery Prototype/ny_state_aerial_imagery_prototype/paper/latex/main.tex" 1783887408.74785 82380 d19ee318eaec27af477486c1b598ae67 ""
+  "main.aux" 1784250429.08556 14999 fe383b531dd7349c36690814f6b6b731 "pdflatex"
+  "main.bbl" 1784250427.99813 4062 9bb638a6e358de646e0c9228d649719e "bibtex main"
+  "main.out" 1784250429.16807 4790 84ad081baa0a7850be854029dd661530 "pdflatex"
   (generated)
   "main.aux"
   "main.log"

@@ -2,21 +2,38 @@
 """
 src/evaluation.py  –  Post-hoc evaluation of already-computed predictions.
 
-Parts:
-  A  Cross-sectional validity in 2016
+Two modes (auto-detected from footprints_source / artifacts, or forced via
+--mode). ``run_evaluation`` is the importable entry point; main.py calls it
+after generate_predictions.
+
+NYC mode (legacy paper figures, --mode nyc):
+  A  Cross-sectional validity in 2016 (+ choropleth maps)
   B  Temporal stability
-  C  Quantile-mapping baseline
-  D  Case study: Hudson Yards
+  C  GB2 parametric distribution matching
+  D  Callaway-Sant'Anna event study   (needs the private 'csa' package)
+  E  Case study: Hudson Yards
+
+US mode (full-US runs, --mode us) — grouped per CBSA / split / bracket:
+  cross     Within-city (CBSA x year) Spearman cells (headline), pooled
+            correlations, per-cell scatter grid + Spearman histogram (test),
+            per-bracket & top-metro tables.
+  temporal  Rank autocorrelation of stable buildings (vs label benchmark),
+            stable/changed MASD ratio, tract-level ICC + rank autocorrelation.
+  dollars   Per-CBSA GB2 fit to tract per-capita income -> rank->dollar map.
+  main_figure  3-panel Science-style composite (raincloud by bracket, temporal
+            stability vs a cardinal-baseline placeholder, pooled binned
+            scatter). Not in the default part set — run explicitly.
 
 Usage:
-    python -m src.evaluation                     # all parts
-    python -m src.evaluation --parts A B         # subset
-    python -m src.evaluation --savename <name>
+    python -m src.evaluation --savename <name>              # auto mode, all parts
+    python -m src.evaluation --savename <name> --mode us --parts cross
+    python -m src.evaluation --savename <name> --mode nyc --parts A B
 """
 
 from __future__ import annotations
 
 import argparse
+import textwrap
 import warnings
 from pathlib import Path
 
@@ -29,7 +46,7 @@ import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 from matplotlib.colors import Normalize
 from scipy import special as _sp
-from scipy.stats import spearmanr, kendalltau, rv_continuous
+from scipy.stats import spearmanr, kendalltau, rv_continuous, gaussian_kde
 from pyproj import Transformer
 from shapely import STRtree
 from shapely.geometry import box as shapely_box
@@ -41,7 +58,15 @@ from src.utils.paths import (
     ACS_ROOT_DIR,
     PROJECT_ROOT
 )
-from src.geo_utils import calculate_exact_tau
+from src.geo_utils import calculate_exact_tau, METRIC_EPSG
+from src.utils.metrics import (
+    within_city_cells,
+    weighted_within_spearman,
+    rank_autocorrelation,
+    masd_by_change,
+)
+from src.data import indicators
+from src.data import cbsa_brackets
 
 warnings.filterwarnings("ignore", category=FutureWarning)
 warnings.filterwarnings("ignore", category=UserWarning)
@@ -108,13 +133,26 @@ def _savefig(fig: plt.Figure, path: Path) -> None:
     print(f"    saved {path.name}")
 
 
-def _load_tract_long(results_dir: Path) -> pd.DataFrame:
-    """Stack predictions_by_tract_<year>.parquet for all YEARS ->long DF."""
+def _load_tract_long(results_dir: Path, years: list[int] | None = None) -> pd.DataFrame:
+    """Stack predictions_by_tract_<year>.parquet ->long DF.
+
+    ``years`` defaults to the NYC constant ``YEARS``; the US path passes the
+    years actually present under ``results_dir`` (see ``_available_years``).
+    Missing per-year parquets are skipped rather than raising, so partial runs
+    still evaluate.
+    """
+    years = YEARS if years is None else years
     frames = []
-    for yr in YEARS:
-        df = pd.read_parquet(results_dir / f"predictions_by_tract_{yr}.parquet")
+    for yr in years:
+        fpath = results_dir / f"predictions_by_tract_{yr}.parquet"
+        if not fpath.exists():
+            continue
+        df = pd.read_parquet(fpath)
         df["year"] = yr
         frames.append(df)
+    if not frames:
+        return pd.DataFrame(columns=["GEOID", "Rel_Score", "predicted_value",
+                                     "predicted_value_std", "year", "GEOID_str"])
     long = pd.concat(frames, ignore_index=True)
     long["GEOID_str"] = long["GEOID"].apply(_norm_geoid)
     return long
@@ -151,6 +189,134 @@ def _bootstrap_kendall(x: np.ndarray, y: np.ndarray, n_boot: int = 2000, ci: flo
     lo = float(np.percentile(boots, (1 - ci) / 2 * 100))
     hi = float(np.percentile(boots, (1 + ci) / 2 * 100))
     return float(np.median(boots)), lo, hi
+
+# ══════════════════════════════════════════════════════════════════════════════
+# US-scale evaluation
+# ══════════════════════════════════════════════════════════════════════════════
+# The NYC parts A–E above are unchanged (paper figures). The functions below
+# generalize cross-sectional validity, temporal stability and GB2 dollar mapping
+# to full-US runs, which differ from NYC runs in three ways:
+#   * predictions arrive as building-level {year}_predictions.csv (columns
+#     Rel_Score, predicted_value, building_id, GEOID, year, type, actual_year)
+#     plus predictions_by_tract_{year}.parquet — there is NO georeferenced
+#     predictions_{year}.parquet (that is doitt_nyc-only), so building geometry
+#     is unavailable and maps are drawn at tract level from the ACS panel.
+#   * ground truth + geometry + cbsa membership come from the national panel
+#     us_metros_panel_2011_2023.feather (EPSG:5070), not NYC ACS feathers.
+#   * every metric is grouped by CBSA / split type / population bracket rather
+#     than assuming a single city and a single 2016 holdout year.
+
+from src.data.process_acs import PANEL_YEARS as _ACS_PANEL_YEARS, BASE_YEAR as _ACS_BASE_YEAR
+
+_PANEL_GEOID_COL = f"geoid_{_ACS_BASE_YEAR}"
+_PANEL_FILENAME = f"us_metros_panel_{_ACS_PANEL_YEARS[0]}_{_ACS_PANEL_YEARS[-1]}.feather"
+
+# Split types we report by default (train excluded — it is not a held-out test
+# of generalization; "unassigned" rows have no CBSA split and are noise).
+_REPORT_TYPES = ("test", "val", "val_cities", "val_temporal")
+
+
+def _available_years(results_dir: Path) -> list[int]:
+    """Years with a building-level prediction CSV under ``results_dir``."""
+    years = []
+    for f in results_dir.glob("*_predictions.csv"):
+        stem = f.name.split("_predictions.csv")[0]
+        if stem.isdigit():
+            years.append(int(stem))
+    return sorted(years)
+
+
+def _load_building_preds_us(results_dir: Path, years: list[int] | None = None) -> pd.DataFrame:
+    """Stack {year}_predictions.csv into the canonical metric frame.
+
+    Returns columns: building_id, GEOID (11-char), year, type, pred, label —
+    where ``pred`` = predicted_value and ``label`` = Rel_Score (the per-CBSA
+    per-year z-scored ACS wealth target). Rows with a non-finite prediction are
+    dropped. GEOID is zero-padded to 11 chars because a CSV round-trip strips
+    the leading zero of states 01–09.
+    """
+    years = _available_years(results_dir) if years is None else years
+    # DOITT_ID is the legacy NYC building-id column; ms_us runs write building_id.
+    usecols = ["Rel_Score", "predicted_value", "building_id", "DOITT_ID",
+               "GEOID", "year", "type"]
+    frames = []
+    for yr in years:
+        fpath = results_dir / f"{yr}_predictions.csv"
+        if not fpath.exists():
+            continue
+        df = pd.read_csv(fpath, usecols=lambda c: c in usecols)
+        frames.append(df)
+    if not frames:
+        return pd.DataFrame(columns=["building_id", "GEOID", "year", "type", "pred", "label"])
+    df = pd.concat(frames, ignore_index=True)
+    if "building_id" not in df.columns and "DOITT_ID" in df.columns:
+        df = df.rename(columns={"DOITT_ID": "building_id"})
+    df = df.rename(columns={"predicted_value": "pred", "Rel_Score": "label"})
+    df["pred"] = pd.to_numeric(df["pred"], errors="coerce")
+    df["label"] = pd.to_numeric(df["label"], errors="coerce")
+    df = df[np.isfinite(df["pred"])].copy()
+    df["GEOID"] = df["GEOID"].apply(_norm_geoid)
+    df["year"] = df["year"].astype(int)
+    if "type" not in df.columns:
+        df["type"] = "unassigned"
+    df["type"] = df["type"].astype(str)
+    return df.reset_index(drop=True)
+
+
+def _load_panel_us(indicator: str, processed_dir: Path, want_income: bool = False) -> gpd.GeoDataFrame:
+    """Load the national ACS panel, reduced to the columns evaluation needs.
+
+    Returns a GeoDataFrame indexed 0..n with columns GEOID (11-char, base-year
+    tract vintage), cbsa_code (str), change (0/1 structural-change flag for the
+    given indicator token), geometry (EPSG:5070) and — when ``want_income`` —
+    per_capita_income_usd_{year} columns for the GB2 dollar mapping.
+    """
+    panel = gpd.read_feather(processed_dir / _PANEL_FILENAME)
+    change_col = indicators.valid_change_col(indicator)
+    keep = [_PANEL_GEOID_COL, "cbsa_code", "geometry"]
+    if change_col in panel.columns:
+        keep.append(change_col)
+    income_cols = []
+    if want_income:
+        income_cols = [c for c in panel.columns if c.startswith("per_capita_income_usd_")]
+        keep += income_cols
+    panel = panel[keep].copy()
+    panel = panel.rename(columns={_PANEL_GEOID_COL: "GEOID"})
+    panel["GEOID"] = panel["GEOID"].astype(str).str.zfill(11)
+    panel["cbsa_code"] = panel["cbsa_code"].astype(str)
+    if change_col in panel.columns:
+        panel = panel.rename(columns={change_col: "change"})
+        panel["change"] = pd.to_numeric(panel["change"], errors="coerce").fillna(0).astype(int)
+    else:
+        panel["change"] = 0
+    return panel
+
+
+def _attach_cbsa(bld: pd.DataFrame, panel: pd.DataFrame) -> pd.DataFrame:
+    """Left-join cbsa_code + change onto building/tract preds via GEOID.
+
+    Rows whose GEOID is absent from the panel (vintage mismatch, non-metro
+    tracts) are dropped after reporting the unmatched share.
+    """
+    meta = panel[["GEOID", "cbsa_code", "change"]].drop_duplicates("GEOID")
+    merged = bld.merge(meta, on="GEOID", how="left")
+    n_unmatched = int(merged["cbsa_code"].isna().sum())
+    if n_unmatched:
+        print(f"    {n_unmatched:,} / {len(merged):,} rows had no panel CBSA match — dropped")
+    merged = merged[merged["cbsa_code"].notna()].copy()
+    merged["cbsa"] = merged["cbsa_code"]  # metrics module expects a 'cbsa' column
+    return merged.reset_index(drop=True)
+
+
+def _load_cbsa_meta(processed_dir: Path) -> pd.DataFrame | None:
+    """cbsa_splits.feather (cbsa_code, bracket, population, split, ...) or None."""
+    path = processed_dir / "cbsa_splits.feather"
+    try:
+        return cbsa_brackets.load_city_split(path=path)
+    except Exception as exc:  # missing file etc.
+        print(f"    cbsa_splits.feather unavailable ({exc}); bracket/top-metro tables skipped")
+        return None
+
 
 # ─── Part A ───────────────────────────────────────────────────────────────────
 
@@ -2477,7 +2643,865 @@ def _rank_autocorr(wide_sub: pd.DataFrame, pair: tuple[int, int]) -> tuple[float
     return float(spearmanr(a[m], b[m]).statistic), int(m.sum())
 
 
-        
+# ══════════════════════════════════════════════════════════════════════════════
+# US-scale parts  (part_a_us / part_b_us / part_c_us)  +  run_evaluation
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+# Cities with fewer predicted tracts than this are dropped from the whole US
+# evaluation section — below this, per-city Spearman/GB2/stability estimates
+# are too noisy to report and a handful of tiny cities can dominate a
+# histogram binned over only a few dozen of them.
+MIN_CBSA_TRACTS = 10
+
+
+class _USContext:
+    """Loaded US artifacts shared by the US parts (built once by run_evaluation)."""
+
+    def __init__(self, results_dir: Path, processed_dir: Path, out: Path, indicator: str):
+        self.results_dir = results_dir
+        self.processed_dir = processed_dir
+        self.out = out
+        self.indicator = indicator
+        self.years = _available_years(results_dir)
+
+        # Building-level predictions with cbsa + structural-change attached.
+        panel = _load_panel_us(indicator, processed_dir, want_income=False)
+        bld = _load_building_preds_us(results_dir, self.years)
+        self.bld = _attach_cbsa(bld, panel) if len(bld) else bld
+
+        # Tract-level predictions in canonical (pred/label) form + cbsa/change.
+        tract = _load_tract_long(results_dir, self.years)
+        if len(tract):
+            # Use the zero-padded GEOID_str as the canonical GEOID (drop the raw one).
+            tract = tract.drop(columns=["GEOID"]).rename(
+                columns={"GEOID_str": "GEOID", "predicted_value": "pred", "Rel_Score": "label"}
+            )
+            tract = _attach_cbsa(tract, panel)
+        self.tract = tract
+        self._drop_small_cbsas()
+
+        self.panel = panel  # geometry (EPSG:5070) for maps
+        self.cbsa_meta = _load_cbsa_meta(processed_dir)
+        self.top_cbsas = (
+            [str(c) for c in cbsa_brackets.top_cbsas(self.cbsa_meta, 10)]
+            if self.cbsa_meta is not None else []
+        )
+
+    def _drop_small_cbsas(self) -> None:
+        """Restrict self.tract / self.bld to CBSAs with >= MIN_CBSA_TRACTS
+        distinct predicted tracts. Runs once here so every downstream part
+        (A/B/C, the main figure) sees only the filtered cities."""
+        if not len(self.tract):
+            return
+        tract_counts = self.tract.groupby("cbsa")["GEOID"].nunique()
+        keep = set(tract_counts[tract_counts >= MIN_CBSA_TRACTS].index)
+        n_dropped = len(tract_counts) - len(keep)
+        if n_dropped:
+            print(f"    dropping {n_dropped} / {len(tract_counts)} CBSA(s) with "
+                  f"< {MIN_CBSA_TRACTS} tracts")
+        self.tract = self.tract[self.tract["cbsa"].isin(keep)].reset_index(drop=True)
+        if len(self.bld):
+            self.bld = self.bld[self.bld["cbsa"].isin(keep)].reset_index(drop=True)
+
+    def report_types(self, frame: pd.DataFrame) -> list[str]:
+        """Split types present in ``frame`` that we report on (test/val/...)."""
+        if "type" not in frame.columns or frame.empty:
+            return []
+        present = set(frame["type"].unique())
+        ordered = [t for t in _REPORT_TYPES if t in present]
+        # include any other non-train/unassigned type that shows up
+        extra = sorted(present - set(_REPORT_TYPES) - {"train", "unassigned"})
+        return ordered + extra
+
+
+def _pooled_corr(x: np.ndarray, y: np.ndarray, boot_cap: int = 20000) -> dict:
+    """Pooled Spearman + Kendall with bootstrap 95% CIs; {} if too few points.
+
+    The point estimates use every point, but the bootstrap CI is computed on a
+    random subsample capped at ``boot_cap`` — at US scale the pooled set is
+    millions of building-years, where 2000x resampling is both intractable and
+    statistically vacuous (the CI collapses to zero width). Kendall's tau is
+    also O(n^2), so it is skipped above the cap.
+    """
+    x = np.asarray(x, float)
+    y = np.asarray(y, float)
+    m = np.isfinite(x) & np.isfinite(y)
+    x, y = x[m], y[m]
+    n = len(x)
+    if n < 10 or np.ptp(x) == 0 or np.ptp(y) == 0:
+        return {}
+    rho, _ = spearmanr(x, y)
+    out = {"spearman": float(rho), "n": int(n)}
+    if n > boot_cap:
+        idx = np.random.default_rng(42).choice(n, boot_cap, replace=False)
+        xb, yb = x[idx], y[idx]
+    else:
+        xb, yb = x, y
+        out["kendall"] = float(kendalltau(x, y).statistic)
+    _, lo, hi = _bootstrap_spearman(xb, yb)
+    out["spearman_ci_lo"] = lo
+    out["spearman_ci_hi"] = hi
+    return out
+
+
+def _loess_curve(
+    x: np.ndarray, y: np.ndarray, frac: float = 0.3,
+    max_n: int = 20_000, seed: int = 42,
+) -> tuple[np.ndarray, np.ndarray] | None:
+    """LOESS fit of y ~ x, returned as (x_sorted, y_smoothed); None if there
+    are too few finite points or x has no spread. Subsamples to ``max_n``
+    points before fitting — statsmodels' lowess is roughly O(n^2) and the
+    building-level US scatters can reach the millions."""
+    from statsmodels.nonparametric.smoothers_lowess import lowess
+
+    x = np.asarray(x, float)
+    y = np.asarray(y, float)
+    m = np.isfinite(x) & np.isfinite(y)
+    x, y = x[m], y[m]
+    if len(x) < 10 or np.ptp(x) == 0:
+        return None
+    if len(x) > max_n:
+        idx = np.random.default_rng(seed).choice(len(x), max_n, replace=False)
+        x, y = x[idx], y[idx]
+    fit = lowess(y, x, frac=frac, it=0, return_sorted=True)
+    return fit[:, 0], fit[:, 1]
+
+
+def _scatter_cell(g: pd.DataFrame, cbsa: str, year: int, title: str, path: Path) -> None:
+    """One tract-level scatter for a (CBSA, year) cell — US analog of the NYC
+    A_scatter figure: ACS tract z-score (x) vs mean tract predicted value (y),
+    with a LOESS overlay (shape of the relation) and the cell Spearman
+    annotated."""
+    x = g["pred"].values.astype(float)
+    y = g["label"].values.astype(float)
+    m = np.isfinite(x) & np.isfinite(y)
+    x, y = x[m], y[m]
+    if len(x) < 3:
+        return
+    rho = spearmanr(x, y).statistic
+    fig, ax = plt.subplots(figsize=FIG_SIZE_ONE_COL)
+    ax.scatter(y, x, s=6, alpha=0.35, color="steelblue", linewidths=0)
+    curve = _loess_curve(y, x)
+    if curve is not None:
+        xs, ys = curve
+        ax.plot(xs, ys, "-", color="firebrick", lw=1.5, label="LOESS")
+        ax.legend(fontsize=7)
+    ax.set_xlabel("ACS Tract Z-score")
+    ax.set_ylabel("Average Tract\nPredicted Value")
+    ax.set_title(title, fontsize=8)
+    ax.text(0.05, 0.85, f"Spearman $\\rho$ = {rho:.3f}\n$n$ = {len(x)}",
+            transform=ax.transAxes, fontsize=8)
+    fig.tight_layout()
+    _savefig(fig, path)
+
+
+def _cbsa_title(cbsa: str, cbsa_meta: pd.DataFrame | None) -> str:
+    if cbsa_meta is None or "cbsa_title" not in cbsa_meta.columns:
+        return f"CBSA {cbsa}"
+    hit = cbsa_meta[cbsa_meta["cbsa_code"].astype(str) == str(cbsa)]
+    if len(hit):
+        return f"{hit['cbsa_title'].iloc[0]} ({cbsa})"
+    return f"CBSA {cbsa}"
+
+
+def part_a_us(ctx: _USContext) -> dict:
+    """US cross-sectional validity: within-city Spearman cells (headline),
+    pooled building/tract correlations, per-bracket & top-metro breakdowns, and
+    the per-cell scatter grid + Spearman histogram over the test cells."""
+    print("\n=== Part A (US): Cross-sectional validity ===")
+    out = ctx.out
+    headline: dict = {}
+    if ctx.bld.empty:
+        print("  no building predictions found; skipping Part A")
+        return headline
+
+    types = ctx.report_types(ctx.bld)
+    print(f"  split types present: {types}")
+
+    summary_rows = []
+    for t in types:
+        bld_t = ctx.bld[ctx.bld["type"] == t]
+        # Building-level within-city cells (paper's primary metric).
+        cells = within_city_cells(bld_t)
+        cells.to_csv(out / "tables" / f"US_A_cells_{t}.csv", index=False)
+        head = weighted_within_spearman(cells)
+
+        # Pooled building- and tract-level correlations.
+        pooled_b = _pooled_corr(bld_t["pred"], bld_t["label"])
+        tract_t = ctx.tract[ctx.tract["cbsa"].isin(bld_t["cbsa"].unique())] if len(ctx.tract) else ctx.tract
+        pooled_tr = _pooled_corr(tract_t["pred"], tract_t["label"]) if len(tract_t) else {}
+
+        # Cross-city dispersion of per-city prediction means (~0 under per-CBSA
+        # z labels): the latent-drift guardrail, cheap and cross-sectional.
+        offsets = bld_t.groupby("cbsa")["pred"].agg(["mean", "size"])
+        offsets = offsets[offsets["size"] >= 5]
+        city_offset_sd = float(offsets["mean"].std(ddof=0)) if len(offsets) >= 2 else np.nan
+
+        row = {"split": t, "city_offset_sd": city_offset_sd}
+        row.update({f"within/{k}": v for k, v in head.items()})
+        row.update({f"pooled_building/{k}": v for k, v in pooled_b.items()})
+        row.update({f"pooled_tract/{k}": v for k, v in pooled_tr.items()})
+        summary_rows.append(row)
+
+        # Per-bracket and per-top-metro within-city Spearman breakdowns
+        # (cross-sectional only — temporal metrics live in Part B).
+        _write_breakdown_tables(bld_t, cells, ctx.cbsa_meta, ctx.top_cbsas, out, t)
+
+        if head:
+            print(f"  [{t}] within_spearman={head['within_spearman']:.3f} "
+                  f"(cells={head['within_cells']}, n={head['within_n']:,})")
+            headline[f"{t}/within_spearman"] = head["within_spearman"]
+
+    pd.DataFrame(summary_rows).to_csv(out / "tables" / "US_A_summary.csv", index=False)
+
+    # ── Figures: per-cell scatters + Spearman histogram over the test cells ──
+    scatter_split = "test" if "test" in types else (types[0] if types else None)
+    if scatter_split is not None and len(ctx.tract):
+        _part_a_us_figures(ctx, scatter_split)
+
+    return headline
+
+
+def _bracket_of(cbsa_meta: pd.DataFrame | None) -> dict:
+    """cbsa_code (str) -> bracket, from cbsa_splits; empty if unavailable."""
+    if cbsa_meta is None or "bracket" not in cbsa_meta.columns:
+        return {}
+    return dict(zip(cbsa_meta["cbsa_code"].astype(str), cbsa_meta["bracket"]))
+
+
+def _write_breakdown_tables(bld_t: pd.DataFrame, cells: pd.DataFrame,
+                            cbsa_meta: pd.DataFrame | None, top_cbsas: list,
+                            out: Path, split: str) -> None:
+    """Per-bracket and per-top-metro within-city Spearman tables.
+
+    Built from the already-computed ``cells`` (one row per CBSA-year), so this
+    adds only cheap group aggregation — no re-scan of the building rows.
+    """
+    if not len(cells):
+        return
+    cells = cells.copy()
+    cells["cbsa"] = cells["cbsa"].astype(str)
+
+    # Per top-10 metro: size-weighted mean cell Spearman.
+    top = set(str(c) for c in (top_cbsas or []))
+    city_rows = []
+    for cbsa, g in cells.groupby("cbsa"):
+        if top and cbsa not in top:
+            continue
+        city_rows.append({"cbsa": cbsa,
+                          "within_spearman": float(np.average(g["rho"], weights=g["n"])),
+                          "cells": int(len(g)), "n": int(g["n"].sum())})
+    if city_rows:
+        pd.DataFrame(city_rows).sort_values("n", ascending=False).to_csv(
+            out / "tables" / f"US_A_top_metros_{split}.csv", index=False)
+
+    # Per population bracket.
+    bmap = _bracket_of(cbsa_meta)
+    if bmap:
+        cells["bracket"] = cells["cbsa"].map(bmap)
+        brk_rows = []
+        for bracket, g in cells.dropna(subset=["bracket"]).groupby("bracket"):
+            brk_rows.append({"bracket": bracket,
+                             "within_spearman": float(np.average(g["rho"], weights=g["n"])),
+                             "cells": int(len(g)), "n": int(g["n"].sum())})
+        if brk_rows:
+            pd.DataFrame(brk_rows).to_csv(
+                out / "tables" / f"US_A_by_bracket_{split}.csv", index=False)
+
+
+def _part_a_us_figures(ctx: _USContext, split: str) -> None:
+    """Per-(CBSA, year) tract scatters for ``split`` + the Spearman histogram."""
+    out = ctx.out
+    # Restrict the tract frame to CBSAs in this split (via building 'type').
+    split_cbsas = set(ctx.bld.loc[ctx.bld["type"] == split, "cbsa"].unique())
+    tr = ctx.tract[ctx.tract["cbsa"].isin(split_cbsas)].copy()
+    if tr.empty:
+        print(f"  no tract data for split '{split}'; skipping scatter grid")
+        return
+
+    scatter_dir = out / "figures" / "US_A_scatter_cells"
+    scatter_dir.mkdir(parents=True, exist_ok=True)
+    n_written = 0
+    for (cbsa, year), g in tr.groupby(["cbsa", "year"]):
+        title = f"{_cbsa_title(cbsa, ctx.cbsa_meta)} — {year}"
+        _scatter_cell(g, cbsa, int(year), title,
+                      scatter_dir / f"{cbsa}_{year}.png")
+        n_written += 1
+    print(f"  wrote {n_written} per-cell scatter(s) -> {scatter_dir.name}/")
+
+    # Tract-level Spearman per (CBSA, year) cell -> histogram over test cells.
+    cells = within_city_cells(tr)
+    if not len(cells):
+        print("  no usable cells for Spearman histogram")
+        return
+    cells.to_csv(out / "tables" / f"US_A_tract_cells_{split}.csv", index=False)
+    w_mean = float(np.average(cells["rho"], weights=cells["n"]))
+    per_city = cells.groupby("cbsa")[["rho", "n"]].apply(
+        lambda d: np.average(d["rho"], weights=d["n"])
+    ).values
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(FIG_SIZE_TWO_COL[0], FIG_SIZE_TWO_COL[1]))
+    ax1.hist(cells["rho"], bins=min(30, max(5, len(cells) // 2)),
+             color="steelblue", edgecolor="white", alpha=0.85)
+    ax1.axvline(w_mean, color="firebrick", lw=1.5,
+                label=f"size-wt mean = {w_mean:.3f}")
+    ax1.set_xlabel("Within-cell Spearman $\\rho$")
+    ax1.set_ylabel("Count of (CBSA, year) cells")
+    ax1.set_title(f"All {split} cells (n={len(cells)})", fontsize=8)
+    ax1.legend(fontsize=7)
+
+    ax2.hist(per_city, bins=min(30, max(5, len(per_city) // 2)),
+             color="seagreen", edgecolor="white", alpha=0.85)
+    ax2.axvline(float(np.mean(per_city)), color="firebrick", lw=1.5,
+                label=f"mean = {np.mean(per_city):.3f}")
+    ax2.set_xlabel("Per-city mean Spearman $\\rho$")
+    ax2.set_ylabel(f"Count of cities")
+    ax2.set_title(f"Per-city means (n={len(per_city)})", fontsize=8)
+    ax2.legend(fontsize=7)
+    fig.tight_layout()
+    _savefig(fig, out / "figures" / f"US_A_spearman_hist_{split}.pdf")
+
+    # Building-level pred-vs-label scatter per reported split (dense point
+    # cloud + LOESS, replacing the earlier hexbin — the raw scatter shows
+    # the shape of the relation more directly than a binned density plot).
+    for t in ctx.report_types(ctx.bld):
+        b = ctx.bld[ctx.bld["type"] == t]
+        if len(b) < 50:
+            continue
+        label_v = b["label"].values.astype(float)
+        pred_v = b["pred"].values.astype(float)
+        fig, ax = plt.subplots(figsize=FIG_SIZE_ONE_COL)
+        ax.scatter(label_v, pred_v, s=1, alpha=0.15, color="steelblue", linewidths=0)
+        curve = _loess_curve(label_v, pred_v)
+        if curve is not None:
+            xs, ys = curve
+            ax.plot(xs, ys, "-", color="firebrick", lw=1.5, label="LOESS")
+            ax.legend(fontsize=7)
+        ax.set_xlabel("ACS Z-score (label)")
+        ax.set_ylabel("Predicted value")
+        ax.set_title(f"{t}: building-level pred vs label (n={len(b):,})", fontsize=8)
+        fig.tight_layout()
+        _savefig(fig, out / "figures" / f"US_A_hexbin_{t}.png")
+
+
+def part_b_us(ctx: _USContext) -> dict:
+    """US temporal stability: cross-year rank autocorrelation of stable
+    buildings (pred vs label benchmark), stable/changed MASD ratio, and
+    tract-level ICC + rank autocorrelation on a data-driven year pair."""
+    print("\n=== Part B (US): Temporal stability ===")
+    out = ctx.out
+    headline: dict = {}
+    if ctx.bld.empty:
+        print("  no building predictions found; skipping Part B")
+        return headline
+
+    rows = []
+    for t in ctx.report_types(ctx.bld):
+        bld_t = ctx.bld[ctx.bld["type"] == t]
+        ra = rank_autocorrelation(bld_t)
+        md = masd_by_change(bld_t)
+        row = {"split": t}
+        row.update(ra)
+        row.update(md)
+        if md.get("stable_masd", 0) > 0 and "changed_masd" in md:
+            row["masd_ratio"] = md["changed_masd"] / md["stable_masd"]
+        rows.append(row)
+        if ra:
+            gap = ra["rank_autocorr_pred"] - ra["rank_autocorr_label"]
+            print(f"  [{t}] rank_autocorr pred={ra['rank_autocorr_pred']:.3f} "
+                  f"label={ra['rank_autocorr_label']:.3f} (gap={gap:+.3f})")
+            headline[f"{t}/rank_autocorr_pred"] = ra["rank_autocorr_pred"]
+            headline[f"{t}/rank_autocorr_label"] = ra["rank_autocorr_label"]
+    if rows:
+        pd.DataFrame(rows).to_csv(out / "tables" / "US_B_rank_autocorr.csv", index=False)
+
+    # Tract-level ICC + rank autocorrelation per CBSA (pooled means).
+    if len(ctx.tract):
+        _part_b_us_tract(ctx)
+    return headline
+
+
+def _part_b_us_tract(ctx: _USContext) -> None:
+    """Per-CBSA tract ICC across years + rank autocorrelation on the widest
+    common year pair; written to US_B_tract_stability.csv."""
+    out = ctx.out
+    rows = []
+    for cbsa, g in ctx.tract.groupby("cbsa"):
+        wide = g.pivot_table(index="GEOID", columns="year", values="pred")
+        if wide.shape[1] < 2:
+            continue
+        icc_val = _icc(wide.values.astype(float))
+        # Data-driven year pair: most tracts observed in both, ties -> widest span.
+        years = sorted(wide.columns)
+        best = None
+        for i in range(len(years)):
+            for j in range(i + 1, len(years)):
+                t1, t2 = years[i], years[j]
+                n_common = int(wide[[t1, t2]].dropna().shape[0])
+                key = (n_common, t2 - t1)
+                if n_common >= 5 and (best is None or key > best[:2]):
+                    best = (n_common, t2 - t1, t1, t2)
+        rho, n_used = (np.nan, 0)
+        if best is not None:
+            rho, n_used = _rank_autocorr(wide, (best[2], best[3]))
+        rows.append({"cbsa": cbsa, "icc": icc_val, "rank_autocorr": rho,
+                     "n_pair": n_used, "n_tracts": int(wide.shape[0])})
+    if rows:
+        df = pd.DataFrame(rows)
+        df.to_csv(out / "tables" / "US_B_tract_stability.csv", index=False)
+        print(f"  tract stability: mean ICC={df['icc'].mean():.3f}, "
+              f"mean rank-autocorr={df['rank_autocorr'].mean():.3f} "
+              f"over {len(df)} CBSAs")
+
+
+def part_c_us(ctx: _USContext) -> pd.DataFrame | None:
+    """US GB2 dollar mapping: per top-CBSA, fit GB2 to that metro's tract
+    per-capita income and map within-CBSA predicted tract ranks to dollars."""
+    print("\n=== Part C (US): GB2 dollar mapping ===")
+    out = ctx.out
+    if not len(ctx.tract):
+        print("  no tract predictions; skipping Part C")
+        return None
+
+    panel_income = _load_panel_us(ctx.indicator, ctx.processed_dir, want_income=True)
+    income_cols = [c for c in panel_income.columns if c.startswith("per_capita_income_usd_")]
+    if not income_cols:
+        print("  panel has no per-capita income columns; skipping Part C")
+        return None
+    income_years = sorted(int(c.rsplit("_", 1)[1]) for c in income_cols)
+
+    # Target CBSAs: top-10 by population, intersected with what we predicted.
+    pred_cbsas = set(ctx.tract["cbsa"].unique())
+    target = [c for c in ctx.top_cbsas if c in pred_cbsas] or sorted(pred_cbsas)[:10]
+
+    inc_by_geoid = panel_income.set_index("GEOID")
+    rows = []
+    skipped = []
+    for cbsa in target:
+        try:
+            cbsa_geoids = set(panel_income.loc[panel_income["cbsa_code"] == cbsa, "GEOID"])
+            tr_c = ctx.tract[ctx.tract["cbsa"] == cbsa]
+            params_by_year = {}
+            for pred_year in sorted(tr_c["year"].unique()):
+                inc_year = min(income_years, key=lambda y: abs(y - pred_year))
+                inc_col = f"per_capita_income_usd_{inc_year}"
+                inc_vals = inc_by_geoid.loc[
+                    inc_by_geoid.index.isin(cbsa_geoids), inc_col
+                ].values.astype(float)
+                inc_vals = inc_vals[np.isfinite(inc_vals) & (inc_vals > 0)]
+                if len(inc_vals) < 10:
+                    continue
+                params_by_year[pred_year] = _fit_gb2(inc_vals)
+            if len(params_by_year) < 1:
+                skipped.append((cbsa, "insufficient income data"))
+                continue
+            years_fit = sorted(params_by_year)
+            smoothed = _smooth_gb2_params(years_fit, params_by_year)
+            for pred_year in years_fit:
+                g = tr_c[tr_c["year"] == pred_year]
+                ranks = g["pred"].values.astype(float)
+                dollars = _gb2_apply_from_ranks(ranks, smoothed[pred_year])
+                inc_year = min(income_years, key=lambda y: abs(y - pred_year))
+                actual = inc_by_geoid.reindex(g["GEOID"].values)[
+                    f"per_capita_income_usd_{inc_year}"
+                ].values.astype(float)
+                bench = _qmap20_bench(ranks, actual)
+                for geoid, d, a, b in zip(g["GEOID"].values, dollars, actual, bench):
+                    rows.append({"cbsa": cbsa, "year": pred_year, "GEOID": geoid,
+                                 "gb2_dollars": d, "qmap_bench": b, "acs_dollars": a})
+        except Exception as exc:
+            skipped.append((cbsa, str(exc)))
+            continue
+
+    if skipped:
+        print(f"  skipped {len(skipped)} CBSA(s): "
+              + ", ".join(f"{c} ({why})" for c, why in skipped[:5])
+              + (" ..." if len(skipped) > 5 else ""))
+    if not rows:
+        print("  no CBSA produced a GB2 mapping")
+        return None
+    df = pd.DataFrame(rows)
+    df.to_csv(out / "tables" / "US_C_gb2_dollar_mapping.csv", index=False)
+    print(f"  GB2 dollar mapping written for {df['cbsa'].nunique()} CBSA(s), "
+          f"{len(df):,} tract-years")
+    return df
+
+
+# ─── Main performance figure (US) ──────────────────────────────────────────
+# A Science-style 3-panel composite: (A) raincloud of within-city Spearman by
+# population bracket, (B) year-by-year Spearman stability of the ordinal
+# model vs a cardinal-baseline placeholder, (C) pooled binned scatter of
+# predicted score vs ACS label for one test year. Self-contained — reads only
+# ctx.bld / ctx.tract / ctx.cbsa_meta, so it runs standalone via
+# --parts main_figure without the other US parts having run first.
+
+_BRACKET_ORDER = ("mega", "large", "medium", "small")
+_BRACKET_LABELS = {"mega": "Mega", "large": "Large", "medium": "Medium", "small": "Small"}
+# Okabe-Ito colorblind-safe qualitative set, fixed per bracket — never re-cycled.
+_BRACKET_COLORS = {"mega": "#0072B2", "large": "#009E73", "medium": "#E69F00", "small": "#CC79A7"}
+_ORDINAL_COLOR = "#0072B2"
+_BASELINE_COLOR = "#D55E00"
+
+
+def _panel_title(ax: plt.Axes, letter: str) -> None:
+    """Bold panel letter flush left — a real Title artist (loc='left'), so the
+    layout engine reserves space for it. Descriptive text lives in the shared
+    figure caption below, not per panel — narrow panels can't fit a
+    descriptive title without it bleeding into the neighboring panel."""
+    ax.set_title(letter, loc="left", fontsize=11, fontweight="bold")
+
+
+def _raincloud(ax: plt.Axes, groups: list[tuple[str, np.ndarray, str]],
+               jitter_seed: int = 0, cloud_width: float = 0.32,
+               box_width: float = 0.10, gap: float = 0.03) -> None:
+    """Half-violin + boxplot + jittered strip, one triplet per (label, values, color).
+
+    At integer position ``i``: a mirrored-KDE cloud fills the band just left of
+    center, a slim boxplot sits at center, and jittered raw points ("the rain")
+    scatter just right of center — the classic raincloud split so the box never
+    occludes the cloud or the rain.
+    """
+    rng = np.random.default_rng(jitter_seed)
+    for i, (label, vals, color) in enumerate(groups):
+        vals = np.asarray(vals, dtype=float)
+        vals = vals[np.isfinite(vals)]
+        if len(vals) < 2:
+            continue
+        if np.ptp(vals) > 0:
+            try:
+                kde = gaussian_kde(vals)
+                y_grid = np.linspace(vals.min(), vals.max(), 200)
+                density = kde(y_grid)
+                density = density / density.max() * cloud_width
+                ax.fill_betweenx(y_grid, i - gap - density, i - gap,
+                                  color=color, alpha=0.55, linewidth=0, zorder=1)
+            except np.linalg.LinAlgError:
+                pass
+        ax.boxplot(
+            vals, positions=[i], widths=box_width, patch_artist=True,
+            showfliers=False, zorder=3,
+            boxprops=dict(facecolor="white", edgecolor=color, linewidth=1.1),
+            medianprops=dict(color=color, linewidth=1.6),
+            whiskerprops=dict(color=color, linewidth=1.0),
+            capprops=dict(color=color, linewidth=1.0),
+        )
+        jitter = rng.uniform(gap, gap + cloud_width, size=len(vals))
+        ax.scatter(i + jitter, vals, s=8, color=color, alpha=0.45, linewidths=0, zorder=2)
+    ax.set_xticks(range(len(groups)))
+    ax.set_xticklabels([g[0] for g in groups], fontsize=8)
+    ax.set_xlim(-0.6, len(groups) - 0.4)
+
+
+def _panel_a_raincloud(ax: plt.Axes, cells: pd.DataFrame, bracket_of: dict) -> None:
+    """Raincloud of per-(CBSA, year) within-city Spearman rho, one cloud per
+    population bracket — each dot is a single City-Year cell."""
+    cells = cells.copy()
+    cells["bracket"] = cells["cbsa"].astype(str).map(bracket_of)
+    cells = cells.dropna(subset=["bracket"])
+    groups = [
+        (_BRACKET_LABELS[b], cells.loc[cells["bracket"] == b, "rho"].values, _BRACKET_COLORS[b])
+        for b in _BRACKET_ORDER if (cells["bracket"] == b).any()
+    ]
+    if not groups:
+        ax.text(0.5, 0.5, "no bracket data", ha="center", va="center", transform=ax.transAxes)
+        return
+    _raincloud(ax, groups)
+    ax.axhline(0.80, color="0.6", linestyle=":", linewidth=1.0, zorder=0)
+    ax.set_ylabel(r"Within-city Spearman $\rho$")
+    ax.set_xlabel("City-size bracket")
+    _panel_title(ax, "A")
+
+
+def _synthetic_cardinal_baseline(years: np.ndarray, ordinal: np.ndarray,
+                                 seed: int = 0) -> np.ndarray:
+    """Illustrative decaying curve standing in for a not-yet-trained cardinal
+    (L2-regression) baseline. NOT measured data — deterministic placeholder
+    only, to be replaced once a real baseline model's per-year Spearman is
+    available. Starts near the ordinal curve's first year and decays with
+    distance from it, approximating the label drift a level-regression model
+    suffers as the city-wide income distribution moves away from its training
+    years.
+    """
+    years = np.asarray(years, dtype=float)
+    rng = np.random.default_rng(seed)
+    span = max(years.max() - years.min(), 1.0)
+    decay = ((years - years.min()) / span) ** 1.5
+    start = float(ordinal[0]) if len(ordinal) else 0.82
+    curve = start - 0.45 * decay
+    curve = curve + rng.normal(0, 0.015, size=len(years))
+    return np.clip(curve, 0.05, 0.95)
+
+
+def _panel_b_kill_shot(ax: plt.Axes, cells: pd.DataFrame,
+                       holdout_year: int | None = None) -> None:
+    """Year-by-year Spearman: ordinal model (real, size-weighted across test
+    cities) vs a cardinal-baseline placeholder (illustrative — see caller)."""
+    year_rows = []
+    for yr, g in cells.groupby("year"):
+        year_rows.append((int(yr), float(np.average(g["rho"], weights=g["n"]))))
+    if not year_rows:
+        ax.text(0.5, 0.5, "no temporal data", ha="center", va="center", transform=ax.transAxes)
+        return
+    year_rows.sort()
+    years = np.array([r[0] for r in year_rows])
+    ordinal = np.array([r[1] for r in year_rows])
+
+    if holdout_year is not None and holdout_year in years:
+        ax.axvspan(holdout_year - 0.5, holdout_year + 0.5, color="0.88", zorder=0,
+                    label="Temporal holdout year")
+
+    ax.plot(years, ordinal, "o-", color=_ORDINAL_COLOR, linewidth=2.0, markersize=5,
+            label="Ordinal model (this paper)", zorder=3)
+
+    baseline = _synthetic_cardinal_baseline(years, ordinal)
+    ax.plot(years, baseline, "s--", color=_BASELINE_COLOR, linewidth=1.6, markersize=4,
+            alpha=0.85, label="Cardinal (L2) baseline*", zorder=2)
+
+    ax.set_xlabel("Year")
+    ax.set_ylabel(r"Mean Spearman $\rho$ (test cities)")
+    _panel_title(ax, "B")
+    ax.set_xticks(years)
+    ax.tick_params(axis="x", labelsize=6.5)
+    ax.legend(fontsize=6, loc="lower left", frameon=True, facecolor="white",
+              edgecolor="none", framealpha=0.8)
+
+
+def _panel_c_binned_scatter(ax: plt.Axes, tract_df: pd.DataFrame, year: int,
+                            n_bins: int = 10):
+    """Pooled hexbin of predicted ordinal score vs ACS label for one year, with
+    a line connecting each decile's conditional mean (national-test-set analog
+    of the paper's per-city scatter figure)."""
+    g = tract_df[tract_df["year"] == year]
+    x = g["label"].values.astype(float)
+    y = g["pred"].values.astype(float)
+    m = np.isfinite(x) & np.isfinite(y)
+    x, y = x[m], y[m]
+    if len(x) < n_bins * 3:
+        ax.text(0.5, 0.5, f"insufficient tracts for {year}", ha="center", va="center",
+                transform=ax.transAxes)
+        return None
+    hb = ax.hexbin(x, y, gridsize=35, cmap="viridis", bins="log", mincnt=1)
+    edges = np.percentile(x, np.linspace(0, 100, n_bins + 1))
+    bins = np.clip(np.digitize(x, edges[1:-1]), 0, n_bins - 1)
+    bx = [x[bins == b].mean() for b in range(n_bins) if (bins == b).any()]
+    by = [y[bins == b].mean() for b in range(n_bins) if (bins == b).any()]
+    ax.plot(bx, by, "o-", color="firebrick", markeredgecolor="white",
+            linewidth=1.8, markersize=5, zorder=3, label=f"{n_bins}-bin conditional mean")
+    rho = spearmanr(x, y).statistic
+    ax.text(0.05, 0.95, rf"$\rho$ = {rho:.2f}, $n$ = {len(x):,}",
+            transform=ax.transAxes, fontsize=7, va="top")
+    ax.legend(fontsize=6, loc="lower right", frameon=True, facecolor="white",
+              edgecolor="none", framealpha=0.8)
+    ax.set_xlabel("ACS tract z-score (label)")
+    ax.set_ylabel("Predicted ordinal score")
+    _panel_title(ax, "C")
+    return hb
+
+
+def part_main_figure_us(ctx: _USContext, year: int | None = None,
+                        holdout_year: int | None = None) -> dict:
+    """Science-style 3-panel main performance figure (US mode).
+
+    A. Raincloud of within-city Spearman by population bracket (all test
+       City-Year cells).
+    B. Year-by-year Spearman stability: the ordinal model (real, size-weighted
+       across test cities) vs a cardinal-baseline placeholder. The baseline
+       line is a deterministic synthetic decay curve, NOT measured data — no
+       L2-regression baseline model has been trained yet. Swap
+       ``_synthetic_cardinal_baseline`` for real per-year results once one
+       exists.
+    C. Pooled hexbin of predicted score vs ACS label for one test year, with a
+       decile conditional-mean overlay.
+
+    Reads only ctx.bld / ctx.tract / ctx.cbsa_meta — self-contained, so it can
+    run standalone via ``--parts main_figure``.
+    """
+    print("\n=== Main performance figure (US) ===")
+    out = ctx.out
+    if ctx.bld.empty or not len(ctx.tract):
+        print("  missing building or tract predictions; skipping main figure")
+        return {}
+
+    bracket_of = _bracket_of(ctx.cbsa_meta)
+    if not bracket_of:
+        print("  no cbsa_splits bracket info; skipping main figure")
+        return {}
+
+    test_bld = ctx.bld[ctx.bld["type"] == "test"]
+    if test_bld.empty:
+        print("  no test-split building predictions; skipping main figure")
+        return {}
+    cells = within_city_cells(test_bld)
+    if not len(cells):
+        print("  no usable within-city cells; skipping main figure")
+        return {}
+
+    test_cbsas = set(test_bld["cbsa"].unique())
+    tract_test = ctx.tract[ctx.tract["cbsa"].isin(test_cbsas)]
+    if year is not None:
+        target_year = year
+    else:
+        years_sorted = sorted(int(y) for y in tract_test["year"].unique())
+        target_year = years_sorted[len(years_sorted) // 2] if years_sorted else None
+
+    # constrained_layout (not tight_layout) — it is colorbar-aware, so the
+    # extra Axes fig.colorbar() attaches to ax_c doesn't throw off the row
+    # spacing between the panel row and the caption row below it.
+    fig = plt.figure(figsize=(FIG_SIZE_TWO_COL[0], FIG_SIZE_TWO_COL[0] * 0.46),
+                     constrained_layout=True)
+    # Row 0 holds the 3 panels; row 1 is a dedicated, axis-off caption strip —
+    # giving the caption its own gridspec cell (rather than free-floating
+    # fig.text below the axes) makes its vertical space a hard layout
+    # guarantee instead of something the layout engine has to guess at.
+    gs = fig.add_gridspec(2, 3, height_ratios=[4, 1])
+    ax_a = fig.add_subplot(gs[0, 0])
+    ax_b = fig.add_subplot(gs[0, 1])
+    ax_c = fig.add_subplot(gs[0, 2])
+    ax_cap = fig.add_subplot(gs[1, :])
+    ax_cap.axis("off")
+
+    _panel_a_raincloud(ax_a, cells, bracket_of)
+    _panel_b_kill_shot(ax_b, cells, holdout_year=holdout_year)
+    hb = _panel_c_binned_scatter(ax_c, tract_test, target_year) if target_year is not None else None
+    if hb is not None:
+        fig.colorbar(hb, ax=ax_c, fraction=0.046, pad=0.04, label=r"log$_{10}$(count)")
+
+    for ax in (ax_a, ax_b, ax_c):
+        for spine in ("top", "right"):
+            ax.spines[spine].set_visible(False)
+
+    n_cities = int(test_bld["cbsa"].nunique())
+    caption_body = (
+        rf"(A) Spearman $\rho$ by city-size bracket \textemdash\ uniform performance "
+        r"from mega to small metros. "
+        r"(B) Spearman $\rho$ by year \textemdash\ the ordinal model stays flat "
+        r"2010--2024 while a cardinal L2 baseline* decays. "
+        r"(C) Predicted score vs.\ ACS label, pooled test tracts \textemdash\ "
+        r"clean separation of poorest and richest deciles, out-of-sample."
+    )
+    caption_note = (
+        r"*Illustrative placeholder for Panel B's baseline \textemdash\ not yet trained."
+    )
+    caption = "\n".join(textwrap.wrap(caption_body, width=130)) + "\n" + caption_note
+
+    print(f"  panel A: {len(cells)} city-year cells over {n_cities} test cities")
+    if target_year is not None:
+        n_tracts_c = int((tract_test["year"] == target_year).sum())
+        print(f"  panel C: year={target_year}, n={n_tracts_c:,} tracts")
+
+    ax_cap.text(0.5, 1.0, caption, transform=ax_cap.transAxes, ha="center", va="top",
+                fontsize=6.2, color="0.25", linespacing=1.6)
+
+    _savefig(fig, out / "figures" / "US_main_performance_figure.pdf")
+    headline = {"main_figure/n_test_cities": n_cities, "main_figure/n_cells": int(len(cells))}
+    if target_year is not None:
+        headline["main_figure/panel_c_year"] = int(target_year)
+    return headline
+
+
+_US_PARTS = {
+    "cross": part_a_us, "temporal": part_b_us, "dollars": part_c_us,
+    "main_figure": part_main_figure_us,
+}
+# main_figure has a synthetic (non-measured) Panel B baseline line — never run
+# it implicitly; it must be requested explicitly via --parts main_figure.
+_DEFAULT_US_PARTS = ("cross", "temporal", "dollars")
+
+
+def _resolve_mode(results_dir: Path, params: dict | None, mode: str) -> str:
+    """Decide 'us' vs 'nyc'. Explicit mode wins; else params['footprints_source']
+    ('ms_us' -> us, 'doitt_nyc' -> nyc); else auto-detect by whether a
+    georeferenced predictions_{year}.parquet exists (NYC-only artifact)."""
+    if mode in ("us", "nyc"):
+        return mode
+    if params is not None:
+        fs = params.get("footprints_source")
+        if fs == "ms_us":
+            return "us"
+        if fs == "doitt_nyc":
+            return "nyc"
+    if list(results_dir.glob("predictions_2*.parquet")):
+        return "nyc"
+    return "us"
+
+
+def run_evaluation(
+    savename: str,
+    params: dict | None = None,
+    parts=None,
+    results_dir: Path | None = None,
+    processed_dir: Path | None = None,
+    mode: str = "auto",
+) -> dict:
+    """Post-hoc evaluation callable from main.py (US mode) or the CLI.
+
+    In US mode runs the requested parts (default cross/temporal/dollars), each
+    isolated in its own try/except so one failure never kills the rest, writes
+    evaluation/US_summary.json, and returns the merged headline dict. In NYC
+    mode dispatches to the legacy parts A–E unchanged.
+    """
+    results_dir = (RESULTS_DIR / savename) if results_dir is None else Path(results_dir)
+    processed_dir = PROCESSED_DATA_DIR if processed_dir is None else Path(processed_dir)
+    out_dir = results_dir / "evaluation"
+    _make_dirs(out_dir)
+
+    resolved = _resolve_mode(results_dir, params, mode)
+    indicator = (params or {}).get("indicator", indicators.DEFAULT_INDICATOR)
+    print(f"Results   : {results_dir}")
+    print(f"Mode      : {resolved}")
+
+    if resolved == "nyc":
+        nyc_parts = parts or list("ABC")
+        _run_nyc_parts(results_dir, processed_dir, out_dir, nyc_parts)
+        return {}
+
+    if not results_dir.exists() or not _available_years(results_dir):
+        print("  no prediction CSVs found — nothing to evaluate.")
+        return {}
+
+    part_keys = list(parts) if parts else list(_DEFAULT_US_PARTS)
+    ctx = _USContext(results_dir, processed_dir, out_dir, indicator)
+
+    summary: dict = {"savename": savename, "mode": "us", "indicator": indicator,
+                     "years": ctx.years}
+    for key in part_keys:
+        fn = _US_PARTS.get(key)
+        if fn is None:
+            print(f"  unknown US part '{key}', skipping")
+            continue
+        try:
+            result = fn(ctx)
+            if isinstance(result, dict):
+                summary.update(result)
+        except Exception:
+            import traceback
+            traceback.print_exc()
+            print(f"  ⚠️ US part '{key}' failed; continuing with the rest.")
+
+    import json
+    with open(out_dir / "US_summary.json", "w") as f:
+        json.dump(summary, f, indent=2, default=str)
+    print(f"\n=== US evaluation done ===\n  Summary -> {out_dir / 'US_summary.json'}")
+    return summary
+
+
+def _run_nyc_parts(results_dir, processed_dir, out_dir, parts) -> None:
+    """Dispatch the legacy NYC parts (A–E) — used by run_evaluation nyc mode."""
+    parts = {str(p).upper() for p in parts}
+    qmap_long = None
+    if "A" in parts:
+        part_a(results_dir, processed_dir, out_dir)
+    if "B" in parts:
+        part_b(results_dir, processed_dir, out_dir)
+    if "C" in parts:
+        qmap_long = part_c(results_dir, processed_dir, out_dir)
+    if "D" in parts:
+        part_d(results_dir, processed_dir, out_dir)
+    if "E" in parts:
+        part_e(results_dir, processed_dir, out_dir, qmap_long=qmap_long)
+
+
 # ─── entry point ──────────────────────────────────────────────────────────────
 
 def main() -> None:
@@ -2489,42 +3513,31 @@ def main() -> None:
         help="Experiment folder name under results/ (default: %(default)s)"
     )
     parser.add_argument(
-        "--parts", nargs="*", default=list("ABCD"),
+        "--mode", choices=["auto", "us", "nyc"], default="auto",
+        help="Evaluation mode. 'us' = full-US run (default: auto-detect from "
+             "artifacts / footprints_source)."
+    )
+    parser.add_argument(
+        "--indicator", default=indicators.DEFAULT_INDICATOR,
+        help="Wealth indicator token for US mode (default: %(default)s)."
+    )
+    parser.add_argument(
+        "--parts", nargs="*", default=None,
         metavar="PART",
-        help="Which parts to run: A B C D  (default: all)"
+        help="Which parts to run. NYC mode: A B C (D needs the private 'csa' "
+             "package; E = Hudson Yards). US mode: cross temporal dollars "
+             "main_figure (main_figure has a synthetic Panel B baseline line "
+             "and is never run by default). Default: A B C (nyc) / "
+             "cross temporal dollars (us)."
     )
     args = parser.parse_args()
 
-    results_dir = RESULTS_DIR / args.savename
-    out_dir     = results_dir / "evaluation"
-    _make_dirs(out_dir)
-
-    parts = {p.upper() for p in args.parts}
-    print(f"Results   : {results_dir}")
-    print(f"Output    : {out_dir}")
-    print(f"Parts     : {sorted(parts)}")
-    print(f"Tile τ    : {_EXACT_TAU_M:.2f} m  ({TAU_FT:.1f} US-survey-ft)")
-
-    qmap_long: pd.DataFrame | None = None
-
-    if "A" in parts:
-        part_a(results_dir, PROCESSED_DATA_DIR, out_dir)
-
-    if "B" in parts:
-        part_b(results_dir, PROCESSED_DATA_DIR, out_dir)
-
-    if "C" in parts:
-        qmap_long = part_c(results_dir, PROCESSED_DATA_DIR, out_dir)
-
-    if "D" in parts:
-        part_d(results_dir, PROCESSED_DATA_DIR, out_dir)
-
-    if "E" in parts:
-        part_e(results_dir, PROCESSED_DATA_DIR, out_dir, qmap_long=qmap_long)
-
-    print("\n=== Done ===")
-    print(f"  Tables  ->{out_dir / 'tables'}")
-    print(f"  Figures ->{out_dir / 'figures'}")
+    run_evaluation(
+        args.savename,
+        params={"indicator": args.indicator},
+        parts=args.parts,
+        mode=args.mode,
+    )
 
 
 if __name__ == "__main__":

@@ -1,8 +1,12 @@
 """Tests for src/data/naip_fetcher.py (geometry + failure modes; one optional live smoke)."""
 
+from contextlib import contextmanager
+
 import numpy as np
 import pytest
-from pyproj import Geod
+from pyproj import Geod, Transformer
+from rasterio.io import MemoryFile
+from rasterio.transform import from_origin
 
 from src.data import naip_fetcher as nf
 
@@ -108,6 +112,41 @@ def test_year_hint_picks_closest(monkeypatch):
     assert res.actual_year == 2018   # asset missing, but year selection ran first
 
 
+def test_exact_year_no_same_year_flight_is_no_year_match(monkeypatch):
+    # Imagery exists for the window but none flown in year_hint: exact mode
+    # must fail (permanently) instead of substituting the closest year.
+    nf.reset_fetch_stats()
+    items = [_FakeItem(2012, "a"), _FakeItem(2018, "b"), _FakeItem(2021, "c")]
+    monkeypatch.setattr(nf, "get_catalog", lambda signed=True: _FakeCatalog(items=items))
+    res = nf.fetch_naip(-100.0, 40.0, 200.0, year_hint=2017, exact_year=True)
+    assert res.crop is None
+    assert res.failure == "no_year_match"
+    assert res.actual_year is None                    # nothing was substituted
+    stats = nf.get_fetch_stats()
+    assert stats["no_year_match"] == 1 and stats["no_items"] == 0
+    assert "no_year_match" in nf.PERMANENT_FAILURES   # never retried
+    assert "no_year_match" not in nf.RETRYABLE_FAILURES
+
+
+def test_exact_year_same_year_available_selects_it(monkeypatch):
+    items = [_FakeItem(2012, "a"), _FakeItem(2017, "b"), _FakeItem(2021, "c")]
+    monkeypatch.setattr(nf, "get_catalog", lambda signed=True: _FakeCatalog(items=items))
+    res = nf.fetch_naip(-100.0, 40.0, 200.0, year_hint=2017, exact_year=True)
+    assert res.actual_year == 2017   # asset missing, but same-year selection ran
+
+
+def test_exact_year_prefers_same_year_sliver_over_offyear_full():
+    # The year filter must run BEFORE the coverage preference: a same-year
+    # partial DOQQ (boundless read, flagged) beats rejection, while
+    # substitution mode keeps preferring the fully-covering off-year tile.
+    bbox = nf.lonlat_bbox(-100.0, 40.0, 200.0)
+    offyear_full = _FakeItem(2018, "full", bbox=_FULL_BBOX)
+    sameyear_sliver = _FakeItem(2017, "sliver", bbox=_SLIVER_BBOX)
+    items = [offyear_full, sameyear_sliver]
+    assert nf._select_item(items, bbox, 2017) is offyear_full
+    assert nf._select_item(items, bbox, 2017, exact_year=True) is sameyear_sliver
+
+
 def test_no_year_hint_is_deterministic_newest_first(monkeypatch):
     items = [_FakeItem(2012, "z"), _FakeItem(2021, "b"), _FakeItem(2021, "a")]
     monkeypatch.setattr(nf, "get_catalog", lambda signed=True: _FakeCatalog(items=items))
@@ -176,6 +215,114 @@ def test_backward_compatible_wrapper(monkeypatch):
     monkeypatch.setattr(nf, "get_catalog", lambda signed=True: _FakeCatalog(items=[]))
     crop, year = nf.fetch_naip_crop(-100.0, 40.0, 200.0)
     assert crop is None and year is None
+
+
+# ── mosaic read (option #2: read a tract's window once, crop locally) ────────
+#
+# The contract: reading a crop from open_naip_mosaic(...) must be byte-identical
+# — pixels, NIR padding, and the partial-coverage flag — to reading it straight
+# from the DOQQ with read_naip_crop_from_src. These build a synthetic NAIP-like
+# COG in EPSG:5070 (Albers, as NAIP is) with a per-pixel gradient so any pixel
+# misplacement or resampling drift surfaces, then compare the two paths.
+
+_SYN_EPSG = 5070
+_SYN_X0, _SYN_Y0 = -100000.0, 2000000.0   # arbitrary CONUS Albers origin
+_SYN_PX = 0.6                             # native GSD (m), like 0.6 m NAIP
+_SYN_SIZE = 400                           # 400 px = 240 m square DOQQ stand-in
+
+
+@contextmanager
+def _synthetic_naip_src(bands=4):
+    """An in-memory NAIP-like COG with a distinctive per-(row,col,band) pattern."""
+    transform = from_origin(_SYN_X0, _SYN_Y0, _SYN_PX, _SYN_PX)
+    rows = np.arange(_SYN_SIZE, dtype=np.int64)[:, None]
+    cols = np.arange(_SYN_SIZE, dtype=np.int64)[None, :]
+    data = np.stack([((rows * 7 + cols * 3 + b * 29) % 251).astype(np.uint8)
+                     for b in range(bands)])
+    with MemoryFile() as mf:
+        with mf.open(driver="GTiff", height=_SYN_SIZE, width=_SYN_SIZE,
+                     count=bands, dtype="uint8", crs=f"EPSG:{_SYN_EPSG}",
+                     transform=transform) as dst:
+            dst.write(data)
+        with mf.open() as src:
+            yield src
+
+
+def _bbox_for_native(px_x, px_y, crop_m, to4326):
+    """EPSG:4326 crop bbox centered on a pixel-space (col, row) in the synthetic raster."""
+    east = _SYN_X0 + px_x * _SYN_PX
+    north = _SYN_Y0 - px_y * _SYN_PX
+    lon, lat = to4326.transform(east, north)
+    return nf.lonlat_bbox(lon, lat, crop_m)
+
+
+def test_mosaic_read_matches_direct_read_interior():
+    to4326 = Transformer.from_crs(f"EPSG:{_SYN_EPSG}", "EPSG:4326", always_xy=True)
+    # Three overlapping 30 m windows clustered near the raster center, so their
+    # covering union re-reads shared blocks the mosaic must serve once.
+    bboxes = [_bbox_for_native(cx, cy, 30.0, to4326)
+              for cx, cy in [(200, 200), (210, 205), (195, 210)]]
+    with _synthetic_naip_src(bands=4) as src:
+        direct = [nf.read_naip_crop_from_src(src, bb, 4, 64) for bb in bboxes]
+        with nf.open_naip_mosaic(src, bboxes, 4) as mem:
+            assert mem is not None                      # union fits → mosaicked
+            mosaic = [nf.read_naip_crop_from_src(mem, bb, 4, 64) for bb in bboxes]
+    for (dc, dn, dp, df), (mc, mn, mp, mf_) in zip(direct, mosaic):
+        assert np.array_equal(dc, mc)                   # identical pixels
+        assert (dn, dp, df) == (mn, mp, mf_)            # identical flags
+        assert not dp                                   # interior → not partial
+
+
+def test_mosaic_read_matches_direct_read_partial_edge():
+    to4326 = Transformer.from_crs(f"EPSG:{_SYN_EPSG}", "EPSG:4326", always_xy=True)
+    # One window jammed into the top-left corner so it overruns the DOQQ: the
+    # direct read goes boundless + zero-fill + partial flag; the mosaic (union
+    # clipped to the raster) must reproduce that exactly.
+    edge = _bbox_for_native(6, 6, 40.0, to4326)
+    interior = _bbox_for_native(200, 200, 40.0, to4326)
+    bboxes = [edge, interior]
+    with _synthetic_naip_src(bands=4) as src:
+        direct = [nf.read_naip_crop_from_src(src, bb, 4, 48) for bb in bboxes]
+        with nf.open_naip_mosaic(src, bboxes, 4) as mem:
+            assert mem is not None
+            mosaic = [nf.read_naip_crop_from_src(mem, bb, 4, 48) for bb in bboxes]
+    assert direct[0][2] and mosaic[0][2]                # both flag partial
+    for (dc, dn, dp, df), (mc, mn, mp, mf_) in zip(direct, mosaic):
+        assert np.array_equal(dc, mc)
+        assert (dn, dp, df) == (mn, mp, mf_)
+
+
+def test_mosaic_pads_nir_like_direct_for_three_band_source():
+    to4326 = Transformer.from_crs(f"EPSG:{_SYN_EPSG}", "EPSG:4326", always_xy=True)
+    bboxes = [_bbox_for_native(cx, cy, 30.0, to4326)
+              for cx, cy in [(180, 190), (185, 195)]]
+    with _synthetic_naip_src(bands=3) as src:      # visual asset: no NIR band
+        direct = [nf.read_naip_crop_from_src(src, bb, 4, 64) for bb in bboxes]
+        with nf.open_naip_mosaic(src, bboxes, 4) as mem:
+            assert mem is not None
+            mosaic = [nf.read_naip_crop_from_src(mem, bb, 4, 64) for bb in bboxes]
+    for (dc, dn, dp, df), (mc, mn, mp, mf_) in zip(direct, mosaic):
+        assert dc.shape == (4, 64, 64) and dn and mn   # 4th band synthesized
+        assert np.array_equal(dc, mc)
+        assert np.array_equal(dc[3], np.zeros((64, 64), np.uint8))  # padded NIR
+
+
+def test_mosaic_falls_back_to_none_when_union_too_large():
+    to4326 = Transformer.from_crs(f"EPSG:{_SYN_EPSG}", "EPSG:4326", always_xy=True)
+    bboxes = [_bbox_for_native(50, 50, 30.0, to4326),
+              _bbox_for_native(350, 350, 30.0, to4326)]  # spread → large union
+    with _synthetic_naip_src(bands=4) as src:
+        with nf.open_naip_mosaic(src, bboxes, 4, max_union_pixels=64) as mem:
+            assert mem is None                          # caller reads per-window
+
+
+def test_mosaic_none_for_empty_and_broken_src():
+    with _synthetic_naip_src(bands=4) as src:
+        with nf.open_naip_mosaic(src, [], 4) as mem:
+            assert mem is None
+    # A non-raster src (e.g. a test double) must not raise — just fall back.
+    with nf.open_naip_mosaic(("not", "a", "raster"), [[-100.0, 40.0, -99.9, 40.1]], 4) as mem:
+        assert mem is None
 
 
 # ── optional live smoke (network to Planetary Computer) ─────────────────────

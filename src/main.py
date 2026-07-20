@@ -3,6 +3,7 @@
 ### Main libraries
 import os
 import gc
+import ctypes
 import math
 import time
 import json
@@ -1039,13 +1040,14 @@ class InBatchRankingDataset(Dataset):
     The HybridBatchSampler constructs valid hybrid batches at iteration time
     using the exposed metadata (year_to_idxs, building_to_idxs).
     """
-    def __init__(self, cache_manager: CyclicCacheManager, transform=None):
+    def __init__(self, cache_manager: CyclicCacheManager, transform=None, se_lookup=None):
         if not cache_manager._is_initialized:
             raise RuntimeError(
                 "Call cache_manager.build_initial_cache() before instantiating InBatchRankingDataset."
             )
         self.cache_manager = cache_manager
         self.transform = transform
+        self.se_lookup = se_lookup
         self.images = None
         self.scores = None
         self.geoids = None
@@ -1099,6 +1101,16 @@ class InBatchRankingDataset(Dataset):
         self.score_bins       = torch.cat(sb_list)
         self.cbsa_ids         = torch.cat(cb_list)
 
+        if getattr(self, 'se_lookup', None) is not None and len(self.se_lookup) > 0:
+            se_list = []
+            geoids_list = self.geoids.tolist()
+            years_list = self.years.tolist()
+            for g, y in zip(geoids_list, years_list):
+                se_list.append(self.se_lookup.get((g, y), 0.151))
+            self.ses = torch.tensor(se_list, dtype=torch.float32)
+        else:
+            self.ses = None
+
         # Build lookups for the batch sampler
         self.year_to_idxs = {}
         self.yearcbsa_to_idxs = {}
@@ -1124,8 +1136,9 @@ class InBatchRankingDataset(Dataset):
         img = self.images[idx]
         if self.transform:
             img = self.transform(img)
+        se_val = self.ses[idx] if self.ses is not None else 0.0
         return (img, self.scores[idx], self.geoids[idx], self.years[idx],
-                self.building_ids[idx], self.structural_change[idx], self.metas[idx], self.score_bins[idx])
+                self.building_ids[idx], self.structural_change[idx], self.metas[idx], self.score_bins[idx], se_val)
 
 
 class HybridBatchSampler(torch.utils.data.Sampler):
@@ -1365,6 +1378,41 @@ def _subsample_val_buildings(df_val, n_buildings_per_tract=1, seed=825):
     return out.iloc[order].reset_index(drop=True)
 
 
+def build_se_lookup(indicator_token):
+    import pandas as pd
+    from src.data.process_acs import PROCESSED_DATA_DIR, PANEL_YEARS
+    from src.data.indicators import token_to_var
+    se_dict = {}
+    panel_path = PROCESSED_DATA_DIR / "us_metros_panel_2011_2023.feather"
+    if not panel_path.exists():
+        print(f"⚠️ Warning: Panel {panel_path} not found. MOE filter will fallback to score bins.")
+        return se_dict
+    
+    var = token_to_var(indicator_token)
+    if not var: 
+        return se_dict
+    prefix = f"Rel_SE_{var}"
+    
+    df = pd.read_feather(panel_path)
+    se_cols = [c for c in df.columns if c.startswith(prefix)]
+    if not se_cols: return se_dict
+    
+    available_years = [int(c.split("_")[-1]) for c in se_cols]
+    if not available_years: return se_dict
+
+    def get_closest(yr):
+        return min(available_years, key=lambda x: abs(x - yr))
+    
+    for _, row in df.iterrows():
+        geo = int(row["geoid_2023"])
+        for yr in PANEL_YEARS:
+            closest_yr = get_closest(yr)
+            val = row[f"{prefix}_{closest_yr}"]
+            if pd.notna(val):
+                se_dict[(geo, yr)] = val
+    return se_dict
+
+
 def setup_dataloaders(df_train, dfs_val_dict, df_test, all_years_datasets, params, train_cache_manager=None, val_cache_manager=None, batch_dumper=None):
     print("--- Initializing PyTorch Datasets ---")
     string_val_lengths = "| ".join([f"{name}: {len(df)}" for name, df in dfs_val_dict.items()])
@@ -1398,10 +1446,15 @@ def setup_dataloaders(df_train, dfs_val_dict, df_test, all_years_datasets, param
         transforms.Normalize(mean=mean, std=std) # 🔴 ImageNet Normalization
     ])
 
+    # Build SE lookup for MOE filter
+    indicator = params.get("indicator", "W2_r5")
+    se_lookup = build_se_lookup(indicator)
+
     # In-Batch Pairwise Ranking: individual images + metadata, grouped by HybridBatchSampler
     train_dataset = InBatchRankingDataset(
         cache_manager=train_cache_manager,
         transform=train_transform_cpu,
+        se_lookup=se_lookup,
     )
     hybrid_sampler = HybridBatchSampler(
         dataset=train_dataset,
@@ -1507,6 +1560,19 @@ def fill_params_defaults(params):
         "footprints_source": "ms_us",  # "ms_us" (national MS index) | "doitt_nyc" (legacy)
         "states": None,       # optional list of state stems to subset the MS index
         "reject_padded_nir": False,  # drop NAIP crops whose NIR band is zero-padded
+        "predict_split": "test",     # "test" (main run) | "all" (every selected city: train+val+test)
+        "predict_chunk_size": 4096,  # rows per resumable prediction chunk (NAIP path)
+        "predict_exact_year": True,  # forbid flight-year substitution: no same-year NAIP flight => no_year_match -> NaN, never the closest year's imagery. In the fingerprint (exact/substituted chunks never mix).
+        "predict_tract_sample_frac": 0.10,   # per CBSA: sample max(ceil(frac*n_tracts), min) tracts (None = all tracts). Deterministic hash of GEOID — same tracts every year/rerun.
+        "predict_tract_sample_min": 100,     # tract floor per CBSA: bounds small-city 95% CIs
+        "predict_buildings_per_tract": 100,  # <=100 buildings per sampled tract (None = all): tract-mean 95% CI +-0.098 at sigma_within=0.5 (+-0.196 worst case) given the loss anchors global SD=1 — invisible to rank metrics
+        "predict_full_universe_geoid_prefixes": ("36005", "36047", "36061", "36081", "36085"),  # NYC's 5 boroughs: FULL universe (bypasses split filter + sampling) for the CSA event study; DoITT change data is city-only
+        "predict_fetch_workers": 16,  # NAIP fetch shards per chunk. Each shard opens each (DOQQ, tract) run's COG once and reads its crops per-window from that shared handle (GDAL block cache dedupes overlaps; per-crop beat the old mosaic 1.6-4x on real tracts — src/probe_naip_concurrency.py --mode real-granularity). Keep near the tract count, not maxed out. PC is not request-count throttling (0 throttles to 64 workers); throughput is a per-process saturation ceiling that PEAKS ~16-32 workers and DEGRADES past it (measured chunk fetch ~34 crops/s flat 8->32w). To go faster, shard chunks across processes/machines, not raise this.
+        "predict_batch_size": 512,   # eval-only batch (None = legacy batch_size*8). Set near the VRAM cap: predict_chunk_rows halves on OOM and remembers the working size, so aggressive is safe.
+        "predict_fetch_pipeline": 3,  # chunks fetched concurrently ahead of the GPU (RAM ~0.8GB each at 4096/4/224): smooths the fast/slow chunk variance so the network stays busy. 1 = legacy two-in-flight.
+        "predict_retry_fast_fail_frac": 0.01,  # transient-failure fraction at or below which stragglers get ONE immediate retry then drop (isolated data problems), instead of the full cooldown ladder (throttling signature).
+        "search_grid_meters": 20000,  # STAC search cache cell (EPSG:5070 m): one search per ~20km cell serves all its tracts, not one per tract. Larger = fewer/bigger searches.
+        "persist_search_cache": True, # cache STAC search results to CACHE_DIR/naip_search_cache so reruns are ~search-free (NAIP item lists per cell are stable).
         "tau_meters": 100,
         "subsample_step": 1,
         "max_jitter": 10,
@@ -1557,7 +1623,7 @@ class InBatchPairwiseRankingLoss(nn.Module):
         self.lambda_s = lambda_s
         self.lambda_var = lambda_var  # CS-only variance regularizer weight
 
-    def forward(self, scores, labels, geoids, years, building_ids, structural_change, score_bins=None, current_epoch=None, current_step=None):
+    def forward(self, scores, labels, geoids, years, building_ids, structural_change, score_bins=None, current_epoch=None, current_step=None, se_values=None):
         scores = scores.squeeze(-1)
         labels = labels.float()
         
@@ -1583,8 +1649,16 @@ class InBatchPairwiseRankingLoss(nn.Module):
             idx_k, idx_l = torch.triu_indices(B_cs, B_cs, offset=1, device=scores.device)
             valid_mask = cs_geoids[idx_k] != cs_geoids[idx_l]
             
-            # --- Easy-to-Hard Curriculum Filtering ---
-            if current_epoch is not None and score_bins is not None:
+            # --- Margin of Error (MOE) Filtering ---
+            if se_values is not None and (se_values > 0).any():
+                cs_se = se_values[cs_mask]
+                se_k, se_l = cs_se[idx_k], cs_se[idx_l]
+                z_k, z_l = cs_labels[idx_k], cs_labels[idx_l]
+                
+                moe = 1.645 * torch.sqrt(se_k**2 + se_l**2)
+                delta_z = torch.abs(z_l - z_k)
+                valid_mask &= (delta_z >= moe)
+            elif current_epoch is not None and score_bins is not None:
                 cs_bins = score_bins[cs_mask]
                 bin_diff = torch.abs(cs_bins[idx_k] - cs_bins[idx_l])
                 
@@ -1802,220 +1876,13 @@ def check_feature_importance(model):
             "weights/commute_to_image_ratio": ratio
         }, commit=False) # commit=False ties it to the next step log
 
-def _within_city_cells(val_df, min_bld=5):
-    """Per-(cbsa, year) Spearman cells — the within-city cross-sectional metric.
-
-    Each cell holds one row per building (a building appears at most once per
-    year), so cell Spearmans are free of the repeated-building inflation that
-    affects the pooled set-level Spearman. Cells with fewer than ``min_bld``
-    buildings, or without label/pred variation, are dropped (they are noise).
-
-    Returns a DataFrame [cbsa, year, n, rho]; empty if no usable cell.
-    """
-    from scipy.stats import spearmanr
-
-    rows = []
-    for (cbsa, year), g in val_df.groupby(["cbsa", "year"]):
-        if len(g) < min_bld or g["pred"].nunique() < 2 or g["label"].nunique() < 2:
-            continue
-        rho, _ = spearmanr(g["pred"], g["label"])
-        if not np.isnan(rho):
-            rows.append({"cbsa": cbsa, "year": year, "n": len(g), "rho": float(rho)})
-    return pd.DataFrame(rows, columns=["cbsa", "year", "n", "rho"])
-
-
-def _rank_autocorrelation(val_df, min_common=5):
-    """Cross-year rank stability of STABLE buildings, per city, n-weighted.
-
-    For each city, picks the year pair with the most stable buildings observed
-    in both years (ties -> widest span, mirroring the paper's 2016<->2024 pair)
-    and computes Spearman(rank_t, rank_t') for predictions AND for labels over
-    those common buildings. Both are comparisons of two within-year rankings —
-    never of score levels across years — so per-year z-scoring of the labels
-    does not affect them. The label autocorrelation is the genuine-reshuffling
-    benchmark: the pred-minus-label gap is model-induced instability.
-
-    Returns {} when no city has >= min_common common stable buildings.
-    """
-    from scipy.stats import spearmanr
-
-    stable = val_df[val_df["change"] == 0]
-    per_city = []
-    for cbsa, g in stable.groupby("cbsa"):
-        piv_p = g.pivot_table(index="building_id", columns="year", values="pred")
-        piv_l = g.pivot_table(index="building_id", columns="year", values="label")
-        years = sorted(piv_p.columns)
-        best = None  # (n_common, span, t1, t2)
-        for i in range(len(years)):
-            for j in range(i + 1, len(years)):
-                t1, t2 = years[i], years[j]
-                n_common = int(piv_p[[t1, t2]].dropna().shape[0])
-                key = (n_common, t2 - t1)
-                if n_common >= min_common and (best is None or key > best[:2]):
-                    best = (n_common, t2 - t1, t1, t2)
-        if best is None:
-            continue
-        _, _, t1, t2 = best
-        pp = piv_p[[t1, t2]].dropna()
-        ll = piv_l.loc[pp.index, [t1, t2]]
-        rho_p, _ = spearmanr(pp[t1], pp[t2])
-        rho_l, _ = spearmanr(ll[t1], ll[t2])
-        if np.isnan(rho_p) or np.isnan(rho_l):
-            continue
-        per_city.append({"n": len(pp), "rho_p": float(rho_p), "rho_l": float(rho_l)})
-    if not per_city:
-        return {}
-    ns = np.array([c["n"] for c in per_city], dtype=float)
-    return {
-        "rank_autocorr_pred": float(np.average([c["rho_p"] for c in per_city], weights=ns)),
-        "rank_autocorr_label": float(np.average([c["rho_l"] for c in per_city], weights=ns)),
-        "rank_autocorr_n": int(ns.sum()),
-    }
-
-
-def compute_val_metrics(val_df, cbsa_meta=None, top_cities=None, min_city_n=50):
-    """Validation metrics for one val set (pure pandas/numpy; unit-testable).
-
-    Args:
-        val_df: DataFrame with columns building_id, year, pred, label, change,
-            and (optionally) cbsa — one row per validated image.
-        cbsa_meta: content of cbsa_splits.feather (cbsa_code, bracket,
-            population, ...) or None -> base metrics only (pre-US shards).
-        top_cities: cbsa codes to report per-city metrics for (#31 top-10),
-            wherever they have >= min_city_n predictions in this val set.
-        min_city_n: noise guard for the per-city breakdown.
-
-    Returns a flat dict: base keys (mse, spearman, stable_masd, changed_masd,
-    changed_da, pred_mean, pred_std), the goal-aligned metrics
-    (within_spearman/within_cells/within_n, rank_autocorr_pred/label/n,
-    masd_ratio, city_offset_sd — see _within_city_cells/_rank_autocorrelation),
-    plus 'bracket/{name}/{metric}' and 'city/{cbsa}/{metric}' breakdowns.
-    Keys with no data are omitted. NOTE: 'spearman' and 'n' pool building x year
-    image rows (repeated buildings inflate them); 'within_spearman' is the
-    honest per-cell quantity and drives checkpointing when
-    params["selection_metric"] == "within".
-    """
-    from scipy.stats import spearmanr
-
-    # Under autocast the val loop hands us float16 preds; pandas' unstack
-    # (pivot_table in _rank_autocorrelation) has no float16 kernel and raises
-    # "TypeError: No matching signature found". Normalize once, up front.
-    if not val_df.empty:
-        val_df = val_df.copy()
-        for _c in ("pred", "label"):
-            if _c in val_df.columns:
-                val_df[_c] = val_df[_c].astype(np.float64)
-
-    def _temporal(df):
-        # Stable/changed MASD + directional accuracy over all ordered year pairs
-        out = {}
-        counts = df["building_id"].value_counts()
-        multi = counts[counts >= 2].index
-        if not len(multi):
-            return out
-        sub = df[df["building_id"].isin(multi)].sort_values(["building_id", "year"])
-        stable_disps, changed_disps = [], []
-        da_correct, da_total = 0, 0
-        for _, grp in sub.groupby("building_id"):
-            preds_arr = grp["pred"].values
-            labels_arr = grp["label"].values
-            is_changed = grp["change"].iloc[0]
-            n = len(preds_arr)
-            for i in range(n):
-                for j in range(i + 1, n):
-                    pred_d = preds_arr[j] - preds_arr[i]
-                    label_d = labels_arr[j] - labels_arr[i]
-                    if is_changed == 0:
-                        stable_disps.append(abs(pred_d))
-                    else:
-                        changed_disps.append(abs(pred_d))
-                        if label_d != 0:  # skip tied labels
-                            da_total += 1
-                            if (pred_d > 0) == (label_d > 0):
-                                da_correct += 1
-        if stable_disps:
-            out["stable_masd"] = float(np.mean(stable_disps))
-        if changed_disps:
-            out["changed_masd"] = float(np.mean(changed_disps))
-        if da_total > 0:
-            out["changed_da"] = da_correct / da_total
-        return out
-
-    def _base(df):
-        out = {}
-        if df.empty:
-            return out
-        out["mse"] = float(np.mean((df["pred"] - df["label"]) ** 2))
-        if df["pred"].nunique() > 1 and df["label"].nunique() > 1:
-            rho, _ = spearmanr(df["pred"], df["label"])
-            if not np.isnan(rho):
-                out["spearman"] = float(rho)
-        # Predicted-score moments: the cross-city latent-drift detector (#31) —
-        # per-CBSA z-scored labels mean every city should predict ~N(0, 1).
-        out["pred_mean"] = float(df["pred"].mean())
-        out["pred_std"] = float(df["pred"].std()) if len(df) > 1 else 0.0
-        out.update(_temporal(df))
-        return out
-
-    metrics = _base(val_df)
-
-    # ── Headline within-city metrics + diagnostics (goal-aligned, additive) ──
-    # within_spearman: n-weighted mean of per-(city, year) cell Spearmans — one
-    #   observation per building per cell, so no repeated-building inflation.
-    # rank_autocorr_pred/label: cross-year rank stability of stable buildings
-    #   (label variant = genuine-reshuffling benchmark). Diagnostics only.
-    # masd_ratio: changed vs stable displacement (>1 = moves where reality moved).
-    # city_offset_sd: dispersion of per-city prediction means (~0 under the
-    #   per-CBSA z labels) — the cross-city latent-drift guardrail.
-    if {"cbsa", "year"}.issubset(val_df.columns) and not val_df.empty:
-        cells = _within_city_cells(val_df)
-        if len(cells):
-            metrics["within_spearman"] = float(np.average(cells["rho"], weights=cells["n"]))
-            metrics["within_cells"] = int(len(cells))
-            metrics["within_n"] = int(cells["n"].sum())
-        metrics.update(_rank_autocorrelation(val_df))
-        if metrics.get("stable_masd", 0) > 0 and "changed_masd" in metrics:
-            metrics["masd_ratio"] = metrics["changed_masd"] / metrics["stable_masd"]
-        offsets = val_df.groupby("cbsa")["pred"].agg(["mean", "size"])
-        offsets = offsets[offsets["size"] >= 5]
-        if len(offsets) >= 2:
-            metrics["city_offset_sd"] = float(offsets["mean"].std(ddof=0))
-
-    if cbsa_meta is not None and "cbsa" in val_df.columns:
-        bracket_of = {}
-        for code, bracket in zip(cbsa_meta["cbsa_code"], cbsa_meta["bracket"]):
-            try:
-                bracket_of[int(code)] = bracket
-            except (TypeError, ValueError):
-                continue
-        df = val_df.copy()
-        df["cbsa"] = df["cbsa"].astype(int)
-        df["bracket"] = df["cbsa"].map(bracket_of)
-        for bracket, grp in df.groupby("bracket"):
-            sub = _base(grp)
-            sub["n"] = len(grp)
-            bcells = _within_city_cells(grp)
-            if len(bcells):
-                sub["within_spearman"] = float(np.average(bcells["rho"], weights=bcells["n"]))
-            metrics.update({f"bracket/{bracket}/{k}": v for k, v in sub.items()})
-        if top_cities:
-            top_ints = set()
-            for c in top_cities:
-                try:
-                    top_ints.add(int(c))
-                except (TypeError, ValueError):
-                    continue
-            for cbsa, grp in df.groupby("cbsa"):
-                if cbsa not in top_ints or len(grp) < min_city_n:
-                    continue
-                sub = _base(grp)
-                sub["n"] = len(grp)
-                ccells = _within_city_cells(grp)
-                if len(ccells):
-                    sub["within_spearman"] = float(np.average(ccells["rho"], weights=ccells["n"]))
-                metrics.update({f"city/{cbsa}/{k}": v for k, v in sub.items()})
-
-    return metrics
+# Validation metrics live in src/utils/metrics.py, shared with evaluation.py so
+# training-time and post-hoc evaluation can never drift apart.
+from src.utils.metrics import (
+    compute_val_metrics,
+    rank_autocorrelation as _rank_autocorrelation,
+    within_city_cells as _within_city_cells,
+)
 
 
 def train_model(
@@ -2086,7 +1953,7 @@ def train_model(
         )
 
         t_batch_start = time.perf_counter()  # start timer before first batch
-        for batch_idx, (images, scores, geoids, years, building_ids, structural_change, metas, score_bins) in train_bar:
+        for batch_idx, (images, scores, geoids, years, building_ids, structural_change, metas, score_bins, se_values) in train_bar:
             t_data_end = time.perf_counter()  # data is ready; measure load time
 
             # Move all to device
@@ -2102,6 +1969,7 @@ def train_model(
             structural_change = structural_change.to(device)
             metas      = metas.to(device)
             score_bins = score_bins.to(device)
+            se_values  = se_values.to(device)
             
             # Single unified forward pass over the entire hybrid batch
             t_forward_start = time.perf_counter()
@@ -2113,7 +1981,7 @@ def train_model(
                 # In-Batch Pairwise Ranking Loss (3 decoupled objectives)
                 loss, diag = loss_fn(
                     outputs, scores_lbl, geoids, years, building_ids, structural_change, 
-                    score_bins=score_bins, current_epoch=epoch, current_step=batch_idx
+                    score_bins=score_bins, current_epoch=epoch, current_step=batch_idx, se_values=se_values
                 )
 
                 # Scale loss to account for accumulation
@@ -2422,138 +2290,6 @@ import queue
 import threading
 import pandas as pd
 
-class FastPredictLoader:
-    def __init__(self, df, all_years_datasets, params, batch_size, eval_transform):
-        self.df = df
-        self.all_years_datasets = all_years_datasets
-        self.params = params
-        self.batch_size = batch_size
-        self.eval_transform = eval_transform
-        
-        self.image_size = int((self.df["row_stop"] - self.df["row_start"]).min())
-        self.nbands = params["nbands"]
-        self.step = params["subsample_step"]
-        
-        # Fake dataset to satisfy print statements in predict_buildings
-        class FakeDataset:
-            def __init__(self, length):
-                self.length = length
-            def __len__(self):
-                return self.length
-        self.dataset = FakeDataset(len(self.df))
-        
-        self.queue = queue.Queue(maxsize=10) # 10 batches buffered ahead keeping GPU fed
-        self.thread = threading.Thread(target=self._worker)
-        self.thread.daemon = True
-        self.thread.start()
-
-    def _extract_raw_image(self, row):
-        dataset_name = row.get("dataset")
-        zarr_array = self.all_years_datasets[dataset_name]["value"]
-        
-        row_start = int(row["row_start"])
-        row_stop  = row_start + self.image_size
-        col_start = int(row["col_start"])
-        col_stop  = col_start + self.image_size
-        
-        try:
-            tile = zarr_array[:self.nbands, row_start:row_stop, col_start:col_stop]
-            if tile.shape[0] == self.nbands and tile.shape[1] == self.image_size and tile.shape[2] == self.image_size:
-                return tile.to_numpy()
-        except:
-            pass
-        return None
-
-    def _worker(self):
-        from concurrent.futures import ThreadPoolExecutor, as_completed
-        import torch
-
-        def _extract(item):
-            _, row = item
-            label = row["Rel_Score"]
-            dist_to_center = row.get("dist_to_center", 0.0)
-            return self._extract_raw_image(row), label, dist_to_center, row
-
-        raw_chunk, label_chunk, meta_chunk, row_chunk = [], [], [], []
-        rows = list(self.df.iterrows())
-        MAX_EXTRACT_WORKERS = 18
-
-        # KEY FIX: Only allow this many images to be in-flight at once.
-        # Without this, pool.map() submits ALL rows as futures simultaneously,
-        # storing every extracted numpy tile in memory before any are consumed.
-        MAX_IN_FLIGHT = self.batch_size * 4  # e.g., 4 batches worth (~1GB for 224px tiles)
-
-        with ThreadPoolExecutor(max_workers=MAX_EXTRACT_WORKERS) as pool:
-            i = 0
-            while i < len(rows):
-                # Submit only a bounded window of futures at a time
-                chunk_end = min(i + MAX_IN_FLIGHT, len(rows))
-                futures = {pool.submit(_extract, rows[j]): j for j in range(i, chunk_end)}
-                i = chunk_end
-
-                for future in as_completed(futures):
-                    raw_img, label, meta, row = future.result()
-
-                    if raw_img is None or pd.isna(label):
-                        continue
-
-                    raw_chunk.append(raw_img)
-                    label_chunk.append(label)
-                    meta_chunk.append(meta)
-                    row_chunk.append(row)
-
-                    if len(raw_chunk) >= self.batch_size:
-                        batch = torch.stack([torch.from_numpy(img) for img in raw_chunk])
-                        batch = batch[:, :, ::self.step, ::self.step]
-
-                        labels_tensor = torch.tensor(label_chunk, dtype=torch.float32)
-                        metas_tensor = torch.tensor(meta_chunk, dtype=torch.float32).unsqueeze(1)
-                        building_ids = torch.tensor([r.get("building_id", 0) for r in row_chunk])
-                        geoids = [str(r.get("GEOID", "")) for r in row_chunk]
-                        years_t = torch.tensor([r.get("year", 0) for r in row_chunk])
-                        types = [str(r.get("type", "")) for r in row_chunk]
-
-                        # queue.put() blocks here if GPU is slow — this is your backpressure valve
-                        self.queue.put((
-                            self.eval_transform(batch), labels_tensor, metas_tensor,
-                            building_ids, geoids, years_t, types
-                        ))
-
-                        raw_chunk.clear(); label_chunk.clear()
-                        meta_chunk.clear(); row_chunk.clear()
-
-        # Flush the last partial batch
-        if raw_chunk:
-            batch = torch.stack([torch.from_numpy(img) for img in raw_chunk])
-            batch = batch[:, :, ::self.step, ::self.step]
-
-            labels_tensor = torch.tensor(label_chunk, dtype=torch.float32)
-            metas_tensor = torch.tensor(meta_chunk, dtype=torch.float32).unsqueeze(1)
-            building_ids = torch.tensor([r.get("building_id", 0) for r in row_chunk])
-            geoids = [str(r.get("GEOID", "")) for r in row_chunk]
-            years_t = torch.tensor([r.get("year", 0) for r in row_chunk])
-            types = [str(r.get("type", "")) for r in row_chunk]
-
-            self.queue.put((
-                self.eval_transform(batch), labels_tensor, metas_tensor,
-                building_ids, geoids, years_t, types
-            ))
-
-        self.queue.put(None)
-
-    def __iter__(self):
-        return self
-    
-    def __next__(self):
-        batch = self.queue.get()
-        if batch is None:
-            raise StopIteration
-        return batch
-        
-    def __len__(self):
-        return max(1, len(self.df) // self.batch_size)
-
-
 def predict_buildings_chunked(model, df, all_years_datasets, params,
                               device, output_path, eval_transform, verbose=True):
     """
@@ -2596,6 +2332,11 @@ def predict_buildings_chunked(model, df, all_years_datasets, params,
         eval_transform:     torchvision transform (scale + normalise)
         verbose:            print summary stats when done
     """
+    if all_years_datasets is None:
+        raise ValueError(
+            "predict_buildings_chunked is zarr-only; the NAIP/ms_us path uses "
+            "src.prediction.predict_year_chunked instead."
+        )
     model.eval()
 
     # ── Hyperparameters ───────────────────────────────────────────────────────
@@ -2808,58 +2549,13 @@ def predict_buildings_chunked(model, df, all_years_datasets, params,
               f"loads: {stats['loads']}")
 
 
-def predict_buildings(model, dataloader, device, output_path, verbose=True):
-    """
-    Streams predictions directly to CSV in chunks — no full-dataset RAM accumulation.
-    """
-    model.eval()
-    first_write = True
-
-    # Create output directory if it doesn't exist
-    output_dir = os.path.dirname(output_path)
-    if output_dir and not os.path.exists(output_dir):
-        os.makedirs(output_dir, exist_ok=True)
-
-    if verbose:
-        print(f"Starting inference on {len(dataloader.dataset)} items...")
-
-    with torch.no_grad():
-        iterator = enumerate(dataloader)
-        if verbose:
-            iterator = tqdm(iterator, total=len(dataloader), desc="Predicting Batches")
-
-        for batch_idx, (batch_images, batch_labels, batch_metas, batch_building_ids, batch_geoids, batch_years, batch_types) in iterator:
-            batch_images = batch_images.to(device)
-            batch_metas = batch_metas.to(device)
-
-            with autocast(device_type='cuda'):
-                outputs = model(batch_images, metadata=batch_metas)
-
-            preds = outputs.view(-1).cpu().numpy()
-
-            chunk_df = pd.DataFrame({
-                "Rel_Score":       batch_labels.cpu().numpy(),
-                "predicted_value": preds,
-                "building_id":        batch_building_ids.cpu().numpy(),
-                "GEOID":           batch_geoids,
-                "year":            batch_years.cpu().numpy(),
-                "type":            batch_types,
-            })
-
-            # Write header only on first chunk, then append
-            mode = 'w' if first_write else 'a'
-            chunk_df.to_csv(output_path, mode=mode, header=first_write, index=False)
-            first_write = False
-
-    if verbose:
-        print(f"Predictions saved to {output_path}")
-
 def run(
     params=None,
     train=True,
     compute_loss=True,
     generate_predictions=False,
     retrain=False,
+    evaluate=False,
 ):
     """Run all the code of this file.
 
@@ -2904,7 +2600,7 @@ def run(
     print("\n" + "="*80)
     print(f"🚀 STARTING RUN: {savename}")
     print("="*80 + "\n")
-    print(f"- Train: {train} \n- Compute Loss: {compute_loss} \n- Generate Predictions: {generate_predictions} \n- Retrain: {retrain}\n")
+    print(f"- Train: {train} \n- Compute Loss: {compute_loss} \n- Generate Predictions: {generate_predictions} \n- Retrain: {retrain} \n- Evaluate: {evaluate}\n")
     print("="*84 + "\n")
 
     if train:
@@ -3142,8 +2838,14 @@ def run(
     if generate_predictions:
         print("Generando predicciones...")
 
+        if params["predict_split"] not in ("test", "all"):
+            raise ValueError(
+                f"predict_split must be 'test' or 'all', got {params['predict_split']!r}"
+            )
+
         pred_pair_table = None
         pred_split_map = None
+        pred_holdout_years = None
         if params["footprints_source"] == "ms_us" and not small_sample:
             # Normalized path: ONE lazy table over the full universe; per-year
             # frames are materialized inside the year loop below (the legacy
@@ -3158,7 +2860,14 @@ def run(
                 pred_split_map = dict(zip(
                     city_split["cbsa_code"].astype(str), city_split["split"]
                 ))
+                pred_holdout_years = cbsa_brackets.holdout_year_map(city_split)
             except FileNotFoundError:
+                if params["predict_split"] == "test":
+                    raise RuntimeError(
+                        "predict_split='test' needs cbsa_splits.feather to know "
+                        "which CBSAs are the test set — generate the split first, "
+                        "or use predict_split='all'."
+                    )
                 print("⚠️ cbsa_splits.feather not found — prediction 'type' column will be 'all'.")
         else:
             all_years_datasets, all_years_extents, df_train, df_vals_dict, df_test, df_dead_zone = build_dataset.generate_datasets(
@@ -3211,19 +2920,56 @@ def run(
             transforms.Normalize(mean=mean, std=std)  # 🔴 ImageNet Normalization — must match training
         ])
         
-        # 4. Process each year using the new chunk-grouped strategy
-        for year in [2016, 2018, 2020, 2022, 2024, 2010, 2012, 2014]:
+        # 4. Process each year. NAIP path: resumable chunked prediction with
+        # one manifest-guarded chunk cache per predict_split (src/prediction.py).
+        if pred_pair_table is not None:
+            from src import prediction
+            # Chunk cache on WSL-native disk (CACHE_DIR, ext4): the resumable
+            # chunk parquets are many small writes, which are slow through the
+            # /mnt/c NTFS bridge. Durable outputs ({year}_predictions.csv)
+            # still land in RESULTS_DIR.
+            pred_chunk_root = CACHE_DIR / "pred_chunks" / savename / params["predict_split"]
+            prediction.init_chunk_root(
+                pred_chunk_root,
+                prediction.prediction_fingerprint(params, best_model_path),
+            )
+            pred_years = years
+        else:
+            pred_years = [2016, 2018, 2020, 2022, 2024, 2010, 2012, 2014]
 
+        # Return freed heap pages to the OS between years. gc.collect() alone
+        # only frees at the Python level; repeatedly building/freeing the
+        # ~71.8M-row per-year frames fragments glibc's malloc arenas so RSS
+        # creeps up every year until materialize_year OOM-kills the process
+        # (observed mid-run). malloc_trim(0) hands the freed pages back.
+        def _release_memory():
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            try:
+                ctypes.CDLL("libc.so.6").malloc_trim(0)
+            except OSError:
+                pass  # non-glibc platform; gc.collect() above is the fallback
+
+        for year in pred_years:
+            if year<=2015:
+                continue  # Skip pre-2016 years for now; already computed
             print(f"\n{'='*80}")
             print(f"🚀 Processing Predictions for Year: {year}")
             print(f"{'='*80}")
-            
+
+            _release_memory()  # reclaim last year's frames before the next big alloc
+
             if pred_pair_table is not None:
                 df_year = pred_pair_table.materialize_year(year)
-                if len(df_year) and pred_split_map is not None:
-                    df_year["type"] = (
-                        df_year["cbsa_code"].map(pred_split_map).fillna("unassigned")
-                    )
+                df_year = prediction.assign_prediction_types(
+                    df_year, year, pred_split_map, pred_holdout_years
+                )
+                # Split filter + evaluation sampling (max(10%,100) tracts per
+                # CBSA x <=100 buildings per tract, deterministic and
+                # year-stable) + the NYC full-universe bypass for the CSA
+                # event study. See prediction.select_prediction_rows.
+                df_year = prediction.select_prediction_rows(df_year, params)
             else:
                 df_year = df_all[(df_all["year"] == year)].copy()
             if df_year.empty:
@@ -3233,19 +2979,36 @@ def run(
             print(f"Found {len(df_year)} buildings to predict for {year}")
 
             output_path = RESULTS_DIR / f"{savename}/{year}_predictions.csv"
-            
-            # Use new chunk-grouped prediction strategy
-            predict_buildings_chunked(
-                model=model,
-                df=df_year,
-                all_years_datasets=all_years_datasets,
-                params=params,
-                device=device,
-                output_path=output_path,
-                eval_transform=eval_transform,
-                verbose=True
-            )
-            
+
+            if pred_pair_table is not None:
+                produced = prediction.predict_year_chunked(
+                    model=model,
+                    df_year=df_year,
+                    year=year,
+                    params=params,
+                    device=device,
+                    eval_transform=eval_transform,
+                    chunk_root=pred_chunk_root,
+                    output_csv=output_path,
+                    max_workers=int(params.get("predict_fetch_workers", 16)),
+                    verbose=True,
+                )
+                if not produced:
+                    print(f"No labeled rows for year {year}, skipping.")
+                    continue
+            else:
+                # Legacy zarr path (doitt_nyc / small_sample only)
+                predict_buildings_chunked(
+                    model=model,
+                    df=df_year,
+                    all_years_datasets=all_years_datasets,
+                    params=params,
+                    device=device,
+                    output_path=output_path,
+                    eval_transform=eval_transform,
+                    verbose=True
+                )
+
             df_result = pd.read_csv(output_path)
 
             if len(df_result) == 0:
@@ -3272,8 +3035,30 @@ def run(
             df_result_tracts.columns = ["GEOID", "Rel_Score", "predicted_value", "predicted_value_std"]
 
             df_result_tracts.to_parquet(RESULTS_DIR / f"{savename}/predictions_by_tract_{year}.parquet")
-           
+
             print(f"Finished evaluating {len(df_result)} valid buildings for year {year} at {RESULTS_DIR}")
+
+            # Drop large per-year objects before the next iteration — repeated
+            # buildup of df_year/df_result/tract frames across ~8 years is the
+            # likely cause of the WSL OOM kill observed mid-run.
+            del df_year, df_result, df_result_tracts
+            if params["footprints_source"] == "doitt_nyc":
+                del gdf
+            _release_memory()
+
+    if evaluate:
+        # Must run AFTER generate_predictions — it consumes the per-year
+        # prediction CSVs / tract parquets written above. Imported lazily so an
+        # evaluation-only import error can never break training/prediction.
+        print("\n" + "=" * 80 + "\n📊 EVALUATION\n" + "=" * 80)
+        try:
+            from src.evaluation import run_evaluation
+            run_evaluation(savename, params)
+        except Exception:
+            import traceback
+            traceback.print_exc()
+            print("⚠️ Evaluation failed; prediction artifacts are intact — rerun with: "
+                  f"python -m src.evaluation --savename {savename}")
 
 if __name__ == "__main__":
 
@@ -3289,14 +3074,32 @@ if __name__ == "__main__":
         "nbands": 3,
         "batch_size": 8,
         "small_sample": False,
-        "n_epochs": 700,
+        "n_epochs": 750,
         "learning_rate": 0.0001,
         "sat_data": "NAIP",
-        "years": list(range(2010, 2025, 2)),
+        # Every year the data can support, derived from the annual ACS panel
+        # (2011-2023) plus one clamped edge year each side (2010/2024 labels
+        # clamp to the nearest vintage). NOT the legacy even-years grid — that
+        # was a relic of the biennial NYC orthos; NAIP availability is
+        # discovered per (region, year) by the exact-year resolve
+        # (no same-year flight => no_year_match -> NaN).
+        "years": list(range(min(ACS_PANEL_YEARS) - 1, max(ACS_PANEL_YEARS) + 2)),
         # US-scale data selection
         "indicator": "W2_r5",          # W2 occupant wealth, rho=0.05 (r_k=0.045)
         "footprints_source": "ms_us",  # Microsoft US Building Footprints index
         "states": None,                # None = all states present in buildings_index
+        "predict_split": "test",       # main run predicts test CBSAs only; "all" = every selected city
+        "predict_exact_year": True,    # forbid flight-year substitution: no same-year NAIP flight => no_year_match -> NaN, never the closest year's imagery.
+        "predict_tract_sample_frac": 0.10,   # per CBSA: max(ceil(frac*n_tracts), min) tracts, hash-deterministic (None = all)
+        "predict_tract_sample_min": 100,     # tract floor per CBSA (bounds small-city CIs)
+        "predict_buildings_per_tract": 100,  # <=100 buildings per sampled tract (None = all); CI +-0.098 at sigma_within=0.5
+        "predict_full_universe_geoid_prefixes": ("36005", "36047", "36061", "36081", "36085"),  # NYC boroughs: full universe for the CSA event study
+        "predict_fetch_workers": 16,   # NAIP fetch shards per chunk. Each shard opens each (DOQQ, tract) run's COG once and reads crops per-window from that shared handle (per-crop beat the old mosaic 1.6-4x on real tracts). Keep near the tract count, not maxed out. Measured knee (src/probe_naip_concurrency.py): PC is not request-count throttling; read throughput peaks ~16-32 workers and DEGRADES past it. Scale out across processes/machines to go faster, not up.
+        "predict_batch_size": 512,     # eval-only batch (None = batch_size*8); OOM auto-halves and sticks, so aggressive is safe
+        "predict_fetch_pipeline": 3,   # chunks fetched concurrently ahead of the GPU (~0.8GB RAM each); 1 = legacy two-in-flight
+        "predict_retry_fast_fail_frac": 0.01,  # <=1% transient failures: one immediate retry then drop (data problem), no cooldown ladder
+        "search_grid_meters": 20000,   # STAC search cache cell (EPSG:5070 m): one search per ~20km cell serves all its tracts. Larger = fewer/bigger searches.
+        "persist_search_cache": True,  # persist STAC searches to CACHE_DIR/naip_search_cache so reruns are ~search-free.
         # In-Batch Ranking hyperparameters
         "m_base": 1.0,
         "m_min": 0.05,
@@ -3309,4 +3112,4 @@ if __name__ == "__main__":
     }
 
     # Run full pipeline
-    run(params, train=True, retrain=False, compute_loss=False, generate_predictions=True)
+    run(params, train=True, retrain=False, compute_loss=False, generate_predictions=True, evaluate=True)

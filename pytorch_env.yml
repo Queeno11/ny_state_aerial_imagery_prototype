@@ -30,6 +30,7 @@ dependencies:
   - numpy
   - scikit-learn
   - scipy
+  - statsmodels
   - pyarrow
   - numba
   - tqdm
