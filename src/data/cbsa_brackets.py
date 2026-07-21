@@ -32,7 +32,7 @@ import pandas as pd
 from src.utils.paths import PROCESSED_DATA_DIR
 
 SPLIT_SEED = 825
-BRACKET_TARGETS = {"train": 0.50, "val": 0.20, "test": 0.30}
+BRACKET_TARGETS = {"train": 0.65, "val": 0.05, "test": 0.30}
 # Tie-break priority when two splits have the same tract deficit.
 _SPLIT_PRIORITY = ("train", "test", "val")
 N_MEGA = 4
@@ -110,7 +110,9 @@ def assign_brackets(pop_df: pd.DataFrame, n_mega: int = N_MEGA) -> pd.DataFrame:
 
 
 def build_city_split(tract_counts: pd.Series, pop_df: pd.DataFrame,
-                     seed: int = SPLIT_SEED) -> pd.DataFrame:
+                     seed: int = SPLIT_SEED,
+                     forced_splits: dict | None = None,
+                     exclude_cbsas=None) -> pd.DataFrame:
     """Assign whole cities to train/val/test, stratified by population bracket.
 
     Args:
@@ -118,6 +120,17 @@ def build_city_split(tract_counts: pd.Series, pop_df: pd.DataFrame,
             (the split universe: CBSAs actually present in the buildings data).
         pop_df: output of :func:`cbsa_populations`.
         seed: RNG seed (mega permutation only; the rest is fully deterministic).
+        forced_splits: optional ``{cbsa_code -> split}`` pinning specific cities
+            to a split (e.g. the US-scale-up test anchors, see
+            :mod:`src.data.us_split`). Pinned cities are removed from the
+            stratified pool and placed verbatim; the ~50/20/30 balance is
+            computed over the remaining ("free") cities, so forced cities sit
+            *on top* of that balance rather than perturbing it. Codes absent
+            from the universe are ignored with a warning.
+        exclude_cbsas: optional iterable of cbsa_codes dropped from the
+            whole-city universe entirely (they never get a single whole-city
+            split). Used for NYC, whose tracts are split within-city from the
+            validated notebook holdout (``nyc_tract_splits.feather``) instead.
 
     Returns ``[cbsa_code, cbsa_title, population, n_tracts, bracket, split]``.
     Deterministic given seed. Raises when the universe has < 3 CBSAs (a
@@ -149,43 +162,81 @@ def build_city_split(tract_counts: pd.Series, pop_df: pd.DataFrame,
     df = assign_brackets(df)
     df["n_tracts"] = df["cbsa_code"].map(counts).astype(int)
 
+    # NYC (and any other tract-level-handled city) leaves the whole-city universe.
+    exclude_cbsas = {str(c) for c in (exclude_cbsas or [])}
+    if exclude_cbsas:
+        df = df[~df["cbsa_code"].isin(exclude_cbsas)].reset_index(drop=True)
+
+    # Forced cities are PINNED to their split but stay inside their bracket's
+    # tract accounting: the greedy targets are computed against the bracket TOTAL
+    # (forced + free) and the forced tracts are pre-loaded into ``assigned``, so
+    # the manual picks count *toward* the 65/5/30 shares rather than sitting on
+    # top of them (net-of-manual-selection targets). E.g. if the forced large
+    # cities are 2.4% of all large tracts, the free large cities absorb a 27.6%
+    # test target, not 30%. Mega is uncontrolled: NYC is excluded and Chicago is
+    # forced to test, so the remaining megas fall wherever the deficit sends them.
+    forced_splits = {str(k): v for k, v in (forced_splits or {}).items()}
+    universe_codes = set(df["cbsa_code"])
+    present_forced = {c: s for c, s in forced_splits.items() if c in universe_codes}
+    missing_forced = sorted(set(forced_splits) - universe_codes)
+    if missing_forced:
+        warnings.warn(
+            f"{len(missing_forced)} forced-split CBSA(s) absent from the split "
+            f"universe — ignored: {missing_forced}"
+        )
+
     rng = np.random.default_rng(seed)
     split_of: dict[str, str] = {}
 
     for bracket in BRACKETS:
-        cities = df[df["bracket"] == bracket]
-        if cities.empty:
+        bracket_all = df[df["bracket"] == bracket]
+        if bracket_all.empty:
             continue
-        if bracket == "mega":
-            # Fixed 2 train / 1 val / 1 test, seeded permutation.
-            codes = list(cities.sort_values(
-                ["population", "cbsa_code"], ascending=[False, True])["cbsa_code"])
-            perm = [codes[i] for i in rng.permutation(len(codes))]
-            assignment = ["train", "train", "val", "test"][: len(perm)]
-            split_of.update(dict(zip(perm, assignment)))
-            continue
+        tracts_of = dict(zip(bracket_all["cbsa_code"], bracket_all["n_tracts"]))
+        forced_here = {c: present_forced[c] for c in tracts_of if c in present_forced}
 
-        cities = cities.sort_values(
-            ["n_tracts", "cbsa_code"], ascending=[False, True])
-        if len(cities) == 1:
-            split_of[cities["cbsa_code"].iloc[0]] = "train"
-            continue
-        if len(cities) == 2:
-            split_of[cities["cbsa_code"].iloc[0]] = "train"
-            split_of[cities["cbsa_code"].iloc[1]] = "test"
-            continue
-
-        # Greedy: assign each city (largest first) to the split with the
-        # largest remaining tract deficit vs the 50/20/30 targets.
-        total = cities["n_tracts"].sum()
-        targets = {s: BRACKET_TARGETS[s] * total for s in _SPLIT_PRIORITY}
+        # Pre-load the running tally with the pinned cities' tracts.
         assigned = {s: 0 for s in _SPLIT_PRIORITY}
-        for _, city in cities.iterrows():
+        for code, split in forced_here.items():
+            split_of[code] = split
+            assigned[split] = assigned.get(split, 0) + tracts_of[code]
+
+        free_here = bracket_all[~bracket_all["cbsa_code"].isin(forced_here)]
+
+        # Backward-compatible special cases only when nothing is pinned in this
+        # bracket (preserves the legacy no-override behaviour and its tests).
+        if not forced_here:
+            if bracket == "mega":
+                codes = list(free_here.sort_values(
+                    ["population", "cbsa_code"], ascending=[False, True])["cbsa_code"])
+                perm = [codes[i] for i in rng.permutation(len(codes))]
+                assignment = ["train", "train", "val", "test"][: len(perm)]
+                split_of.update(dict(zip(perm, assignment)))
+                continue
+            if len(free_here) == 1:
+                split_of[free_here["cbsa_code"].iloc[0]] = "train"
+                continue
+            if len(free_here) == 2:
+                ordered = free_here.sort_values(
+                    ["n_tracts", "cbsa_code"], ascending=[False, True])
+                split_of[ordered["cbsa_code"].iloc[0]] = "train"
+                split_of[ordered["cbsa_code"].iloc[1]] = "test"
+                continue
+
+        # Greedy: assign each free city (largest first) to the split with the
+        # largest remaining tract deficit vs targets computed on the bracket
+        # TOTAL (so pinned cities count toward the shares).
+        total = bracket_all["n_tracts"].sum()
+        targets = {s: BRACKET_TARGETS[s] * total for s in _SPLIT_PRIORITY}
+        free_sorted = free_here.sort_values(
+            ["n_tracts", "cbsa_code"], ascending=[False, True])
+        for _, city in free_sorted.iterrows():
             deficits = {s: targets[s] - assigned[s] for s in _SPLIT_PRIORITY}
             best = max(_SPLIT_PRIORITY, key=lambda s: (deficits[s], -_SPLIT_PRIORITY.index(s)))
             split_of[city["cbsa_code"]] = best
             assigned[best] += city["n_tracts"]
 
+    # (Pinned cities were assigned inline above, inside their bracket loop.)
     df["split"] = df["cbsa_code"].map(split_of)
 
     # Global post-check: every split must own at least one city. When a split

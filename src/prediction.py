@@ -128,6 +128,13 @@ def prediction_fingerprint(params: dict, model_path: Path) -> dict:
             str(p) for p in (params.get("predict_full_universe_geoid_prefixes",
                                         FULL_UNIVERSE_GEOID_PREFIXES_DEFAULT)
                              or ())),
+        # Whitelisted/capped diagnostic runs must never share chunks with the
+        # full paper run — both knobs change which rows exist per chunk.
+        "predict_cbsa_whitelist": (
+            sorted(str(c) for c in params["predict_cbsa_whitelist"])
+            if params.get("predict_cbsa_whitelist") else None),
+        "predict_full_universe_buildings_per_tract": _knob(
+            params, "predict_full_universe_buildings_per_tract", None, int),
         # Deliberately NOT fingerprinted: the year SET. A chunk's content
         # depends only on its own year's frame (guarded per-year by
         # _check_year_meta), so ADDING years to a run must not invalidate
@@ -238,12 +245,22 @@ def select_prediction_rows(df_year: pd.DataFrame, params: dict,
                            verbose: bool = True) -> pd.DataFrame:
     """Split filter + deterministic evaluation sampling for one year's frame.
 
-    Three tiers (all driven by ``params``, all in the run fingerprint):
+    Tiers (all driven by ``params``, all in the run fingerprint):
 
+    * **CBSA whitelist** — when ``predict_cbsa_whitelist`` is a non-empty
+      collection of cbsa codes, ONLY those metros' rows enter any later tier
+      (including the full-universe bypass). None/empty = off. Meant for
+      cheap diagnostic runs (e.g. NYC + LA + a few small cities) — the full
+      paper run leaves it None.
     * **Full-universe bypass** — rows whose GEOID starts with any
       ``predict_full_universe_geoid_prefixes`` prefix (default: the NYC five
       boroughs) are ALWAYS kept, regardless of split type and untouched by
-      sampling. The CSA event study needs every building of the city.
+      tract sampling. The CSA event study needs every building of the city.
+      ``predict_full_universe_buildings_per_tract`` (None = unlimited)
+      optionally hash-caps buildings per tract WITHIN these rows — every
+      tract stays represented, so tract-level diagnostics keep full spatial
+      coverage at a fraction of the fetch cost; leave None for event-study
+      runs, which need every building.
     * **Split filter** — with ``predict_split='test'`` only test-CBSA rows
       survive (plus the bypass above); ``'all'`` keeps every row.
     * **Sampling** — per CBSA, the ``max(ceil(frac * n_tracts), min_tracts)``
@@ -266,6 +283,13 @@ def select_prediction_rows(df_year: pd.DataFrame, params: dict,
     if df_year.empty:
         return df_year
 
+    whitelist = params.get("predict_cbsa_whitelist")
+    if whitelist:
+        allowed = {str(c) for c in whitelist}
+        df_year = df_year[df_year["cbsa_code"].astype(str).isin(allowed)]
+        if df_year.empty:
+            return df_year
+
     prefixes = params.get("predict_full_universe_geoid_prefixes",
                           FULL_UNIVERSE_GEOID_PREFIXES_DEFAULT)
     prefixes = tuple(str(p) for p in (prefixes or ()))
@@ -281,6 +305,20 @@ def select_prediction_rows(df_year: pd.DataFrame, params: dict,
         base = (df_year["type"].astype(str) == "test") & ~full
     else:
         base = ~full
+
+    # Full-universe building cap (post-``base`` so capped-out rows are dropped,
+    # never resampled): hash-rank buildings within each tract, keep the top
+    # cap — same deterministic ranking as the sampled tier, so membership is
+    # identical across years, restarts, and row order.
+    fu_cap = params.get("predict_full_universe_buildings_per_tract")
+    if fu_cap is not None and bool(full.any()):
+        fu = pd.DataFrame({
+            "GEOID": geoid[full],
+            "building_id": df_year.loc[full, "building_id"],
+        }).assign(_h=lambda d: _stable_hash(d["building_id"]))
+        fu = fu.sort_values(["GEOID", "_h", "building_id"], kind="stable")
+        pos = fu.groupby("GEOID", sort=False).cumcount()
+        full.loc[fu.index[pos.to_numpy() >= int(fu_cap)]] = False
 
     pool = pd.DataFrame({
         "GEOID": geoid[base],

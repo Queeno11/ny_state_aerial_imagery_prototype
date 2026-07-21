@@ -12,7 +12,7 @@ import numpy as np
 from typing import List, Dict
 
 import shapely
-from src.utils.paths import FIGURES_DIR, PROJECT_ROOT, DATA_DIR, EXTERNAL_DATA_DIR, RAW_DATA_DIR, INTERIM_DATA_DIR, PROCESSED_DATA_DIR, RESULTS_DIR, LOGS_DIR, IMAGERY_ROOT
+from src.utils.paths import FIGURES_DIR, TABLES_DIR, PROJECT_ROOT, DATA_DIR, EXTERNAL_DATA_DIR, RAW_DATA_DIR, INTERIM_DATA_DIR, PROCESSED_DATA_DIR, RESULTS_DIR, LOGS_DIR, IMAGERY_ROOT
 from pathlib import Path
 from shapely.geometry import box
 
@@ -27,6 +27,7 @@ import pandas as pd
 import src.geo_utils as geo_utils
 from src.data import indicators
 from src.data import cbsa_brackets
+from src.data import us_split
 from src.data.pair_table import LazyPairTable, FLAT_COLUMNS, weighted_qcut
 from src.data.process_acs import BASE_YEAR as ACS_BASE_YEAR, PANEL_YEARS as ACS_PANEL_YEARS
 
@@ -871,19 +872,25 @@ def plot_city_splits(tract_panel):
     print(tract_panel['type'].value_counts().to_string())
     print("-" * 25)
 
-def assign_buildings_by_city(df: pd.DataFrame, city_split_df: pd.DataFrame):
-    """Whole-city split (#28): every building inherits its CBSA's split.
+def assign_buildings_by_city(df: pd.DataFrame, city_split_df: pd.DataFrame,
+                             tract_overrides: dict | None = None):
+    """Whole-city split (#28) + US scale-up tract overrides.
 
-    Train-city rows in that city's temporal-holdout year go to ``val_temporal``;
-    val cities contribute ALL years to ``val_cities``; test cities contribute
-    all years to test. No dead zone: train and holdout cities are different
-    metros, so there is no spatial adjacency to buffer (the returned dead-zone
-    mask is all-False, kept for return-arity compatibility).
+    Every building inherits its CBSA's whole-city split, then tract-level
+    overrides win where present: NYC tracts follow the validated within-city
+    notebook holdout, and spatially-clustered tracts carved from the large test
+    cities become ``val_spatial`` (with a ``dead_zone`` buffer, dropped from every
+    split). Train-city rows in that city's temporal-holdout year go to
+    ``val_temporal``; val cities contribute ALL years to ``val_cities``; test
+    cities contribute all years to test. See :mod:`src.data.us_split`.
 
     Args:
-        df: flat buildings table (needs ``cbsa_code`` and ``year``).
+        df: flat buildings table (needs ``cbsa_code``, ``GEOID``, ``year``).
         city_split_df: output of ``cbsa_brackets.build_city_split`` +
             ``attach_holdout_years`` (columns cbsa_code, split, holdout_year).
+        tract_overrides: ``{GEOID -> type}`` overlay from
+            ``us_split.build_tract_overrides`` (NYC + clustered val). ``None``
+            falls back to the pure whole-city split.
 
     Returns:
         (train_mask, test_mask, val_masks_dict, dead_zone_mask) boolean Series
@@ -894,44 +901,48 @@ def assign_buildings_by_city(df: pd.DataFrame, city_split_df: pd.DataFrame):
     codes = city_split_df["cbsa_code"].astype(str)
     split_map = dict(zip(codes, city_split_df["split"]))
     holdout_map = {
-        code: int(year)
+        int(code): int(year)
         for code, year, split in zip(codes, city_split_df["holdout_year"], city_split_df["split"])
         if split == "train" and pd.notna(year)
     }
 
-    building_cbsa = df["cbsa_code"].astype(str)
-    city_split = building_cbsa.map(split_map)
-    unassigned = city_split.isna()
+    types = us_split.resolve_building_types(
+        df["cbsa_code"], df["GEOID"], df["year"],
+        split_map, holdout_map, tract_overrides or {},
+    )
+    df["type"] = types.to_numpy()
+
+    unassigned = types == "unassigned"
     if unassigned.any():
         print(f"⚠️ {unassigned.sum():,} building-rows belong to CBSAs outside the city split "
               f"(below MIN_METRO_POP or missing crosswalk) — excluded from every split.")
 
-    test_mask = city_split == "test"
-    val_cities_mask = city_split == "val"
-    is_train_city = city_split == "train"
-    holdout_year_of = building_cbsa.map(holdout_map)
-    val_temporal_mask = is_train_city & (df["year"] == holdout_year_of)
-    train_mask = is_train_city & ~val_temporal_mask
-    dead_zone_mask = pd.Series(False, index=df.index)
+    train_mask = types == "train"
+    test_mask = types == "test"
+    val_cities_mask = types == "val_cities"
+    val_temporal_mask = types == "val_temporal"
+    dead_zone_mask = types == "dead_zone"
+    spatial_val_masks = {vt: (types == vt) for vt in us_split.SPATIAL_VAL_TYPES}
+    any_spatial_val = np.logical_or.reduce(
+        [m.to_numpy() for m in spatial_val_masks.values()]
+    ) if spatial_val_masks else np.zeros(len(df), dtype=bool)
 
-    assert not (test_mask & (val_cities_mask | val_temporal_mask)).any(), "test/val overlap!"
-    assert not (train_mask & (test_mask | val_cities_mask | val_temporal_mask)).any(), "train/holdout overlap!"
-    assert not (val_cities_mask & val_temporal_mask).any(), "val_cities/val_temporal overlap!"
+    all_val = val_cities_mask | val_temporal_mask | pd.Series(any_spatial_val, index=df.index)
+    assert not (test_mask & all_val).any(), "test/val overlap!"
+    assert not (train_mask & (test_mask | all_val)).any(), "train/holdout overlap!"
 
-    df["type"] = "unassigned"
-    df.loc[train_mask, "type"] = "train"
-    df.loc[test_mask, "type"] = "test"
-    df.loc[val_cities_mask, "type"] = "val_cities"
-    df.loc[val_temporal_mask, "type"] = "val_temporal"
+    val_masks = {"val_cities": val_cities_mask, "val_temporal": val_temporal_mask,
+                 **spatial_val_masks}
 
-    val_masks = {"val_cities": val_cities_mask, "val_temporal": val_temporal_mask}
-
-    print("\n--- Final Dataset Assignment (whole-city split) ---")
+    print("\n--- Final Dataset Assignment (whole-city split + tract overrides) ---")
     print(f"Total building-rows evaluated: {len(df):,}")
-    for name, mask in [("Train", train_mask),
-                       ("Test (whole cities)", test_mask),
-                       ("Val (whole cities)", val_cities_mask),
-                       ("Val (temporal holdout year)", val_temporal_mask)]:
+    rows = [("Train", train_mask),
+            ("Test (whole cities)", test_mask),
+            ("Val (whole cities)", val_cities_mask),
+            ("Val (temporal holdout year)", val_temporal_mask)]
+    rows += [(f"Val ({vt})", m) for vt, m in spatial_val_masks.items()]
+    rows += [("Dead zone (dropped)", dead_zone_mask)]
+    for name, mask in rows:
         n_tracts = df.loc[mask, "GEOID"].nunique()
         print(f"{name}: {mask.sum():,} rows ({n_tracts:,} tracts)")
     print("-" * 30)
@@ -1494,13 +1505,24 @@ def drop_zero_population_tracts(pair_table, zero_geoids):
 def _city_split_and_artifacts(tract_panel, years, naip_coverage_csv, split_seed):
     """Whole-city split frame + persisted artifacts (shared legacy/lazy).
 
-    Builds the stratified CBSA split, attaches the per-train-city temporal
-    holdout year, saves ``cbsa_splits.feather`` and the tract-level
-    ``tract_splits.feather`` (read by evaluation.py), and plots the split map.
+    Builds the stratified CBSA split (with the US scale-up overrides: forced test
+    anchors + NYC held out of the whole-city universe, see :mod:`src.data.us_split`),
+    attaches the per-train-city temporal holdout year, saves ``cbsa_splits.feather``
+    and the tract-level ``tract_splits.feather`` (read by evaluation.py), plots the
+    split map, and computes the tract-level overrides (NYC within-city split +
+    clustered test-city validation).
+
+    Returns ``(city_split_df, tract_overrides)`` where ``tract_overrides`` maps
+    ``GEOID -> {train, test, val_spatial, dead_zone}`` and wins over the whole-city
+    label in the building-assignment step.
     """
     tract_counts = tract_panel.groupby("cbsa_code")["GEOID"].nunique()
     pop_df = cbsa_brackets.cbsa_populations(panel=tract_panel)
-    city_split_df = cbsa_brackets.build_city_split(tract_counts, pop_df, seed=split_seed)
+    city_split_df = cbsa_brackets.build_city_split(
+        tract_counts, pop_df, seed=split_seed,
+        forced_splits=us_split.forced_test_split_map(),
+        exclude_cbsas=[us_split.NYC_CBSA],
+    )
 
     # Temporal holdout year per TRAIN city: imagery year nearest the middle of
     # the state's NAIP coverage window (interpolation, never extrapolation).
@@ -1517,14 +1539,43 @@ def _city_split_and_artifacts(tract_panel, years, naip_coverage_csv, split_seed)
     )
     cbsa_brackets.save_city_split(city_split_df, path=PROCESSED_DATA_DIR / "cbsa_splits.feather")
 
+    # Tract-level overrides: NYC within-city (validated notebook split) +
+    # clustered validation carved from the large test cities.
+    tract_overrides = us_split.build_tract_overrides(tract_panel)
+
     # --- Plot and persist the tract-level split view (evaluation.py reads it) ---
-    tract_panel["type"] = tract_panel["cbsa_code"].map(
+    city_type = tract_panel["cbsa_code"].map(
         dict(zip(city_split_df["cbsa_code"].astype(str), city_split_df["split"]))
     )
+    override_type = tract_panel["GEOID"].astype(str).map(tract_overrides)
+    tract_type = override_type.where(override_type.notna(), city_type)
+    # tract_splits.feather feeds evaluation.py's train/val/test view: fold the
+    # named spatial-val clusters (val_within_nyc/chicago) into "val" so existing
+    # readers keep working; dead_zone tracts are surfaced explicitly (ignored by
+    # the split map / whole-city plots).
+    tract_panel["type"] = tract_type.replace(
+        {vt: "val" for vt in us_split.SPATIAL_VAL_TYPES}
+    ).fillna("unassigned")
     plot_city_splits(tract_panel)
     tract_panel[["GEOID", "geometry", "type"]].to_feather(PROCESSED_DATA_DIR / "tract_splits.feather", index=False)
     print(f"Created file: {PROCESSED_DATA_DIR / 'tract_splits.feather'}")
-    return city_split_df
+
+    # --- Descriptive figures & tables for the paper annex (maps + split tables) ---
+    from src.data import split_reporting
+    nyc_mask = tract_panel["cbsa_code"].astype(str) == us_split.NYC_CBSA
+    nyc_row = None
+    if nyc_mask.any():
+        nyc_row = {
+            "cbsa_code": us_split.NYC_CBSA,
+            "cbsa_title": "New York-Newark-Jersey City, NY-NJ (within-city)",
+            "bracket": "mega", "split": "within_city",
+            "n_tracts": int(nyc_mask.sum()), "holdout_year": float("nan"),
+        }
+    split_reporting.report_splits(
+        tract_panel[["cbsa_code", "geometry", "type"]], city_split_df,
+        FIGURES_DIR, TABLES_DIR, nyc_row=nyc_row,
+    )
+    return city_split_df, tract_overrides
 
 
 def _create_split_lazy(pair_table, savename, naip_coverage_csv, split_seed):
@@ -1575,31 +1626,40 @@ def _create_split_lazy(pair_table, savename, naip_coverage_csv, split_seed):
         print(f"🚫 Excluding {len(zero_pop):,} zero-population tract(s) "
               f"({n_zero_bldgs:,} buildings) from train/val/test.")
 
-    city_split_df = _city_split_and_artifacts(
+    city_split_df, tract_overrides = _city_split_and_artifacts(
         tract_panel, pair_table.years, naip_coverage_csv, split_seed
     )
     split_map = dict(zip(city_split_df["cbsa_code"].astype(str), city_split_df["split"]))
     holdout_map = cbsa_brackets.holdout_year_map(city_split_df)
 
     print("\nAssigning buildings to whole-city train/test/val splits (lazy)...")
-    city_split = pair_table.buildings["cbsa_code"].map(split_map)
-    unassigned = city_split.isna().to_numpy()
+    # years=None: on the lazy static-buildings table a building has no single
+    # year, so val_temporal is materialized below via materialize_holdout_years;
+    # the resolver applies the whole-city split + NYC/clustered-val overrides.
+    types = us_split.resolve_building_types(
+        pair_table.buildings["cbsa_code"], pair_table.buildings["GEOID"], None,
+        split_map, holdout_map, tract_overrides,
+    )
+    unassigned = (types == "unassigned").to_numpy()
     if unassigned.any():
         print(f"⚠️ {unassigned.sum():,} buildings belong to CBSAs outside the city split "
               f"(below MIN_METRO_POP, missing crosswalk, or zero NAIP coverage) — "
               f"excluded from every split.")
 
-    train_city_mask = (city_split == "train").to_numpy()
-    val_city_mask = (city_split == "val").to_numpy()
-    test_mask = (city_split == "test").to_numpy()
+    train_city_mask = (types == "train").to_numpy()
+    val_city_mask = (types == "val_cities").to_numpy()
+    test_mask = (types == "test").to_numpy()
+    spatial_val_masks = {vt: (types == vt).to_numpy() for vt in us_split.SPATIAL_VAL_TYPES}
     assert test_mask.any(), "Empty test dataset!"
     assert train_city_mask.any(), "Empty train dataset!"
 
-    print("\n--- Final Dataset Assignment (whole-city split, lazy) ---")
+    print("\n--- Final Dataset Assignment (whole-city split + overrides, lazy) ---")
     print(f"Total buildings evaluated: {pair_table.n_buildings:,}")
-    for name, mask in [("Train cities", train_city_mask),
-                       ("Test (whole cities)", test_mask),
-                       ("Val (whole cities)", val_city_mask)]:
+    rows = [("Train cities (+ NYC train tracts)", train_city_mask),
+            ("Test (whole cities)", test_mask),
+            ("Val (whole cities)", val_city_mask)]
+    rows += [(f"Val ({vt})", m) for vt, m in spatial_val_masks.items()]
+    for name, mask in rows:
         n_tracts = pair_table.buildings.loc[mask, "GEOID"].nunique()
         print(f"{name}: {mask.sum():,} buildings ({n_tracts:,} tracts)")
     print("-" * 30)
@@ -1615,6 +1675,12 @@ def _create_split_lazy(pair_table, savename, naip_coverage_csv, split_seed):
         .sample_buildings_per_tract(1, seed=825)
         if val_city_mask.any() else pd.DataFrame(columns=FLAT_COLUMNS)
     )
+    for vt, m in spatial_val_masks.items():
+        df_vals_dict[vt] = (
+            pair_table.subset(m, split_type=vt, holdout_map={})
+            .sample_buildings_per_tract(1, seed=825)
+            if m.any() else pd.DataFrame(columns=FLAT_COLUMNS)
+        )
     df_vals_dict["val_temporal"] = (
         pair_table.subset(train_city_mask, split_type="val_temporal", holdout_map={})
         .materialize_holdout_years(holdout_map, n_buildings_per_tract=1, seed=825)
@@ -1668,13 +1734,13 @@ def create_train_test_dataframes(buildings_df, savename, small_sample=False,
 
     ###### Split whole cities (CBSAs)
     years = sorted(int(y) for y in buildings_df["year"].unique())
-    city_split_df = _city_split_and_artifacts(
+    city_split_df, tract_overrides = _city_split_and_artifacts(
         tract_panel, years, naip_coverage_csv, split_seed
     )
 
     ###### Split Buildings
     train_mask, test_mask, val_masks_dict, dead_zone_mask = assign_buildings_by_city(
-        buildings_df, city_split_df
+        buildings_df, city_split_df, tract_overrides
     )
 
     # Keep only relevant columns for the DataLoader

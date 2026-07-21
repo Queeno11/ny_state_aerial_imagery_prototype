@@ -477,6 +477,58 @@ def test_select_full_universe_bypasses_split_and_sampling():
     assert set(out.loc[out["GEOID"] == "36061000100", "type"]) == {"train"}
 
 
+def test_select_cbsa_whitelist_filters_everything():
+    # Whitelist keeps only listed metros — sampled tier AND full-universe
+    # bypass rows of other metros are gone; None/empty leaves all in.
+    params = dict(SEL_PARAMS,
+                  predict_full_universe_geoid_prefixes=("36061",),
+                  predict_cbsa_whitelist=("35620", "A"))
+    spec = [("36061000100", "35620", "train", 3),   # NYC bypass, whitelisted
+            ("01001000001", "A", "test", 3),        # whitelisted test city
+            ("02001000001", "B", "test", 3)]        # test city NOT whitelisted
+    out = prediction.select_prediction_rows(make_sel_df(spec), params,
+                                            verbose=False)
+    assert set(out["cbsa_code"]) == {"35620", "A"}
+    off = dict(params, predict_cbsa_whitelist=None)
+    out = prediction.select_prediction_rows(make_sel_df(spec), off,
+                                            verbose=False)
+    assert set(out["cbsa_code"]) == {"35620", "A", "B"}
+
+
+def test_select_full_universe_building_cap():
+    # Cap applies within full-universe rows only; every bypass tract stays
+    # represented; membership is stable across years and row order.
+    params = dict(SEL_PARAMS,
+                  predict_full_universe_geoid_prefixes=("36061", "36005"),
+                  predict_full_universe_buildings_per_tract=4)
+    spec = [("36061000100", "35620", "train", 12),
+            ("36005000200", "35620", "train", 2),
+            ("01001000001", "A", "test", 12)]
+    out = prediction.select_prediction_rows(make_sel_df(spec), params,
+                                            verbose=False)
+    sizes = out.groupby("GEOID").size()
+    assert sizes["36061000100"] == 4           # capped
+    assert sizes["36005000200"] == 2           # under cap: untouched
+    assert sizes["01001000001"] == 5           # sampled tier keeps ITS cap (5)
+    shuffled = (make_sel_df(spec, year=2016)
+                .sample(frac=1.0, random_state=3).reset_index(drop=True))
+    out2 = prediction.select_prediction_rows(shuffled, params, verbose=False)
+    assert set(out["building_id"]) == set(out2["building_id"])
+
+
+def test_fingerprint_pins_whitelist_and_fu_cap(tmp_path):
+    model = tmp_path / "m.pth"
+    model.write_bytes(b"x")
+    fp = prediction.prediction_fingerprint(dict(PARAMS), model)
+    assert fp["predict_cbsa_whitelist"] is None
+    fp2 = prediction.prediction_fingerprint(
+        dict(PARAMS, predict_cbsa_whitelist=("31080", "35620"),
+             predict_full_universe_buildings_per_tract=25), model)
+    assert fp2["predict_cbsa_whitelist"] == ["31080", "35620"]
+    assert fp2["predict_full_universe_buildings_per_tract"] == 25
+    assert fp != fp2
+
+
 def test_select_split_filter():
     spec = [("01001000001", "A", "test", 4), ("02001000001", "B", "val", 4)]
     df = make_sel_df(spec)

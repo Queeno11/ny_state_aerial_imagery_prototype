@@ -3212,4 +3212,4 @@ if __name__ == "__main__":
     }
 
     # Run full pipeline
-    run(params, train=True, retrain=False, compute_loss=False, generate_predictions=True, evaluate=True)
+    run(params, train=True, retrain=False, compute_loss=False, generate_predictions=True, evaluate=True)    run(params, train=False, retrain=False, compute_loss=False, generate_predictions=True, evaluate=True)
