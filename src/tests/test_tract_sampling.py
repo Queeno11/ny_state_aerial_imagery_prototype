@@ -16,7 +16,8 @@ import torch
 import src.geo_utils  # noqa: F401  (breaks the pair_table<->build_dataset import cycle)
 from src.data.pair_table import FLAT_COLUMNS, LazyPairTable
 from src.data.tract_sampling import (
-    GradientHardnessRegistry, groupby_mean, hash_geoids, stable_geoid_hash,
+    GradientHardnessRegistry, MiningSchedule, groupby_mean, hash_geoids,
+    stable_geoid_hash,
 )
 
 YEARS = [2012, 2014, 2018]
@@ -126,6 +127,127 @@ def test_registry_validates_inputs():
     reg = GradientHardnessRegistry()
     with pytest.raises(ValueError):
         reg.update(np.array([1, 2]), np.array([0.1]))
+
+
+# ── schedulable alpha/cap ────────────────────────────────────────────────────
+
+def test_registry_set_alpha_and_cap_change_weights():
+    reg = GradientHardnessRegistry(alpha=0.0, beta=0.9, cap=10.0)
+    reg.update(np.array([1, 2]), np.array([0.5, 1.5]))
+    assert np.allclose(reg.weights_for(np.array([1, 2])), 1.0)  # alpha=0 -> uniform
+
+    reg.set_alpha(1.0)
+    w = reg.weights_for(np.array([1, 2]))
+    assert np.allclose(w, [0.5, 1.5])            # pure ratio, mean_ema == 1.0
+    reg.set_cap(1.2)                             # cap now binds on the hard tract
+    assert np.allclose(reg.weights_for(np.array([2]))[0], 1.2)
+
+    # EMAs are untouched by hyperparameter changes — only the bias moves
+    assert reg._ema == {1: 0.5, 2: 1.5}
+
+
+def test_registry_setters_validate():
+    reg = GradientHardnessRegistry()
+    with pytest.raises(ValueError):
+        reg.set_alpha(1.5)
+    with pytest.raises(ValueError):
+        reg.set_alpha(-0.1)
+    with pytest.raises(ValueError):
+        reg.set_cap(0.5)
+
+
+def test_mining_schedule_ramp_shape():
+    s = MiningSchedule(alpha_start=0.3, alpha_final=0.6, cap_start=10.0,
+                       cap_final=3.0, start_epoch=150, end_epoch=300)
+    assert s.is_active
+    # flat before, linear through, flat after (epochs are 1-indexed)
+    assert s.alpha_at(1) == pytest.approx(0.3)
+    assert s.alpha_at(150) == pytest.approx(0.3)
+    assert s.alpha_at(225) == pytest.approx(0.45)      # midpoint
+    assert s.alpha_at(300) == pytest.approx(0.6)
+    assert s.alpha_at(750) == pytest.approx(0.6)
+    # cap ramps DOWN over the same window
+    assert s.cap_at(150) == pytest.approx(10.0)
+    assert s.cap_at(225) == pytest.approx(6.5)
+    assert s.cap_at(300) == pytest.approx(3.0)
+    # monotone, bounded
+    xs = [s.alpha_at(e) for e in range(1, 400)]
+    assert all(b >= a - 1e-12 for a, b in zip(xs, xs[1:]))
+    assert min(xs) >= 0.3 and max(xs) <= 0.6
+
+
+def test_mining_schedule_inert_by_default():
+    s = MiningSchedule(alpha_start=0.3, alpha_final=0.3)
+    assert not s.is_active
+    assert {s.alpha_at(e) for e in (1, 200, 750)} == {0.3}
+
+
+def test_mining_schedule_step_when_start_equals_end():
+    s = MiningSchedule(alpha_start=0.3, alpha_final=1.0,
+                       start_epoch=400, end_epoch=400)
+    assert s.alpha_at(399) == pytest.approx(0.3)
+    assert s.alpha_at(400) == pytest.approx(1.0)       # clean step at the epoch
+
+
+def test_mining_schedule_validates():
+    with pytest.raises(ValueError):
+        MiningSchedule(alpha_final=1.5)
+    with pytest.raises(ValueError):
+        MiningSchedule(cap_final=0.5)
+    with pytest.raises(ValueError):
+        MiningSchedule(start_epoch=0)
+    with pytest.raises(ValueError):
+        MiningSchedule(start_epoch=300, end_epoch=150)
+
+
+def test_mining_schedule_apply_is_stateless_and_idempotent():
+    """A resumed run must land on the same ramp point as an uninterrupted one."""
+    s = MiningSchedule(alpha_start=0.3, alpha_final=0.6, cap_start=10.0,
+                       cap_final=3.0, start_epoch=150, end_epoch=300)
+    reg = GradientHardnessRegistry(alpha=0.3, beta=0.9, cap=10.0)
+    reg.update(np.array([1, 2]), np.array([0.5, 1.5]))
+
+    log = s.apply(reg, 225)
+    assert reg.alpha == pytest.approx(0.45) and reg.cap == pytest.approx(6.5)
+    assert log == {"mining/alpha": pytest.approx(0.45),
+                   "mining/cap": pytest.approx(6.5),
+                   "mining/ramp_progress": pytest.approx(0.5)}
+
+    s.apply(reg, 225)                                   # idempotent
+    assert reg.alpha == pytest.approx(0.45)
+
+    # a "resume": fresh registry + reloaded EMAs, same epoch -> same state
+    fresh = GradientHardnessRegistry(alpha=0.3, beta=0.9, cap=10.0)
+    fresh._ema = dict(reg._ema)
+    s.apply(fresh, 225)
+    assert fresh.alpha == pytest.approx(reg.alpha)
+    assert np.allclose(fresh.weights_for(np.array([1, 2])),
+                       reg.weights_for(np.array([1, 2])))
+
+
+def test_mining_ramp_concentrates_draws_over_time():
+    """The ramp must actually tilt shard draws — and keep a floor at alpha=0.6."""
+    rng = np.random.default_rng(0)
+    n = 4000
+    hashes = np.arange(n)
+    ema = rng.lognormal(mean=-1.3, sigma=0.45, size=n)   # ~ observed spread
+    reg = GradientHardnessRegistry(alpha=0.3, beta=0.9, cap=10.0)
+    reg._ema = {int(k): float(v) for k, v in zip(hashes, ema)}
+    s = MiningSchedule(alpha_start=0.3, alpha_final=0.6, cap_start=10.0,
+                       cap_final=3.0, start_epoch=150, end_epoch=300)
+
+    def top_decile_share(epoch):
+        s.apply(reg, epoch)
+        w = reg.weights_for(hashes)
+        p = w / w.sum()
+        return p[np.argsort(-p)[: n // 10]].sum(), w.min()
+
+    early, floor_early = top_decile_share(1)
+    late, floor_late = top_decile_share(300)
+    assert 0.10 < early < late                  # mining strengthens along the ramp
+    assert late > 1.25 * (early - 0.10) + 0.10  # and materially so
+    assert floor_late > 0.25                    # alpha=0.6 keeps a real floor
+    assert floor_late < floor_early             # ...but a tighter one than at 0.3
 
 
 # ── materialize_tract_sample ─────────────────────────────────────────────────

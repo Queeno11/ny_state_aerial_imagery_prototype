@@ -429,6 +429,73 @@ class LazyPairTable:
         years = np.tile(self._years_arr, len(picked))
         return self._flat_from(rep, years, as_str_keys=True)
 
+    def sample_cross_sectional(self, years_per_city=1, seed=825):
+        """Cross-sectional val frame: 1 building/tract, each city at a fixed set
+        of ``years_per_city`` randomly-chosen flight year(s).
+
+        The within-city ranking metric is a per-(cbsa, year) Spearman, so its
+        precision is set by TRACT COVERAGE, not by how many years a building
+        carries. Emitting one (or few) year(s) per city — instead of all of
+        them, as :meth:`sample_buildings_per_tract` does — spends the fixed
+        validation-shard budget on ~``n_years``× more tracts while keeping every
+        (cbsa, year) cell dense: all of a city's sampled tracts share the SAME
+        chosen year, so they land in one cell rather than scattering. Years are
+        drawn PER CITY (deterministic in ``seed`` and the CBSA), so the val set
+        still spans multiple NAIP vintages instead of committing to one.
+
+        NAIP flight-year substitution (in the shard generator) may remap a
+        requested year to the nearest actual flight and relabel to that year's
+        ACS score; a whole metro shares its flight, so its tracts remap together
+        and the cell stays dense. Use :meth:`sample_temporal_stability` for the
+        multi-year buildings the MASD / rank-autocorrelation stability
+        diagnostics need — those are decoupled from this coverage on purpose.
+        """
+        from src.data.tract_sampling import stable_geoid_hash
+
+        n_yr = min(max(1, int(years_per_city)), self.n_years)
+        rng = np.random.default_rng(seed)
+        order = rng.permutation(self.n_buildings)
+        shuffled = self.buildings.take(order)
+        keep = shuffled.groupby("GEOID", observed=True).cumcount() < 1
+        picked = shuffled[keep.to_numpy()].reset_index(drop=True)  # one building/tract
+        if len(picked) == 0:
+            return pd.DataFrame(columns=FLAT_COLUMNS)
+
+        # Per-city year choice (deterministic in seed + CBSA): a city's tracts
+        # share its year(s) so cells stay dense, yet vintages vary across cities.
+        cbsa = picked["cbsa_code"].astype(str)
+        seed_int = int(seed[0]) if isinstance(seed, (tuple, list)) else int(seed)
+        year_by_city = {
+            c: np.random.default_rng(seed_int + stable_geoid_hash(c))
+                 .choice(self._years_arr, size=n_yr, replace=False)
+            for c in pd.unique(cbsa)
+        }
+        rep_rows = picked.take(np.repeat(np.arange(len(picked)), n_yr))
+        years = np.concatenate([year_by_city[c] for c in cbsa])
+        return self._flat_from(rep_rows, years, as_str_keys=True)
+
+    def sample_temporal_stability(self, n_buildings_per_cbsa=25, seed=825):
+        """Small multi-year val frame for the temporal-stability diagnostics
+        (stable/changed MASD, directional accuracy, rank autocorrelation).
+
+        Keeps up to ``n_buildings_per_cbsa`` buildings PER CITY, each with ALL
+        its years, so a building's score can be tracked across time. Kept
+        deliberately small: stability is a within-building quantity with little
+        cross-tract variance and drives no checkpoint selection, so it needs far
+        fewer tracts than the cross-sectional ranking metric — the whole point
+        of splitting it off from :meth:`sample_cross_sectional`.
+        """
+        rng = np.random.default_rng(seed)
+        order = rng.permutation(self.n_buildings)
+        shuffled = self.buildings.take(order)
+        keep = shuffled.groupby("cbsa_code", observed=True).cumcount() < n_buildings_per_cbsa
+        picked = shuffled[keep.to_numpy()]
+        if len(picked) == 0:
+            return pd.DataFrame(columns=FLAT_COLUMNS)
+        rep = picked.take(np.repeat(np.arange(len(picked)), self.n_years))
+        years = np.tile(self._years_arr, len(picked))
+        return self._flat_from(rep, years, as_str_keys=True)
+
     def materialize_holdout_years(self, holdout_map, n_buildings_per_tract=2, seed=825):
         """val_temporal frame: ≤n buildings per tract, ONLY their city's holdout
         year. Buildings in cities without a holdout year are excluded."""

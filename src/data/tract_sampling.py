@@ -42,6 +42,7 @@ from __future__ import annotations
 import json
 import threading
 import zlib
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
@@ -143,14 +144,41 @@ class GradientHardnessRegistry:
         """
         keys = np.asarray(geoid_hashes, dtype=np.int64)
         with self._lock:
-            if not self._ema or self.alpha == 0.0:
+            # Snapshot alpha/cap under the lock together with the EMAs: a
+            # concurrent set_alpha/set_cap (the ramp, applied on the training
+            # thread) must not land between the early-return test and the
+            # weight computation, or a shard would mix two schedule points.
+            alpha, cap = self.alpha, self.cap
+            if not self._ema or alpha == 0.0:
                 return np.ones(keys.size, dtype=np.float64)
             mean_ema = float(np.mean(list(self._ema.values())))
             ema = np.array([self._ema.get(int(k), mean_ema) for k in keys])
         if mean_ema <= 0.0:
             return np.ones(keys.size, dtype=np.float64)
-        ratio = np.minimum(ema / mean_ema, self.cap)
-        return (1.0 - self.alpha) + self.alpha * ratio
+        ratio = np.minimum(ema / mean_ema, cap)
+        return (1.0 - alpha) + alpha * ratio
+
+    # ── schedulable hyperparameters (see MiningSchedule) ─────────────────────
+    def set_alpha(self, alpha: float) -> None:
+        """Set the hardness mixture weight in place.
+
+        Safe to call while shard generation is in flight: ``weights_for``
+        snapshots alpha under the same lock, so a shard sees either the old or
+        the new value, never a mix. The EMAs are hyperparameter-free, so
+        changing alpha mid-run needs no registry reset — only the sampling bias
+        moves, not the learned hardness.
+        """
+        if not 0.0 <= alpha <= 1.0:
+            raise ValueError(f"alpha must be in [0, 1], got {alpha}")
+        with self._lock:
+            self.alpha = float(alpha)
+
+    def set_cap(self, cap: float) -> None:
+        """Set the hardness-ratio cap in place (see :meth:`set_alpha`)."""
+        if cap < 1.0:
+            raise ValueError(f"cap must be >= 1, got {cap}")
+        with self._lock:
+            self.cap = float(cap)
 
     # ── persistence (registry survives run restarts) ─────────────────────────
     def save(self, path) -> None:
@@ -191,4 +219,109 @@ class GradientHardnessRegistry:
             "mining/registry_tracts": int(vals.size),
             "mining/ema_mean": float(vals.mean()),
             "mining/ema_p90": float(np.quantile(vals, 0.9)),
+        }
+
+
+@dataclass(frozen=True)
+class MiningSchedule:
+    """Warmup-then-mine ramp for the registry's ``alpha`` (and ``cap``).
+
+    Why ramp instead of mining from epoch 1. Two things make early mining both
+    useless and mildly harmful here:
+
+    * **The estimate isn't ready.** A tract's weight is its EMA relative to the
+      registry mean, and unseen tracts fall back to that mean (weight 1.0
+      exactly). Until the registry has covered most of the tract universe, a
+      large alpha mostly amplifies which tracts happened to be drawn first.
+    * **The ranking loss needs the label range.** Low-|lambda| tracts are the
+      ones the model already orders correctly, which in a wealth ranking skews
+      toward the distribution's extremes — the anchors that give in-batch pairs
+      their spread. Starving them early compresses the within-batch label range
+      and degrades exactly the full-distribution within-city Spearman that
+      selects checkpoints. This is the ranking-objective analogue of the
+      semi-hard mining lesson (Schroff et al. 2015).
+
+    Once coverage is broad, concentrating the shard budget on high-gradient
+    tracts is the variance-optimal choice (Katharopoulos & Fleuret 2018), so
+    alpha ramps up linearly between ``start_epoch`` and ``end_epoch``.
+
+    ``cap`` ramps DOWN over the same window on purpose. The cap only binds when
+    alpha is large enough for the hardness ratio to dominate the weight, so the
+    irreducibly-hard / label-noise guard (Mindermann et al. 2022) is inert at
+    low alpha and has to tighten as alpha grows or it never fires at all.
+
+    Epochs are **1-indexed**, matching the ``Epoch [n/N]`` training log. The
+    schedule is a pure function of the epoch and holds no state, so a resumed
+    run lands on the correct ramp point with nothing to persist — which is why
+    :meth:`GradientHardnessRegistry.load` deliberately keeps the constructor's
+    alpha/beta/cap rather than restoring saved ones.
+
+    ``alpha_final == alpha_start`` (the default) reproduces the old fixed-alpha
+    behavior exactly, so the schedule is inert unless configured.
+    """
+
+    alpha_start: float = 0.3
+    alpha_final: float = 0.3
+    cap_start: float = 10.0
+    cap_final: float = 10.0
+    start_epoch: int = 150
+    end_epoch: int = 300
+
+    def __post_init__(self):
+        for name in ("alpha_start", "alpha_final"):
+            v = getattr(self, name)
+            if not 0.0 <= v <= 1.0:
+                raise ValueError(f"{name} must be in [0, 1], got {v}")
+        for name in ("cap_start", "cap_final"):
+            v = getattr(self, name)
+            if v < 1.0:
+                raise ValueError(f"{name} must be >= 1, got {v}")
+        if self.start_epoch < 1:
+            raise ValueError(f"start_epoch must be >= 1, got {self.start_epoch}")
+        if self.end_epoch < self.start_epoch:
+            raise ValueError(
+                f"end_epoch ({self.end_epoch}) must be >= start_epoch "
+                f"({self.start_epoch})"
+            )
+
+    @property
+    def is_active(self) -> bool:
+        """True when the schedule actually moves something."""
+        return (self.alpha_final != self.alpha_start
+                or self.cap_final != self.cap_start)
+
+    def progress(self, epoch: int) -> float:
+        """Ramp fraction in [0, 1] for a 1-indexed ``epoch``.
+
+        ``end_epoch == start_epoch`` is a clean step at that epoch (the
+        ``>= end_epoch`` test is checked first).
+        """
+        if epoch >= self.end_epoch:
+            return 1.0
+        if epoch <= self.start_epoch:
+            return 0.0
+        span = self.end_epoch - self.start_epoch
+        return (epoch - self.start_epoch) / span
+
+    def alpha_at(self, epoch: int) -> float:
+        t = self.progress(epoch)
+        return self.alpha_start + t * (self.alpha_final - self.alpha_start)
+
+    def cap_at(self, epoch: int) -> float:
+        t = self.progress(epoch)
+        return self.cap_start + t * (self.cap_final - self.cap_start)
+
+    def apply(self, registry, epoch: int) -> dict:
+        """Push this epoch's (alpha, cap) onto ``registry``; return W&B diagnostics.
+
+        Call once at the top of each epoch, before any shard for that epoch is
+        drawn. Idempotent — re-applying the same epoch is a no-op.
+        """
+        alpha, cap = self.alpha_at(epoch), self.cap_at(epoch)
+        registry.set_alpha(alpha)
+        registry.set_cap(cap)
+        return {
+            "mining/alpha": alpha,
+            "mining/cap": cap,
+            "mining/ramp_progress": self.progress(epoch),
         }

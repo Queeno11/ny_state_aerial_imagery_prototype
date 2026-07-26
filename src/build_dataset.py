@@ -111,7 +111,8 @@ def load_satellite_datasets(years,stretch=False, engine="zarr"):
 
 def generate_datasets(savename, sat_data, years, small_sample=False, tau_meters=100,
                       indicator=None, footprints_source="ms_us", states=None,
-                      naip_coverage_csv=None):
+                      naip_coverage_csv=None, val_years_per_city=1,
+                      val_stability_buildings_per_cbsa=25):
 
     indicator = indicator if indicator is not None else indicators.DEFAULT_INDICATOR
     all_years_datasets, all_years_extents, df = open_datasets(
@@ -121,7 +122,9 @@ def generate_datasets(savename, sat_data, years, small_sample=False, tau_meters=
 
     df_train, df_vals_dict, df_test, df_dead_zone = create_train_test_dataframes(
         df, savename, small_sample=small_sample, indicator=indicator,
-        naip_coverage_csv=naip_coverage_csv
+        naip_coverage_csv=naip_coverage_csv,
+        val_years_per_city=val_years_per_city,
+        val_stability_buildings_per_cbsa=val_stability_buildings_per_cbsa,
     )
 
     return all_years_datasets, all_years_extents, df_train, df_vals_dict, df_test, df_dead_zone
@@ -1578,7 +1581,8 @@ def _city_split_and_artifacts(tract_panel, years, naip_coverage_csv, split_seed)
     return city_split_df, tract_overrides
 
 
-def _create_split_lazy(pair_table, savename, naip_coverage_csv, split_seed):
+def _create_split_lazy(pair_table, savename, naip_coverage_csv, split_seed,
+                       val_years_per_city=1, val_stability_buildings_per_cbsa=25):
     """Whole-city split over a LazyPairTable — buildings level, no pair unroll.
 
     Same split semantics as :func:`assign_buildings_by_city`, expressed on the
@@ -1669,21 +1673,38 @@ def _create_split_lazy(pair_table, savename, naip_coverage_csv, split_seed):
     ).shuffle_buildings(seed=825)
     df_test = pair_table.subset(test_mask, split_type="test", holdout_map={})
 
+    # Validation is split into two decoupled pools (see the sampler docstrings
+    # in pair_table.py). The CROSS-SECTIONAL pool — val_cities, the spatial
+    # val_within_* holdouts, and val_temporal — drives checkpoint selection via
+    # the per-(cbsa, year) within-Spearman, whose precision is set by TRACT
+    # coverage; it keeps 1 building/tract at ``val_years_per_city`` year(s) per
+    # city, spending the shard budget on tracts instead of redundant years
+    # (building-weighted, all-years sampling previously covered only ~10-17% of
+    # each val city's tracts, making the small bracket's number pure noise). The
+    # separate val_stability pool carries the few multi-year buildings the MASD /
+    # rank-autocorrelation diagnostics need — it is small and NOT in the
+    # selection score.
     df_vals_dict = {}
     df_vals_dict["val_cities"] = (
         pair_table.subset(val_city_mask, split_type="val_cities", holdout_map={})
-        .sample_buildings_per_tract(1, seed=825)
+        .sample_cross_sectional(years_per_city=val_years_per_city, seed=825)
         if val_city_mask.any() else pd.DataFrame(columns=FLAT_COLUMNS)
     )
     for vt, m in spatial_val_masks.items():
         df_vals_dict[vt] = (
             pair_table.subset(m, split_type=vt, holdout_map={})
-            .sample_buildings_per_tract(1, seed=825)
+            .sample_cross_sectional(years_per_city=val_years_per_city, seed=825)
             if m.any() else pd.DataFrame(columns=FLAT_COLUMNS)
         )
     df_vals_dict["val_temporal"] = (
         pair_table.subset(train_city_mask, split_type="val_temporal", holdout_map={})
         .materialize_holdout_years(holdout_map, n_buildings_per_tract=1, seed=825)
+    )
+    df_vals_dict["val_stability"] = (
+        pair_table.subset(val_city_mask, split_type="val_stability", holdout_map={})
+        .sample_temporal_stability(
+            n_buildings_per_cbsa=val_stability_buildings_per_cbsa, seed=825)
+        if val_city_mask.any() else pd.DataFrame(columns=FLAT_COLUMNS)
     )
     for val_name, df_val in df_vals_dict.items():
         if df_val.shape[0] == 0:
@@ -1706,7 +1727,9 @@ def _create_split_lazy(pair_table, savename, naip_coverage_csv, split_seed):
 
 def create_train_test_dataframes(buildings_df, savename, small_sample=False,
                                  indicator=None, naip_coverage_csv=None,
-                                 split_seed=cbsa_brackets.SPLIT_SEED):
+                                 split_seed=cbsa_brackets.SPLIT_SEED,
+                                 val_years_per_city=1,
+                                 val_stability_buildings_per_cbsa=25):
     """Whole-city (CBSA) train/val/test split (#28), Khachiyan et al. (2022)-style.
 
     Cities (CBSAs) are the split atoms: each is assigned wholesale to
@@ -1723,7 +1746,11 @@ def create_train_test_dataframes(buildings_df, savename, small_sample=False,
             # Materialize a tiny flat frame and reuse the legacy row-level path.
             buildings_df = buildings_df.sample_pairs(1000, seed=825)
         else:
-            return _create_split_lazy(buildings_df, savename, naip_coverage_csv, split_seed)
+            return _create_split_lazy(
+                buildings_df, savename, naip_coverage_csv, split_seed,
+                val_years_per_city=val_years_per_city,
+                val_stability_buildings_per_cbsa=val_stability_buildings_per_cbsa,
+            )
 
     if small_sample:
         buildings_df = buildings_df.sample(min(1000, len(buildings_df)), random_state=825).reset_index(drop=True)

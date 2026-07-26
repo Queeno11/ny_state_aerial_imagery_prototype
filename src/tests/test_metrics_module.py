@@ -15,6 +15,7 @@ from src.utils.metrics import (
     weighted_within_spearman,
     rank_autocorrelation,
     masd_by_change,
+    selection_score,
 )
 
 
@@ -56,12 +57,57 @@ def test_within_city_cells_and_weighting():
     cells = within_city_cells(df)
     assert len(cells) == 1
     assert cells["n"].iloc[0] == n
+    assert cells["n_tracts"].iloc[0] == n  # distinct labels -> one tract each
     exp_rho = spearmanr(df["pred"], df["label"]).statistic
     assert cells["rho"].iloc[0] == pytest.approx(exp_rho)
     head = weighted_within_spearman(cells)
     assert head["within_spearman"] == pytest.approx(exp_rho)
     assert head["within_cells"] == 1
     assert head["within_n"] == n
+    assert head["within_tracts"] == n
+
+
+def test_within_weighting_is_by_tracts_not_buildings():
+    # Cell A ("downtown"): 8 buildings but only 2 distinct tract labels.
+    # Cell B ("suburb"):   5 buildings, 5 distinct tract labels.
+    # Building-count weights would give A 8/13 of the mean; tract weights 2/7.
+    a = pd.DataFrame({
+        "building_id": range(8), "year": 2016,
+        "pred": [1, 2, 3, 4, 5, 6, 7, 8],
+        "label": [0.1] * 4 + [0.9] * 4,   # 2 tracts, 4 buildings each
+        "change": 0, "cbsa": 101,
+    })
+    b = pd.DataFrame({
+        "building_id": range(100, 105), "year": 2016,
+        "pred": [1, 2, 3, 4, 5],
+        "label": [0.2, 0.3, 0.5, 0.4, 0.6],  # 5 tracts
+        "change": 0, "cbsa": 102,
+    })
+    cells = within_city_cells(pd.concat([a, b]))
+    assert dict(zip(cells["cbsa"], cells["n_tracts"])) == {101: 2, 102: 5}
+    rho_a = spearmanr(a["pred"], a["label"]).statistic
+    rho_b = spearmanr(b["pred"], b["label"]).statistic
+    head = weighted_within_spearman(cells)
+    assert head["within_spearman"] == pytest.approx((2 * rho_a + 5 * rho_b) / 7)
+    assert head["within_n"] == 13
+    assert head["within_tracts"] == 7
+
+
+def test_within_tract_count_prefers_geoid_column():
+    # With a GEOID column present, tract count must come from it — here labels
+    # are all distinct (6 would-be "tracts") but GEOID says 3.
+    n = 6
+    df = pd.DataFrame({
+        "building_id": range(n), "year": 2016,
+        "pred": [1, 2, 3, 4, 5, 6],
+        "label": [0.1, 0.2, 0.3, 0.4, 0.5, 0.6],
+        "change": 0, "cbsa": 101,
+        "GEOID": ["36061000100", "36061000100", "36061000200",
+                  "36061000200", "36061000300", "36061000300"],
+    })
+    cells = within_city_cells(df)
+    assert cells["n_tracts"].iloc[0] == 3
+    assert cells["n"].iloc[0] == n
 
 
 def test_within_city_cells_drops_small_and_constant():
@@ -104,3 +150,91 @@ def test_rank_autocorrelation_widest_span_and_benchmark():
 def test_rank_autocorrelation_empty_without_common():
     df = _val_df()  # only building 1 is stable & multi-year, n=1 < min_common
     assert rank_autocorrelation(df) == {}
+
+
+# ---- selection_score -----------------------------------------------------
+
+
+def _sel_metrics():
+    return {
+        "val_cities":         {"within_spearman": 0.40, "within_tracts": 300, "spearman": 0.45},
+        "val_within_nyc":     {"within_spearman": 0.30, "within_tracts": 100, "spearman": 0.35},
+        "val_within_chicago": {"within_spearman": 0.60, "within_tracts": 100, "spearman": 0.65},
+        "val_temporal":       {"within_spearman": 0.58, "within_tracts": 200, "spearman": 0.59},
+    }
+
+
+def test_selection_within_50_50_tract_weighted_pooling():
+    score, comp = selection_score(_sel_metrics(), mode="within_50_50")
+    # Cross-sectional side pools the three non-temporal sets by tract weight:
+    cs = (0.40 * 300 + 0.30 * 100 + 0.60 * 100) / 500  # = 0.42
+    assert comp["cross_sectional_within"] == pytest.approx(cs)
+    assert comp["temporal_within"] == pytest.approx(0.58)
+    assert score == pytest.approx(0.5 * cs + 0.5 * 0.58)
+
+
+def test_selection_excludes_diagnostic_stability_set():
+    # val_stability is a few noisy multi-year buildings; it must not perturb
+    # the checkpoint-selection score (default diagnostic_sets excludes it).
+    base = _sel_metrics()
+    score_base, comp_base = selection_score(base, mode="within_50_50")
+    poisoned = dict(base)
+    poisoned["val_stability"] = {"within_spearman": -0.9, "within_tracts": 400}
+    score, comp = selection_score(poisoned, mode="within_50_50")
+    assert score == pytest.approx(score_base)
+    assert comp["cross_sectional_within"] == pytest.approx(comp_base["cross_sectional_within"])
+    # opting the set back in (empty exclusion) does drag the score down
+    score_in, _ = selection_score(poisoned, mode="within_50_50", diagnostic_sets=())
+    assert score_in < score_base
+
+
+def test_selection_within_50_50_matches_pooled_cells():
+    # Weighting set-level within_spearmans by within_tracts must equal the
+    # tract-weighted mean over the union of the sets' cells.
+    cells_a = pd.DataFrame({"rho": [0.2, 0.6], "n": [10, 10], "n_tracts": [10, 30]})
+    cells_b = pd.DataFrame({"rho": [0.8], "n": [10], "n_tracts": [60]})
+    m_a = weighted_within_spearman(cells_a)
+    m_b = weighted_within_spearman(cells_b)
+    score, comp = selection_score(
+        {"val_cities": m_a, "val_within_chicago": m_b,
+         "val_temporal": {"within_spearman": 0.0, "within_tracts": 1}},
+        mode="within_50_50",
+    )
+    pooled = np.average([0.2, 0.6, 0.8], weights=[10, 30, 60])
+    assert comp["cross_sectional_within"] == pytest.approx(pooled)
+    assert score == pytest.approx(pooled / 2)
+
+
+def test_selection_within_50_50_fallback_and_missing_sides():
+    # Set without within cells falls back to pooled spearman (weight n).
+    score, comp = selection_score(
+        {"val_cities": {"spearman": 0.5, "n": 100},
+         "val_temporal": {"within_spearman": 0.7, "within_tracts": 10}},
+        mode="within_50_50",
+    )
+    assert comp["cross_sectional_within"] == pytest.approx(0.5)
+    assert score == pytest.approx(0.6)
+    # Missing temporal side: cross-sectional side carries the score alone.
+    score, comp = selection_score(
+        {"val_cities": {"within_spearman": 0.4, "within_tracts": 10}},
+        mode="within_50_50",
+    )
+    assert "temporal_within" not in comp
+    assert score == pytest.approx(0.4)
+    # Nothing usable at all.
+    score, comp = selection_score({"val_cities": {"mse": 1.0}}, mode="within_50_50")
+    assert score is None and comp == {}
+
+
+def test_selection_legacy_modes_are_unweighted_set_means():
+    m = _sel_metrics()
+    score_w, comp_w = selection_score(m, mode="within")
+    assert score_w == pytest.approx(np.mean([0.40, 0.30, 0.60, 0.58]))
+    score_p, _ = selection_score(m, mode="pooled")
+    assert score_p == pytest.approx(np.mean([0.45, 0.35, 0.65, 0.59]))
+    # "within" falls back per set to pooled spearman when within is missing.
+    m["val_cities"] = {"spearman": 0.45}
+    score_f, comp_f = selection_score(m, mode="within")
+    assert comp_f["val_cities"] == pytest.approx(0.45)
+    with pytest.raises(ValueError):
+        selection_score(m, mode="nonsense")

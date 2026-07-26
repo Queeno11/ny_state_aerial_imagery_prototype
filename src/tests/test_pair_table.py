@@ -254,6 +254,51 @@ class TestOtherMaterializers:
         again = table.sample_buildings_per_tract(2, seed=825)
         pd.testing.assert_frame_equal(got, again)
 
+    def test_sample_cross_sectional_one_year_per_city(self, table):
+        got = table.sample_cross_sectional(years_per_city=1, seed=825)
+        # one building per tract
+        assert (got.groupby("GEOID")["building_id"].nunique() <= 1).all()
+        # exactly one row per building (one year) -> tract coverage, not depth
+        assert (got.groupby("building_id").size() == 1).all()
+        # every tract of every city is present (full coverage within budget)
+        for cbsa, grp in got.groupby("cbsa_code"):
+            city_geoids = set(table.buildings.loc[
+                table.buildings["cbsa_code"].astype(str) == cbsa, "GEOID"].astype(str))
+            assert set(grp["GEOID"]) == city_geoids
+            # a city's tracts all share ITS chosen year -> one dense cell
+            assert grp["year"].nunique() == 1
+        # labels attach at the chosen year
+        assert got["Rel_Score"].notna().all()
+
+    def test_sample_cross_sectional_years_vary_across_cities(self, table):
+        # With one year per city drawn per-CBSA, different cities can pick
+        # different vintages (deterministically) — not all pinned to one year.
+        got = table.sample_cross_sectional(years_per_city=1, seed=825)
+        year_by_city = got.groupby("cbsa_code")["year"].first()
+        assert year_by_city.nunique() >= 2
+
+    def test_sample_cross_sectional_two_years_dense_cells(self, table):
+        got = table.sample_cross_sectional(years_per_city=2, seed=825)
+        assert (got.groupby("building_id").size() == 2).all()
+        for _cbsa, grp in got.groupby("cbsa_code"):
+            assert grp["year"].nunique() == 2  # two dense cells per city
+
+    def test_sample_cross_sectional_deterministic(self, table):
+        a = table.sample_cross_sectional(years_per_city=1, seed=825)
+        b = table.sample_cross_sectional(years_per_city=1, seed=825)
+        pd.testing.assert_frame_equal(a, b)
+
+    def test_sample_temporal_stability(self, table):
+        got = table.sample_temporal_stability(n_buildings_per_cbsa=3, seed=825)
+        # cap is per CITY, not per tract
+        assert (got.groupby("cbsa_code")["building_id"].nunique() <= 3).all()
+        # every kept building carries ALL years (temporal tracking)
+        per_building = got.groupby("building_id")["year"].apply(
+            lambda s: sorted(s) == sorted(YEARS))
+        assert per_building.all()
+        again = table.sample_temporal_stability(n_buildings_per_cbsa=3, seed=825)
+        pd.testing.assert_frame_equal(got, again)
+
     def test_sample_pairs_deterministic(self, table):
         got = table.sample_pairs(10, seed=825)
         again = table.sample_pairs(10, seed=825)

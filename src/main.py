@@ -32,10 +32,18 @@ import src.geo_utils as geo_utils
 from src.data import indicators
 from src.data import cbsa_brackets
 from src.data.pair_table import LazyPairTable
-from src.data.tract_sampling import GradientHardnessRegistry, stable_geoid_hash
+from src.data.tract_sampling import (
+    GradientHardnessRegistry,
+    MiningSchedule,
+    stable_geoid_hash,
+)
 from src.debug_batch_dump import BatchImageDumper
 from src.data.process_acs import PANEL_YEARS as ACS_PANEL_YEARS
 from src.utils.paths import PROJECT_ROOT, DATA_DIR, EXTERNAL_DATA_DIR, RAW_DATA_DIR, INTERIM_DATA_DIR, PROCESSED_DATA_DIR, CACHE_DIR, RESULTS_DIR, LOGS_DIR, MODELS_DIR, IMAGERY_ROOT
+from src.utils.atomic_io import (
+    atomic_save_dir, atomic_torch_save, atomic_write_text,
+    is_valid_torch_checkpoint, previous_version_path,
+)
 pd.set_option("display.max_columns", None)
 
 ### ML libraries
@@ -60,8 +68,9 @@ if torch.cuda.is_available():
 os.environ['WANDB_API_KEY'] = os.getenv("WANDB_API_KEY")
 os.environ['HF_TOKEN'] = os.getenv("HF_TOKEN")
 
-# Define a subset of the data that will comfortably fit in RAM cache
-CACHE_SIZE = 2048*4 # Around 8000k images (4 batch size)
+# Define a subset of the data that will comfortably fit in RAM cache.
+# CACHE_SIZE = 8192 images total; shards are CACHE_SIZE // 10 ≈ 819 images each.
+CACHE_SIZE = 2048*4
 
 def generate_savename(run_id=None):
     """Short run identifier: ``params["run_id"]`` if provided, else ``run_{YYYYMMDD}``.
@@ -91,11 +100,65 @@ def read_cache_marker(cache_dir=None):
 
 
 def write_cache_marker(savename, cache_dir=None):
-    """Record which run owns the shard caches (read back to allow crash-resume)."""
-    path = _cache_marker_path(cache_dir)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps({"savename": savename,
-                                "written_at": datetime.now().isoformat()}))
+    """Record which run owns the shard caches (read back to allow crash-resume).
+
+    Written atomically: read_cache_marker() treats a torn file as "no marker",
+    which silently costs a full NAIP refetch of every shard.
+    """
+    atomic_write_text(
+        _cache_marker_path(cache_dir),
+        json.dumps({"savename": savename, "written_at": datetime.now().isoformat()}),
+    )
+
+
+def select_resume_checkpoint(checkpoint_dir, savename, retrain=False):
+    """Pick the best readable checkpoint to resume ``savename`` from, or None.
+
+    Preference order, richest resume state first:
+      1. ``<savename>_last.pth``       -- model + optimizer + scheduler + epoch
+      2. ``<savename>_last.prev.pth``  -- same, one epoch older
+      3. ``<savename>_best.pth``       -- head weights only, no optimizer state
+
+    Every candidate is screened with :func:`is_valid_torch_checkpoint` before it
+    is chosen. A checkpoint truncated by an interrupted save (the pre-atomic
+    failure mode, or bad media) must degrade to the next option with a named
+    reason -- aborting ~20 minutes into setup with a bare PytorchStreamReader
+    traceback costs a full dataset build to rediscover.
+
+    Returns ``None`` for a fresh run: retrain=True, no directory, or nothing
+    readable in it.
+    """
+    checkpoint_dir = Path(checkpoint_dir)
+    if retrain or not checkpoint_dir.exists():
+        if not retrain:
+            print(f"{checkpoint_dir} does not exist. Starting fresh training run.")
+        return None
+
+    last_path = checkpoint_dir / f"{savename}_last.pth"
+    candidates = [
+        (last_path, "🟢 Resuming from checkpoint: {}"),
+        (previous_version_path(last_path),
+         "🟡 Resuming from the previous epoch's checkpoint: {} (one epoch of training lost)"),
+        (checkpoint_dir / f"{savename}_best.pth",
+         "🟡 Found best weights only: {} (resume with no optimizer state)"),
+    ]
+
+    for candidate, message in candidates:
+        if not candidate.exists():
+            continue
+        if not is_valid_torch_checkpoint(candidate):
+            print(f"❌ Checkpoint is corrupt/truncated, skipping: {candidate} "
+                  f"({candidate.stat().st_size / 1e6:.1f} MB, no readable zip directory "
+                  f"— almost certainly a save interrupted by a kill or reboot). "
+                  f"Move it aside once the run is going.")
+            continue
+        print(message.format(candidate))
+        return candidate
+
+    if any(c.exists() for c, _ in candidates):
+        print(f"🔴 Every checkpoint in {checkpoint_dir} is unreadable — "
+              f"starting training from the pretrained backbone.")
+    return None
 
 
 def _wandb_id_is_unusable(exc):
@@ -1583,8 +1646,8 @@ def fill_params_defaults(params):
         "naip_coverage_csv": None,  # naip_coverage_audit.py CSV for per-city holdout years (#28); None = auto-probe ~/outputs/naip_coverage.csv
         "extra": "",
         "run_id": None,       # short custom savename; default is run_{YYYYMMDD}
-        "resume_lr_override": None,  # force this lr after restoring optimizer state on resume (None = keep checkpoint lr)
-        "selection_metric": "within",  # "within" (mean per-city-year spearman, honest) | "pooled" (legacy set-level)
+        "resume_lr_override": 0.00001,  # force this lr after restoring optimizer state on resume (None = keep checkpoint lr)
+        "selection_metric": "within_50_50",  # 50% pooled cross-sectional within-spearman (val_cities + val_within_*) / 50% val_temporal | "within" (per-set mean) | "pooled" (legacy set-level)
         "indicator": indicators.DEFAULT_INDICATOR,  # training label (see src/data/indicators.py)
         "footprints_source": "ms_us",  # "ms_us" (national MS index) | "doitt_nyc" (legacy)
         "states": None,       # optional list of state stems to subset the MS index
@@ -1617,7 +1680,22 @@ def fill_params_defaults(params):
         "grad_mining_alpha": 0.0,    # hardness mixture weight in tract weights: (1-a) + a*min(ema/mean, cap); 0 = uniform tract sampling
         "grad_mining_beta": 0.9,     # per-tract |lambda| EMA decay (stale hardness fades as the model improves)
         "grad_mining_cap": 10.0,     # hardness ratio cap: irreducibly-hard tracts can't monopolize shards
+        "grad_mining_alpha_final": 0.6,
+        "grad_mining_cap_final": 3.0,
+        "grad_mining_ramp_start": 150,
+        "grad_mining_ramp_end": 300,
         "sampling_seed": 825,        # base seed for per-shard tract draws (combined with shard_id)
+        # Two-pool validation (lazy ms_us path). The cross-sectional pool
+        # (val_cities / val_within_* / val_temporal) drives checkpoint selection
+        # via the per-(cbsa, year) within-Spearman, whose CI is set by TRACT
+        # coverage: sample 1 building/tract at val_years_per_city year(s)/city so
+        # the fixed shard budget buys tracts, not redundant years (1 year is the
+        # most efficient — extra years are correlated cells). The small
+        # val_stability pool carries val_stability_buildings_per_cbsa multi-year
+        # buildings/city for the MASD / rank-autocorr diagnostics only (excluded
+        # from selection). See src/data/pair_table.py sampler docstrings.
+        "val_years_per_city": 1,
+        "val_stability_buildings_per_cbsa": 25,
     }
     validate_parameters(params, default_params)
 
@@ -1951,6 +2029,7 @@ def check_feature_importance(model):
 # training-time and post-hoc evaluation can never drift apart.
 from src.utils.metrics import (
     compute_val_metrics,
+    selection_score,
     rank_autocorrelation as _rank_autocorrelation,
     within_city_cells as _within_city_cells,
 )
@@ -1971,13 +2050,17 @@ def train_model(
     initial_best_val_loss=None,
     val_cache_managers=None,
     cbsa_meta=None,
-    selection_metric="within",
+    selection_metric="within_50_50",
+    mining_schedule=None,
 ):
     print("--- Starting PyTorch Training Loop ---")
-    # "within": checkpoint on the mean per-(city, year) within-city Spearman —
-    # the quantity the ordinal loss actually optimizes. "pooled": legacy
-    # set-level pooled Spearman (kept for continuity with pre-US runs).
-    sel_key = "within_spearman" if selection_metric == "within" else "spearman"
+    # "within_50_50": checkpoint on 0.5 * tract-weighted within-Spearman pooled
+    # over the cross-sectional sets (val_cities + val_within_*) + 0.5 *
+    # val_temporal within-Spearman — the paper's out-of-city vs out-of-year
+    # balance, with the city holdouts at natural tract weight. Legacy modes:
+    # "within" (unweighted per-set mean) and "pooled" (set-level Spearman).
+    # See metrics.selection_score for the exact semantics of all three.
+    sel_key = "spearman" if selection_metric == "pooled" else "within_spearman"
     best_val_spearman = (
         initial_best_val_loss if initial_best_val_loss is not None else float(-1)
     )
@@ -1996,12 +2079,30 @@ def train_model(
     scaler = GradScaler()
     accumulation_steps = 8  # Accumulate gradients (e.g., batch_size 8 * 4 steps = effective batch size 32)
 
+    # Hard-tract mining ramp state: applied at the top of each epoch, before the
+    # cache manager draws any shard for it. Pure function of the epoch, so a
+    # resumed run picks up at the right point with nothing restored.
+    mining_registry = getattr(loss_fn, "hardness_registry", None)
+    mining_log = {}
+    prev_mining_alpha = None
+
     for epoch in range(start_epoch, epochs):
-               
+
+        if mining_schedule is not None and mining_registry is not None:
+            mining_log = mining_schedule.apply(mining_registry, epoch + 1)
+            alpha_now = mining_log["mining/alpha"]
+            if prev_mining_alpha is None or abs(alpha_now - prev_mining_alpha) > 1e-9:
+                tqdm.write(
+                    f"🪜 [Mining] epoch {epoch+1}: alpha={alpha_now:.3f} "
+                    f"cap={mining_log['mining/cap']:.2f} "
+                    f"(ramp {100*mining_log['mining/ramp_progress']:.0f}%)"
+                )
+            prev_mining_alpha = alpha_now
+
         # ==========================
         # 1. TRAINING PHASE
         # ==========================
-        
+
         # Start training loop
         model.train() # Set model to training mode (enables dropout, batchnorm updates)
         running_train_loss = 0.0
@@ -2249,10 +2350,18 @@ def train_model(
                     parts.append(f"C-DA: {set_metrics['changed_da']:.2%}")
                 tqdm.write(f"{val_name} {' | '.join(parts)}")
 
-            # Use mean validation spearman for early stopping / best model checkpointing
-            epoch_val_spearman = sum(val_spearmans.values()) / max(len(val_spearmans), 1)
+            # Checkpoint-selection score (see metrics.selection_score): under
+            # "within_50_50" the val_within_* city holdouts fold into the
+            # cross-sectional side at tract weight instead of a fixed per-set
+            # share; val_spearmans above stays per-set for display/logging.
+            epoch_val_spearman, sel_components = selection_score(
+                val_set_metrics, mode=selection_metric
+            )
+            if epoch_val_spearman is None:
+                epoch_val_spearman = float('-inf')  # no set had a usable metric
         else:
             epoch_val_spearman = float('-inf')  # No validation data
+            sel_components = {}
 
         # Step the scheduler (ReduceLROnPlateau needs the metric)
         if scheduler:
@@ -2264,7 +2373,7 @@ def train_model(
         # ==========================
         # 3. LOGGING & CHECKPOINTING
         # ==========================
-        val_display = " | ".join([f"{k} Spearman: {v:.4f}" for k, v in val_spearmans.items()])
+        val_display = " | ".join([f"{k} {sel_key}: {v:.4f}" for k, v in val_spearmans.items()])
         tqdm.write(f"Epoch [{epoch+1}/{epochs}] | Train Loss: {epoch_train_loss:.4f} | Train Acc: {epoch_train_acc:.4f} | {val_display}")
 
         # 🎯 Log metrics directly to W&B cloud!
@@ -2288,6 +2397,22 @@ def train_model(
                         log_dict[f"{val_name}_{key}"] = value
                     else:
                         log_dict[f"{val_name}/{key}"] = value
+            # Exact checkpoint-selection quantity: the score that drives
+            # best-model saving and the LR scheduler, its components (the two
+            # 50/50 sides under "within_50_50", per-set values under legacy
+            # modes), and the per-set sel_key values for reference.
+            # selection/best_so_far includes the current epoch.
+            for val_name, v in val_spearmans.items():
+                log_dict[f"selection/{val_name}"] = v
+            for comp_name, v in sel_components.items():
+                log_dict[f"selection/{comp_name}"] = v
+            if epoch_val_spearman != float('-inf'):
+                log_dict["selection/score"] = epoch_val_spearman
+                log_dict["selection/best_so_far"] = max(best_val_spearman, epoch_val_spearman)
+
+        # Current ramp point, so mining/alpha is plottable against the val
+        # curves that are supposed to respond to it.
+        log_dict.update(mining_log)
 
         wandb.log(log_dict)
 
@@ -2302,8 +2427,13 @@ def train_model(
             # state_dict() tensors are always detached — requires_grad is never set on them,
             # so a filter like `if v.requires_grad` produces an empty dict.
             lora_dir = save_dir / f"{savename}_best_lora"
-            model.backbone.save_pretrained(lora_dir)         # saves adapter_config.json + adapter_model.safetensors
-            torch.save(model.head.state_dict(), model_path)  # saves the regression head weights
+            # Both writes are staged then renamed into place (src/utils/atomic_io.py):
+            # an interrupted save must not leave a half-written adapter or head,
+            # which would only surface epochs later as an unloadable _best.pth.
+            atomic_save_dir(                                 # adapter_config.json + adapter_model.safetensors
+                lambda staging: model.backbone.save_pretrained(staging), lora_dir
+            )
+            atomic_torch_save(model.head.state_dict(), model_path)  # regression head weights
 
             # Tell wandb to track these files
             wandb.save(str(model_path))
@@ -2352,7 +2482,11 @@ def train_model(
             # selection metric must reset the tracker (values not comparable)
             "selection_metric": selection_metric,
         }
-        torch.save(checkpoint, save_dir / f"{savename}_last.pth")
+        # ~670 MB/epoch: a plain torch.save holds the only copy truncated for the
+        # whole write, so a kill in that window leaves a file with no zip central
+        # directory and the next resume dies in PytorchStreamReader. Stage + rename
+        # instead, and keep the prior epoch as _last.prev.pth to resume from.
+        atomic_torch_save(checkpoint, save_dir / f"{savename}_last.pth", keep_previous=True)
 
         # Persist the hard-tract mining state next to the checkpoint so a
         # resumed run keeps its learned tract weights (cold registry = uniform).
@@ -2686,6 +2820,8 @@ def run(
             savename, sat_data, years, small_sample=small_sample, tau_meters=tau_meters,
             indicator=params["indicator"], footprints_source=params["footprints_source"], states=params["states"],
             naip_coverage_csv=params.get("naip_coverage_csv"),
+            val_years_per_city=params.get("val_years_per_city", 1),
+            val_stability_buildings_per_cbsa=params.get("val_stability_buildings_per_cbsa", 25),
         )
 
         # Per-city split metadata (#28/#31): temporal-holdout years feed the NAIP
@@ -2698,20 +2834,8 @@ def run(
         best_checkpoint_path = checkpoint_dir / f"{savename}_best.pth"
         last_checkpoint_path = checkpoint_dir / f"{savename}_last.pth"
 
-        resume_cache = False    
-        resume_model_checkpoint = None
-
-        if not retrain and checkpoint_dir.exists():
-            if last_checkpoint_path.exists():
-                resume_model_checkpoint = last_checkpoint_path
-                resume_cache = True
-                print(f"🟢 Resuming from checkpoint: {last_checkpoint_path}")
-            elif best_checkpoint_path.exists():
-                resume_model_checkpoint = best_checkpoint_path
-                resume_cache = True
-                print(f"🟡 Found best weights only: {best_checkpoint_path} (resume with no optimizer state)")
-        else:
-            print(f"{checkpoint_dir} does not exist. Starting fresh training run.")
+        resume_model_checkpoint = select_resume_checkpoint(checkpoint_dir, savename, retrain=retrain)
+        resume_cache = resume_model_checkpoint is not None
 
         # Cache-only resume: a previous run with the SAME savename may have crashed
         # while still building the NAIP shard caches, i.e. before any model
@@ -2738,12 +2862,34 @@ def run(
         # shard generator as tract sampling weights. Requires tract_sampling;
         # alpha=0 disables the bias (registry still logs hardness diagnostics).
         hardness_registry = None
+        mining_schedule = None
         if params.get("tract_sampling", False):
             hardness_registry = GradientHardnessRegistry(
                 alpha=params.get("grad_mining_alpha", 0.0),
                 beta=params.get("grad_mining_beta", 0.9),
                 cap=params.get("grad_mining_cap", 10.0),
             )
+            # Warmup-then-mine ramp. Defaults make it inert (final == start), so
+            # runs that don't set the *_final params keep fixed-alpha behavior.
+            # train_model re-applies it at the top of every epoch, so the values
+            # above only govern build_initial_cache() below — on a resume deep
+            # into the ramp those first 10 shards are drawn at alpha_start, but
+            # 4 of 10 rotate per epoch so the cache is fully ramped by ~epoch 3.
+            mining_schedule = MiningSchedule(
+                alpha_start=params.get("grad_mining_alpha", 0.0),
+                alpha_final=params.get("grad_mining_alpha_final",
+                                       params.get("grad_mining_alpha", 0.0)),
+                cap_start=params.get("grad_mining_cap", 10.0),
+                cap_final=params.get("grad_mining_cap_final",
+                                     params.get("grad_mining_cap", 10.0)),
+                start_epoch=params.get("grad_mining_ramp_start", 150),
+                end_epoch=params.get("grad_mining_ramp_end", 300),
+            )
+            if mining_schedule.is_active:
+                print(f"🪜 Mining ramp: alpha {mining_schedule.alpha_start} → "
+                      f"{mining_schedule.alpha_final}, cap {mining_schedule.cap_start} → "
+                      f"{mining_schedule.cap_final} over epochs "
+                      f"{mining_schedule.start_epoch}–{mining_schedule.end_epoch}")
             hardness_path = checkpoint_dir / f"{savename}_hardness.json"
             if resume_model_checkpoint is not None and hardness_registry.load(hardness_path):
                 print(f"🟢 Restored hardness registry ({len(hardness_registry):,} tracts) "
@@ -2771,21 +2917,25 @@ def run(
         vals_cache_manager_dict = {}
         for val_name, df_val in df_vals_dict.items():
             if df_val.shape[0] > 0:
-                # Subsample buildings (not rows) so every kept building retains ALL
-                # its years: multi-year buildings are what make the stable/changed
-                # MASD and directional-accuracy metrics computable inside val_cities.
-                # (Lazy ms_us vals arrive pre-sampled at 1/tract, so the per-tract
-                # pick is a no-op there; the building-level shuffle still applies.)
+                # Enforce ≤1 building/tract (labels are tract-level, so extra
+                # buildings add rows but no ranking information) and shuffle at
+                # building level so the shard-cap truncation below is a random
+                # tract sample. The cross-sectional pools (val_cities /
+                # val_within_* / val_temporal) arrive at 1 building/tract × few
+                # years, so this is a reshuffle; val_stability keeps its whole
+                # multi-year buildings (one per tract) for the MASD diagnostics.
                 df_val = _subsample_val_buildings(df_val)
-                # Cap the static val cache at MAX_VAL_SHARDS shards: full coverage
-                # would need ceil(len/shard_size) shards — far more val imagery than
-                # the metrics need. df_val arrives building-shuffled, so truncation
-                # to MAX_VAL_SHARDS * shard_size rows is a random building sample.
-                # 3 shards ≈ 60k rows ≈ 3.8k tracts → per-year Spearman CI ≈ ±0.03,
-                # tighter on the multi-year composite — enough for epoch tracking.
-                MAX_VAL_SHARDS = 3
+                # Cap the static val cache at max_val_shards shards. With the
+                # cross-sectional pools now spending their budget on tracts (1
+                # year/city) rather than ~n_years redundant rows/tract, a val set
+                # is ~one row per tract, so shard_size≈819 → 5 shards covers
+                # ~4k tracts — full coverage of every val city (the biggest,
+                # val_cities, is ~2.2k tracts). This is what makes the small
+                # bracket's within-Spearman a real ±0.1 estimate instead of the
+                # ~20-tract noise the old all-years sampling left it with.
+                max_val_shards = 5
                 val_num_shards = max(1, (len(df_val) + current_shard_size - 1) // current_shard_size)
-                val_num_shards = min(val_num_shards, MAX_VAL_SHARDS)
+                val_num_shards = min(val_num_shards, max_val_shards)
                 val_cache_manager = CyclicCacheManager(
                     df=df_val, # Or full df_val
                     all_years_datasets=all_years_datasets,
@@ -2863,7 +3013,19 @@ def run(
         initial_best_val_loss = None
         if not retrain and resume_model_checkpoint is not None and resume_model_checkpoint.exists():
             print(f"➡️ Resuming model/optimizer from checkpoint: {resume_model_checkpoint}")
-            checkpoint = torch.load(resume_model_checkpoint, map_location=device, weights_only=False)
+            try:
+                checkpoint = torch.load(resume_model_checkpoint, map_location=device, weights_only=False)
+            except Exception as e:
+                # Screened above, so reaching here means damage the zip trailer check
+                # cannot see (bad block, partial copy). Name the file and the way out
+                # rather than surfacing the raw deserialization error.
+                raise RuntimeError(
+                    f"Checkpoint {resume_model_checkpoint} could not be read ({type(e).__name__}: {e}).\n"
+                    f"The file is damaged. To continue, move it aside and rerun — the "
+                    f"resume will fall back to {previous_version_path(last_checkpoint_path).name}, "
+                    f"then to {best_checkpoint_path.name} (weights only, optimizer state lost). "
+                    f"Passing retrain=True starts over from the pretrained backbone."
+                ) from e
             
             # Restore all states
             if "model_state_dict" in checkpoint:
@@ -2925,6 +3087,7 @@ def run(
             val_cache_managers=vals_cache_manager_dict,
             cbsa_meta=cbsa_meta,
             selection_metric=params["selection_metric"],
+            mining_schedule=mining_schedule,
         )
         
         wandb.finish()
@@ -3206,10 +3369,30 @@ if __name__ == "__main__":
         # 47% of NYC-metro tracts but 13% of buildings, Manhattan 0.17%).
         "tract_sampling": True,
         "grad_mining_alpha": 0.3,
-        "run_id": "run_20260710",  # default run_{YYYYMMDD}: same-day restarts share a savename and resume the shard cache
-        "resume_lr_override": 3e-5,  # lr decay on resume (plateau since ~ep 175 at 1e-4); optimizer state otherwise untouched
-        "selection_metric": "within",  # checkpoint on mean within-city (CBSA x year) spearman; resets best tracker on first resume
+        # Warmup-then-mine ramp (see MiningSchedule). At alpha=0.3 the sampler
+        # is ~99% of uniform ESS (top decile takes 12.3% of draws vs 10%), so
+        # mining is effectively off; the ramp is what turns it on. Starts at 150
+        # because the only precondition that improves with time is registry
+        # coverage, which reaches ~97% of the tract universe by ~epoch 200 —
+        # hardness dispersion itself is near-flat (p90/mean +0.8% over 46
+        # epochs), so waiting longer buys nothing. alpha stops at 0.6, not 1.0:
+        # at 1.0 the uniform floor vanishes (w_min 0.09, i.e. the easiest tracts
+        # wait ~600 epochs between draws) and the in-batch label range that the
+        # ranking pairs need collapses. Set *_final == start to disable.
+        "grad_mining_alpha_final": 0.6,
+        "grad_mining_cap_final": 3.0,
+        "grad_mining_ramp_start": 150,
+        "grad_mining_ramp_end": 300,
+        # Two-pool validation: cross-sectional sets sample 1 building/tract at 1
+        # year/city (tract coverage, not redundant years, sets the within-ρ CI —
+        # small bracket goes from ~20 tracts/±0.3 noise to full coverage/±0.1);
+        # val_stability keeps 25 multi-year buildings/city for MASD diagnostics.
+        "val_years_per_city": 1,
+        "val_stability_buildings_per_cbsa": 25,
+        "run_id": "run_20260722",  # default run_{YYYYMMDD}: same-day restarts share a savename and resume the shard cache
+        "resume_lr_override": 0.0001, #3e-5,  # lr decay on resume (plateau since ~ep 175 at 1e-4); optimizer state otherwise untouched
+        "selection_metric": "within_50_50",  # 50% cross-sectional within-spearman (val_cities + val_within_* pooled by tract weight) / 50% val_temporal within; resets best tracker on first resume
     }
 
     # Run full pipeline
-    run(params, train=True, retrain=False, compute_loss=False, generate_predictions=True, evaluate=True)    run(params, train=False, retrain=False, compute_loss=False, generate_predictions=True, evaluate=True)
+    run(params, train=False, retrain=False, compute_loss=False, generate_predictions=False, evaluate=True)

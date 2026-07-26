@@ -2653,6 +2653,10 @@ def _rank_autocorr(wide_sub: pd.DataFrame, pair: tuple[int, int]) -> tuple[float
 # are too noisy to report and a handful of tiny cities can dominate a
 # histogram binned over only a few dozen of them.
 MIN_CBSA_TRACTS = 10
+# Cap on points rasterized in a single raw scatter (matplotlib's Agg backend
+# materializes a full RGBA path per marker; at US scale building-level frames
+# reach the millions and an uncapped scatter can exhaust system RAM).
+SCATTER_MAX_POINTS = 50_000
 
 
 class _USContext:
@@ -2850,7 +2854,8 @@ def part_a_us(ctx: _USContext) -> dict:
 
         if head:
             print(f"  [{t}] within_spearman={head['within_spearman']:.3f} "
-                  f"(cells={head['within_cells']}, n={head['within_n']:,})")
+                  f"(cells={head['within_cells']}, n={head['within_n']:,}, "
+                  f"tracts={head['within_tracts']:,})")
             headline[f"{t}/within_spearman"] = head["within_spearman"]
 
     pd.DataFrame(summary_rows).to_csv(out / "tables" / "US_A_summary.csv", index=False)
@@ -2883,15 +2888,16 @@ def _write_breakdown_tables(bld_t: pd.DataFrame, cells: pd.DataFrame,
     cells = cells.copy()
     cells["cbsa"] = cells["cbsa"].astype(str)
 
-    # Per top-10 metro: size-weighted mean cell Spearman.
+    # Per top-10 metro: tract-weighted mean cell Spearman.
     top = set(str(c) for c in (top_cbsas or []))
     city_rows = []
     for cbsa, g in cells.groupby("cbsa"):
         if top and cbsa not in top:
             continue
         city_rows.append({"cbsa": cbsa,
-                          "within_spearman": float(np.average(g["rho"], weights=g["n"])),
-                          "cells": int(len(g)), "n": int(g["n"].sum())})
+                          "within_spearman": float(np.average(g["rho"], weights=g["n_tracts"])),
+                          "cells": int(len(g)), "n": int(g["n"].sum()),
+                          "tracts": int(g["n_tracts"].sum())})
     if city_rows:
         pd.DataFrame(city_rows).sort_values("n", ascending=False).to_csv(
             out / "tables" / f"US_A_top_metros_{split}.csv", index=False)
@@ -2903,8 +2909,9 @@ def _write_breakdown_tables(bld_t: pd.DataFrame, cells: pd.DataFrame,
         brk_rows = []
         for bracket, g in cells.dropna(subset=["bracket"]).groupby("bracket"):
             brk_rows.append({"bracket": bracket,
-                             "within_spearman": float(np.average(g["rho"], weights=g["n"])),
-                             "cells": int(len(g)), "n": int(g["n"].sum())})
+                             "within_spearman": float(np.average(g["rho"], weights=g["n_tracts"])),
+                             "cells": int(len(g)), "n": int(g["n"].sum()),
+                             "tracts": int(g["n_tracts"].sum())})
         if brk_rows:
             pd.DataFrame(brk_rows).to_csv(
                 out / "tables" / f"US_A_by_bracket_{split}.csv", index=False)
@@ -2936,16 +2943,18 @@ def _part_a_us_figures(ctx: _USContext, split: str) -> None:
         print("  no usable cells for Spearman histogram")
         return
     cells.to_csv(out / "tables" / f"US_A_tract_cells_{split}.csv", index=False)
-    w_mean = float(np.average(cells["rho"], weights=cells["n"]))
-    per_city = cells.groupby("cbsa")[["rho", "n"]].apply(
-        lambda d: np.average(d["rho"], weights=d["n"])
+    # Tract frame: one row per tract, so n_tracts == n; kept as n_tracts for
+    # uniformity with the building-level tables.
+    w_mean = float(np.average(cells["rho"], weights=cells["n_tracts"]))
+    per_city = cells.groupby("cbsa")[["rho", "n_tracts"]].apply(
+        lambda d: np.average(d["rho"], weights=d["n_tracts"])
     ).values
 
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(FIG_SIZE_TWO_COL[0], FIG_SIZE_TWO_COL[1]))
     ax1.hist(cells["rho"], bins=min(30, max(5, len(cells) // 2)),
              color="steelblue", edgecolor="white", alpha=0.85)
     ax1.axvline(w_mean, color="firebrick", lw=1.5,
-                label=f"size-wt mean = {w_mean:.3f}")
+                label=f"tract-wt mean = {w_mean:.3f}")
     ax1.set_xlabel("Within-cell Spearman $\\rho$")
     ax1.set_ylabel("Count of (CBSA, year) cells")
     ax1.set_title(f"All {split} cells (n={len(cells)})", fontsize=8)
@@ -2971,6 +2980,13 @@ def _part_a_us_figures(ctx: _USContext, split: str) -> None:
             continue
         label_v = b["label"].values.astype(float)
         pred_v = b["pred"].values.astype(float)
+        m = np.isfinite(label_v) & np.isfinite(pred_v)
+        label_v, pred_v = label_v[m], pred_v[m]
+        if len(label_v) < 50:
+            continue
+        if len(label_v) > SCATTER_MAX_POINTS:
+            idx = np.random.default_rng(42).choice(len(label_v), SCATTER_MAX_POINTS, replace=False)
+            label_v, pred_v = label_v[idx], pred_v[idx]
         fig, ax = plt.subplots(figsize=FIG_SIZE_ONE_COL)
         ax.scatter(label_v, pred_v, s=1, alpha=0.15, color="steelblue", linewidths=0)
         curve = _loess_curve(label_v, pred_v)

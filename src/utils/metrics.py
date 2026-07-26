@@ -23,33 +23,122 @@ def within_city_cells(val_df, min_bld=5):
     affects the pooled set-level Spearman. Cells with fewer than ``min_bld``
     buildings, or without label/pred variation, are dropped (they are noise).
 
-    Returns a DataFrame [cbsa, year, n, rho]; empty if no usable cell.
+    ``n_tracts`` is the number of distinct tracts in the cell — the effective
+    sample size, since labels are tract-level: buildings in one tract share a
+    label, so extra buildings per tract add rows but no label information.
+    Counted from ``GEOID`` when the frame carries it (evaluation.py), else from
+    distinct label values (the training-time val frame has no tract column;
+    tract z-scores are continuous, so distinct labels ≈ distinct tracts).
+
+    Returns a DataFrame [cbsa, year, n, n_tracts, rho]; empty if no usable cell.
     """
     from scipy.stats import spearmanr
 
+    tract_col = "GEOID" if "GEOID" in val_df.columns else "label"
     rows = []
     for (cbsa, year), g in val_df.groupby(["cbsa", "year"]):
         if len(g) < min_bld or g["pred"].nunique() < 2 or g["label"].nunique() < 2:
             continue
         rho, _ = spearmanr(g["pred"], g["label"])
         if not np.isnan(rho):
-            rows.append({"cbsa": cbsa, "year": year, "n": len(g), "rho": float(rho)})
-    return pd.DataFrame(rows, columns=["cbsa", "year", "n", "rho"])
+            rows.append({"cbsa": cbsa, "year": year, "n": len(g),
+                         "n_tracts": int(g[tract_col].nunique()), "rho": float(rho)})
+    return pd.DataFrame(rows, columns=["cbsa", "year", "n", "n_tracts", "rho"])
 
 
 def weighted_within_spearman(cells):
-    """Size-weighted mean of the per-cell Spearmans — the headline number.
+    """Tract-weighted mean of the per-cell Spearmans — the headline number.
+
+    Weighting by ``n_tracts`` (not building count ``n``) keeps dense downtowns
+    with many buildings per tract from dominating cells that cover the same
+    labeled area with fewer, larger structures.
 
     Takes the frame returned by :func:`within_city_cells`; returns a dict
-    {within_spearman, within_cells, within_n}, empty when no usable cell.
+    {within_spearman, within_cells, within_n, within_tracts}, empty when no
+    usable cell.
     """
     if not len(cells):
         return {}
     return {
-        "within_spearman": float(np.average(cells["rho"], weights=cells["n"])),
+        "within_spearman": float(np.average(cells["rho"], weights=cells["n_tracts"])),
         "within_cells": int(len(cells)),
         "within_n": int(cells["n"].sum()),
+        "within_tracts": int(cells["n_tracts"].sum()),
     }
+
+
+DIAGNOSTIC_VAL_SETS = ("val_stability",)
+
+
+def selection_score(val_set_metrics, mode="within_50_50", temporal_set="val_temporal",
+                    diagnostic_sets=DIAGNOSTIC_VAL_SETS):
+    """Checkpoint-selection score from the per-set outputs of compute_val_metrics.
+
+    Modes:
+      "within_50_50" -- 0.5 * cross-sectional + 0.5 * temporal.
+        The cross-sectional side pools every non-temporal set (val_cities plus
+        the val_within_* spatial holdouts) by averaging their within_spearman
+        weighted by within_tracts. Each set's within_spearman is itself the
+        tract-weighted mean of its (cbsa, year) cells, so this equals the
+        tract-weighted within-Spearman over the union of their cells -- the
+        city holdouts enter with their natural tract weight instead of a fixed
+        per-set share. The temporal side is the temporal set's within_spearman.
+        A set without within cells falls back to its pooled spearman (weighted
+        by its row count n); a side with no usable set drops out and the other
+        side carries the score alone.
+      "within" -- legacy: unweighted mean of within_spearman across all sets
+        (per-set fallback to pooled spearman).
+      "pooled" -- legacy: unweighted mean of pooled spearman across all sets.
+
+    ``diagnostic_sets`` names val sets excluded from the score entirely (still
+    logged): the temporal-stability pool (val_stability) is a few multi-year
+    buildings for MASD / rank-autocorrelation, so its noisy within-Spearman must
+    not enter checkpoint selection.
+
+    Returns ``(score, components)``: score is None when no set has a usable
+    value; components is a flat {name: value} dict for logging (the per-side
+    values under "within_50_50", the per-set values under the legacy modes).
+    """
+    diag = set(diagnostic_sets or ())
+    val_set_metrics = {k: v for k, v in val_set_metrics.items() if k not in diag}
+    if mode == "within_50_50":
+        cs_vals, cs_wts = [], []
+        temporal_val = None
+        for name, m in val_set_metrics.items():
+            if "within_spearman" in m:
+                val, wt = m["within_spearman"], float(m.get("within_tracts", 1))
+            elif "spearman" in m:
+                val, wt = m["spearman"], float(m.get("n", 1))
+            else:
+                continue
+            if name == temporal_set:
+                temporal_val = val
+            else:
+                cs_vals.append(val)
+                cs_wts.append(wt)
+        components = {}
+        sides = []
+        if cs_vals:
+            cs_side = float(np.average(cs_vals, weights=cs_wts))
+            components["cross_sectional_within"] = cs_side
+            sides.append(cs_side)
+        if temporal_val is not None:
+            components["temporal_within"] = float(temporal_val)
+            sides.append(float(temporal_val))
+        score = float(np.mean(sides)) if sides else None
+        return score, components
+
+    if mode not in ("within", "pooled"):
+        raise ValueError(f"Unknown selection mode: {mode!r}")
+    key = "within_spearman" if mode == "within" else "spearman"
+    components = {}
+    for name, m in val_set_metrics.items():
+        if key in m:
+            components[name] = float(m[key])
+        elif "spearman" in m:
+            components[name] = float(m["spearman"])
+    score = float(np.mean(list(components.values()))) if components else None
+    return score, components
 
 
 def rank_autocorrelation(val_df, min_common=5):
@@ -161,8 +250,8 @@ def compute_val_metrics(val_df, cbsa_meta=None, top_cities=None, min_city_n=50):
     plus 'bracket/{name}/{metric}' and 'city/{cbsa}/{metric}' breakdowns.
     Keys with no data are omitted. NOTE: 'spearman' and 'n' pool building x year
     image rows (repeated buildings inflate them); 'within_spearman' is the
-    honest per-cell quantity and drives checkpointing when
-    params["selection_metric"] == "within".
+    honest per-cell quantity (tract-weighted, see weighted_within_spearman) and
+    drives checkpointing when params["selection_metric"] == "within".
     """
     from scipy.stats import spearmanr
 
@@ -194,8 +283,9 @@ def compute_val_metrics(val_df, cbsa_meta=None, top_cities=None, min_city_n=50):
     metrics = _base(val_df)
 
     # ── Headline within-city metrics + diagnostics (goal-aligned, additive) ──
-    # within_spearman: n-weighted mean of per-(city, year) cell Spearmans — one
-    #   observation per building per cell, so no repeated-building inflation.
+    # within_spearman: tract-weighted mean of per-(city, year) cell Spearmans —
+    #   one observation per building per cell, so no repeated-building
+    #   inflation, and weights reflect label information (tracts), not density.
     # rank_autocorr_pred/label: cross-year rank stability of stable buildings
     #   (label variant = genuine-reshuffling benchmark). Diagnostics only.
     # masd_ratio: changed vs stable displacement (>1 = moves where reality moved).
@@ -227,7 +317,7 @@ def compute_val_metrics(val_df, cbsa_meta=None, top_cities=None, min_city_n=50):
             sub["n"] = len(grp)
             bcells = within_city_cells(grp)
             if len(bcells):
-                sub["within_spearman"] = float(np.average(bcells["rho"], weights=bcells["n"]))
+                sub["within_spearman"] = float(np.average(bcells["rho"], weights=bcells["n_tracts"]))
             metrics.update({f"bracket/{bracket}/{k}": v for k, v in sub.items()})
         if top_cities:
             top_ints = set()
@@ -243,7 +333,7 @@ def compute_val_metrics(val_df, cbsa_meta=None, top_cities=None, min_city_n=50):
                 sub["n"] = len(grp)
                 ccells = within_city_cells(grp)
                 if len(ccells):
-                    sub["within_spearman"] = float(np.average(ccells["rho"], weights=ccells["n"]))
+                    sub["within_spearman"] = float(np.average(ccells["rho"], weights=ccells["n_tracts"]))
                 metrics.update({f"city/{cbsa}/{k}": v for k, v in sub.items()})
 
     return metrics
