@@ -18,8 +18,10 @@ def test_evaluate_calls_run_evaluation(monkeypatch):
     calls = []
 
     import src.evaluation as ev
-    monkeypatch.setattr(ev, "run_evaluation",
-                        lambda savename, params: calls.append((savename, params)))
+    monkeypatch.setattr(
+        ev, "run_evaluation",
+        lambda savename, params, **kw: calls.append((savename, params, kw)),
+    )
     # Neutralize the heavy machinery so only the evaluate branch executes.
     monkeypatch.setattr(main, "generate_parameters_log", lambda *a, **k: None)
 
@@ -28,15 +30,18 @@ def test_evaluate_calls_run_evaluation(monkeypatch):
              generate_predictions=False, evaluate=True)
 
     assert len(calls) == 1
-    savename, passed = calls[0]
+    savename, passed, kwargs = calls[0]
     assert savename == main.generate_savename("unit_eval")
     assert passed["footprints_source"] == "ms_us"
+    # A pipeline run must evaluate BOTH halves: the US parts and the NYC parts
+    # (CSA event study + Hudson Yards) off this run's NYC prediction pass.
+    assert kwargs["mode"] == "both"
 
 
 def test_evaluate_swallows_errors(monkeypatch):
     import src.evaluation as ev
 
-    def _boom(savename, params):
+    def _boom(savename, params, **kw):
         raise RuntimeError("evaluation exploded")
 
     monkeypatch.setattr(ev, "run_evaluation", _boom)

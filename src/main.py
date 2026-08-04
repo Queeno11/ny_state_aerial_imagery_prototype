@@ -2526,12 +2526,26 @@ def predict_buildings_chunked(model, df, all_years_datasets, params,
     │    ① Pull batch from queue                                              │
     │    ② Move tensors to GPU with non_blocking=True                        │
     │    ③ autocast forward pass                                              │
-    │    ④ Append results to CSV                                              │
+    │    ④ Accumulate results; flush to a per-group chunk parquet on         │
+    │      _GROUP_DONE (see Resumability below)                              │
     └─────────────────────────────────────────────────────────────────────────┘
 
     The GPU is always either running inference or waiting for the very next
     batch.  Because the queue is pre-filled (QUEUE_DEPTH deep) the typical
     case is that a new batch is ready the moment the previous one finishes.
+
+    Resumability
+    ────────────
+    A year takes ~4h, so a crash partway through must not lose that work.
+    Predictions are written per spatial groupby-chunk (the same ~2500x2500px
+    groups the pipeline already iterates in) to
+    ``{output_path}_chunks/chunk_{row}_{col}.parquet``, each via a tmp-then-
+    ``os.replace`` atomic write. On (re)start, groups whose chunk file already
+    exists are skipped entirely (no preload, no extraction, no inference); the
+    final CSV at ``output_path`` is assembled from *all* chunk files (old +
+    new) only after every group has been produced, then written atomically.
+    A crash mid-run leaves finished groups' chunk files in place and simply
+    resumes at the next unfinished group when re-run with the same df.
 
     Args:
         model:              PyTorch model (will be set to eval mode)
@@ -2572,11 +2586,49 @@ def predict_buildings_chunked(model, df, all_years_datasets, params,
     if output_dir and not os.path.exists(output_dir):
         os.makedirs(output_dir, exist_ok=True)
 
-    groups      = list(df.groupby('groupby_chunk_id'))
+    # Per-group chunk directory: the unit of resumability. Each groupby-chunk's
+    # predictions land in their own parquet, written atomically (tmp then
+    # os.replace) the moment that group finishes. Callers that skip
+    # re-generating a year when output_path already exists (see
+    # run_nyc_zarr_validation_predictions) still rely on the final CSV only
+    # appearing once every group is done — see the assembly step below.
+    chunk_dir = Path(output_dir) / f"{Path(output_path).stem}_chunks"
+    chunk_dir.mkdir(parents=True, exist_ok=True)
+
+    def _group_chunk_path(chunk_id):
+        cr, cc = chunk_id
+        return chunk_dir / f"chunk_{cr:06d}_{cc:06d}.parquet"
+
+    # Guard chunk identity across restarts: chunk files are keyed by
+    # groupby_chunk_id, which depends on image_size/groupby_chunk_size and the
+    # exact set of buildings in df. If any of those changed since a previous
+    # (possibly crashed) run left chunks in chunk_dir, silently reusing them
+    # would mix predictions from two different universes.
+    meta_path = chunk_dir / "_meta.json"
+    meta = {"n_rows": int(len(df)), "image_size": int(image_size),
+            "groupby_chunk_size": int(groupby_chunk_size)}
+    if meta_path.exists():
+        existing_meta = json.loads(meta_path.read_text())
+        if existing_meta != meta:
+            raise RuntimeError(
+                f"Existing prediction chunks in {chunk_dir} were built from "
+                f"{existing_meta} but this run has {meta} — the dataset "
+                f"changed. Delete {chunk_dir} to recompute this year."
+            )
+    else:
+        tmp_meta = meta_path.with_name(meta_path.name + ".tmp")
+        tmp_meta.write_text(json.dumps(meta))
+        os.replace(tmp_meta, meta_path)
+
+    groups_all  = list(df.groupby('groupby_chunk_id'))
+    groups      = [(chunk_id, df_grp) for chunk_id, df_grp in groups_all
+                   if not _group_chunk_path(chunk_id).exists()]
     batch_queue = queue.Queue(maxsize=QUEUE_DEPTH)
 
     if verbose:
-        print(f"Processing {len(df)} buildings across {len(groups)} groupby chunks...")
+        n_done = len(groups_all) - len(groups)
+        print(f"Processing {len(df)} buildings across {len(groups_all)} groupby chunks "
+              f"({n_done} already done, {len(groups)} to go)...")
         print(f"  Pipeline: PRELOAD_WORKERS={PRELOAD_WORKERS}  "
               f"EXTRACT_WORKERS={EXTRACT_WORKERS}  "
               f"QUEUE_DEPTH={QUEUE_DEPTH}  "
@@ -2651,17 +2703,29 @@ def predict_buildings_chunked(model, df, all_years_datasets, params,
         )
 
     # ── Producer thread ───────────────────────────────────────────────────────
+    # Sentinel tuple marking "all batches for this group have been pushed" —
+    # distinct from the `None` end-of-stream sentinel. Lets the consumer know
+    # when it can flush that group's accumulated predictions to its chunk
+    # parquet, which is what makes resume possible at group granularity.
+    _GROUP_DONE = "__GROUP_DONE__"
+
     def _producer():
         """
         Iterates spatial groups.  For each group:
           1. Waits for that group's preload to finish.
           2. Immediately fires off the *next* group's preload in background.
           3. Extracts images in parallel and pushes packed batches to the queue.
+          4. Pushes a _GROUP_DONE marker so the consumer can flush that
+             group's chunk file (see Resumability in the module docstring).
 
         The queue's maxsize creates automatic back-pressure: if the GPU falls
         behind, put() blocks here, throttling extraction so we don't waste RAM
         storing thousands of pre-built batches.
         """
+        if not groups:
+            batch_queue.put(None)
+            return
+
         # One persistent thread for background preloading of the next group
         preload_executor = ThreadPoolExecutor(max_workers=1)
         extract_executor = ThreadPoolExecutor(max_workers=EXTRACT_WORKERS)
@@ -2700,6 +2764,10 @@ def predict_buildings_chunked(model, df, all_years_datasets, params,
                 if pending:
                     batch_queue.put(_pack_batch(pending))
 
+                # ⑤ Signal this group is fully queued — consumer can now
+                # write chunk_id's parquet once it drains the batches above.
+                batch_queue.put((_GROUP_DONE, chunk_id))
+
         except Exception as e:
             logging.error(f"Producer thread crashed: {e}", exc_info=True)
         finally:
@@ -2711,9 +2779,21 @@ def predict_buildings_chunked(model, df, all_years_datasets, params,
                                        name="zarr-producer")
     producer_thread.start()
 
-    # ── Consumer (main thread): GPU inference + CSV write ─────────────────────
-    first_write  = True
-    total_approx = max(1, len(df) // batch_size)
+    _CHUNK_COLUMNS = ["Rel_Score", "predicted_value", "building_id", "GEOID", "year", "type"]
+
+    def _write_group_chunk(chunk_id, pieces):
+        """Atomically write one group's accumulated predictions as a parquet."""
+        df_chunk = (pd.concat(pieces, ignore_index=True) if pieces
+                    else pd.DataFrame(columns=_CHUNK_COLUMNS))
+        path = _group_chunk_path(chunk_id)
+        tmp = path.with_name(path.name + ".tmp")
+        df_chunk.to_parquet(tmp)
+        os.replace(tmp, path)
+
+    # ── Consumer (main thread): GPU inference + per-group chunk write ────────
+    n_todo_rows  = sum(len(df_grp) for _, df_grp in groups)
+    total_approx = max(1, n_todo_rows // batch_size)
+    pending_pieces = []   # predictions for the group currently being drained
 
     with torch.no_grad():
         pbar = tqdm(total=total_approx, desc="Generating predictions", leave=False)
@@ -2721,6 +2801,14 @@ def predict_buildings_chunked(model, df, all_years_datasets, params,
             item = batch_queue.get()
             if item is None:
                 break   # producer finished
+
+            # Batches are (tensor, ...) so guard with isinstance first — never
+            # let a plain `==` compare a torch.Tensor against this string.
+            if isinstance(item[0], str) and item[0] == _GROUP_DONE:
+                _, chunk_id = item
+                _write_group_chunk(chunk_id, pending_pieces)
+                pending_pieces = []
+                continue
 
             batch_tensor, metas_tensor, labels, building_ids, geoids, years, types = item
 
@@ -2733,23 +2821,32 @@ def predict_buildings_chunked(model, df, all_years_datasets, params,
 
             preds = outputs.view(-1).cpu().numpy()
 
-            pd.DataFrame({
+            pending_pieces.append(pd.DataFrame({
                 "Rel_Score":       labels,
                 "predicted_value": preds,
                 "building_id":        building_ids,
                 "GEOID":           geoids,
                 "year":            years,
                 "type":            types,
-            }).to_csv(output_path,
-                      mode='w' if first_write else 'a',
-                      header=first_write,
-                      index=False)
-            first_write = False
+            }))
             pbar.update(1)
 
         pbar.close()
 
     producer_thread.join()
+
+    # Assemble the final CSV from every group's chunk parquet — old (from a
+    # prior, possibly crashed run) and new alike — only once all of them
+    # exist. Write atomically so a reader never sees a half-written file at
+    # output_path, and so a crash here still leaves every chunk parquet in
+    # place for the next attempt to pick up (assembly is idempotent and cheap
+    # relative to the GPU pass, so redoing it costs nothing).
+    parts = [pd.read_parquet(_group_chunk_path(chunk_id)) for chunk_id, _ in groups_all]
+    df_result = (pd.concat(parts, ignore_index=True) if parts
+                 else pd.DataFrame(columns=_CHUNK_COLUMNS))
+    tmp_output_path = f"{output_path}.tmp"
+    df_result.to_csv(tmp_output_path, index=False)
+    os.replace(tmp_output_path, output_path)
 
     if verbose:
         stats = cache.get_stats()
@@ -2760,6 +2857,146 @@ def predict_buildings_chunked(model, df, all_years_datasets, params,
               f"loads: {stats['loads']}")
 
 
+def run_nyc_zarr_validation_predictions(model, device, eval_transform, savename, params):
+    """NYC evaluation pass: the **whole city, unsampled**, predicted from the legacy
+    zarr aerial imagery (not NAIP) — reproducing the NYC-only model's coverage so the
+    US-trained model can be held to the same NYC exercise (parts A-E, including the
+    construction-cohort CSA event study and the Hudson Yards case study).
+
+    Every building of every NYC tract, all split types, all 8 even years:
+    ~1.08M buildings and ~2,275 tracts per year (8.6M building-years total),
+    against the ~8,540 buildings / 100 tracts the 10% tract sample produced —
+    ~127x the zarr reads. That cost is the point: the CSA needs the full universe
+    (at 98 sampled tracts only ~30 came out treated at the 5% threshold, far too
+    thin for a credible event study) and the train-vs-held-out diagnostic needs
+    the non-test tracts. Hardcoded (years, footprints_source, no sampling) on
+    purpose.
+
+    Deliberately calls build_dataset.open_datasets, NOT generate_datasets /
+    create_train_test_dataframes: the latter re-derives the whole-city CBSA split
+    from whatever CBSA universe is in scope and OVERWRITES the canonical
+    cbsa_splits.feather. Here that scope is NYC-only (doitt_nyc footprints) —
+    which is excluded from the whole-city split entirely (see
+    src.data.us_split.NYC_CBSA) — so it would clobber the real US split (used by
+    the ms_us training run) with an empty one. NYC's own split is a within-city
+    tract override (us_split.nyc_tract_type_map), applied directly below instead.
+    """
+    from src import prediction
+    from src.data import us_split
+
+    nyc_years = [2010, 2012, 2014, 2016, 2018, 2020, 2022, 2024]  # NYC zarr coverage
+    nyc_epsg = geo_utils.NYC_EVAL_EPSG   # the grid the legacy zarr store is indexed on
+
+    print("\n" + "=" * 80)
+    print("🗽 NYC zarr evaluation pass (FULL city, unsampled, 2010-2024 even years)")
+    print("=" * 80)
+
+    # The zarr grid is EPSG:6539 at 0.5 ftUS/pixel, not the 0.5 m/pixel national
+    # grid params["tau_meters"]/["subsample_step"] were snapped to. Re-snap here so
+    # the raw window is an exact multiple of image_size on *this* raster, and target
+    # the training footprint (the already-overridden tau) so the crops the model
+    # sees stay as close as the grid allows to the scale it was trained at.
+    nyc_tau, nyc_step = geo_utils.calculate_exact_tau(
+        params["tau_meters"], params["image_size"], epsg_code=nyc_epsg
+    )
+    nyc_params = {**params, "tau_meters": nyc_tau, "subsample_step": nyc_step}
+    train_span = 2 * params["tau_meters"]
+    print(f"📐 NYC zarr grid (EPSG:{nyc_epsg}): tau {params['tau_meters']:.2f}m → "
+          f"{nyc_tau:.2f}m (step N={nyc_step}, raw tile = {nyc_step * params['image_size']}px, "
+          f"footprint {2 * nyc_tau:.1f}m vs {train_span:.1f}m at train time)")
+
+    all_years_datasets, _, df = build_dataset.open_datasets(
+        sat_data="aerial", years=nyc_years, tau_meters=nyc_tau,
+        indicator=params["indicator"], footprints_source="doitt_nyc", states=None,
+        epsg=nyc_epsg,
+    )
+    nyc_types = us_split.nyc_tract_type_map()
+    # "unassigned" rather than NaN for tracts the within-city split does not cover:
+    # the column is written to the prediction CSVs, and evaluation derives the real
+    # split from tract_splits.feather anyway (see evaluation._csa_split_of).
+    df["type"] = df["GEOID"].astype(str).map(nyc_types).fillna("unassigned")
+    # No .copy(): the frame is now the whole city (~8.6M building-years), and a
+    # needless duplicate is ~GB of RAM on a box that has already OOM'd mid-run.
+    df_nyc = df
+    if df_nyc.empty:
+        print("⚠️ No NYC rows resolved from open_datasets — skipping.")
+        return
+    print(f"📊 Full NYC universe: {df_nyc['GEOID'].nunique():,} tracts, "
+          f"{len(df_nyc):,} building-years")
+    print("   split mix: "
+          + ", ".join(f"{k}={v:,}" for k, v in
+                      df_nyc["type"].value_counts().sort_index().items()))
+
+    # No sampling: predict every building of every NYC tract, as the NYC-only
+    # model did. select_prediction_rows documents all-None knobs + 'all' split as
+    # the legacy predict-everything path; it still runs so the (empty) filter tiers
+    # and the deterministic ordering stay identical to the sampled configuration.
+    #
+    # This is deliberately the expensive option — ~1.08M buildings/year against the
+    # ~8.5k the 10% tract sample produced, i.e. ~127x the zarr reads per year. It
+    # is what the CSA event study needs: at 98 sampled tracts only ~30 came out
+    # treated at the 5% threshold, far too thin for a credible event study, and the
+    # train-vs-held-out diagnostic needs the non-test tracts too.
+    sampling_params = {
+        "predict_split": "all",                       # every split type, not just test
+        "predict_tract_sample_frac": None,            # no tract sampling
+        "predict_tract_sample_min": None,
+        "predict_buildings_per_tract": None,          # every building in each tract
+        "predict_full_universe_geoid_prefixes": (),   # bypass unnecessary: nothing is sampled
+        "predict_full_universe_buildings_per_tract": None,
+    }
+    output_dir = RESULTS_DIR / savename / "nyc_zarr_check"
+
+    for year in nyc_years:
+        output_path = output_dir / f"{year}_predictions.csv"
+        if output_path.exists():
+            print(f"\n--- NYC zarr check, year {year}: {output_path.name} already "
+                  "exists, skipping (delete it to force a re-run) ---")
+            continue
+
+        print(f"\n--- NYC zarr check, year {year} ---")
+        df_year = df_nyc[df_nyc["year"] == year].copy()
+        if df_year.empty:
+            print(f"No NYC data for {year}, skipping.")
+            continue
+        df_year = prediction.select_prediction_rows(df_year, sampling_params)
+        if df_year.empty:
+            print(f"No NYC rows for {year}, skipping.")
+            continue
+        print(f"    predicting {len(df_year):,} buildings across "
+              f"{df_year['GEOID'].nunique():,} tracts")
+
+        predict_buildings_chunked(
+            model=model, df=df_year, all_years_datasets=all_years_datasets, params=nyc_params,
+            device=device, output_path=output_path, eval_transform=eval_transform, verbose=True,
+        )
+
+        df_result = pd.read_csv(output_path)
+        if len(df_result) == 0:
+            print(f"No valid predictions generated for {year}.")
+            continue
+        df_result = df_result.set_index("building_id")
+
+        # Best-effort geometry join (paper map figures); the prerequisite parquet may
+        # not exist if this exact (indicator, year range) combo hasn't been built before.
+        tag = build_dataset.temporal_data_tag("doitt_nyc", params["indicator"], nyc_epsg)
+        geom_path = (PROCESSED_DATA_DIR
+                     / f"building_geometries_{tag}_years{min(nyc_years)}-{max(nyc_years)}.parquet")
+        if geom_path.exists():
+            gdf = gpd.read_parquet(geom_path).join(df_result, how="inner")
+            gdf.to_parquet(output_dir / f"predictions_{year}.parquet")
+        else:
+            print(f"⚠️ {geom_path.name} not found — skipping the georeferenced parquet for {year}.")
+
+        df_result_tracts = df_result.groupby("GEOID").agg({
+            "Rel_Score": "mean", "predicted_value": ["mean", "std"],
+        }).reset_index()
+        df_result_tracts.columns = ["GEOID", "Rel_Score", "predicted_value", "predicted_value_std"]
+        df_result_tracts.to_parquet(output_dir / f"predictions_by_tract_{year}.parquet")
+
+        print(f"Finished NYC zarr check: {len(df_result)} buildings for {year} -> {output_dir}")
+
+
 def run(
     params=None,
     train=True,
@@ -2767,6 +3004,9 @@ def run(
     generate_predictions=False,
     retrain=False,
     evaluate=False,
+    generate_predictions_nyc=False,   # TEMPORARY — NYC/zarr validation pass, see
+                                      # run_nyc_zarr_validation_predictions; only fires
+                                      # inside `if generate_predictions:`.
 ):
     """Run all the code of this file.
 
@@ -2800,6 +3040,9 @@ def run(
     )
     params["tau_meters"] = tau_meters
     params["subsample_step"] = subsample_step
+    # Keep the pre-override request: any pass running on a different raster grid
+    # (e.g. the NYC zarr check, 0.5 ftUS/px) has to redo this snap on its own grid.
+    params["tau_meters_requested"] = tau_meters_requested
     print(f"📐 Exact tau override: {tau_meters_requested}m → {tau_meters:.2f}m  "
           f"(subsample step N={subsample_step}, raw tile = {subsample_step * image_size}px)")
 
@@ -3209,114 +3452,122 @@ def run(
             except OSError:
                 pass  # non-glibc platform; gc.collect() above is the fallback
 
-        for year in pred_years:
-            if year<=2015:
-                continue  # Skip pre-2016 years for now; already computed
-            print(f"\n{'='*80}")
-            print(f"🚀 Processing Predictions for Year: {year}")
-            print(f"{'='*80}")
+        # for year in pred_years:
+        #     if year<=2015:
+        #         continue  # Skip pre-2016 years for now; already computed
+        #     print(f"\n{'='*80}")
+        #     print(f"🚀 Processing Predictions for Year: {year}")
+        #     print(f"{'='*80}")
 
-            _release_memory()  # reclaim last year's frames before the next big alloc
+        #     _release_memory()  # reclaim last year's frames before the next big alloc
 
-            if pred_pair_table is not None:
-                df_year = pred_pair_table.materialize_year(year)
-                df_year = prediction.assign_prediction_types(
-                    df_year, year, pred_split_map, pred_holdout_years
-                )
-                # Split filter + evaluation sampling (max(10%,100) tracts per
-                # CBSA x <=100 buildings per tract, deterministic and
-                # year-stable) + the NYC full-universe bypass for the CSA
-                # event study. See prediction.select_prediction_rows.
-                df_year = prediction.select_prediction_rows(df_year, params)
-            else:
-                df_year = df_all[(df_all["year"] == year)].copy()
-            if df_year.empty:
-                print(f"No data for year {year}, skipping.")
-                continue
+        #     if pred_pair_table is not None:
+        #         df_year = pred_pair_table.materialize_year(year)
+        #         df_year = prediction.assign_prediction_types(
+        #             df_year, year, pred_split_map, pred_holdout_years
+        #         )
+        #         # Split filter + evaluation sampling (max(10%,100) tracts per
+        #         # CBSA x <=100 buildings per tract, deterministic and
+        #         # year-stable) + the NYC full-universe bypass for the CSA
+        #         # event study. See prediction.select_prediction_rows.
+        #         df_year = prediction.select_prediction_rows(df_year, params)
+        #     else:
+        #         df_year = df_all[(df_all["year"] == year)].copy()
+        #     if df_year.empty:
+        #         print(f"No data for year {year}, skipping.")
+        #         continue
 
-            print(f"Found {len(df_year)} buildings to predict for {year}")
+        #     print(f"Found {len(df_year)} buildings to predict for {year}")
 
-            output_path = RESULTS_DIR / f"{savename}/{year}_predictions.csv"
+        #     output_path = RESULTS_DIR / f"{savename}/{year}_predictions.csv"
 
-            if pred_pair_table is not None:
-                produced = prediction.predict_year_chunked(
-                    model=model,
-                    df_year=df_year,
-                    year=year,
-                    params=params,
-                    device=device,
-                    eval_transform=eval_transform,
-                    chunk_root=pred_chunk_root,
-                    output_csv=output_path,
-                    max_workers=int(params.get("predict_fetch_workers", 16)),
-                    verbose=True,
-                )
-                if not produced:
-                    print(f"No labeled rows for year {year}, skipping.")
-                    continue
-            else:
-                # Legacy zarr path (doitt_nyc / small_sample only)
-                predict_buildings_chunked(
-                    model=model,
-                    df=df_year,
-                    all_years_datasets=all_years_datasets,
-                    params=params,
-                    device=device,
-                    output_path=output_path,
-                    eval_transform=eval_transform,
-                    verbose=True
-                )
+        #     if pred_pair_table is not None:
+        #         produced = prediction.predict_year_chunked(
+        #             model=model,
+        #             df_year=df_year,
+        #             year=year,
+        #             params=params,
+        #             device=device,
+        #             eval_transform=eval_transform,
+        #             chunk_root=pred_chunk_root,
+        #             output_csv=output_path,
+        #             max_workers=int(params.get("predict_fetch_workers", 16)),
+        #             verbose=True,
+        #         )
+        #         if not produced:
+        #             print(f"No labeled rows for year {year}, skipping.")
+        #             continue
+        #     else:
+        #         # Legacy zarr path (doitt_nyc / small_sample only)
+        #         predict_buildings_chunked(
+        #             model=model,
+        #             df=df_year,
+        #             all_years_datasets=all_years_datasets,
+        #             params=params,
+        #             device=device,
+        #             output_path=output_path,
+        #             eval_transform=eval_transform,
+        #             verbose=True
+        #         )
 
-            df_result = pd.read_csv(output_path)
+        #     df_result = pd.read_csv(output_path)
 
-            if len(df_result) == 0:
-                print(f"No valid predictions generated for year {year}.")
-                continue
+        #     if len(df_result) == 0:
+        #         print(f"No valid predictions generated for year {year}.")
+        #         continue
 
-            # Save georeferenced predictions. Polygon geometries only exist for the
-            # legacy DoITT source; the MS index is centroid-only (polygons live in
-            # the cold buildings_polygons store) so we skip the polygon join there.
-            df_result = df_result.set_index("building_id")
-            if params["footprints_source"] == "doitt_nyc":
-                tag = f"{params['footprints_source']}_{params['indicator']}_epsg{geo_utils.METRIC_EPSG}"
-                gdf = gpd.read_parquet(
-                    PROCESSED_DATA_DIR / f"building_geometries_{tag}_years{min(years)}-{max(years)}.parquet"
-                )
-                gdf = gdf.join(df_result, how="inner")
-                gdf.to_parquet(RESULTS_DIR / f"{savename}/predictions_{year}.parquet")
+        #     # Save georeferenced predictions. Polygon geometries only exist for the
+        #     # legacy DoITT source; the MS index is centroid-only (polygons live in
+        #     # the cold buildings_polygons store) so we skip the polygon join there.
+        #     df_result = df_result.set_index("building_id")
+        #     if params["footprints_source"] == "doitt_nyc":
+        #         tag = f"{params['footprints_source']}_{params['indicator']}_epsg{geo_utils.METRIC_EPSG}"
+        #         gdf = gpd.read_parquet(
+        #             PROCESSED_DATA_DIR / f"building_geometries_{tag}_years{min(years)}-{max(years)}.parquet"
+        #         )
+        #         gdf = gdf.join(df_result, how="inner")
+        #         gdf.to_parquet(RESULTS_DIR / f"{savename}/predictions_{year}.parquet")
 
-            # Dissolve by census tract
-            df_result_tracts = df_result.groupby("GEOID").agg({
-                "Rel_Score": "mean",
-                "predicted_value": ["mean", "std"]
-            }).reset_index()
-            df_result_tracts.columns = ["GEOID", "Rel_Score", "predicted_value", "predicted_value_std"]
+        #     # Dissolve by census tract
+        #     df_result_tracts = df_result.groupby("GEOID").agg({
+        #         "Rel_Score": "mean",
+        #         "predicted_value": ["mean", "std"]
+        #     }).reset_index()
+        #     df_result_tracts.columns = ["GEOID", "Rel_Score", "predicted_value", "predicted_value_std"]
 
-            df_result_tracts.to_parquet(RESULTS_DIR / f"{savename}/predictions_by_tract_{year}.parquet")
+        #     df_result_tracts.to_parquet(RESULTS_DIR / f"{savename}/predictions_by_tract_{year}.parquet")
 
-            print(f"Finished evaluating {len(df_result)} valid buildings for year {year} at {RESULTS_DIR}")
+        #     print(f"Finished evaluating {len(df_result)} valid buildings for year {year} at {RESULTS_DIR}")
 
-            # Drop large per-year objects before the next iteration — repeated
-            # buildup of df_year/df_result/tract frames across ~8 years is the
-            # likely cause of the WSL OOM kill observed mid-run.
-            del df_year, df_result, df_result_tracts
-            if params["footprints_source"] == "doitt_nyc":
-                del gdf
-            _release_memory()
+        #     # Drop large per-year objects before the next iteration — repeated
+        #     # buildup of df_year/df_result/tract frames across ~8 years is the
+        #     # likely cause of the WSL OOM kill observed mid-run.
+        #     del df_year, df_result, df_result_tracts
+        #     if params["footprints_source"] == "doitt_nyc":
+        #         del gdf
+        #     _release_memory()
+
+        if generate_predictions_nyc:
+            run_nyc_zarr_validation_predictions(model, device, eval_transform, savename, params)
 
     if evaluate:
         # Must run AFTER generate_predictions — it consumes the per-year
         # prediction CSVs / tract parquets written above. Imported lazily so an
         # evaluation-only import error can never break training/prediction.
+        #
+        # mode="both": the US parts on this run's predictions plus the NYC parts
+        # (incl. the construction-cohort CSA event study and the Hudson Yards
+        # case study) on the NYC pass written above. When no NYC pass exists the
+        # NYC half reports that and is skipped — it never fails the US half.
         print("\n" + "=" * 80 + "\n📊 EVALUATION\n" + "=" * 80)
         try:
             from src.evaluation import run_evaluation
-            run_evaluation(savename, params)
+            run_evaluation(savename, params, mode="both")
         except Exception:
             import traceback
             traceback.print_exc()
             print("⚠️ Evaluation failed; prediction artifacts are intact — rerun with: "
-                  f"python -m src.evaluation --savename {savename}")
+                  f"python -m src.evaluation --savename {savename} --mode both")
 
 if __name__ == "__main__":
 
@@ -3395,4 +3646,4 @@ if __name__ == "__main__":
     }
 
     # Run full pipeline
-    run(params, train=False, retrain=False, compute_loss=False, generate_predictions=False, evaluate=True)
+    run(params, train=False, retrain=False, compute_loss=False, generate_predictions=True, generate_predictions_nyc=True, evaluate=True)

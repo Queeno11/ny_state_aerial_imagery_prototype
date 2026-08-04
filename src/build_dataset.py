@@ -33,13 +33,26 @@ from src.data.process_acs import BASE_YEAR as ACS_BASE_YEAR, PANEL_YEARS as ACS_
 
 
 def open_datasets(sat_data="aerial", years=[2013, 2018, 2022], tau_meters=100,
-                  indicator=None, footprints_source="ms_us", states=None):
+                  indicator=None, footprints_source="ms_us", states=None, epsg=None):
+    """Build the (building, year) table and, for the zarr path, link it to imagery.
 
+    ``epsg``: projected CRS the table's centroids/bboxes are built in. Defaults to
+    the grid the imagery actually lives on — ``NYC_EVAL_EPSG`` (6539, US survey
+    feet, 0.5 units/pixel) for the legacy ``sat_data="aerial"`` zarr store, and
+    the national ``METRIC_EPSG`` (5070, meters) for everything else. Building the
+    table in 5070 and then indexing a 6539 raster with it silently matches zero
+    buildings, which is exactly what the guard in ``assign_datasets_to_gdf``
+    now catches.
+    """
     ### Open dataframe with files and labels
     print("Reading dataset...")
     indicator = indicator if indicator is not None else indicators.DEFAULT_INDICATOR
+    if epsg is None:
+        epsg = geo_utils.NYC_EVAL_EPSG if sat_data == "aerial" else geo_utils.METRIC_EPSG
+    epsg = int(epsg)
     df = load_income_dataset(years, tau_meters=tau_meters, indicator=indicator,
-                             footprints_source=footprints_source, states=states)
+                             footprints_source=footprints_source, states=states,
+                             epsg=epsg)
 
     year_cols = []
     if isinstance(df, LazyPairTable) and sat_data != "NAIP":
@@ -51,7 +64,9 @@ def open_datasets(sat_data="aerial", years=[2013, 2018, 2022], tau_meters=100,
         datasets_all_years, extents_all_years = load_satellite_datasets(
             years=years
         )
-        df = assign_datasets_to_gdf(df, datasets_all_years, extents_all_years, years=years, verbose=True, save_plot=False)
+        _check_datasets_crs(datasets_all_years, epsg)
+        df = assign_datasets_to_gdf(df, datasets_all_years, extents_all_years, years=years,
+                                    verbose=True, save_plot=False, epsg=epsg)
     elif sat_data == "NAIP":
         datasets_all_years = None
         extents_all_years = None
@@ -69,6 +84,30 @@ def open_datasets(sat_data="aerial", years=[2013, 2018, 2022], tau_meters=100,
     print("Datasets loaded!")
 
     return datasets_all_years, extents_all_years, df
+
+
+def _check_datasets_crs(datasets, epsg):
+    """Fail loudly if the imagery grid is not the CRS the table was built in.
+
+    Best-effort: rasters that do not record a CRS are skipped with a warning
+    (the extent/centroid guard in :func:`assign_datasets_to_gdf` still catches
+    the mismatch, just later and with a coarser message).
+    """
+    unknown = []
+    for name, ds in datasets.items():
+        ds_epsg = geo_utils.dataset_epsg(ds)
+        if ds_epsg is None:
+            unknown.append(name)
+        elif ds_epsg != int(epsg):
+            raise ValueError(
+                f"CRS mismatch: dataset {name!r} is EPSG:{ds_epsg} but the building "
+                f"table was built in EPSG:{epsg}. Rebuild the table with "
+                f"open_datasets(..., epsg={ds_epsg}) — comparing coordinates across "
+                f"CRSs matches zero buildings."
+            )
+    if unknown:
+        print(f"⚠️  No CRS recorded on {len(unknown)} dataset(s) "
+              f"(e.g. {unknown[0]}); assuming EPSG:{epsg}.")
 
 
 def load_satellite_datasets(years,stretch=False, engine="zarr"):
@@ -578,15 +617,46 @@ def _load_income_pair_table(panel_years, tau_meters=100,
     return table
 
 
+def _check_projection_finite(gdf, what, epsg):
+    """Fail loudly when a reprojection silently produced non-finite coordinates.
+
+    Crossing datums (e.g. the national NAD83/EPSG:5070 grid → NAD83(2011)/EPSG:6539
+    for the NYC zarr) can make PROJ reach for a shift grid from cdn.proj.org. With
+    ``PROJ_NETWORK=ON`` and no reachable network, the transform yields ``inf``
+    instead of raising — every downstream bbox test then matches nothing.
+    """
+    bounds = np.asarray(gdf.total_bounds, dtype="float64")
+    if not np.isfinite(bounds).all():
+        raise ValueError(
+            f"Reprojecting {what} to EPSG:{epsg} produced non-finite coordinates "
+            f"(total_bounds={bounds.tolist()}). PROJ could not build the datum "
+            f"transform — it usually wants a grid from cdn.proj.org. Re-run with "
+            f"network access, or set PROJ_NETWORK=OFF to fall back to the "
+            f"(sub-metre) ballpark transform."
+        )
+
+
+def temporal_data_tag(footprints_source, indicator, epsg=None):
+    """Artifact tag for the flat temporal table / geometry lookup.
+
+    CRS + indicator + source tags keep stale artifacts (old CRS or another
+    label) from being silently reused; callers that need to *find* an artifact
+    (e.g. the NYC geometry join in main.py) must build the tag through here so
+    the epsg never drifts apart from the builder.
+    """
+    epsg = geo_utils.METRIC_EPSG if epsg is None else int(epsg)
+    return f"{footprints_source}_{indicator}_epsg{epsg}"
+
+
 def load_income_dataset(panel_years, tau_meters=100,
                         indicator=indicators.DEFAULT_INDICATOR,
-                        footprints_source="ms_us", states=None):
+                        footprints_source="ms_us", states=None, epsg=None):
     """
     Produces the flat table for the Zero-Join DataLoader:
 
       temporal_data parquet — one row per (building, year) with bbox/centroid
-      coordinates (METRIC_CRS = EPSG:5070), the selected indicator's ACS label
-      (as ``Rel_Score``), its structural-change flag (as
+      coordinates (``epsg``, default METRIC_CRS = EPSG:5070), the selected
+      indicator's ACS label (as ``Rel_Score``), its structural-change flag (as
       ``Valid_Structural_Change``), ``cbsa_code``, and stratification bins.
       No geometry column: training crops are centroid + tau.
 
@@ -597,19 +667,31 @@ def load_income_dataset(panel_years, tau_meters=100,
     ``"doitt_nyc"`` (legacy dated NYC footprints; also writes the geometry
     lookup parquet used by NYC evaluation).
 
+    ``epsg`` selects the projected CRS the coordinates are built in. Everything
+    US-scale stays on the national grid (EPSG:5070, meters); the legacy NYC zarr
+    imagery is indexed on EPSG:6539 (US survey feet), so the NYC evaluation pass
+    must pass ``epsg=geo_utils.NYC_EVAL_EPSG`` to produce coordinates that can
+    address that raster at all. ``tau_meters`` is always metres regardless.
+
     ms_us returns a :class:`LazyPairTable` (the building×year cross product is
     never materialized — 575M rows at US scale); doitt_nyc keeps returning the
     legacy flat DataFrame.
     """
+    epsg = geo_utils.METRIC_EPSG if epsg is None else int(epsg)
     if footprints_source == "ms_us":
+        if epsg != geo_utils.METRIC_EPSG:
+            raise NotImplementedError(
+                f"footprints_source='ms_us' is built on the national grid "
+                f"EPSG:{geo_utils.METRIC_EPSG} only (the persisted pair artifacts are "
+                f"tagged with it); got epsg={epsg}."
+            )
         return _load_income_pair_table(
             panel_years, tau_meters=tau_meters, indicator=indicator, states=states
         )
 
     OUTPUT_DIR = PROCESSED_DATA_DIR
-    # CRS + indicator + source tags keep stale artifacts (old CRS or another
-    # label) from being silently reused.
-    tag = f"{footprints_source}_{indicator}_epsg{geo_utils.METRIC_EPSG}"
+    crs = f"EPSG:{epsg}"
+    tag = temporal_data_tag(footprints_source, indicator, epsg)
     temporal_data_path = OUTPUT_DIR / (
         f"temporal_data_{tag}_t{tau_meters}_years{min(panel_years)}-{max(panel_years)}.parquet"
     )
@@ -623,6 +705,9 @@ def load_income_dataset(panel_years, tau_meters=100,
         return pd.read_parquet(temporal_data_path)
 
     panel_tract_gdf = process_acs_panel()
+    if panel_tract_gdf.crs is None or panel_tract_gdf.crs.to_epsg() != epsg:
+        panel_tract_gdf = panel_tract_gdf.to_crs(crs)
+        _check_projection_finite(panel_tract_gdf, "the ACS tract panel", epsg)
     vc_col = indicators.valid_change_col(indicator)
     needed = [PANEL_GEOID_COL, "cbsa_code", vc_col,
               indicators.score_col(indicator, get_closest_acs_year(min(panel_years)))]
@@ -634,13 +719,14 @@ def load_income_dataset(panel_years, tau_meters=100,
         )
 
     # ------------------------------------------------------------------ #
-    # 1. Building universe -> centroids in METRIC_CRS + tract GEOID       #
+    # 1. Building universe -> centroids in `crs` + tract GEOID            #
     # ------------------------------------------------------------------ #
-    print(f"1. Loading building universe ({footprints_source})...")
+    print(f"1. Loading building universe ({footprints_source}, EPSG:{epsg})...")
     if footprints_source == "ms_us":
         buildings_mapped = load_buildings_index(states=states)
     elif footprints_source == "doitt_nyc":
-        buildings_nyc = load_building_data().to_crs(geo_utils.METRIC_CRS)
+        buildings_nyc = load_building_data().to_crs(crs)
+        _check_projection_finite(buildings_nyc, "the DoITT building footprints", epsg)
         tracts = (
             panel_tract_gdf[[PANEL_GEOID_COL, "geometry"]]
             .rename(columns={PANEL_GEOID_COL: "GEOID"})
@@ -676,14 +762,15 @@ def load_income_dataset(panel_years, tau_meters=100,
     ctr = centers.reindex(buildings_mapped["cbsa_code"])
     dx = buildings_mapped["centroid_x"].to_numpy() - ctr["x"].to_numpy()
     dy = buildings_mapped["centroid_y"].to_numpy() - ctr["y"].to_numpy()
-    meters_per_unit = geo_utils.projected_units_to_meters(1.0, geo_utils.METRIC_EPSG)
+    meters_per_unit = geo_utils.projected_units_to_meters(1.0, epsg)
     buildings_mapped["dist_to_center"] = np.hypot(dx, dy) * meters_per_unit / 1000.0
 
     # ------------------------------------------------------------------ #
     # 3. Tau bbox around the centroid                                     #
     # ------------------------------------------------------------------ #
-    print(f"3. Applying Context Spillover (tau = {tau_meters}m) around centroids...")
-    tau_units = geo_utils.meters_to_projected_units(tau_meters, geo_utils.METRIC_EPSG)
+    print(f"3. Applying Context Spillover (tau = {tau_meters}m) around centroids "
+          f"(EPSG:{epsg})...")
+    tau_units = geo_utils.meters_to_projected_units(tau_meters, epsg)
     buildings_mapped["bbox_minx"] = buildings_mapped["centroid_x"] - tau_units
     buildings_mapped["bbox_miny"] = buildings_mapped["centroid_y"] - tau_units
     buildings_mapped["bbox_maxx"] = buildings_mapped["centroid_x"] + tau_units
@@ -782,6 +869,31 @@ def load_income_dataset(panel_years, tau_meters=100,
     return temporal_data_flat
 
 
+def _raise_no_dataset_match(df, extents, years, epsg):
+    """Zero buildings inside any raster extent — almost always a CRS mismatch."""
+    bx = (float(df["centroid_x"].min()), float(df["centroid_y"].min()),
+          float(df["centroid_x"].max()), float(df["centroid_y"].max()))
+    matched_years = [y for y in years if any(str(y) in n for n in extents)]
+    if extents:
+        bounds = np.array([e.bounds for e in extents.values()], dtype="float64")
+        ex = (bounds[:, 0].min(), bounds[:, 1].min(), bounds[:, 2].max(), bounds[:, 3].max())
+        ex_txt = (f"imagery extents union (x: {ex[0]:,.0f}..{ex[2]:,.0f}, "
+                  f"y: {ex[1]:,.0f}..{ex[3]:,.0f})")
+    else:
+        ex_txt = "no dataset extents were loaded at all"
+    raise ValueError(
+        f"No building fell inside any dataset extent — the table and the imagery are "
+        f"not on the same grid.\n"
+        f"  buildings (EPSG:{epsg}) x: {bx[0]:,.0f}..{bx[2]:,.0f}, y: {bx[1]:,.0f}..{bx[3]:,.0f}\n"
+        f"  {ex_txt}\n"
+        f"  years requested: {list(years)}; datasets whose name carries one of those "
+        f"years: {matched_years or 'none'}\n"
+        f"Rebuild the table in the imagery's CRS — the legacy NYC zarr grid is "
+        f"EPSG:{geo_utils.NYC_EVAL_EPSG} (US survey feet), not the national "
+        f"EPSG:{geo_utils.METRIC_EPSG}: open_datasets(..., epsg=...)."
+    )
+
+
 def assign_datasets_to_gdf(
     df,
     datasets,
@@ -789,6 +901,7 @@ def assign_datasets_to_gdf(
     years,
     verbose=True,
     save_plot=True,
+    epsg=None,
 ):
     """Assign each geometry a dataset if the census tract falls within the extent of the dataset (images)
 
@@ -799,14 +912,22 @@ def assign_datasets_to_gdf(
     years: list, years of the satellite images
     centroid: bool, if True, the centroid of the census tract is used to assign the dataset
     select: str, method to select the dataset. Options are "first_match" or "all_matches"
+    epsg: int, CRS both `df` and the rasters are expected to be in (diagnostics/plot only)
     """
     import warnings
     warnings.filterwarnings("ignore")
 
     if "centroid_x" not in df.columns or "centroid_y" not in df.columns:
-        raise ValueError("DataFrame must have 'centroid_x' and 'centroid_y' columns with the coordinates of the centroid of the census tract")  
+        raise ValueError("DataFrame must have 'centroid_x' and 'centroid_y' columns with the coordinates of the centroid of the census tract")
 
+    epsg = geo_utils.METRIC_EPSG if epsg is None else int(epsg)
     colname = "dataset"
+    # Pre-create the output columns: if nothing matches (CRS mismatch, wrong
+    # years) the loop below never assigns and the diagnostics still work.
+    index_cols = ["row_start", "row_stop", "col_start", "col_stop"]
+    df[colname] = pd.NA
+    for c in index_cols:
+        df[c] = np.nan
     for year in years:
         inside_year = df["year"] == year
         for name, bbox in extents.items():
@@ -831,10 +952,13 @@ def assign_datasets_to_gdf(
             y_values = datasets[name].y.values
             boxes = df.loc[inside_dataset, ["bbox_minx", "bbox_miny", "bbox_maxx", "bbox_maxy"]].values
             all_indices = geo_utils.precompute_all_indices(x_values, y_values, boxes)
-            df.loc[inside_dataset, ["row_start", "row_stop", "col_start", "col_stop"]] = all_indices
+            df.loc[inside_dataset, index_cols] = all_indices
 
-    nan_links = df[colname].isna().sum()
-    df = df[df[colname].notna()]
+    nan_links = int(df[colname].isna().sum())
+    if nan_links == len(df):
+        _raise_no_dataset_match(df, extents, years, epsg)
+    df = df[df[colname].notna()].copy()
+    df[index_cols] = df[index_cols].astype("int64")
 
     if verbose:
         print(f"Buildings without images: {nan_links} out of {len(df) + nan_links}")
@@ -843,7 +967,7 @@ def assign_datasets_to_gdf(
         gdf = gpd.GeoDataFrame(
             df,
             geometry=gpd.points_from_xy(df["centroid_x"], df["centroid_y"]),
-            crs=geo_utils.METRIC_CRS,
+            crs=f"EPSG:{epsg}",
         )
         gdf.plot(markersize=1, figsize=(10, 10), alpha=0.5)
         plt.savefig(rf"{PROCESSED_DATA_DIR}/links_with_images.png")

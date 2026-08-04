@@ -477,6 +477,52 @@ def test_select_full_universe_bypasses_split_and_sampling():
     assert set(out.loc[out["GEOID"] == "36061000100", "type"]) == {"train"}
 
 
+def test_select_predict_everything_config_keeps_every_row():
+    """The NYC zarr pass's configuration: no sampling at all, every split type.
+
+    This is the exact dict main.run_nyc_zarr_validation_predictions uses to
+    reproduce the NYC-only model's coverage, so it is pinned here — nothing may
+    be dropped, whatever a tract's split type or building count.
+    """
+    params = dict(
+        PARAMS,
+        predict_split="all",
+        predict_tract_sample_frac=None,
+        predict_tract_sample_min=None,
+        predict_buildings_per_tract=None,
+        predict_full_universe_geoid_prefixes=(),
+        predict_full_universe_buildings_per_tract=None,
+    )
+    spec = ([(f"36061{i:06d}", "35620", "train", 30) for i in range(20)]
+            + [(f"36047{i:06d}", "35620", "test", 25) for i in range(10)]
+            + [(f"36005{i:06d}", "35620", "dead_zone", 7) for i in range(5)]
+            + [(f"36081{i:06d}", "35620", "unassigned", 3) for i in range(4)])
+    df = make_sel_df(spec)
+    out = prediction.select_prediction_rows(df, params, verbose=False)
+
+    assert len(out) == len(df), "predict-everything must not drop a single row"
+    assert out["GEOID"].nunique() == 39
+    # every split type survives, including the ones the sampled config filtered out
+    assert set(out["type"]) == {"train", "test", "dead_zone", "unassigned"}
+    # and no per-tract cap was applied
+    assert out.groupby("GEOID").size().max() == 30
+
+
+def test_select_predict_everything_beats_the_sampled_config():
+    """Guards the reason for the change: the sampled config yielded far fewer
+    tracts than the CSA event study needs."""
+    spec = [(f"36061{i:06d}", "35620", "test", 30) for i in range(40)]
+    df = make_sel_df(spec)
+    sampled = prediction.select_prediction_rows(df, SEL_PARAMS, verbose=False)
+    everything = prediction.select_prediction_rows(
+        df, dict(PARAMS, predict_split="all", predict_tract_sample_frac=None,
+                 predict_tract_sample_min=None, predict_buildings_per_tract=None,
+                 predict_full_universe_geoid_prefixes=()), verbose=False)
+    assert sampled["GEOID"].nunique() == 4        # max(ceil(0.1*40), 2)
+    assert everything["GEOID"].nunique() == 40    # all of them
+    assert len(everything) > len(sampled)
+
+
 def test_select_cbsa_whitelist_filters_everything():
     # Whitelist keeps only listed metros — sampled tier AND full-universe
     # bypass rows of other metros are gone; None/empty leaves all in.

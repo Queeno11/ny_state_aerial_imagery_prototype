@@ -44,6 +44,31 @@ def get_dataset_extent(ds, image_size=None):
     return polygon
 
 
+def dataset_epsg(ds):
+    """Best-effort EPSG code of a raster xarray dataset, or None if not recorded.
+
+    The legacy NYC zarr stores carry their CRS on a ``spatial_ref``/``crs``
+    coordinate (rioxarray convention). Callers use this only to *verify* that
+    the table they built is on the same grid as the imagery — a missing CRS is
+    not an error, so this returns None instead of raising.
+    """
+    for name in ("spatial_ref", "crs"):
+        if name not in getattr(ds, "variables", {}):
+            continue
+        attrs = dict(ds[name].attrs)
+        for key in ("crs_wkt", "spatial_ref", "epsg_code", "EPSG_code"):
+            wkt = attrs.get(key)
+            if not wkt:
+                continue
+            try:
+                epsg = CRS.from_user_input(wkt).to_epsg()
+            except Exception:
+                continue
+            if epsg is not None:
+                return int(epsg)
+    return None
+
+
 def get_datasets_for_polygon(poly, extents):
     """Devuelve el nombre del dataset que contiene el polígono seleccionado."""
 
