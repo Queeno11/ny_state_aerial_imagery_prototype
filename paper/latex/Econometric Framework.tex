@@ -1,0 +1,536 @@
+\section{A Global Latent Space from Local Wealth Comparisons}
+
+\subsection{Motivation}
+
+Consider a collection of locations observed in different cities and at different points in time. For each location, satellite imagery provides a rich set of observable characteristics: building size and density, road quality, vegetation, parking, roof characteristics, surrounding land use, and many other features. Let
+
+[
+I_{ict}
+]
+
+denote the image of area (i) in city (c) at time (t), and let
+
+[
+X_{ict}=h_{\theta}(I_{ict})\in\mathbb{R}^{K}
+]
+
+denote its learned visual representation. Here, (h_{\theta}(\cdot)) can be interpreted as a vision transformer (ViT) or another image encoder. The vector (X_{ict}) is therefore not a hand-selected collection of observable variables, but a high-dimensional representation of the physical and environmental characteristics visible in the image.
+
+The object of interest is not to predict absolute wealth directly from these images. Instead, we seek to recover a one-dimensional latent measure of \emph{structural wealth}, denoted by
+
+[
+R_{ict}\in\mathbb{R}.
+]
+
+The interpretation of (R_{ict}) is deliberately different from a wealth percentile or rank. A higher value of (R) means that a location occupies a higher position in the latent wealth space, but the numerical value of (R) has no intrinsic cardinal interpretation. In particular, (R=2) does not mean ``twice as wealthy'' as (R=1), nor does it mean the location is at the 80th percentile. The scale is simply a one-dimensional representation of the underlying ordering of locations by structural wealth.
+
+The distinction between structural and absolute wealth is important. A location may retain the same physical characteristics and therefore the same structural wealth position while the absolute amount of wealth associated with that position changes over time. For example, an unchanged middle-income neighborhood may remain in approximately the same position in the city's structural wealth space while the purchasing power, incomes, and housing values associated with that position increase substantially over twenty years.
+
+We therefore write absolute wealth as
+
+\begin{equation}
+Y_{ict}=\phi_{ct}(R_{ict}),
+\label{eq:cardinal_mapping}
+\end{equation}
+
+where (Y_{ict}) is cardinal wealth---for example, mean wealth or income in PPP-adjusted dollars---and (\phi_{ct}) is a city-year-specific, strictly increasing mapping from the latent structural wealth scale to the cardinal wealth scale.
+
+The strict monotonicity condition,
+
+\begin{equation}
+r_1>r_2
+\quad\Longrightarrow\quad
+\phi_{ct}(r_1)>\phi_{ct}(r_2),
+\label{eq:monotonic_phi}
+\end{equation}
+
+means that the latent ordering and the wealth ordering coincide within a city and year. However, the function (\phi_{ct}) is allowed to change across cities and over time. Thus,
+
+[
+R_{ic,t}=R_{ic,t'}
+]
+
+does not imply
+
+[
+Y_{ic,t}=Y_{ic,t'}.
+]
+
+The same structural wealth position can correspond to different levels of absolute wealth in different economic environments.
+
+\subsection{The Image-to-Wealth Relationship}
+
+We model the latent structural wealth measure as a linear index of the learned visual representation,
+
+\begin{equation}
+R_{ict}=X_{ict}'B_{ict}+\varepsilon_{ict},
+\label{eq:latent_linear}
+\end{equation}
+
+where (B_{ict}\in\mathbb{R}^{K}) is a vector of coefficients and (\varepsilon_{ict}) contains components of structural wealth that are not captured by the visual representation.
+
+The linear representation in Equation~\eqref{eq:latent_linear} is useful for interpretation. For example, after the vision encoder has transformed an image into a representation (X_{ict}), the final prediction can be understood as a weighted combination of visual characteristics. The weights need not correspond to individual interpretable pixels or manually constructed variables: the preceding neural network can learn highly nonlinear representations of buildings, neighborhoods, and amenities. Nevertheless, conditional on this learned representation, the final latent wealth score is a linear index.
+
+This is also a general representation of a standard neural network with a scalar linear output layer. The machine-learning component therefore determines the representation (X_{ict}), while the final coefficient vector (B_{ict}) maps that representation into the one-dimensional latent economic space.
+
+The central identifying question is whether this mapping can be made sufficiently invariant across locations and time to permit the model to scale beyond the areas on which wealth labels are observed.
+
+\subsection{Local Comparability and the Incomplete Empirical Ordering}
+
+The difficulty is that the available wealth observations do not provide equally informative comparisons between every pair of observations.
+
+Suppose, for example, that two areas in New York are observed in 2020. If one has substantially higher observed wealth than the other, the data provide a direct comparison:
+
+[
+Y_{i,c,2020}>Y_{j,c,2020}.
+]
+
+This comparison is informative about the latent wealth space:
+
+[
+R_{i,c,2020}>R_{j,c,2020}.
+]
+
+Similarly, if the same physical building is observed in two years and its relevant physical characteristics have remained unchanged, the two observations provide a temporal anchor for the latent representation. The model should assign approximately the same structural wealth value to both images:
+
+[
+X_{i,c,t}\simeq X_{i,c,t'}
+\quad\Longrightarrow\quad
+R_{i,c,t}\simeq R_{i,c,t'}.
+]
+
+By contrast, consider two different buildings observed in different years. A comparison between them combines two distinct changes: differences between the buildings themselves and changes in the economic environment between the two years. The observed wealth difference therefore does not identify which component should be attributed to the buildings' structural wealth.
+
+Likewise, a comparison between two buildings in different cities is not directly identified by the local wealth data. A building that is relatively wealthy within one city need not occupy the same cardinal position in another city's wealth distribution. For example, a visual environment associated with high wealth in one metropolitan area may correspond to middle-income households in another because housing markets, amenities, urban form, and local economic institutions differ.
+
+We therefore treat the empirical wealth relation as an \emph{incomplete ordering}: some pairs of observations are directly comparable in the available data, while other pairs are deliberately left incomparable.
+
+Let (\mathcal{X}) denote the space of all observed location-year states, partitioned into city-specific components
+
+[
+\mathcal{X}=\bigsqcup_{c\in C}X_c.
+]
+
+A state (x\in X_c) contains both a time and a vector of physical characteristics. We write
+
+[
+x\succsim y
+]
+
+when the available data establish that (x) is at least as wealthy as (y). The relation is defined only for empirically valid comparisons.
+
+\paragraph{Valid comparisons.}
+The principal valid comparisons are:
+
+\begin{enumerate}
+\item \textbf{Cross-sectional comparisons:} two different areas within the same city and year. For example,
+[
+(i,c,t)\succ (j,c,t).
+]
+These observations share the same economic reference environment, so their relative wealth ordering is directly observed.
+
+```
+\item \textbf{Trajectory comparisons:} the same physical location observed at different points in time when the relevant physical environment is unchanged. For example,
+\[
+(i,c,t)\sim (i,c,t')
+\]
+in structural wealth space when the image provides no evidence of a physical change. These observations anchor the latent representation through time.
+```
+
+\end{enumerate}
+
+\paragraph{Invalid or deliberately unused comparisons.}
+We do not use the following comparisons as direct supervision:
+
+\begin{enumerate}
+\item \textbf{Cross-city comparisons:} for (c\neq c'),
+[
+(i,c,t)\parallel(j,c',t').
+]
+The data do not establish that a given visual wealth position has the same cardinal meaning across cities.
+
+```
+\item \textbf{Intertemporal cross-location comparisons:} for \(i\neq j\) and \(t\neq t'\),
+\[
+(i,c,t)\parallel(j,c,t').
+\]
+Such a comparison simultaneously changes the location and the economic environment, so the observed wealth difference cannot be cleanly attributed to either dimension.
+```
+
+\end{enumerate}
+
+The symbol (\parallel) emphasizes that these observations are not assumed to have no economic ordering in reality. Rather, their ordering is \emph{not identified by the comparison structure used for estimation}. The model may ultimately assign both observations values on the same scalar scale, but that comparison is an interpolation generated by the shared visual representation rather than a restriction imposed directly by the observed wealth labels.
+
+\subsection{Axioms for the Local Wealth Ordering}
+
+The preceding discussion can be formalized using a binary relation (\succsim) representing the empirical ordering of structural wealth.
+
+\begin{axiom}[Restricted Domain of Comparability]
+The empirical wealth relation (\succsim) is defined only on the following comparison sets:
+
+\begin{enumerate}
+\item For any city (c) and year (t), any two observed areas (i,j) are comparable:
+[
+(i,c,t)\succsim(j,c,t).
+]
+
+```
+\item For a given physical location \(i\), observations along its temporal trajectory are comparable when the relevant physical state can be treated as unchanged:
+\[
+(i,c,t)\succsim(i,c,t').
+\]
+
+\item Comparisons between different locations at different times are not imposed:
+\[
+(i,c,t)\parallel(j,c,t'),
+\qquad i\neq j,\quad t\neq t'.
+\]
+
+\item Comparisons across cities are not imposed:
+\[
+(i,c,t)\parallel(j,c',t'),
+\qquad c\neq c'.
+\]
+```
+
+\end{enumerate}
+\end{axiom}
+
+The purpose of this axiom is not to claim that wealth is fundamentally incomparable across these dimensions. It states only that the available empirical information does not justify treating those comparisons as observed supervision. The distinction is important: the latent model may interpolate between observations, but it should not be forced to learn economically questionable comparisons simply because all observations must ultimately receive a scalar output.
+
+\begin{axiom}[Acyclicity and Continuity]
+Within every city, the transitive closure of the empirical relation (\succsim) is assumed to be acyclic and continuous. In intuitive terms, the observed comparisons cannot form logical contradictions such as
+
+[
+A\succ B,\qquad B\succ C,\qquad C\succ A,
+]
+
+and nearby physical states should not generate arbitrarily discontinuous changes in their latent economic ordering.
+\end{axiom}
+
+The continuity assumption is intentionally imposed on the \emph{economic ordering}, not on individual household trajectories. A household or location can experience a discrete economic shock. What is required is only that the underlying wealth ordering of sufficiently similar states admit a continuous scalar representation.
+
+\subsection{From Local Comparisons to a Scalar Latent Space}
+
+Under these conditions, the local wealth ordering can be represented by a scalar function.
+
+\begin{lemma}[Local Scalar Representation]
+For each city (c), there exists a continuous function
+
+[
+u_c:X_c\rightarrow\mathbb{R}
+]
+
+such that whenever the empirical ordering establishes
+
+[
+x\succ y,
+]
+
+then
+
+[
+u_c(x)>u_c(y),
+]
+
+and whenever two states are empirically equivalent,
+
+[
+x\sim y,
+]
+
+then
+
+[
+u_c(x)=u_c(y).
+]
+\end{lemma}
+
+The intuition is straightforward. Suppose that within a city the available data tell us that
+
+[
+A\succ B,\qquad B\succ C,
+]
+
+while providing no direct comparison between (A) and some fourth location (D). A scalar representation can place the observations on a line, for example
+
+[
+u(A)=3,\qquad u(B)=2,\qquad u(C)=1,
+]
+
+while assigning some value to (D) based on its observed characteristics. The important requirement is that the scalar representation never reverses a comparison that is actually observed.
+
+The numerical values themselves are not economically cardinal. Any strictly increasing transformation of (u_c) preserves the same ordering. What matters is the position of each observation in the latent one-dimensional space.
+
+\subsection{A Global Representation}
+
+The key empirical assumption of the paper is that the local latent wealth spaces can be embedded into a common representation through a shared relationship between visual characteristics and structural wealth.
+
+Define
+
+[
+X_{ict}=h_{\theta}(I_{ict}),
+]
+
+and consider
+
+\begin{equation}
+R_{ict}=X_{ict}'B_{ict}+\varepsilon_{ict}.
+\label{eq:global_model_general}
+\end{equation}
+
+We initially allow the coefficient vector to depend on location, city, and time. Write
+
+[
+B_{ict}=C_iD_cE_t,
+]
+
+as a compact representation of these three possible sources of heterogeneity.
+
+We impose three invariance restrictions.
+
+\paragraph{A1. Within-city spatial invariance.}
+
+[
+C_i=C.
+]
+
+Conditional on the visual representation (X_{ict}), the mapping into structural wealth does not depend systematically on the particular area within a city. Intuitively, the model does not need a separate ``wealth coefficient'' for every neighborhood. Two neighborhoods with the same relevant visual and physical characteristics should receive the same latent wealth interpretation.
+
+This is motivated by spatial equilibrium: the built environment and local amenities reflect households' willingness to pay and the capitalization of economic conditions into space. Area-specific deviations that are not captured by the visual representation are absorbed by (\varepsilon_{ict}).
+
+\paragraph{A2. Temporal invariance.}
+
+[
+E_t=E.
+]
+
+The mapping from physical characteristics to structural wealth is stable through time. In particular,
+
+\begin{equation}
+X_{ict}=X_{ict'}
+\quad\Longrightarrow\quad
+R_{ict}=R_{ict'}.
+\label{eq:temporal_invariance}
+\end{equation}
+
+This does \emph{not} imply that absolute wealth is constant:
+
+[
+Y_{ict}\neq Y_{ict'}
+]
+
+is entirely possible because the cardinal mapping may change,
+
+[
+\phi_{ct}\neq\phi_{ct'}.
+]
+
+It also does not imply that the location's percentile or rank must remain unchanged. The relative position of a location in the observed city-wide distribution can change as other locations become richer or poorer. The object held fixed by A2 is the latent structural wealth associated with the location's own physical state.
+
+For example, if an unchanged residential building is observed in 2000 and 2020, the model is allowed to recognize that the building represents the same structural wealth position even if the dollar amount of wealth associated with that position has doubled.
+
+\paragraph{A3. Cross-city invariance.}
+
+[
+D_c=D.
+]
+
+The mapping from visual characteristics into latent structural wealth is sufficiently transportable across cities. This does not require every visual feature to have an identical marginal interpretation everywhere. Because (X) is a learned high-dimensional representation, the common coefficient vector (B) can operate on complex combinations of features.
+
+The substantive assumption is instead that there exists a common latent economic dimension onto which visual environments from different cities can be projected. For example, visual characteristics associated with high-quality housing, desirable amenities, and expensive urban environments should generally move an observation toward the higher end of the latent wealth space regardless of the city in which it is observed.
+
+This is the strongest of the three assumptions. A feature may have a different economic meaning in different urban environments. For example, high-rise development may be associated with wealth in one city but with relatively low-income housing in another. Such systematic failures of transportability are therefore empirical threats to A3 and should be detectable as systematic out-of-sample underperformance in particular cities.
+
+Under A1--A3,
+
+\begin{equation}
+B_{ict}=B
+\end{equation}
+
+and therefore
+
+\begin{equation}
+\boxed{
+R_{ict}=X_{ict}'B+\varepsilon_{ict}.
+}
+\label{eq:global_latent_model}
+\end{equation}
+
+The central implication is that the visual representation can be learned using a \emph{single global relationship} that is invariant across the cities and periods used for estimation.
+
+\subsection{What the Global Model Does and Does Not Assume}
+
+The global scalar model produces a numerical value for every image:
+
+[
+\hat R_{ict}\in\mathbb{R}.
+]
+
+Because the codomain (\mathbb{R}) is totally ordered, the model necessarily produces comparisons even for observations that were never directly comparable in the training data. For example, it will inevitably place a building in New York somewhere above or below a building in Los Angeles.
+
+These comparisons should not be interpreted as additional observed facts. They are \emph{model-implied comparisons}: they arise because the shared representation (h_{\theta}) projects all images into the same latent one-dimensional space.
+
+The distinction is therefore:
+
+[
+\boxed{
+\text{Observed comparisons}
+\quad\neq\quad
+\text{all comparisons produced by the model}.
+}
+]
+
+The observed comparisons are the restrictions that identify the latent representation. The remaining comparisons are generated by the model's shared structure and provide the desired extrapolation across space and time.
+
+This is precisely why the training procedure should use only valid comparisons. A comparison between two buildings in the same city and year tells the model something directly about the latent wealth ordering. A comparison between different buildings in different years or different cities may instead force the model to learn differences in the city-year-specific cardinal mapping (\phi_{ct}), which is precisely the component we do not want the visual representation to absorb.
+
+\subsection{Cardinalizing the Latent Space}
+
+Once the latent structural wealth measure (R_{ict}) has been recovered, the cardinal wealth measure can be reconstructed using the city-year-specific wealth distribution.
+
+Let (F_{R,ct}) denote the distribution of the latent index within city (c) and year (t), and let (F_{Y,ct}) denote the corresponding distribution of observed cardinal wealth. Since (\phi_{ct}) is monotone,
+
+\begin{equation}
+F_{Y,ct}(Y_{ict})
+=================
+
+F_{R,ct}(R_{ict}).
+\end{equation}
+
+Consequently,
+
+\begin{equation}
+Y_{ict}
+=======
+
+F_{Y,ct}^{-1}
+\left(
+F_{R,ct}(R_{ict})
+\right).
+\label{eq:quantile_mapping}
+\end{equation}
+
+Thus, the image model does not need to learn the city-year-specific conversion between latent structural wealth and dollars. That conversion can instead be estimated from survey or census information.
+
+In practice, it is unnecessary to estimate the entire distribution (F_{Y,ct}) nonparametrically when the available census or survey sample is limited. A parsimonious parametric or semi-parametric approximation can characterize the distribution using a small number of parameters,
+
+[
+\theta_{ct}
+===========
+
+(\mu_{ct},\sigma_{ct},\gamma_{1,ct},\gamma_{2,ct},\ldots),
+]
+
+yielding
+
+\begin{equation}
+F_{Y,ct}(y)
+\approx
+F_Y(y;\theta_{ct}).
+\end{equation}
+
+The estimated cardinal wealth is then
+
+\begin{equation}
+\widehat Y_{ict}
+================
+
+F_Y^{-1}
+\left(
+F_{R,ct}(\widehat R_{ict});
+\widehat\theta_{ct}
+\right).
+\end{equation}
+
+This separates the two measurement problems. Satellite imagery provides the high-resolution information needed to locate an area in the latent structural wealth space, while census or survey data provide the information needed to determine how that latent position translates into cardinal wealth in a particular city and year.
+
+The advantage is especially important when census observations are sparse. Rather than estimating a separate wealth value for every image area, the survey data only need to identify a small number of parameters describing the local cardinal distribution. The image model can then propagate that calibration to every observed location.
+
+\subsection{Interpretation}
+
+The resulting framework can be summarized as
+
+\begin{equation}
+\boxed{
+\underbrace{Y_{ict}}_{\text{absolute wealth}}
+=============================================
+
+\underbrace{\phi_{ct}}*{\text{city-year cardinalization}}
+\left(
+\underbrace{
+\overbrace{h*{\theta}(I_{ict})}^{X_{ict}}
+'B+\varepsilon_{ict}
+}*{\text{latent structural wealth }R*{ict}}
+\right).
+}
+\end{equation}
+
+The image model therefore estimates the component of wealth that is intended to be transportable across locations and time, while the census or survey data determine the city-year-specific cardinal mapping.
+
+The central empirical challenge is consequently not whether every pair of observations can be compared. It is whether a single latent space can be constructed that \emph{preserves the comparisons that are valid}, remains stable along unchanged physical trajectories, and generalizes the resulting structure to observations for which no direct wealth comparison is available.
+
+% ==============================================================================
+% LATEX SNIPPET: Structural Valuation Weights & Shadow-Price Factorization
+% ==============================================================================
+
+\subsection{Structural Valuation Weights and Hedonic Factorization}
+
+We model the latent structural wealth index as a linear function of the high-dimensional visual representation:
+\begin{equation}
+R_{ict} = X_{ict}' B_{ict} + \varepsilon_{ict},
+\label{eq:latent_linear_model}
+\end{equation}
+where $X_{ict} = h_\theta(I_{ict}) \in \mathbb{R}^K$ is the visual representation extracted by the vision encoder and $B_{ict} \in \mathbb{R}^K$ is a vector of \emph{marginal structural weights} (or latent index loadings):
+\begin{equation}
+B_{ict} = \frac{\partial R_{ict}}{\partial X_{ict}}.
+\end{equation}
+The vector $B_{ict}$ captures the marginal displacement along the structural wealth continuum associated with a unit shift in the learned visual feature vector $X$. 
+
+Because $R_{ict}$ is a dimensionless, standardized latent index rather than a cardinal dollar amount, $B_{ict}$ should not be confused with a cardinal price or an elasticity. Instead, the connection to cardinal hedonic shadow prices arises through the city-year-specific mapping $Y_{ict} = \phi_{ct}(R_{ict})$. Applying the chain rule to absolute wealth yields:
+\begin{equation}
+\underbrace{\frac{\partial Y_{ict}}{\partial X_{ict}}}_{\substack{\text{Cardinal Dollar} \\ \text{Shadow Price}}} 
+= 
+\underbrace{\phi'_{ct}(R_{ict})}_{\substack{\text{Macro Price Multiplier} \\ \text{(City-Year Specific)}}} 
+\times 
+\underbrace{B_{ict}}_{\substack{\text{Structural Valuation Weight} \\ \text{(Physical Capital Bundle)}}}.
+\label{eq:hedonic_chain_rule}
+\end{equation}
+Equation~\eqref{eq:hedonic_chain_rule} provides a clear economic separation: the true dollar shadow price of physical features fluctuates over space and time because the local macro price multiplier $\phi'_{ct}(\cdot)$ absorbs general price inflation, local real estate market tightness, and aggregate productivity growth. In contrast, the structural weight vector $B_{ict}$ governs the fundamental relative ranking of physical and environmental attributes.
+
+\paragraph{Decomposition and Invariance Assumptions.}
+In the unrestricted model, we decompose the structural weight vector additively into a global baseline and three potential sources of economic heterogeneity:
+\begin{equation}
+B_{ict} = \underbrace{B}_{\text{Global Structural Weights}} + \underbrace{\mathbf{\Delta}_c}_{\text{City Wedge}} + \underbrace{\mathbf{\Lambda}_t}_{\text{Temporal Drift}} + \underbrace{\mathbf{\Gamma}_i}_{\text{Neighborhood Idiosyncrasy}},
+\label{eq:b_additive_decomp}
+\end{equation}
+where $B, \mathbf{\Delta}_c, \mathbf{\Lambda}_t, \mathbf{\Gamma}_i \in \mathbb{R}^K$. We impose three identifying invariance restrictions:
+
+\begin{enumerate}
+    \item[\textbf{A1.}] \textbf{Within-City Spatial Invariance ($\mathbf{\Gamma}_i = \mathbf{0}$ for all $i \in c$):} 
+    Conditional on the learned visual representation $X_{ict}$—which captures building density, structural quality, green amenities, and infrastructure—the marginal contribution of these physical attributes does not vary across neighborhoods within a city ($B_{ict} = B_{ct}$). Residual localized unobservables are absorbed by $\varepsilon_{ict}$.
+    
+    \item[\textbf{A2.}] \textbf{Temporal Invariance ($\mathbf{\Lambda}_t = \mathbf{0}$ for all $t$):} 
+    The relative structural valuation of physical capital is stationary over time ($B_{ct} = B_c$). In particular, an unchanged physical structure ($X_{ict} = X_{ict'}$) retains an invariant position in structural wealth space ($R_{ict} = R_{ict'}$). Macroeconomic growth and nominal wealth drift operate exclusively through shifts in the cardinal mapping $\phi_{ct}(\cdot)$.
+    
+    \item[\textbf{A3.}] \textbf{Cross-City Invariance ($\mathbf{\Delta}_c = \mathbf{0}$ for all $c \in C$):} 
+    The learned feature representation $X$ spans a common latent economic continuum across metropolitan areas ($B_c = B$). High-quality structural capital shifts the latent index in the same direction and with the same relative weight across different urban economies.
+\end{enumerate}
+
+Under Assumptions A1--A3, the structural weight vector is globally invariant:
+\begin{equation}
+B_{ict} = B \quad \forall (i,c,t),
+\end{equation}
+yielding the unified global latent specification:
+\begin{equation}
+\boxed{
+R_{ict} = X_{ict}' B + \varepsilon_{ict}.
+}
+\label{eq:final_global_latent_model}
+\end{equation}
+This formulation highlights the central methodological payoff: the vision network learns a single, invariant projection $B$ onto the latent structural wealth continuum, while all city- and time-varying cardinal adjustments are delegated to the low-dimensional distribution matching function $\phi_{ct}(\cdot)$.
+
+
+
+
+Una cosa que falta es decir que esto es un Nadaraya Watson

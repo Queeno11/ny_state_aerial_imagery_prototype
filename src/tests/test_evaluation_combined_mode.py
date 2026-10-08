@@ -24,7 +24,7 @@ def test_default_parts_per_mode():
     # 'both' is an explicit request for the full set: the 3-panel main figure and
     # the CSA / Hudson Yards parts are included, unlike the us-only default.
     assert "main_figure" in us
-    assert nyc == list(ev._NYC_PARTS) == ["A", "B", "C", "D", "E"]
+    assert nyc == list(ev._NYC_PARTS) == ["A", "B", "C", "D", "E", "F"]
     assert "main_figure" not in ev._DEFAULT_US_PARTS
 
 
@@ -155,7 +155,9 @@ def test_one_failing_nyc_part_does_not_stop_the_others(tmp_path, monkeypatch,
     d = _touch_nyc(tmp_path / "nyc")
     summary = ev._run_nyc_parts(d, tmp_path, tmp_path / "out", ["A", "C", "D", "E"])
     names = [c[0] for c in stub_nyc_parts]
-    assert names == ["A", "D", "E"]          # C blew up, the rest still ran
+    # C blew up, the rest still ran. Part D runs once per anticipation arm —
+    # each arm is a complete, independent set of results in its own folder.
+    assert names == ["A"] + ["D"] * len(ev.CSA_ANTICIPATION_ARMS) + ["E"]
     assert summary["part_C/status"] == "failed"
     # E must still run, falling back to raw predictions
     assert dict(stub_nyc_parts[-1][1])["qmap_long"] is None
@@ -174,7 +176,8 @@ def test_both_mode_runs_the_nyc_half_from_the_subdir(tmp_path, monkeypatch,
         results_dir=run, processed_dir=tmp_path, mode="both",
     )
     assert summary["us/status"] == "no_predictions"
-    assert [c[0] for c in stub_nyc_parts] == ["A", "B", "C", "D", "E"]
+    assert ([c[0] for c in stub_nyc_parts]
+            == ["A", "B", "C"] + ["D"] * len(ev.CSA_ANTICIPATION_ARMS) + ["E"])
     assert summary["nyc/results_dir"] == str(run / ev.NYC_SUBDIR)
     # NYC results land in their own evaluation tree, not the US one
     assert (run / ev.NYC_SUBDIR / "evaluation" / "figures").is_dir()
@@ -341,3 +344,67 @@ def test_us_mode_does_not_touch_the_nyc_half(tmp_path, stub_nyc_parts):
         results_dir=run, processed_dir=tmp_path, mode="us",
     )
     assert not stub_nyc_parts
+
+
+# ─── nodata-hole retrofit ─────────────────────────────────────────────────────
+# The zero-pixel guard in CyclicCacheManager postdates several prediction passes
+# on disk. Those passes carry black crops as ordinary finite predictions, all
+# sharing one bit-identical value; `_drop_nodata_predictions` retrofits the guard
+# so the affected runs can be evaluated without being regenerated.
+
+def _preds(rows):
+    """rows = [(GEOID, year, pred), ...] -> canonical prediction frame."""
+    return pd.DataFrame(rows, columns=["GEOID", "year", "pred"])
+
+
+def test_nodata_filter_is_a_noop_without_the_sentinel():
+    df = _preds([("24025000100", 2013, 0.1 * i) for i in range(10)])
+    out = ev._drop_nodata_predictions(df.copy())
+    pd.testing.assert_frame_equal(out, df)
+
+
+def test_nodata_filter_drops_scattered_black_buildings():
+    """A handful of black crops in an otherwise real tract: drop the rows only."""
+    black = ev.NODATA_PREDICTION_VALUE
+    rows = [("24025000100", 2013, 0.5)] * 8 + [("24025000100", 2013, black)] * 2
+    out = ev._drop_nodata_predictions(_preds(rows))
+    assert len(out) == 8
+    assert (out["pred"] == 0.5).all()          # the tract-year survives
+
+
+def test_nodata_filter_removes_a_tract_year_swallowed_by_the_hole():
+    """REGRESSION: a 90%-black tract-year must leave entirely, not survive on the
+    10% of buildings that fell outside the hole.
+
+    The real guard drops the crop -> the building -> empties the tract-year ->
+    the tract fails build_event_panel's balance check. Dropping only the black
+    rows would instead keep a real tract-year backed by a garbage sample, which
+    is what produced the spurious Baltimore a=1 pre-trend.
+    """
+    black = ev.NODATA_PREDICTION_VALUE
+    rows = ([("24025000100", 2013, black)] * 9
+            + [("24025000100", 2013, 0.5)] * 1          # the 10% remnant
+            + [("24025000100", 2015, 0.5)] * 10)        # a clean year, untouched
+    out = ev._drop_nodata_predictions(_preds(rows))
+    assert set(zip(out["GEOID"], out["year"])) == {("24025000100", 2015)}
+    assert len(out) == 10
+
+
+def test_nodata_filter_is_scoped_to_the_affected_tract_year():
+    """One poisoned year must not remove the same tract in other years, and must
+    not touch a different tract in the same year."""
+    black = ev.NODATA_PREDICTION_VALUE
+    rows = ([("24025000100", 2013, black)] * 10          # poisoned
+            + [("24025000100", 2011, 0.4)] * 10          # same tract, clean year
+            + [("24510000100", 2013, 0.3)] * 10)         # other tract, same year
+    out = ev._drop_nodata_predictions(_preds(rows))
+    assert set(zip(out["GEOID"], out["year"])) == {
+        ("24025000100", 2011), ("24510000100", 2013)}
+    assert len(out) == 20
+
+
+def test_nodata_filter_can_be_disabled(monkeypatch):
+    monkeypatch.setattr(ev, "NODATA_PREDICTION_VALUE", None)
+    rows = [("24025000100", 2013, 0.68359375)] * 5
+    out = ev._drop_nodata_predictions(_preds(rows))
+    assert len(out) == 5

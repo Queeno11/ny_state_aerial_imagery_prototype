@@ -43,9 +43,19 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import faulthandler
+import re
 import textwrap
 import warnings
 from pathlib import Path
+
+# This module drives a lot of native code — GEOS via geopandas, PROJ via pyproj,
+# BLAS via numpy/statsmodels — and a crash down there arrives as a bare
+# "Segmentation fault" with no indication of which line of Python was running.
+# faulthandler costs nothing until a fatal signal arrives and then prints the
+# Python traceback, which is the difference between a reproducible bug report and
+# guesswork. Harmless if the host process already installed it.
+faulthandler.enable()
 
 import numpy as np
 import pandas as pd
@@ -77,6 +87,9 @@ from src.utils.metrics import (
 )
 from src.data import indicators
 from src.data import cbsa_brackets
+# Module level (part_d also imports it locally) so `CONTROL_THRESHOLD` can be
+# part_d's default argument rather than a sentinel.
+from src import csa_event_study as ces
 
 warnings.filterwarnings("ignore", category=FutureWarning)
 warnings.filterwarnings("ignore", category=UserWarning)
@@ -267,6 +280,76 @@ def _available_years(results_dir: Path) -> list[int]:
     return sorted(years)
 
 
+# ─── nodata-hole retrofit ─────────────────────────────────────────────────────
+# `CyclicCacheManager._reject_for_zero_pixels` (src/main.py) drops a crop that is
+# more zero-fill than imagery, so a nodata hole never reaches the model. Any
+# prediction pass written BEFORE that guard existed carries the holes as ordinary
+# finite numbers, and nothing downstream can tell them apart: the balanced-panel
+# check tests presence, not validity.
+#
+# The tell is that the model's response to an all-zero crop is deterministic —
+# every black crop in a pass scores the same value to the bit. Measured in
+# results/run_20260722: Harford County (MD) NAIP 2013 has 3,919 buildings at
+# exactly 0.68359375 against 178-185 in its neighbouring years, 17 tracts
+# ≥99% black, biasing those 2013 tract means +0.25 on a city mean of -0.16. In
+# Baltimore's a=1 event study that lands squarely on k=-1 and produces a spurious
+# +0.256 pre-trend coefficient.
+#
+# This filter retrofits the guard onto predictions already on disk so those runs
+# do not have to be regenerated. It is keyed on the sentinel value rather than on
+# a run name on purpose: a run-name check silently does nothing the moment a
+# directory is renamed or copied, while the sentinel is the actual evidence of the
+# defect and disappears by itself once a pass is regenerated with the guard
+# active. Set `NODATA_PREDICTION_VALUE = None` to disable.
+NODATA_PREDICTION_VALUE: float | None = 0.68359375
+
+# Dropping the black buildings is necessary but not sufficient. The guard drops
+# the crop, which drops the building, which EMPTIES the tract-year, which drops
+# the tract at `build_event_panel`'s balance step. Removing only the rows would
+# instead leave a 99%-black tract represented by the ~1% of buildings that
+# happened to fall outside the hole — a real tract-year backed by a garbage
+# sample. So a tract-year at or above this share is removed whole. Measured on
+# Baltimore a=1: rows-only gets k=-1 from +0.256 to +0.131, rows + tract-years
+# gets it to +0.086, which is what re-running with the guard produces.
+NODATA_TRACT_YEAR_SHARE: float = 0.5
+
+
+def _drop_nodata_predictions(df: pd.DataFrame, source: Path | None = None) -> pd.DataFrame:
+    """Remove nodata-hole predictions from an already-loaded prediction frame.
+
+    Expects the canonical columns (``GEOID``, ``year``, ``pred``). Returns the
+    frame unchanged when the sentinel is absent, which is the normal case for any
+    pass written with the guard active — so this costs one comparison and says
+    nothing on a clean run.
+    """
+    if NODATA_PREDICTION_VALUE is None or df.empty:
+        return df
+    black = df["pred"].round(6) == round(float(NODATA_PREDICTION_VALUE), 6)
+    n_black = int(black.sum())
+    if not n_black:
+        return df
+
+    # Share of each tract-year that is nodata, broadcast back over its rows.
+    share = black.groupby([df["GEOID"], df["year"]]).transform("mean")
+    dead = share >= float(NODATA_TRACT_YEAR_SHARE)
+    n_dead_cells = int(df.loc[dead, ["GEOID", "year"]].drop_duplicates().shape[0])
+    # Only the non-black rows are *additional* removals; the black ones are
+    # already counted above, and most of them sit inside these same tract-years.
+    n_remnant = int((dead & ~black).sum())
+
+    kept = df[~black & ~dead]
+    where = f" in {source}" if source is not None else ""
+    print(f"    ⚠️ nodata-hole filter{where}: dropped {n_black:,} buildings at the "
+          f"black-crop value {NODATA_PREDICTION_VALUE}"
+          + (f", plus the {n_remnant:,} surviving buildings of "
+             f"{n_dead_cells:,} tract-years that were ≥{NODATA_TRACT_YEAR_SHARE:.0%} "
+             f"nodata" if n_dead_cells else "")
+          + f" ({len(df) - len(kept):,} of {len(df):,} rows). These passes predate "
+            f"the CyclicCacheManager zero-pixel guard; regenerating them makes this "
+            f"filter a no-op.")
+    return kept.reset_index(drop=True)
+
+
 def _load_building_preds_us(results_dir: Path, years: list[int] | None = None) -> pd.DataFrame:
     """Stack {year}_predictions.csv into the canonical metric frame.
 
@@ -301,6 +384,7 @@ def _load_building_preds_us(results_dir: Path, years: list[int] | None = None) -
     if "type" not in df.columns:
         df["type"] = "unassigned"
     df["type"] = df["type"].astype(str)
+    df = _drop_nodata_predictions(df, source=results_dir)
     return df.reset_index(drop=True)
 
 
@@ -1665,16 +1749,25 @@ class _GB2Gen(rv_continuous):
                 - (p + q) * np.log1p(xc))
 
     def _cdf(self, x, c, p, q):
+        # Above x = 1 use I_{z/(1+z)}(p,q) = 1 - I_{1/(1+z)}(q,p): with large c,
+        # z = x^c makes z/(1+z) round to 1.0 and the CDF jump straight to 1.
         z = x ** c
-        return _sp.betainc(p, q, z / (1.0 + z))
+        return np.where(z <= 1.0, _sp.betainc(p, q, z / (1.0 + z)),
+                        1.0 - _sp.betainc(q, p, 1.0 / (1.0 + z)))
 
     def _ppf(self, u, c, p, q):
+        # v/(1-v) with 1-v from the complementary inverse (1-V ~ Beta(q, p)):
+        # for large c and tiny p, q (fits seen on W2 wealth, e.g. CBSA 30780)
+        # betaincinv(p, q, u) rounds to exactly 1.0 and the naive 1-v
+        # overflows the quantile to inf even at the median's neighbours.
         v = _sp.betaincinv(p, q, u)
-        return (v / (1.0 - v)) ** (1.0 / c)
+        w = _sp.betaincinv(q, p, 1.0 - u)
+        return (v / w) ** (1.0 / c)
 
     def _sf(self, x, c, p, q):
         z = x ** c
-        return 1.0 - _sp.betainc(p, q, z / (1.0 + z))
+        return np.where(z <= 1.0, 1.0 - _sp.betainc(p, q, z / (1.0 + z)),
+                        _sp.betainc(q, p, 1.0 / (1.0 + z)))
 
 
 gb2 = _GB2Gen(a=0.0, name="gb2", shapes="c, p, q")
@@ -2188,11 +2281,30 @@ _CSA_ALT_COLOR = "#D55E00"     # CVD-safe vermillion, for the second series
 # the NYC panel opens, so the whole panel is post-baseline.
 CSA_BASELINE_YEAR = 2009
 
-# Anticipation allowances (in panel periods) reported as robustness rows. Cohorts
-# are dated from year_built = completion, while site clearance and superstructure
-# are visible in the imagery earlier, so the periods just before completion are
-# partly treated; see src/csa_event_study.py build_event_panel(anticipation=...).
-CSA_ANTICIPATION_PERIODS: tuple[int, ...] = (1, 2)
+# Anticipation allowances, in panel PERIODS, each run as a full arm of Part D
+# into its own output folder. Cohorts are dated from year_built = completion,
+# while demolition, excavation and superstructure are visible in the imagery
+# earlier, so the periods just before completion are partly treated; see
+# src/csa_event_study.py build_event_panel(anticipation=...).
+#
+# These are periods, not years, and a period is not the same number of years in
+# every city: 2 for NYC/Seattle/San Antonio, 2-3 for Tampa's irregular NAIP grid,
+# and 1 for Cook County's annual ortho panel if Chicago ever unblocks. So a=1
+# buys a 4-year baseline gap in NYC and a 2-year one in Chicago. Read the arms
+# against `PeriodMap.event_time_years`, not as a fixed number of years.
+#
+# Which arm is defensible is a per-city question, and the diagnostic is
+# ATT(k=-1) under a=0: Tampa +0.012 (t=1.0) and San Antonio +0.022 (t=0.9) show
+# no pre-completion contamination, Seattle +0.038 (t=2.7) does, and NYC's whole
+# pre-path is elevated rather than just its last period, which no fixed shift
+# fixes. San Antonio's four-period panel also cannot support a=2: it leaves ~23
+# treated tracts against MIN_TREATED_UNITS.
+CSA_ANTICIPATION_ARMS: tuple[int, ...] = (0, 1, 2)
+
+# Backwards-compatible alias for the pre-arm robustness rows.
+CSA_ANTICIPATION_PERIODS: tuple[int, ...] = tuple(
+    a for a in CSA_ANTICIPATION_ARMS if a
+)
 
 
 def _csa_split_of(processed_dir: Path) -> dict[str, str]:
@@ -2218,11 +2330,184 @@ def _csa_split_of(processed_dir: Path) -> dict[str, str]:
     }
 
 
-def _csa_city_tracts(processed_dir: Path, prefixes: tuple[str, ...]) -> gpd.GeoDataFrame:
-    """Tract geometries whose GEOID starts with one of ``prefixes``."""
+def _csa_city_tracts(processed_dir: Path, prefixes: tuple[str, ...],
+                     spec=None, footprints=None) -> gpd.GeoDataFrame:
+    """Tract geometries for a city.
+
+    ``spec.tract_source == "prefix"`` (default) selects by county FIPS. With
+    ``"footprints"`` the prefix set is further restricted to tracts the city's
+    *dated footprints* actually cover — which is what a sub-county source needs.
+    Chicago's municipal footprint layer stops at the city line well inside Cook
+    County, so a bare FIPS prefix would admit ~500 suburban tracts with no
+    year-built data. Those tracts have no datable construction, so every one of
+    them would join the event study as a permanent never-treated control,
+    stuffing the control group with places where the treatment variable cannot
+    even be measured.
+    """
     splits = _load_splits(processed_dir)
     sub = splits[splits["GEOID_str"].str.startswith(tuple(prefixes))].copy()
-    return sub[["GEOID_str", "geometry"]].reset_index(drop=True)
+    sub = sub[["GEOID_str", "geometry"]].reset_index(drop=True)
+    if spec is None or getattr(spec, "tract_source", "prefix") != "footprints":
+        return sub
+    if footprints is None or sub.empty:
+        return sub
+
+    cent = gpd.GeoDataFrame(geometry=footprints.geometry.centroid,
+                            crs=footprints.crs)
+    joined = gpd.sjoin(cent, sub.to_crs(footprints.crs), how="inner",
+                       predicate="within")
+    counts = joined.groupby("GEOID_str").size()
+    covered = set(counts[counts >= int(spec.min_tract_footprints)].index)
+    kept = sub[sub["GEOID_str"].isin(covered)].reset_index(drop=True)
+    print(f"    footprint coverage: {len(kept):,}/{len(sub):,} tracts have "
+          f">={spec.min_tract_footprints} dated footprints")
+    return kept
+
+
+# ─── Part D input cache ───────────────────────────────────────────────────────
+# Part D is called once per (anticipation arm x undated screen) — up to six times
+# per run — and every one of those calls used to re-read each city's footprint
+# parquet, reproject ~1M polygons per threshold, and re-parse the multi-million
+# row prediction CSVs. None of that work depends on the arm or the screen: the
+# anticipation shift is applied in `build_event_panel`, and the screen is applied
+# to already-assigned per-building areas. Doing it once and holding the small,
+# geometry-free derivatives is what keeps peak memory flat across the arms
+# instead of stepping up on each one.
+#
+# What is cached is deliberately bounded: per-building (GEOID, area, year_built,
+# demolition_year) tables and tract-year outcome means — tens of MB for the five
+# cities combined. The footprint GeoDataFrames and the building-level prediction
+# frames, which are the actual gigabytes, are read inside these helpers and
+# dropped before they return. `_csa_cache_clear` releases the rest once the arms
+# are done.
+_CSA_GEOM_CACHE: dict = {}
+_CSA_OUTCOME_CACHE: dict = {}
+
+
+def _csa_cache_clear() -> None:
+    """Drop the Part D input cache and hand the pages back to the OS."""
+    _CSA_GEOM_CACHE.clear()
+    _CSA_OUTCOME_CACHE.clear()
+    _csa_release_memory()
+
+
+def _csa_release_memory() -> None:
+    """Collect, then ask glibc to return freed arenas to the OS.
+
+    Part D's geometry work frees almost everything it allocates, but glibc keeps
+    the arenas: RSS ratchets up by a few hundred MB per arm and never comes back
+    down, because a freed 1M-element object array leaves the arena too
+    fragmented to trim on its own. `malloc_trim` is the documented way to force
+    it, and it is a no-op anywhere it is not available.
+    """
+    import ctypes
+    import gc
+
+    gc.collect()
+    try:
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except (OSError, AttributeError):
+        pass
+
+
+def _csa_city_geometry(processed_dir: Path, spec):
+    """``(per_building, tracts, construction_year)`` for one city, cached.
+
+    ``per_building`` is :func:`ces.footprint_tract_areas` output — the footprint
+    to tract assignment with areas and years, and the single most expensive step
+    in Part D. ``construction_year`` is the year-built series indexed by building
+    id, used for the incumbent-only outcome; ``None`` when the city's footprint
+    id cannot be joined to predictions.
+
+    The footprint GeoDataFrame itself is released before returning: it is the
+    largest object in the whole part (NYC is ~1.1M polygons) and nothing
+    downstream of the tract assignment needs the geometry.
+    """
+    key = (str(processed_dir), spec.key)
+    if key in _CSA_GEOM_CACHE:
+        return _CSA_GEOM_CACHE[key]
+
+    footprints = gpd.read_parquet(processed_dir / spec.footprints_filename)
+    try:
+        construction_year = None
+        if spec.id_index is not None and footprints.index.name == spec.id_index:
+            construction_year = pd.to_numeric(
+                footprints[spec.year_col], errors="coerce"
+            )
+        tracts = _csa_city_tracts(processed_dir, spec.geoid_prefixes,
+                                  spec=spec, footprints=footprints)
+        per_building = (
+            pd.DataFrame() if tracts.empty else
+            ces.footprint_tract_areas(
+                footprints, tracts, year_col=spec.year_col,
+                demolition_col=spec.demolition_col, area_epsg=spec.area_epsg,
+            )
+        )
+    finally:
+        del footprints
+    _csa_release_memory()
+
+    _CSA_GEOM_CACHE[key] = (per_building, tracts, construction_year)
+    return _CSA_GEOM_CACHE[key]
+
+
+def _csa_city_outcomes(csa_root: Path, results_dir: Path, processed_dir: Path,
+                       spec, city_years: list[int], baseline_year: int,
+                       tracts, construction_year, shared_bld_fn):
+    """Tract-year outcome means for one city, cached.
+
+    Reads the city's dense per-city prediction pass (falling back to the shared
+    whole-city pass via ``shared_bld_fn``, called only if needed), reduces it to
+    tract-year means, and drops the building-level frame — which is millions of
+    rows and the other half of Part D's peak.
+    """
+    # `processed_dir` belongs in the key even though it is not read here: the
+    # outcomes depend on `tracts` and `construction_year`, which come from it.
+    key = (str(csa_root), str(results_dir), str(processed_dir), spec.key,
+           tuple(city_years), int(baseline_year))
+    if key in _CSA_OUTCOME_CACHE:
+        return _CSA_OUTCOME_CACHE[key]
+
+    city_bld = _csa_city_preds(csa_root, spec, city_years)
+    if city_bld.empty:
+        city_bld = shared_bld_fn()
+    if city_bld.empty:
+        _CSA_OUTCOME_CACHE[key] = pd.DataFrame()
+        return _CSA_OUTCOME_CACHE[key]
+    city_bld = city_bld[city_bld["GEOID_str"].isin(set(tracts["GEOID_str"]))]
+    if city_bld.empty:
+        _CSA_OUTCOME_CACHE[key] = pd.DataFrame()
+        return _CSA_OUTCOME_CACHE[key]
+    outcomes = ces.tract_outcomes(
+        city_bld, construction_year=construction_year,
+        baseline_year=baseline_year,
+    )
+    del city_bld
+    _csa_release_memory()
+
+    _CSA_OUTCOME_CACHE[key] = outcomes
+    return outcomes
+
+
+def _csa_city_preds(results_dir: Path, spec, years: list[int]) -> pd.DataFrame:
+    """Building-level predictions for one city.
+
+    NYC keeps reading the whole-city zarr pass at the top of ``results_dir``;
+    every other city reads the dense per-city pass that
+    :class:`src.csa_predict.CSAPredictionRunner` writes to
+    ``<results>/csa/<city>/``. Those are different sensors and different
+    sampling designs, so they are deliberately different directories rather
+    than one pooled pile of CSVs.
+    """
+    city_dir = Path(results_dir) / "csa" / spec.key
+    if city_dir.exists():
+        bld = _load_building_preds_us(city_dir, years)
+        if not bld.empty:
+            out = bld.rename(columns={"pred": "predicted_value"})
+            out["GEOID_str"] = out["GEOID"]
+            return out
+        print(f"    {city_dir} exists but holds no predictions for {years}")
+    return pd.DataFrame()
 
 
 def _csa_building_preds(results_dir: Path, years: list[int]) -> pd.DataFrame:
@@ -2278,6 +2563,34 @@ def _plot_event_study(ax, res, *, color: str = _CSA_ATT_COLOR, label: str | None
                           alpha=0.85, lw=0.5))
 
 
+def _csa_cut_label(thresh: float, control_threshold: float | None) -> str:
+    """Figure label naming BOTH sides of the contrast, not just the treated cut.
+
+    "5% of baseline area" hides the thing the pinned control group fixes: which
+    tracts the treated ones are being compared *to*. Once the comparison group
+    is held at a different cut from the treated group, a column heading that
+    names only the treated cut is no longer a full description of the estimate.
+    """
+    treated = rf"$>${_tex_pct(thresh)} of baseline area"
+    if control_threshold is None:
+        return treated
+    return treated + rf" vs $\leq${_tex_pct(control_threshold)}"
+
+
+def _csa_antic_note(anticipation: int, spec, city_years) -> str:
+    """Figure annotation for the arm, in periods AND that city's years.
+
+    A period is 2 years in NYC and 1 in an annual ortho panel, so "anticipation
+    = 1" alone does not tell a reader how much baseline gap the estimate has.
+    Empty for a=0, where there is nothing to declare.
+    """
+    if not anticipation:
+        return ""
+    yrs = ces.PeriodMap.from_years(city_years).event_time_years(anticipation)
+    return (rf"(adoption {anticipation} period"
+            rf"{'' if anticipation == 1 else 's'} $\approx$ {yrs:.0f} yr early) ")
+
+
 def _csa_skip_axis(ax, message: str) -> None:
     ax.text(0.5, 0.5, _tex_escape(str(message)[:120]), ha="center", va="center",
             transform=ax.transAxes, fontsize=7, color="gray", wrap=True)
@@ -2304,15 +2617,24 @@ def _csa_estimate_or_none(panel, *, label: str, control: str = "never",
 def part_d(results_dir: Path, processed_dir: Path, out: Path,
            years: list[int] | None = None,
            thresholds=None,
-           n_boot: int = 10_000) -> dict:
+           n_boot: int = 10_000,
+           csa_results_dir: Path | None = None,
+           max_undated_area_share: float | None = None,
+           control_threshold: float | None = ces.CONTROL_THRESHOLD,
+           anticipation: int = 0,
+           out_tag: str = "") -> dict:
     """Callaway–Sant'Anna event study on construction cohorts (issue #36).
 
     For each city with a footprint + year-built table on disk: date tracts into
     construction cohorts by cumulative new building area, then estimate the
     dynamic ATT of that construction on the model's tract-mean prediction.
 
-    Emits
-    -----
+    Every output goes under ``<out>/csa_anticipation{anticipation}/``, so one
+    call is one complete, self-contained set of results and the arms can be
+    compared folder against folder rather than row against row.
+
+    Emits (all relative to that arm folder)
+    ---------------------------------------
     ``figures/D_event_study_main.pdf``
         Main-body figure: one panel per city at the headline threshold, held-out
         tracts, all-buildings outcome.
@@ -2325,11 +2647,68 @@ def part_d(results_dir: Path, processed_dir: Path, out: Path,
         One row per (city, split, threshold, outcome, control): pre-trend joint
         p-value, post-ATTs at several horizons, sample sizes.
 
+    ``anticipation`` moves every treated tract's effective adoption date that
+    many panel periods earlier, for the whole arm — not just for one robustness
+    row. Cohorts are dated from ``year_built`` = completion while site clearance
+    and superstructure are visible from the air earlier, so under ``a=0`` the
+    last pre-treatment periods are partly treated. Treated tracts left without a
+    pre-period by the shift are dropped, never reclassified as controls. See
+    :data:`CSA_ANTICIPATION_ARMS` for which arm each city can support.
+
+    ``results_dir`` holds NYC's whole-city zarr pass. ``csa_results_dir`` (the
+    *run's* results dir) is where the other cities' dense per-city passes live,
+    under ``csa/<city>/`` — a different directory because they are a different
+    sensor and a different sampling design. Defaults to ``results_dir``.
+
+    ``control_threshold`` pins the never-treated comparison group across the
+    whole threshold grid: every column contrasts "built more than ``threshold``"
+    against the same tracts — those that never crossed ``control_threshold`` —
+    and the tracts in between are dropped rather than handed to the control
+    group. ``None`` restores the old complement-of-treated control group, which
+    changes with every column and makes the grid unreadable as a dose-response
+    (see :data:`src.csa_event_study.CONTROL_THRESHOLD` for the measured size of
+    that effect).
+
+    ``max_undated_area_share`` enables the undated-area sample restriction (see
+    :data:`src.csa_event_study.MAX_UNDATED_AREA_SHARE`); ``None`` is the
+    unrestricted analysis. ``out_tag`` suffixes every figure, table and headline key
+    this call writes, so the restricted and unrestricted arms can both be run
+    against one output directory without overwriting each other — which is the
+    point, since the pair *is* the robustness evidence for the restriction.
+
     Returns a headline dict for the run summary.
     """
     from src import csa_event_study as ces
 
-    print("\n=== Part D: Event study — construction-cohort CSA ===")
+    # Two orthogonal arm dimensions, kept in different namespaces on purpose:
+    # anticipation gets a FOLDER (a whole set of results, read on its own), the
+    # undated screen keeps its filename SUFFIX (a paired robustness comparison,
+    # read side by side with its unrestricted twin). Combining them lets both
+    # vary without either having to know about the other.
+    anticipation = int(anticipation)
+    arm = out / f"csa_anticipation{anticipation}"
+    (arm / "figures").mkdir(parents=True, exist_ok=True)
+    (arm / "tables").mkdir(parents=True, exist_ok=True)
+    ns = f"csa{out_tag}/a{anticipation}"
+
+    print(f"\n=== Part D: Event study — construction-cohort CSA "
+          f"(anticipation = {anticipation} period"
+          f"{'' if anticipation == 1 else 's'}) ===")
+    print(f"  writing to {arm}")
+    if anticipation:
+        print(f"  every treated tract adopts {anticipation} period(s) before its "
+              f"recorded completion year; treated tracts left without a "
+              f"pre-period are dropped, not made controls")
+    if control_threshold is not None:
+        print(f"  control group pinned: never-treated means a tract never crossed "
+              f"{control_threshold:.0%} of baseline area; tracts between that and "
+              f"each column's threshold are dropped, not used as controls")
+    else:
+        print("  ⚠️ control group NOT pinned — the never-treated group is the "
+              "complement of the treated group and changes with every threshold")
+    if max_undated_area_share is not None:
+        print(f"  undated-area screen: dropping tracts with more than "
+              f"{max_undated_area_share:.0%} of baseline area undated")
 
     years = sorted(years) if years else _available_years(results_dir) or list(YEARS)
     thresholds = tuple(thresholds) if thresholds else ces.DEFAULT_THRESHOLDS
@@ -2337,6 +2716,12 @@ def part_d(results_dir: Path, processed_dir: Path, out: Path,
         ces.HEADLINE_THRESHOLD if ces.HEADLINE_THRESHOLD in thresholds
         else thresholds[len(thresholds) // 2]
     )
+    if control_threshold is not None and control_threshold > min(thresholds):
+        raise ValueError(
+            f"control_threshold {control_threshold:.0%} exceeds the smallest "
+            f"threshold {min(thresholds):.0%}; the pinned control group must sit "
+            f"at or below every treated cut in the grid"
+        )
     print(f"  panel years: {years}")
     print(f"  thresholds : {[f'{t:.0%}' for t in thresholds]} "
           f"(headline {headline_t:.0%})")
@@ -2346,65 +2731,99 @@ def part_d(results_dir: Path, processed_dir: Path, out: Path,
         print(f"  ⏭️  {spec.label}: {reason}")
     if not ready:
         print("  no city has a footprint + year-built table — Part D skipped.")
-        return {"csa/status": "no_cohort_source"}
+        return {f"{ns}/status": "no_cohort_source"}
 
     split_of = _csa_split_of(processed_dir)
-    bld = _csa_building_preds(results_dir, years)
-    if bld.empty:
-        print("  no building-level predictions found — Part D skipped.")
-        return {"csa/status": "no_predictions"}
+    # NYC's whole-city pass sits at the top of results_dir; the other cities have
+    # their own per-city directories. Loaded lazily per city, because each city
+    # now has its own panel years and reading one pooled frame would force a
+    # single year grid back on everyone.
+    #
+    # Lazy in a second sense too: this frame is millions of rows, and a run where
+    # every city has its own dense pass never needs it at all. Reading it up
+    # front paid that cost on every arm regardless.
+    _shared_bld: list = []
+
+    def shared_bld_fn() -> pd.DataFrame:
+        if not _shared_bld:
+            _shared_bld.append(_csa_building_preds(results_dir, years))
+        return _shared_bld[0]
+
+    csa_root = Path(csa_results_dir) if csa_results_dir is not None else Path(results_dir)
 
     rows: list[dict] = []
     headline: dict = {}
-    main_panels: list[tuple[str, object]] = []
+    panels_by_city: dict[str, tuple[str, object]] = {}
 
     for spec in ready:
         print(f"\n  --- {spec.label} ---")
-        tracts = _csa_city_tracts(processed_dir, spec.geoid_prefixes)
-        if tracts.empty:
-            print("    no tracts matched this city's GEOID prefixes; skipping")
-            continue
+        city_years = spec.years(years)
+        baseline_year = spec.baseline(CSA_BASELINE_YEAR)
+        print(f"    panel: {city_years} (baseline {baseline_year}, "
+              f"sensor {spec.sensor})")
 
-        footprints = gpd.read_parquet(processed_dir / spec.footprints_filename)
-        construction_year = None
-        if spec.id_index is not None and footprints.index.name == spec.id_index:
-            construction_year = pd.to_numeric(
-                footprints[spec.year_col], errors="coerce"
-            )
-
-        city_bld = bld[bld["GEOID_str"].isin(set(tracts["GEOID_str"]))]
-        if city_bld.empty:
-            print("    no predictions inside this city; skipping")
-            continue
-        outcomes = ces.tract_outcomes(
-            city_bld, construction_year=construction_year,
-            baseline_year=CSA_BASELINE_YEAR,
+        per_building, tracts, construction_year = _csa_city_geometry(
+            processed_dir, spec
         )
+        if tracts.empty:
+            print("    no tracts matched this city; skipping")
+            continue
+
+        outcomes = _csa_city_outcomes(
+            csa_root, results_dir, processed_dir, spec, city_years,
+            baseline_year, tracts, construction_year, shared_bld_fn,
+        )
+        if outcomes.empty:
+            print("    no building-level predictions inside this city; skipping")
+            continue
         outcome_cols = ["pred_all"] + (
             ["pred_incumbent"] if "pred_incumbent" in outcomes.columns else []
         )
+        # Copy before stamping the split group: `outcomes` is the cached frame,
+        # shared with every other arm, and must not be mutated in place.
+        outcomes = outcomes.copy()
         outcomes["split_group"] = outcomes["GEOID_str"].map(split_of)
         print(f"    {outcomes['GEOID_str'].nunique():,} tracts with predictions; "
               f"outcomes: {outcome_cols}")
 
         # Cohorts depend only on footprints, so build once per threshold and
-        # reuse across split groups / outcomes / control groups.
+        # reuse across split groups / outcomes / control groups. The footprint
+        # to tract assignment underneath does not depend on the threshold
+        # either, so it is hoisted out of this loop entirely — see
+        # `_csa_city_geometry` and `ces.footprint_tract_areas`.
         cohorts_by_t = {}
         for thresh in thresholds:
             coh = ces.build_tract_cohorts(
-                footprints, tracts, years,
-                baseline_year=CSA_BASELINE_YEAR, threshold=thresh,
+                None, tracts, city_years,
+                baseline_year=baseline_year, threshold=thresh,
                 year_col=spec.year_col, demolition_col=spec.demolition_col,
                 area_epsg=spec.area_epsg,
+                max_undated_area_share=max_undated_area_share,
+                control_threshold=control_threshold,
+                per_building=per_building,
             )
             cohorts_by_t[thresh] = coh
             s = coh.summary()
             print(f"    {thresh:>5.0%}: {s['n_treated']:,} treated / "
                   f"{s['n_never_treated']:,} never-treated tracts "
-                  f"({s['n_dropped_no_baseline']:,} dropped, no baseline stock)")
+                  f"({s['n_dropped_no_baseline']:,} dropped, no baseline stock"
+                  + (f"; {s['n_dropped_undated']:,} dropped by the undated screen"
+                     if max_undated_area_share is not None else "")
+                  + (f"; {s['n_dropped_ambiguous']:,} dropped as ambiguous, "
+                     f"built between {control_threshold:.0%} and {thresh:.0%}"
+                     if control_threshold is not None else "") + ")")
+            headline[f"{ns}/{spec.key}/n_dropped_undated"] = s["n_dropped_undated"]
+            headline[f"{ns}/{spec.key}/{thresh:.0%}/n_dropped_ambiguous"] = \
+                s["n_dropped_ambiguous"]
 
-        def _panel(thresh: float, group: str, outcome_col: str,
-                   anticipation: int = 0):
+        def _panel(thresh: float, group: str, outcome_col: str):
+            """Every panel in this arm carries the arm's anticipation.
+
+            It is not a parameter here on purpose: the whole point of the arm
+            structure is that one folder is one consistent design, so a figure
+            in it cannot silently be built at a different adoption date from the
+            table beside it.
+            """
             sub = outcomes
             if group is not None:
                 sub = sub[sub["split_group"] == group]
@@ -2412,7 +2831,7 @@ def part_d(results_dir: Path, processed_dir: Path, out: Path,
                 return None
             return ces.build_event_panel(
                 sub, cohorts_by_t[thresh].cohorts,
-                outcome_col=outcome_col, panel_years=years,
+                outcome_col=outcome_col, panel_years=city_years,
                 anticipation=anticipation,
             )
 
@@ -2444,21 +2863,23 @@ def part_d(results_dir: Path, processed_dir: Path, out: Path,
                                     "threshold": thresh, "outcome": "all buildings"})
                         rows.append(row)
                         if group == "heldout" and thresh == headline_t:
-                            main_panels.append((spec.label, res))
-                            headline[f"csa/{spec.key}/pretrend_p"] = res.pretrend_supt_p
-                            headline[f"csa/{spec.key}/overall_att"] = res.overall_att
-                            headline[f"csa/{spec.key}/n_treated"] = res.n_treated
+                            panels_by_city[spec.key] = (spec.label, res)
+                            headline[f"{ns}/{spec.key}/pretrend_p"] = res.pretrend_supt_p
+                            headline[f"{ns}/{spec.key}/overall_att"] = res.overall_att
+                            headline[f"{ns}/{spec.key}/n_treated"] = res.n_treated
                 if r == 0:
-                    ax.set_title(f"{_tex_pct(thresh)} of baseline area", fontsize=8)
+                    ax.set_title(_csa_cut_label(thresh, control_threshold),
+                                 fontsize=8)
                 if r == len(groups) - 1:
                     ax.set_xlabel("Event time (periods since construction)", fontsize=8)
                 if c == 0:
                     ax.set_ylabel(f"{CSA_SPLIT_LABELS.get(group, 'All')}\nATT "
                                   "(tract mean prediction)", fontsize=7.5)
         fig.suptitle(f"{spec.label}: construction-cohort event study "
+                     f"{_csa_antic_note(anticipation, spec, city_years)}"
                      "(shaded = 95\\% simultaneous CI)", fontsize=9)
         fig.tight_layout(rect=[0, 0, 1, 0.97])
-        _savefig(fig, out / "figures" / f"D_event_study_thresholds_{spec.key}.pdf")
+        _savefig(fig, arm / "figures" / f"D_event_study_thresholds_{spec.key}{out_tag}.pdf")
 
         # ── composition check: all buildings vs incumbents only ──────────────
         if "pred_incumbent" in outcome_cols:
@@ -2467,7 +2888,7 @@ def part_d(results_dir: Path, processed_dir: Path, out: Path,
             for i, (oc, lab, col) in enumerate([
                 ("pred_all", "All buildings", _CSA_ATT_COLOR),
                 ("pred_incumbent", "Incumbents only (built $\\leq$ "
-                 f"{CSA_BASELINE_YEAR})", _CSA_ALT_COLOR),
+                 f"{baseline_year})", _CSA_ALT_COLOR),
             ]):
                 panel = _panel(headline_t, "heldout" if "heldout" in groups else groups[0], oc)
                 if panel is None:
@@ -2486,16 +2907,16 @@ def part_d(results_dir: Path, processed_dir: Path, out: Path,
                     row.update({"city": spec.label, "split": "Held out",
                                 "threshold": headline_t, "outcome": "incumbents only"})
                     rows.append(row)
-                    headline[f"csa/{spec.key}/incumbent_overall_att"] = res.overall_att
+                    headline[f"{ns}/{spec.key}/incumbent_overall_att"] = res.overall_att
             if drawn:
                 ax2.set_xlabel("Event time (periods since construction)", fontsize=8)
                 ax2.set_ylabel("ATT (tract mean prediction)", fontsize=8)
                 ax2.set_title(f"{spec.label}: composition check "
-                              f"({_tex_pct(headline_t)} threshold, held out)",
-                              fontsize=8.5)
+                              f"({_csa_cut_label(headline_t, control_threshold)}, "
+                              "held out)", fontsize=8.5)
                 ax2.legend(fontsize=6.5, loc="lower right")
                 fig2.tight_layout()
-                _savefig(fig2, out / "figures" / f"D_event_study_composition_{spec.key}.pdf")
+                _savefig(fig2, arm / "figures" / f"D_event_study_composition_{spec.key}{out_tag}.pdf")
             else:
                 plt.close(fig2)
 
@@ -2514,31 +2935,43 @@ def part_d(results_dir: Path, processed_dir: Path, out: Path,
                             "threshold": headline_t, "outcome": "all buildings"})
                 rows.append(row)
 
-        # ── anticipation robustness ─────────────────────────────────────────
-        # year_built records *completion*, but demolition, excavation and
-        # superstructure are visible in the imagery earlier, so the last one or
-        # two "pre" periods are partly treated. Allowing anticipation moves the
-        # effective adoption date earlier; if the pre-trend rejection is a timing
-        # artifact rather than a parallel-trends violation, it should clear here.
-        for antic in CSA_ANTICIPATION_PERIODS:
-            panel = _panel(headline_t, head_group, "pred_all", anticipation=antic)
-            if panel is None or not panel.n_treated:
-                continue
-            tag = f"{spec.key}/heldout/{headline_t:.0%}/anticipation={antic}"
-            res, reason = _csa_estimate_or_none(panel, label=tag, n_boot=n_boot)
-            if res is None:
-                print(f"    ⏭️  {tag}: {reason}")
-                continue
-            print(f"    anticipation {antic}: pre-trend p = "
-                  f"{res.pretrend_supt_p:.4f}, overall ATT = {res.overall_att:+.4f}")
-            row = res.to_row()
-            row.update({"city": spec.label, "split": "Held out",
-                        "threshold": headline_t, "outcome": "all buildings"})
-            rows.append(row)
-            headline[f"csa/{spec.key}/antic{antic}_pretrend_p"] = res.pretrend_supt_p
-            headline[f"csa/{spec.key}/antic{antic}_overall_att"] = res.overall_att
+        # The anticipation robustness rows that used to live here are gone: this
+        # whole call IS one anticipation setting, so every figure and every row
+        # above already carries it. Re-running a=1 and a=2 inside the a=0 arm
+        # would estimate them twice and, worse, put three different adoption
+        # dates in one table under one folder.
+        #
+        # `pretrend_supt_p` can be None in the higher arms — a shift that leaves
+        # no pre-period to test is a real outcome on a four-period panel like San
+        # Antonio's, not an error — so the summary below must not format it
+        # unconditionally.
+        if spec.key in panels_by_city:
+            head = panels_by_city[spec.key][1]
+            p = head.pretrend_supt_p
+            print(f"    headline ({headline_t:.0%}, a={anticipation}): "
+                  f"pre-trend p = {'n/a' if p is None else f'{p:.4f}'}, "
+                  f"overall ATT = {head.overall_att:+.4f}, "
+                  f"{head.n_treated} treated / {head.n_never_treated} control")
 
-    # ── main-body figure: one panel per city ────────────────────────────────
+    # ── main-body figure: the deep-dive + clean zero-shot pair ──────────────
+    # Issue #36 wants the headline to be NYC (rich, deepest panel) plus one clean
+    # zero-shot city, and to stay shippable whether or not the optional cities
+    # ran. Chicago was the intended second panel but its dated-footprint source
+    # is a frozen 2015 snapshot, so MAIN_FIGURE_CITIES pins NYC + Tampa; Seattle
+    # and Baltimore are annex holdouts. The main figure is pinned to that tuple
+    # in that order, and everything else goes to the annex. Falling back to
+    # whatever estimated would silently change which cities carry the paper's
+    # central claim depending on which parquets happened to be on disk.
+    main_panels = [panels_by_city[k] for k in ces.MAIN_FIGURE_CITIES
+                   if k in panels_by_city]
+    annex_only = [k for k in panels_by_city if k not in ces.MAIN_FIGURE_CITIES]
+    if not main_panels and panels_by_city:
+        print(f"  ⚠️ none of MAIN_FIGURE_CITIES {ces.MAIN_FIGURE_CITIES} "
+              f"estimated; falling back to {sorted(panels_by_city)}")
+        main_panels = list(panels_by_city.values())
+    if annex_only:
+        print(f"  annex-only cities: {', '.join(sorted(annex_only))}")
+
     if main_panels:
         fig, axes = plt.subplots(
             1, len(main_panels), squeeze=False,
@@ -2552,14 +2985,46 @@ def part_d(results_dir: Path, processed_dir: Path, out: Path,
                 ax.spines[spine].set_visible(False)
         axes[0][0].set_ylabel("ATT (tract mean prediction)", fontsize=8)
         fig.suptitle(
-            f"New construction raises predicted wealth ({_tex_pct(headline_t)} of "
-            "baseline building area, held-out tracts)", fontsize=9,
+            "New construction raises predicted wealth "
+            f"({_csa_cut_label(headline_t, control_threshold)}, held-out tracts"
+            + (f", anticipation {anticipation})" if anticipation else ")"),
+            fontsize=9,
         )
         fig.tight_layout(rect=[0, 0, 1, 0.94])
-        _savefig(fig, out / "figures" / "D_event_study_main.pdf")
+        _savefig(fig, arm / "figures" / f"D_event_study_main{out_tag}.pdf")
     else:
         print("  ⚠️ no city produced an estimable held-out event study — "
               "no main figure written.")
+
+    # ── annex: pooled curve over a common event-time window ─────────────────
+    # Only meaningful with >=2 cities, and only over the window they share:
+    # cadences differ (Chicago annual, NYC/Seattle/Nashville biennial), so
+    # averaging raw event times would pool k=+3 meaning "3 years" in one city
+    # and "6 years" in another. Note in the caption that pooling across cities
+    # also pools across *sensors* — an implicit sensor-invariance claim.
+    if len(panels_by_city) >= 2:
+        results = {k: r for k, (_, r) in panels_by_city.items()}
+        window = ces.pooled_common_window(results)
+        if window is None:
+            print("  pooled curve skipped: no common event-time window")
+        else:
+            lo, hi = window
+            figp, axp = plt.subplots(figsize=FIG_SIZE_ONE_COL)
+            for i, (key, (label, res)) in enumerate(sorted(panels_by_city.items())):
+                ks = np.asarray(res.event_times, dtype=float)
+                keep = (ks >= lo) & (ks <= hi)
+                axp.plot(ks[keep], np.asarray(res.att)[keep], "o-", ms=3, lw=1.2,
+                         label=label, alpha=0.85)
+            axp.axhline(0, color="0.55", lw=0.6)
+            axp.axvline(-0.5, color="black", ls="--", lw=0.8)
+            axp.set_xlabel("Event time (periods since construction)", fontsize=8)
+            axp.set_ylabel("ATT (tract mean prediction)", fontsize=8)
+            axp.set_title(f"Held-out cities on the common window "
+                          f"$k \\in [{lo}, {hi}]$", fontsize=8.5)
+            axp.legend(fontsize=6.5)
+            figp.tight_layout()
+            _savefig(figp, arm / "figures" / f"D_event_study_pooled{out_tag}.pdf")
+            headline[f"{ns}/pooled_window"] = f"[{lo},{hi}]"
 
     # ── coefficient table ───────────────────────────────────────────────────
     if rows:
@@ -2568,7 +3033,19 @@ def part_d(results_dir: Path, processed_dir: Path, out: Path,
         # city/split/threshold/outcome, and n_units is n_treated + n_never_treated.
         tab = tab.drop(columns=[c for c in ("label", "n_units") if c in tab.columns])
         tab["threshold"] = tab["threshold"].map(lambda t: f"{t:.0%}")
-        lead = ["city", "split", "threshold", "outcome", "control", "anticipation",
+        # Which tracts the treated ones were compared to. Without this a 5% row
+        # from a pinned run and a 5% row from an unpinned one are different
+        # estimands printed under the same label.
+        tab["control_cut"] = ("complement" if control_threshold is None
+                              else f"{control_threshold:.0%}")
+        # Stamp the sample restriction on every row: the restricted and
+        # unrestricted tables are read side by side, and a coefficient without
+        # its sample definition attached is the easiest thing to misattribute.
+        tab["undated_screen"] = ("none" if max_undated_area_share is None
+                                 else f"{max_undated_area_share:.0%}")
+        lead = ["city", "split", "threshold", "control_cut", "undated_screen",
+                "outcome",
+                "control", "anticipation",
                 "n_treated", "n_never_treated",
                 "pretrend_joint_p", "pretrend_max_abs_t", "pretrend_wald_p",
                 "overall_att", "overall_se"]
@@ -2583,8 +3060,13 @@ def part_d(results_dir: Path, processed_dir: Path, out: Path,
         try:
             from src.data.split_reporting import _write_table
             _write_table(
-                tab, out / "tables", "D_event_study_coefficients",
-                "Construction-cohort Callaway--Sant'Anna event study. Each row "
+                tab, arm / "tables", f"D_event_study_coefficients{out_tag}",
+                "Construction-cohort Callaway--Sant'Anna event study. A tract is "
+                "treated once cumulative new building area exceeds "
+                "\\emph{threshold} of its baseline stock; the never-treated "
+                "comparison group is held fixed across thresholds at tracts that "
+                "never exceeded \\emph{control cut}, and tracts falling between "
+                "the two are dropped rather than used as controls. Each row "
                 "reports the joint pre-trend test (sup-t over all pre-treatment "
                 "event times, with a Wald $\\chi^2$ alternative) and dynamic "
                 "ATTs at successive horizons $k$.",
@@ -2593,13 +3075,20 @@ def part_d(results_dir: Path, processed_dir: Path, out: Path,
         except Exception as exc:
             print(f"    LaTeX table export failed ({exc}); writing CSV only")
             tab.to_csv(
-                out / "tables" / "D_event_study_coefficients.csv", index=False
+                arm / "tables" / f"D_event_study_coefficients{out_tag}.csv", index=False
             )
-        headline["csa/n_specifications"] = len(rows)
+        headline[f"{ns}/n_specifications"] = len(rows)
     else:
         print("  ⚠️ no specification estimated — no coefficient table written.")
-        headline.setdefault("csa/status", "not_estimable")
+        headline.setdefault(f"{ns}/status", "not_estimable")
 
+    # An arm is a self-contained set of results, so nothing it drew should still
+    # be open when the next one starts. `_savefig` closes what it writes, but a
+    # figure whose city raised part-way through never reaches it, and matplotlib
+    # holds every un-closed figure in a global registry for the life of the
+    # process.
+    plt.close("all")
+    _csa_release_memory()
     return headline
 
 
@@ -3786,6 +4275,63 @@ def _panel_c_binned_scatter(ax: plt.Axes, tract_df: pd.DataFrame, year: int | No
     return sc, rho, outlier_note
 
 
+def _figure_test_sample(ctx: _USContext, what: str = "figure",
+                        min_tracts: int = _MIN_FIGURE_TRACTS) -> dict | None:
+    """The test-city sample shared by the main figure and the growth figure.
+
+    Test-split CBSAs (from building-level ``type == 'test'``), restricted to
+    (CBSA, year) cells with at least ``min_tracts`` predicted tracts. Returns
+    ``{'test_bld', 'tract_test', 'cells_tract'}`` or None (with a printed
+    reason) when nothing survives. One function so both figures provably see
+    the same cells.
+    """
+    if ctx.bld.empty or not len(ctx.tract):
+        print(f"  missing building or tract predictions; skipping {what}")
+        return None
+
+    test_bld_all = ctx.bld[ctx.bld["type"] == "test"]
+    if test_bld_all.empty:
+        print(f"  no test-split building predictions; skipping {what}")
+        return None
+
+    test_cbsas = set(test_bld_all["cbsa"].unique())
+    tract_test_all = ctx.tract[ctx.tract["cbsa"].isin(test_cbsas)]
+
+    # Tract-level cells for Panel A — one rho per (CBSA, year) from tract-mean
+    # pred vs. tract label, rather than the building-level correlation (which
+    # over-weights tracts with many buildings and repeats each tract's label
+    # once per building). ``within_city_cells``'s own n_tracts (distinct
+    # GEOID, or distinct label when GEOID is absent) is the authoritative
+    # tract count for the min-tracts floor below.
+    cells_tract_all = within_city_cells(tract_test_all)
+    if not len(cells_tract_all):
+        print(f"  no usable tract-level within-city cells; skipping {what}")
+        return None
+
+    # Drop individual (CBSA, year) cells too thin to give a stable Spearman
+    # rho, before building any panel, so every panel sees the same cells.
+    # This is a per-cell filter (not a whole-city one): a city with plenty of
+    # tracts overall can still have one sparse year dropped while its other
+    # years remain.
+    cells_tract = cells_tract_all[cells_tract_all["n_tracts"] >= min_tracts]
+    n_cy_dropped = len(cells_tract_all) - len(cells_tract)
+    if n_cy_dropped:
+        print(f"  dropping {n_cy_dropped} / {len(cells_tract_all)} city-year cell(s) with "
+              f"< {min_tracts} tracts")
+    if not len(cells_tract):
+        print(f"  no city-year cells meet the tract-count threshold; skipping {what}")
+        return None
+
+    eligible_pairs = pd.MultiIndex.from_frame(cells_tract[["cbsa", "year"]])
+    test_bld = test_bld_all[
+        pd.MultiIndex.from_frame(test_bld_all[["cbsa", "year"]]).isin(eligible_pairs)
+    ].reset_index(drop=True)
+    tract_test = tract_test_all[
+        pd.MultiIndex.from_frame(tract_test_all[["cbsa", "year"]]).isin(eligible_pairs)
+    ].reset_index(drop=True)
+    return {"test_bld": test_bld, "tract_test": tract_test, "cells_tract": cells_tract}
+
+
 def part_main_figure_us(ctx: _USContext, year: int | None = None,
                         holdout_year: int | None = None) -> dict:
     """Science-style 3-panel main performance figure (US mode).
@@ -3821,46 +4367,11 @@ def part_main_figure_us(ctx: _USContext, year: int | None = None,
         print("  no cbsa_splits bracket info; skipping main figure")
         return {}
 
-    test_bld_all = ctx.bld[ctx.bld["type"] == "test"]
-    if test_bld_all.empty:
-        print("  no test-split building predictions; skipping main figure")
+    sample = _figure_test_sample(ctx, what="main figure")
+    if sample is None:
         return {}
-
-    test_cbsas = set(test_bld_all["cbsa"].unique())
-    tract_test_all = ctx.tract[ctx.tract["cbsa"].isin(test_cbsas)]
-
-    # Tract-level cells for Panel A — one rho per (CBSA, year) from tract-mean
-    # pred vs. tract label, rather than the building-level correlation (which
-    # over-weights tracts with many buildings and repeats each tract's label
-    # once per building). ``within_city_cells``'s own n_tracts (distinct
-    # GEOID, or distinct label when GEOID is absent) is the authoritative
-    # tract count for the min-tracts floor below.
-    cells_tract_all = within_city_cells(tract_test_all)
-    if not len(cells_tract_all):
-        print("  no usable tract-level within-city cells; skipping main figure")
-        return {}
-
-    # Drop individual (CBSA, year) cells too thin to give a stable Spearman
-    # rho, before building panels A/B/C, so all three see the same cells.
-    # This is a per-cell filter (not a whole-city one): a city with plenty of
-    # tracts overall can still have one sparse year dropped while its other
-    # years remain.
-    cells_tract = cells_tract_all[cells_tract_all["n_tracts"] >= _MIN_FIGURE_TRACTS]
-    n_cy_dropped = len(cells_tract_all) - len(cells_tract)
-    if n_cy_dropped:
-        print(f"  dropping {n_cy_dropped} / {len(cells_tract_all)} city-year cell(s) with "
-              f"< {_MIN_FIGURE_TRACTS} tracts")
-    if not len(cells_tract):
-        print("  no city-year cells meet the tract-count threshold; skipping main figure")
-        return {}
-
-    eligible_pairs = pd.MultiIndex.from_frame(cells_tract[["cbsa", "year"]])
-    test_bld = test_bld_all[
-        pd.MultiIndex.from_frame(test_bld_all[["cbsa", "year"]]).isin(eligible_pairs)
-    ].reset_index(drop=True)
-    tract_test = tract_test_all[
-        pd.MultiIndex.from_frame(tract_test_all[["cbsa", "year"]]).isin(eligible_pairs)
-    ].reset_index(drop=True)
+    test_bld, tract_test, cells_tract = (
+        sample["test_bld"], sample["tract_test"], sample["cells_tract"])
     if test_bld.empty:
         print("  no test-split building predictions after the tract-count filter; "
               "skipping main figure")
@@ -3971,18 +4482,1517 @@ def part_main_figure_us(ctx: _USContext, year: int | None = None,
     return headline
 
 
+# ─── Long-difference growth figure (US) ───────────────────────────────────────
+# Does the model predict *change*, not just levels? Analog of Khachiyan et al.
+# (2022, AER: Insights) Fig. 2 bottom row, on the main figure's test sample.
+# Each tract is paired (t0, t1): t1 = its latest observed year, t0 = the earlier
+# year minimising |t - (t1 - _GROWTH_TARGET_GAP)|. Realised gaps are bounded by
+# the imagery span of the run (2016-2023 for the first NAIP run → 5-7 years).
+# Predicted and actual ranks are converted to wealth dollars through each
+# city-year's GB2 (Part C machinery) before differencing.
+
+_GROWTH_TARGET_GAP = 10
+_GROWTH_N_BOOT = 1000
+# Khachiyan et al. (2022) Table 2, Income, *without* initial conditions — the
+# out-of-sample R^2 of predicted vs actual change in log total personal income
+# on 2.4 km cells (plus the in-sample 2000-2010 change for reference).
+_KHACHIYAN_INCOME_R2 = (
+    ("2000-2010 (in-sample)", 0.4331),
+    ("2007-2017 (out-of-sample)", -0.0999),
+    ("2000-2017 (out-of-sample)", 0.3731),
+)
+
+
+def _zscore_within(df: pd.DataFrame, col: str, by=("cbsa", "year")) -> pd.Series:
+    """``col`` standardised within each ``by`` group (mean 0, sd 1).
+
+    Puts the model's arbitrary ordinal scale on the label's per-(CBSA, year)
+    z-score scale using only the predictions themselves — no label information
+    enters, so a prediction built this way stays out-of-sample. Groups with no
+    spread return NaN rather than inf.
+    """
+    g = df.groupby(list(by))[col]
+    sd = g.transform("std")
+    return (df[col] - g.transform("mean")) / sd.where(sd > 0)
+
+
+def _long_difference_pairs(tract_df: pd.DataFrame, target_gap: int = _GROWTH_TARGET_GAP,
+                           value_cols=("label", "pred")) -> pd.DataFrame:
+    """One (t0, t1) long-difference row per tract.
+
+    t1 is the tract's latest year; t0 is the earlier year closest to
+    ``t1 - target_gap`` (ties -> the earlier year, i.e. the longer horizon).
+    Tracts observed in a single year are dropped. Returns GEOID, cbsa, t0, t1,
+    gap, ``{c}_0``, ``{c}_1`` and ``d_{c} = {c}_1 - {c}_0`` for each value col.
+    """
+    cols = ["GEOID", "cbsa", "year", *value_cols]
+    if tract_df.duplicated(["GEOID", "year"]).any():
+        raise ValueError("tract_df has duplicate (GEOID, year) rows")
+    obs = tract_df[cols]
+    t1 = obs.groupby("GEOID")["year"].max().rename("t1")
+    cand = obs[["GEOID", "year"]].merge(t1, on="GEOID")
+    cand = cand[cand["year"] < cand["t1"]].copy()
+    cand["dist"] = (cand["year"] - (cand["t1"] - target_gap)).abs()
+    pick = (cand.sort_values(["GEOID", "dist", "year"])
+                .drop_duplicates("GEOID")[["GEOID", "year", "t1"]]
+                .rename(columns={"year": "t0"}))
+    vals = obs.set_index(["GEOID", "year"])[list(value_cols)]
+    v0 = vals.loc[list(zip(pick["GEOID"], pick["t0"]))].add_suffix("_0").reset_index(drop=True)
+    v1 = vals.loc[list(zip(pick["GEOID"], pick["t1"]))].add_suffix("_1").reset_index(drop=True)
+    cbsa = obs.drop_duplicates("GEOID").set_index("GEOID")["cbsa"]
+    pairs = pick.reset_index(drop=True)
+    pairs.insert(1, "cbsa", cbsa.loc[pairs["GEOID"]].values)
+    pairs["gap"] = pairs["t1"] - pairs["t0"]
+    pairs = pd.concat([pairs, v0, v1], axis=1)
+    for c in value_cols:
+        pairs[f"d_{c}"] = pairs[f"{c}_1"] - pairs[f"{c}_0"]
+    return pairs
+
+
+def _r2_oos(y: np.ndarray, yhat: np.ndarray) -> float:
+    """1 - SSE/SST with the prediction taken as-is (no refit) — the
+    out-of-sample R^2 Khachiyan et al. report; negative when the prediction
+    does worse than the sample mean of ``y``."""
+    y, yhat = np.asarray(y, float), np.asarray(yhat, float)
+    sst = np.sum((y - y.mean()) ** 2)
+    return float(1.0 - np.sum((y - yhat) ** 2) / sst) if sst > 0 else float("nan")
+
+
+def _r2_ols(y: np.ndarray, x: np.ndarray) -> float:
+    """R^2 of y on x with an intercept (= Pearson r^2): the fit after an
+    ex-post linear calibration of x — an upper bound on any out-of-sample R^2."""
+    y, x = np.asarray(y, float), np.asarray(x, float)
+    if len(y) < 3 or np.ptp(x) == 0 or np.ptp(y) == 0:
+        return float("nan")
+    return float(np.corrcoef(x, y)[0, 1] ** 2)
+
+
+def _growth_metrics(y: np.ndarray, yhat: np.ndarray) -> dict:
+    """n, out-of-sample R^2, OLS R^2, Pearson r and Spearman rho of yhat vs y."""
+    y, yhat = np.asarray(y, float), np.asarray(yhat, float)
+    m = np.isfinite(y) & np.isfinite(yhat)
+    y, yhat = y[m], yhat[m]
+    if len(y) < 3 or np.ptp(y) == 0 or np.ptp(yhat) == 0:
+        return {"n": int(len(y)), "r2_oos": float("nan"), "r2_ols": float("nan"),
+                "pearson": float("nan"), "spearman": float("nan")}
+    return {"n": int(len(y)), "r2_oos": _r2_oos(y, yhat), "r2_ols": _r2_ols(y, yhat),
+            "pearson": float(np.corrcoef(y, yhat)[0, 1]),
+            "spearman": float(spearmanr(y, yhat).statistic)}
+
+
+def _cluster_bootstrap_ci(y: np.ndarray, yhat: np.ndarray, clusters: np.ndarray,
+                          stat_fn, n_boot: int = _GROWTH_N_BOOT, seed: int = 0,
+                          alpha: float = 0.05) -> tuple[float, float]:
+    """Percentile CI of ``stat_fn(y, yhat)`` resampling whole clusters (CBSAs).
+
+    Tracts within a city share the city's NAIP flight, label vintage and
+    z-score reference set, so they are not independent; resampling cities is
+    the honest unit.
+    """
+    y, yhat, clusters = np.asarray(y, float), np.asarray(yhat, float), np.asarray(clusters)
+    idx_by_c = [np.flatnonzero(clusters == c) for c in pd.unique(clusters)]
+    if len(idx_by_c) < 2:
+        return float("nan"), float("nan")
+    rng = np.random.default_rng(seed)
+    stats = []
+    for _ in range(n_boot):
+        take = rng.integers(0, len(idx_by_c), len(idx_by_c))
+        ii = np.concatenate([idx_by_c[k] for k in take])
+        s = stat_fn(y[ii], yhat[ii])
+        if np.isfinite(s):
+            stats.append(s)
+    if not stats:
+        return float("nan"), float("nan")
+    lo, hi = np.percentile(stats, [100 * alpha / 2, 100 * (1 - alpha / 2)])
+    return float(lo), float(hi)
+
+
+def _demean_within(values: pd.Series, groups: pd.Series) -> pd.Series:
+    """``values`` minus its group mean — strips between-city level shifts."""
+    return values - values.groupby(groups).transform("mean")
+
+
+# BLS CPI-U, U.S. city average, all items (series CUUR0000SA0), annual
+# averages. ACS 5-year dollar estimates are in the nominal dollars of the
+# vintage's final year; deflating to one base year keeps ~25% inflation
+# between 2016 and 2023 from masquerading as wealth growth proportional to
+# each tract's level (which any levels-only model would "predict").
+_CPI_U_ANNUAL = {
+    2010: 218.056, 2011: 224.939, 2012: 229.594, 2013: 232.957, 2014: 236.736,
+    2015: 237.017, 2016: 240.007, 2017: 245.120, 2018: 251.107, 2019: 255.657,
+    2020: 258.811, 2021: 270.970, 2022: 292.655, 2023: 304.702,
+}
+_GROWTH_DOLLAR_BASE_YEAR = 2023
+
+
+def _deflate(values, year: int, base: int = _GROWTH_DOLLAR_BASE_YEAR):
+    """Nominal ``year`` dollars -> constant ``base``-year dollars (CPI-U)."""
+    return values * (_CPI_U_ANNUAL[base] / _CPI_U_ANNUAL[int(year)])
+
+
+def _wealth_dollar_column(indicator: str, year: int) -> str:
+    """Panel column holding the dollar variable behind ``indicator``'s label
+    (the label is the per-CBSA z-score of its log): W-family tokens -> the
+    wealth index (e.g. 'W2_i_r5pct_2016'), 'inc' -> per-capita income."""
+    var = indicators.token_to_var(indicator)
+    return f"{var}_{year}" if var else f"per_capita_income_usd_{year}"
+
+
+def _load_wealth_dollars_long(processed_dir: Path, indicator: str, years) -> pd.DataFrame:
+    """Long [GEOID, cbsa, year, usd] of the indicator's dollar variable for
+    every panel tract, in constant base-year dollars. Years whose column is
+    absent from the panel are skipped."""
+    import pyarrow as pa
+    path = processed_dir / _PANEL_FILENAME
+    present = set(pa.ipc.open_file(path).schema.names)
+    years = [int(y) for y in sorted(set(years))
+             if _wealth_dollar_column(indicator, y) in present and int(y) in _CPI_U_ANNUAL]
+    cols = [_PANEL_GEOID_COL, "cbsa_code"] + [_wealth_dollar_column(indicator, y) for y in years]
+    panel = pd.read_feather(path, columns=cols)
+    panel = panel.rename(columns={_PANEL_GEOID_COL: "GEOID"})
+    panel["GEOID"] = panel["GEOID"].astype(str).str.zfill(11)
+    panel["cbsa_code"] = panel["cbsa_code"].astype(str)
+    panel = panel.drop_duplicates("GEOID")
+    frames = [
+        pd.DataFrame({"GEOID": panel["GEOID"].values, "cbsa": panel["cbsa_code"].values,
+                      "year": y,
+                      "usd": _deflate(panel[_wealth_dollar_column(indicator, y)]
+                                      .values.astype(float), y)})
+        for y in years
+    ]
+    return pd.concat(frames, ignore_index=True)
+
+
+def _fit_city_gb2(wealth_long: pd.DataFrame, cbsas, min_obs: int = 10,
+                  smooth: bool = False) -> dict:
+    """{cbsa: {year: (c, p, q, scale)}} — GB2 MLE on each city-year's tract
+    dollar distribution (all panel tracts of the CBSA, positive values).
+    City-years that fail to fit are dropped (with a note).
+
+    ``smooth=True`` applies Part C's log-space polynomial smoothing of the
+    parameters across years. Off by default: on W2 wealth several cities fit
+    a near-degenerate shape (large c, tiny p and q) where the four parameters
+    trade off almost perfectly, so smoothing each one independently yields
+    combinations describing a different distribution — measured on
+    run_20260722, CBSA 23420 (Fresno) 2016 smoothed P50 = $1.39M vs
+    empirical $307k (raw fit: $314k). Raw per-year fits on 100+ tracts track
+    the empirical P10/P50/P90 to within ~0.1 log points everywhere.
+    """
+    out, failed = {}, []
+    sub = wealth_long[wealth_long["cbsa"].isin({str(c) for c in cbsas})]
+    for cbsa, g_city in sub.groupby("cbsa"):
+        raw = {}
+        for yr, g in g_city.groupby("year"):
+            v = g["usd"].values.astype(float)
+            v = v[np.isfinite(v) & (v > 0)]
+            if len(v) < min_obs:
+                continue
+            try:
+                raw[int(yr)] = _fit_gb2(v)
+            except (ValueError, RuntimeError):
+                failed.append((cbsa, int(yr)))
+        if raw:
+            out[str(cbsa)] = _smooth_gb2_params(sorted(raw), raw) if smooth else raw
+    if failed:
+        print(f"    GB2 fit failed for {len(failed)} city-year(s): {failed[:5]}")
+    return out
+
+
+def _gb2_fit_error(wealth_long: pd.DataFrame, params_by_city: dict, cells,
+                   qs=(0.1, 0.5, 0.9)) -> pd.DataFrame:
+    """Per (cbsa, year) in ``cells``: max |log(GB2 quantile / empirical
+    quantile)| over ``qs`` — the check that the dollar map is faithful to the
+    city's actual ACS distribution in the years it is used."""
+    rows = []
+    for cbsa, yr in cells:
+        params = params_by_city.get(str(cbsa), {}).get(int(yr))
+        v = wealth_long.loc[(wealth_long["cbsa"] == str(cbsa))
+                            & (wealth_long["year"] == int(yr)), "usd"].values.astype(float)
+        v = v[np.isfinite(v) & (v > 0)]
+        if params is None or len(v) == 0:
+            continue
+        err = np.abs(np.log(_gb2_quantile(qs, params) / np.quantile(v, qs)))
+        rows.append({"cbsa": str(cbsa), "year": int(yr), "max_log_err": float(err.max())})
+    return pd.DataFrame(rows, columns=["cbsa", "year", "max_log_err"])
+
+
+def _hazen_within(df: pd.DataFrame, col: str, by=("cbsa", "year")) -> pd.Series:
+    """Hazen plotting position (rank - 0.5) / n of ``col`` within each group —
+    the empirical CDF ``_gb2_apply_from_ranks`` feeds into the GB2 quantile."""
+    from scipy.stats import rankdata
+    return df.groupby(list(by))[col].transform(
+        lambda s: pd.Series((rankdata(s) - 0.5) / len(s), index=s.index))
+
+
+def _gb2_quantile(probs, params: tuple, clip_eps: float = 1e-6) -> np.ndarray:
+    """GB2 quantile at ``probs`` for (c, p, q, scale), clipped like
+    ``_gb2_apply_from_ranks`` so the extreme Hazen positions stay finite."""
+    c, p, q, scale = params
+    probs = np.clip(np.asarray(probs, float), clip_eps, 1.0 - clip_eps)
+    return gb2.ppf(probs, c, p, q, loc=0, scale=scale)
+
+
+def _gb2_dollars(df: pd.DataFrame, prob_col: str, params_by_city: dict,
+                 year_col: str = "year") -> np.ndarray:
+    """Dollar value of each row's ``prob_col`` under its (cbsa, ``year_col``)
+    GB2. Rows whose city-year has no fit get NaN."""
+    out = np.full(len(df), np.nan)
+    keys = df[["cbsa", year_col]].astype({year_col: int}).itertuples(index=False, name=None)
+    probs = df[prob_col].values.astype(float)
+    for i, (cbsa, yr) in enumerate(keys):
+        params = params_by_city.get(str(cbsa), {}).get(yr)
+        if params is not None and np.isfinite(probs[i]):
+            out[i] = _gb2_quantile(probs[i], params)
+    return out
+
+
+def _central_limits(v: np.ndarray, frac: float) -> tuple[float, float]:
+    """[lo, hi] covering the central ``frac`` of ``v`` (frac=1 -> full range)."""
+    margin = 100 * (1 - frac) / 2
+    lo, hi = np.percentile(v, [margin, 100 - margin])
+    return float(lo), float(hi)
+
+
+def _panel_growth_scatter(ax: plt.Axes, x: np.ndarray, y: np.ndarray, *, letter: str,
+                          xlabel: str, ylabel: str, r2_text: str, n_bins: int = 10,
+                          central_frac: float = _PANEL_C_CENTRAL_FRAC) -> int:
+    """Khachiyan-style actual-vs-predicted change scatter: marker-size-1 cloud,
+    decile conditional-mean line (as in main-figure Panel C) and a 45-degree
+    reference line. Axes are clipped to the central ``central_frac`` of each
+    marginal; returns the number of off-canvas points for the caption.
+    Both axes share one range (as in Khachiyan et al.'s Fig. 2), so the 45-degree
+    line is a true diagonal and a near-constant prediction reads as the flat
+    band it is rather than being stretched to fill the panel.
+    """
+    x, y = np.asarray(x, float), np.asarray(y, float)
+    m = np.isfinite(x) & np.isfinite(y)
+    x, y = x[m], y[m]
+    if len(x) < n_bins * 3:
+        ax.text(0.5, 0.5, "insufficient tract pairs", ha="center", va="center",
+                transform=ax.transAxes)
+        _panel_title(ax, letter)
+        return 0
+    ax.scatter(x, y, s=1, alpha=0.3, color="steelblue", linewidths=0, zorder=1)
+    x_lo, x_hi = _central_limits(x, central_frac)
+    y_lo, y_hi = _central_limits(y, central_frac)
+    lo, hi = min(x_lo, y_lo), max(x_hi, y_hi)
+    pad = 0.04 * (hi - lo)
+    ax.set_xlim(lo - pad, hi + pad)
+    ax.set_ylim(lo - pad, hi + pad)
+    ax.plot([lo, hi], [lo, hi], color="0.35", linestyle="--", linewidth=1.0, zorder=2,
+            label=r"45$^\circ$")
+    edges = np.percentile(x, np.linspace(0, 100, n_bins + 1))
+    bins = np.clip(np.digitize(x, edges[1:-1]), 0, n_bins - 1)
+    bx = [x[bins == b].mean() for b in range(n_bins) if (bins == b).any()]
+    by = [y[bins == b].mean() for b in range(n_bins) if (bins == b).any()]
+    ax.plot(bx, by, "o-", color="firebrick", markeredgecolor="white", linewidth=1.8,
+            markersize=5, zorder=3, label=f"{n_bins}-bin conditional mean")
+    ax.axhline(0, color="0.8", linewidth=0.6, zorder=0)
+    ax.axvline(0, color="0.8", linewidth=0.6, zorder=0)
+    ax.text(0.04, 0.96, r2_text, transform=ax.transAxes, fontsize=6.5, va="top",
+            linespacing=1.5, bbox=dict(facecolor="white", edgecolor="none", alpha=0.8, pad=1.5))
+    ax.legend(fontsize=6, loc="lower right", frameon=True, facecolor="white",
+              edgecolor="none", framealpha=0.8)
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel(ylabel)
+    _panel_title(ax, letter)
+    for spine in ("top", "right"):
+        ax.spines[spine].set_visible(False)
+    return int(np.sum((x < x_lo) | (x > x_hi) | (y < y_lo) | (y > y_hi)))
+
+
+def _metric_row(actual: pd.Series, predicted: pd.Series, clusters: pd.Series, *,
+                target: str, predictor: str, scope: str, period: str,
+                n_boot: int = _GROWTH_N_BOOT) -> dict:
+    """One metrics-table row: R^2_oos (with city-cluster CI), R^2_OLS, r, rho.
+
+    ``scope='within-city'`` demeans actual and predicted by CBSA first, which
+    strips each city's average growth — a component the GB2 maps take from
+    that city's own ACS distribution, not from the imagery.
+    """
+    a, p = actual.astype(float), predicted.astype(float)
+    m = np.isfinite(a.values) & np.isfinite(p.values)
+    a, p, cl = a[m], p[m], clusters[m]
+    if scope == "within-city":
+        a, p = _demean_within(a, cl), _demean_within(p, cl)
+    met = _growth_metrics(a.values, p.values)
+    lo, hi = _cluster_bootstrap_ci(a.values, p.values, cl.values, _r2_oos, n_boot=n_boot)
+    return {"source": "this paper", "target": target, "predictor": predictor,
+            "scope": scope, "period": period, **met, "r2_oos_ci_lo": lo, "r2_oos_ci_hi": hi}
+
+
+def _growth_annotation(model: dict, model_w: dict, frozen: dict, frozen_w: dict) -> str:
+    """Panel text: model R^2_oos [CI] pooled and within-city, the rank-frozen
+    benchmark's pair, then rho and n."""
+    return "\n".join([
+        rf"$R^2_{{\mathrm{{oos}}}}$ = {model['r2_oos']:.3f} "
+        rf"[{model['r2_oos_ci_lo']:.3f}, {model['r2_oos_ci_hi']:.3f}]",
+        rf"within-city $R^2_{{\mathrm{{oos}}}}$ = {model_w['r2_oos']:.3f}",
+        rf"rank-frozen: {frozen['r2_oos']:.3f} (within {frozen_w['r2_oos']:.3f})",
+        rf"Spearman $\rho$ = {model['spearman']:.3f}, $n$ = {model['n']:,}",
+    ])
+
+
+def _tex_year_range(text: str) -> str:
+    """'2007-2017 (out-of-sample)' -> '2007--2017 (out-of-sample)': en-dash
+    year ranges only, leaving hyphenated words alone."""
+    return re.sub(r"(\d{4})-(\d{4})", r"\1--\2", text)
+
+
+def _growth_metrics_table(rows: list[dict]) -> pd.DataFrame:
+    """Our rows plus the Khachiyan et al. benchmark rows, one table."""
+    bench = [{"source": "Khachiyan et al. (2022) Table 2", "target": "dlog total personal income",
+              "predictor": "CNN, no initial conditions", "scope": "pooled (2.4km cells)",
+              "period": p, "r2_oos": r2}
+             for p, r2 in _KHACHIYAN_INCOME_R2]
+    return pd.DataFrame(rows + bench)
+
+
+# ACS change significance for a pair, mirroring training's stable/change gate
+# (process_acs.test_significance + STRUCTURAL_CHANGE_P): z = |Δ Rel_Score| /
+# sqrt(SE0^2 + SE1^2), two-tailed. p < 0.10 is the training gate; 0.05 and
+# 0.01 (the ``significant_*`` reporting cut) tighten it.
+_CHANGE_P_LEVELS = (0.10, 0.05, 0.01)
+
+
+def _load_rel_se_long(processed_dir: Path, indicator: str, years) -> pd.DataFrame:
+    """Long [GEOID, year, se] of the label's replicate SE (``Rel_SE_{var}``;
+    ``Rel_SE`` for income) plus each tract's training flag ``valid_change``.
+    Years without an SE column are skipped (W-family SEs start in 2014)."""
+    import pyarrow as pa
+    var = indicators.token_to_var(indicator)
+    prefix = f"Rel_SE_{var}" if var else "Rel_SE"
+    path = processed_dir / _PANEL_FILENAME
+    present = set(pa.ipc.open_file(path).schema.names)
+    years = [int(y) for y in sorted(set(years)) if f"{prefix}_{y}" in present]
+    flag = indicators.valid_change_col(indicator)
+    cols = [_PANEL_GEOID_COL] + [f"{prefix}_{y}" for y in years]
+    cols += [flag] if flag in present else []
+    panel = pd.read_feather(path, columns=cols)
+    panel = panel.rename(columns={_PANEL_GEOID_COL: "GEOID"})
+    panel["GEOID"] = panel["GEOID"].astype(str).str.zfill(11)
+    panel = panel.drop_duplicates("GEOID")
+    vc = (panel[flag].astype(float).values if flag in panel.columns
+          else np.full(len(panel), np.nan))
+    frames = [pd.DataFrame({"GEOID": panel["GEOID"].values, "year": y,
+                            "se": panel[f"{prefix}_{y}"].values.astype(float),
+                            "valid_change": vc})
+              for y in years]
+    return pd.concat(frames, ignore_index=True)
+
+
+def _attach_change_pvalue(pairs: pd.DataFrame, se_long: pd.DataFrame) -> pd.DataFrame:
+    """Add se_0, se_1, change_z, change_p over each pair's own (t0, t1), and
+    the tract's training flag ``valid_change`` (NaN where unavailable).
+
+    Each year takes the SE of the closest year that has one — the same
+    convention as training's ``main.build_se_lookup``. W-family replicate SEs
+    exist only for 2014 and 2023, so a 2016/17 -> 2022/23 pair is tested
+    with the 2014 and 2023 SEs.
+    """
+    se = se_long.set_index(["GEOID", "year"])
+    se_years = np.array(sorted(se_long["year"].unique()))
+    nearest = lambda yrs: se_years[np.abs(se_years[None, :] - np.asarray(yrs, int)[:, None])
+                                   .argmin(axis=1)]
+    out = pairs.copy()
+    for k, tcol in (("0", "t0"), ("1", "t1")):
+        out[f"se_year_{k}"] = nearest(out[tcol].values)
+        out[f"se_{k}"] = se["se"].reindex(
+            pd.MultiIndex.from_arrays([out["GEOID"], out[f"se_year_{k}"]])).values
+    out["valid_change"] = se_long.drop_duplicates("GEOID").set_index("GEOID")[
+        "valid_change"].reindex(out["GEOID"]).values
+    se_diff = np.sqrt(out["se_0"] ** 2 + out["se_1"] ** 2)
+    out["change_z"] = np.abs(out["label_1"] - out["label_0"]) / se_diff.where(se_diff > 0)
+    from scipy.stats import norm
+    out["change_p"] = 2 * (1 - norm.cdf(out["change_z"]))
+    return out
+
+
+def _change_groups(pairs: pd.DataFrame, levels=_CHANGE_P_LEVELS) -> dict[str, pd.Series]:
+    """Boolean masks: 'stable' (p >= the loosest level) and nested
+    'change p<L' for each level, plus training's own panel flag when present.
+    Pairs without an SE belong to no group."""
+    p = pairs["change_p"]
+    known = p.notna()
+    groups = {f"stable (p>={max(levels):.2f})": known & (p >= max(levels))}
+    for lv in sorted(levels, reverse=True):
+        groups[f"change p<{lv:.2f}"] = known & (p < lv)
+    vc = pairs.get("valid_change")
+    if vc is not None and vc.notna().any():
+        groups["training flag: stable"] = vc == 0
+        groups["training flag: change"] = vc == 1
+    return groups
+
+
+def _change_detection_stats(sub: pd.DataFrame, stable: pd.DataFrame, actual: str,
+                            predicted: str) -> dict:
+    """Diagnostics that separate label noise from prediction failure:
+
+    * ``label_reliability`` = 1 - mean(SE0^2 + SE1^2) / Var(Δ label): the
+      share of the group's label-change variance that is real (can be < 0 in
+      the stable group, which is selected on small |Δ|).
+    * ``sign_agree``: share of pairs whose predicted and actual change agree
+      in sign (0.5 = coin flip).
+    * ``auc_abs_vs_stable``: AUC of |Δ predicted| separating this group from
+      the stable group (0.5 = predicted change size ignores real change).
+    """
+    from sklearn.metrics import roc_auc_score
+    out = {"label_reliability": float("nan"), "auc_abs_vs_stable": float("nan")}
+    if {"se_0", "se_1"} <= set(sub.columns) and sub["d_label"].var() > 0:
+        noise = (sub["se_0"] ** 2 + sub["se_1"] ** 2).mean()
+        out["label_reliability"] = float(1 - noise / sub["d_label"].var())
+    a, p = sub[actual].values, sub[predicted].values
+    ok = np.isfinite(a) & np.isfinite(p)
+    out["sign_agree"] = float((np.sign(a[ok]) == np.sign(p[ok])).mean()) if ok.any() else float("nan")
+    s = np.abs(stable[predicted].values)
+    c = np.abs(p[ok])
+    s = s[np.isfinite(s)]
+    if len(c) and len(s) and sub.index.isin(stable.index).sum() == 0:
+        out["auc_abs_vs_stable"] = float(roc_auc_score(
+            np.r_[np.ones(len(c)), np.zeros(len(s))], np.r_[c, s]))
+    return out
+
+
+def _growth_by_change_rows(pairs: pd.DataFrame, n_boot: int = _GROWTH_N_BOOT,
+                           levels=_CHANGE_P_LEVELS) -> list[dict]:
+    """Model and rank-frozen R^2 for Δ$, Δlog$ and Δz within each change group
+    (pooled across cities). Each row carries the group's n and sd of the
+    actual change, so a rising R^2 can be read against the signal it had —
+    R^2_oos mechanically rises with SST even when tracking does not improve —
+    plus ``_change_detection_stats``."""
+    groups = _change_groups(pairs, levels)
+    stable = pairs[groups[f"stable (p>={max(levels):.2f})"]]
+    specs = (("d wealth USD (GB2, 2023$)", "d_label_usd", "d_pred_usd", "d_frozen_usd"),
+             ("dlog wealth USD (GB2)", "dlog_label_usd", "dlog_pred_usd", "dlog_frozen_usd"),
+             ("d W2_r5 within-city z (label)", "d_label", "d_pred_z", None))
+    rows = []
+    for gname, mask in groups.items():
+        sub = pairs[mask]
+        for target, actual, pred_col, frz_col in specs:
+            for who, col in (("model", pred_col), ("rank-frozen", frz_col)):
+                if col is None:
+                    continue
+                if len(sub) < 10:
+                    rows.append({"group": gname, "target": target, "predictor": who,
+                                 "n": int(len(sub))})
+                    continue
+                r = _metric_row(sub[actual], sub[col], sub["cbsa"], target=target,
+                                predictor=who, scope="pooled", period="", n_boot=n_boot)
+                r["group"] = gname
+                r["sd_actual"] = float(sub[actual].std())
+                r.update(_change_detection_stats(sub, stable, actual, col))
+                rows.append(r)
+    return rows
+
+
+def _add_gb2_dollar_pairs(pairs: pd.DataFrame, params_by_city: dict) -> pd.DataFrame:
+    """Rank-frozen benchmark and log differences on top of the dollar pairs.
+
+    ``frozen_usd_1`` carries the tract's t0 *predicted* rank to t1's GB2 — what
+    the mapping alone predicts with no t1 imagery. Its R^2 is the share of
+    dollar growth explained by the city-year GB2 maps (ACS distribution shift
+    by quantile) plus the t0 level; the model adds information about change
+    only to the extent it beats this benchmark.
+    """
+    out = pairs.copy()
+    out["frozen_usd_1"] = _gb2_dollars(out, "pred_prob_0", params_by_city, year_col="t1")
+    out["d_frozen_usd"] = out["frozen_usd_1"] - out["pred_usd_0"]
+    with np.errstate(divide="ignore", invalid="ignore"):
+        for side, a, b in (("label", "label_usd_1", "label_usd_0"),
+                           ("pred", "pred_usd_1", "pred_usd_0"),
+                           ("frozen", "frozen_usd_1", "pred_usd_0"),
+                           ("acs", "acs_usd_1", "acs_usd_0")):
+            ratio = out[a] / out[b]
+            out[f"dlog_{side}_usd"] = np.log(ratio.where(ratio > 0))
+    return out
+
+
+def part_growth_figure_us(ctx: _USContext, target_gap: int = _GROWTH_TARGET_GAP,
+                          wealth_long: pd.DataFrame | None = None,
+                          se_long: pd.DataFrame | None = None,
+                          n_boot: int = _GROWTH_N_BOOT) -> dict:
+    """Long-difference growth figure (US): actual vs predicted change in
+    wealth *dollars*, both sides through the GB2 mapping.
+
+    Same test sample as ``part_main_figure_us`` (``_figure_test_sample``).
+    Each tract contributes one (t0, t1) pair (see ``_long_difference_pairs``).
+
+    Mapping (per test CBSA): GB2 fitted by MLE to the CBSA's tract
+    distribution of the label's dollar variable (W2_r5 per-capita wealth) in
+    each panel year, in constant 2023 dollars (CPI-U), unsmoothed (see
+    ``_fit_city_gb2``; fit quality vs the empirical quantiles is printed and
+    returned as ``growth/gb2_fit_max_log_err``). Within each (CBSA, year) cell the predicted score and the
+    label are converted to Hazen ranks and pushed through that year's GB2
+    quantile -> predicted and actual wealth $ at t0 and t1. Both sides are
+    then in dollars, so R^2_oos = 1 - SSE/SST needs no refit.
+
+    A. Δ wealth $ (actual vs predicted).  B. Δ log wealth $ (Khachiyan's
+    log-difference scale). Each panel also reports the within-city R^2 and
+    the rank-frozen benchmark (``_add_gb2_dollar_pairs``). The GB2 map at t1
+    uses that year's ACS distribution for the city, i.e. contemporaneous ACS
+    marginals Khachiyan et al.'s no-initial-conditions model never sees.
+
+    ``wealth_long`` ([GEOID, cbsa, year, usd], constant dollars) is loaded
+    from the ACS panel when omitted. Writes figures/US_growth_figure.pdf,
+    tables/US_growth_metrics.csv and tables/US_growth_pairs.csv.
+    """
+    print("\n=== Long-difference growth figure (US, GB2 wealth dollars) ===")
+    out = ctx.out
+    sample = _figure_test_sample(ctx, what="growth figure")
+    if sample is None:
+        return {}
+    tract = sample["tract_test"].copy()
+    tract["cbsa"] = tract["cbsa"].astype(str)
+
+    if wealth_long is None:
+        try:
+            wealth_long = _load_wealth_dollars_long(
+                ctx.processed_dir, getattr(ctx, "indicator", indicators.DEFAULT_INDICATOR),
+                _ACS_PANEL_YEARS)
+        except Exception as exc:
+            print(f"  wealth panel unavailable ({exc}); skipping growth figure")
+            return {}
+    print(f"  fitting GB2 per test city-year ({tract['cbsa'].nunique()} cities)...")
+    params = _fit_city_gb2(wealth_long, tract["cbsa"].unique())
+    fit_err = _gb2_fit_error(
+        wealth_long, params, tract[["cbsa", "year"]].drop_duplicates().itertuples(index=False))
+    if len(fit_err):
+        worst = fit_err.loc[fit_err["max_log_err"].idxmax()]
+        print(f"  GB2 fit vs empirical P10/P50/P90: median max|log err| = "
+              f"{fit_err['max_log_err'].median():.3f}, worst {worst['max_log_err']:.3f} "
+              f"(CBSA {worst['cbsa']}, {worst['year']})")
+
+    tract["pred_z"] = _zscore_within(tract, "pred")
+    tract["pred_prob"] = _hazen_within(tract, "pred")
+    tract["label_prob"] = _hazen_within(tract, "label")
+    tract["pred_usd"] = _gb2_dollars(tract, "pred_prob", params)
+    tract["label_usd"] = _gb2_dollars(tract, "label_prob", params)
+    acs = wealth_long.set_index(["GEOID", "year"])["usd"]
+    tract["acs_usd"] = acs.reindex(
+        pd.MultiIndex.from_arrays([tract["GEOID"], tract["year"].astype(int)])).values
+
+    pairs = _long_difference_pairs(
+        tract, target_gap,
+        value_cols=("label", "pred_z", "pred_prob", "label_usd", "pred_usd", "acs_usd"))
+    pairs = _add_gb2_dollar_pairs(pairs, params)
+    ok = np.isfinite(pairs[["d_label_usd", "d_pred_usd", "d_frozen_usd"]]).all(axis=1)
+    if (~ok).any():
+        print(f"  dropping {int((~ok).sum())} pair(s) without a finite GB2 dollar value")
+    pairs = pairs[ok].reset_index(drop=True)
+    if len(pairs) < 30:
+        print(f"  only {len(pairs)} tract pairs; skipping growth figure")
+        return {}
+
+    gaps = pairs["gap"].value_counts().sort_index()
+    gap_str = "; ".join(f"{int(g)}y: {n:,}" for g, n in gaps.items())
+    print(f"  {len(pairs):,} tract pairs over {pairs['cbsa'].nunique()} test cities; gaps {gap_str}")
+
+    cl = pairs["cbsa"]
+    row = lambda a, p, **kw: _metric_row(pairs[a], pairs[p], cl, period=gap_str,
+                                         n_boot=n_boot, **kw)
+    res = {}
+    for key, actual, target in (("usd", "d_label_usd", "d wealth USD (GB2, 2023$)"),
+                                ("log", "dlog_label_usd", "dlog wealth USD (GB2)")):
+        pred_col = "d_pred_usd" if key == "usd" else "dlog_pred_usd"
+        frz_col = "d_frozen_usd" if key == "usd" else "dlog_frozen_usd"
+        for who, col in (("model", pred_col), ("rank-frozen", frz_col)):
+            for scope in ("pooled", "within-city"):
+                res[(key, who, scope)] = row(actual, col, target=target, predictor=who, scope=scope)
+    rows = list(res.values())
+    # Diagnostics: the raw-rank change (no GB2) and raw ACS dollars as the actual.
+    rows.append(row("d_label", "d_pred_z", target="d W2_r5 within-city z (label)",
+                    predictor="model (pred z within city-year)", scope="pooled"))
+    for who, col in (("model", "d_pred_usd"), ("rank-frozen", "d_frozen_usd")):
+        rows.append(row("d_acs_usd", col, target="d wealth USD (raw ACS W2, 2023$)",
+                        predictor=who, scope="pooled"))
+
+    # ── figure ──────────────────────────────────────────────────────────────
+    fig = plt.figure(figsize=(FIG_SIZE_TWO_COL[0], FIG_SIZE_TWO_COL[0] * 0.56),
+                     constrained_layout=True)
+    gs = fig.add_gridspec(2, 2, height_ratios=[4, 1.15])
+    ax_a, ax_b = fig.add_subplot(gs[0, 0]), fig.add_subplot(gs[0, 1])
+    ax_cap = fig.add_subplot(gs[1, :])
+    ax_cap.axis("off")
+    ann = {k: _growth_annotation(res[(k, "model", "pooled")], res[(k, "model", "within-city")],
+                                 res[(k, "rank-frozen", "pooled")],
+                                 res[(k, "rank-frozen", "within-city")]) for k in ("usd", "log")}
+    n_off = _panel_growth_scatter(
+        ax_a, pairs["d_label_usd"] / 1e3, pairs["d_pred_usd"] / 1e3, letter="A",
+        xlabel=r"$\Delta$ wealth per capita, actual (\$k, 2023)",
+        ylabel=r"$\Delta$ wealth per capita, predicted (\$k, 2023)", r2_text=ann["usd"])
+    n_off += _panel_growth_scatter(
+        ax_b, pairs["dlog_label_usd"], pairs["dlog_pred_usd"], letter="B",
+        xlabel=r"$\Delta$ log wealth per capita, actual",
+        ylabel=r"$\Delta$ log wealth per capita, predicted", r2_text=ann["log"])
+
+    bench = "; ".join(f"{_tex_year_range(p)}: {r2:.2f}" for p, r2 in _KHACHIYAN_INCOME_R2)
+    caption_body = (
+        rf"Actual vs.~predicted tract wealth change, test cities ({pairs['cbsa'].nunique()} "
+        rf"CBSAs, {len(pairs):,} tracts). Each tract pairs its latest year $t_1$ with the "
+        rf"earlier year closest to $t_1-{target_gap}$ (gaps: {gap_str}). In every city-year, "
+        r"predicted and ACS label ranks are mapped to dollars through a GB2 fitted to that "
+        r"city's ACS W2 tract wealth that year (2023 dollars, CPI-U), so "
+        r"$R^2_{\mathrm{oos}}=1-\mathrm{SSE}/\mathrm{SST}$ needs no refit. (A) Dollar change; "
+        r"(B) log change. Within-city: both sides demeaned by CBSA. Rank-frozen: the tract's "
+        r"$t_0$ predicted rank carried to $t_1$'s GB2 \textemdash\ no $t_1$ imagery, so its "
+        r"$R^2$ comes from the GB2 maps alone. Brackets: 95\% city-cluster bootstrap CIs."
+    )
+    caption_note = (
+        rf"Benchmark \textemdash\ Khachiyan et al.~(2022), Table 2, income, no initial "
+        rf"conditions, $R^2$ of $\Delta$ log total personal income: {bench}. "
+        r"Unlike theirs, the GB2 map at $t_1$ uses that year's ACS city distribution."
+    )
+    if n_off:
+        caption_note += (rf"  Axes show the central {100 * _PANEL_C_CENTRAL_FRAC:.1f}\% of each "
+                         rf"marginal; {n_off:,} points fall outside and are not shown.")
+    caption = "\n".join(textwrap.wrap(caption_body, width=125)) + "\n" + "\n".join(
+        textwrap.wrap(caption_note, width=125))
+    ax_cap.text(0.5, 1.0, caption, transform=ax_cap.transAxes, ha="center", va="top",
+                fontsize=6.0, color="0.25", linespacing=1.6)
+    _savefig(fig, out / "figures" / "US_growth_figure.pdf")
+
+    table = _growth_metrics_table(rows)
+    table.to_csv(out / "tables" / "US_growth_metrics.csv", index=False)
+
+    # ── R^2 by ACS change significance (training's MOE gate, per pair) ──────
+    by_change = None
+    if se_long is None:
+        try:
+            se_long = _load_rel_se_long(
+                ctx.processed_dir, getattr(ctx, "indicator", indicators.DEFAULT_INDICATOR),
+                _ACS_PANEL_YEARS)
+        except Exception as exc:
+            print(f"  label SEs unavailable ({exc}); stable/change split skipped")
+    if se_long is not None:
+        pairs = _attach_change_pvalue(pairs, se_long)
+        by_change = pd.DataFrame(_growth_by_change_rows(pairs, n_boot=n_boot))
+        by_change.to_csv(out / "tables" / "US_growth_by_change.csv", index=False)
+        print("  R2 by ACS change significance (pooled; model vs rank-frozen):")
+        for r in by_change.itertuples(index=False):
+            if pd.notna(getattr(r, "r2_oos", np.nan)):
+                print(f"    {r.group:24s} {r.target[:30]:30s} {r.predictor:11s} n={r.n:5d} "
+                      f"sd={r.sd_actual:10.3f} R2_oos={r.r2_oos:8.4f} "
+                      f"[{r.r2_oos_ci_lo:.3f}, {r.r2_oos_ci_hi:.3f}] "
+                      f"R2_ols={r.r2_ols:.4f} rho={r.spearman:.3f} "
+                      f"rel={r.label_reliability:.3f} sign={r.sign_agree:.3f} "
+                      f"auc={r.auc_abs_vs_stable:.3f}")
+    pairs.to_csv(out / "tables" / "US_growth_pairs.csv", index=False)
+    for r in rows:
+        print(f"  {r['target'][:34]:34s} {r['predictor'][:22]:22s} {r['scope']:11s} "
+              f"R2_oos={r['r2_oos']:8.4f} [{r['r2_oos_ci_lo']:.4f}, {r['r2_oos_ci_hi']:.4f}] "
+              f"R2_ols={r['r2_ols']:.4f} rho={r['spearman']:.4f}")
+    print("  Khachiyan et al. (2022) Table 2, income, no IC: "
+          + ", ".join(f"{p}={r2:.4f}" for p, r2 in _KHACHIYAN_INCOME_R2))
+
+    headline = {
+        "growth/n_tract_pairs": int(len(pairs)),
+        "growth/n_test_cities": int(pairs["cbsa"].nunique()),
+        "growth/gap_median": float(pairs["gap"].median()),
+        "growth/gb2_fit_max_log_err": float(fit_err["max_log_err"].max()) if len(fit_err)
+        else float("nan"),
+    }
+    for (key, who, scope), r in res.items():
+        tag = f"growth/{key}_{'model' if who == 'model' else 'frozen'}_" \
+              f"{'pooled' if scope == 'pooled' else 'within'}"
+        headline[f"{tag}_r2_oos"] = r["r2_oos"]
+        headline[f"{tag}_r2_ols"] = r["r2_ols"]
+    if by_change is not None and "r2_oos" in by_change.columns:
+        model = by_change[by_change["predictor"] == "model"]
+        for r in model.itertuples(index=False):
+            key = re.sub(r"[^a-z0-9]+", "_", f"{r.group} {r.target}".lower()).strip("_")
+            headline[f"growth/by_change/{key}/r2_oos"] = r.r2_oos
+            headline[f"growth/by_change/{key}/n"] = r.n
+    return headline
+
+
+# ─── Part F: growth R^2 by construction cohort (NYC) ──────────────────────────
+# The long-difference growth test (``part_growth_figure_us``) on the sample
+# whose change status is known from the ground rather than from ACS: NYC tracts
+# grouped by Part D's construction cohorts. "stable" is Part D's pinned control
+# (never crossed CONTROL_THRESHOLD of baseline building area); "change h" is a
+# tract that first crossed h inside the pair's window (t0, t1]. Tracts that
+# crossed before t0 changed outside the window and belong to no group.
+
+
+def _construction_window_groups(pairs: pd.DataFrame, cohorts_by_t: dict) -> dict[str, pd.Series]:
+    """Boolean masks over ``pairs`` rows (needs GEOID, t0, t1).
+
+    ``cohorts_by_t`` maps threshold -> ``CohortResult.cohorts`` (GEOID_str,
+    cohort_year; 0 = never treated under the pinned control; tracts dropped as
+    ambiguous or without baseline stock are absent). The stable group is the
+    same tracts at every threshold because the control is pinned, so it is
+    taken from the first threshold.
+    """
+    groups = {}
+    for i, (thresh, coh) in enumerate(sorted(cohorts_by_t.items())):
+        year = pairs["GEOID"].map(coh.set_index("GEOID_str")["cohort_year"])
+        if i == 0:
+            groups["stable"] = year == 0
+        groups[f"change {thresh:.0%}"] = (year > pairs["t0"]) & (year <= pairs["t1"])
+        groups[f"pre-window {thresh:.0%}"] = (year > 0) & (year <= pairs["t0"])
+    return groups
+
+
+def _construction_group_row(sub: pd.DataFrame, stable: pd.DataFrame, n_boot: int) -> dict:
+    """Metrics for one (split, group): R^2 of Δlabel on the within-year z-scored
+    Δpred, plus the two-period mean shifts vs the stable group in both the
+    label and the raw prediction (the latter is a 2-period analogue of the
+    CSA ATT, in the same tract-mean-prediction units)."""
+    row = {"n": int(len(sub)),
+           "mean_d_label": float(sub["d_label"].mean()),
+           "mean_d_pred": float(sub["d_pred"].mean()),
+           "d_label_vs_stable": float(sub["d_label"].mean() - stable["d_label"].mean()),
+           "d_pred_vs_stable": float(sub["d_pred"].mean() - stable["d_pred"].mean())}
+    if len(sub) < 10:
+        return row
+    met = _growth_metrics(sub["d_label"].values, sub["d_pred_z"].values)
+    lo, hi = _cluster_bootstrap_ci(sub["d_label"].values, sub["d_pred_z"].values,
+                                   sub["GEOID"].values, _r2_oos, n_boot=n_boot)
+    row.update(met)
+    row.update({"r2_oos_ci_lo": lo, "r2_oos_ci_hi": hi,
+                "sd_d_label": float(sub["d_label"].std())})
+    row.update(_change_detection_stats(sub, stable, "d_label", "d_pred_z"))
+    return row
+
+
+def part_f(results_dir: Path, processed_dir: Path, out: Path,
+           years: list[int] | None = None, target_gap: int = _GROWTH_TARGET_GAP,
+           thresholds=None, n_boot: int = _GROWTH_N_BOOT) -> pd.DataFrame | None:
+    """Growth R^2 for NYC tracts by construction cohort, train vs held out.
+
+    Pairs: each tract's latest year t1 and the earlier year closest to
+    t1 - ``target_gap`` (2014 -> 2024 on the biennial NYC grid). Outcome is
+    Part D's tract-mean prediction (all buildings); the label is the tract's
+    W2 z-score from the NYC pass. The prediction is z-scored within year so
+    R^2_oos needs no refit. Writes tables/F_growth_by_construction.csv.
+    """
+    from src import csa_event_study as ces
+
+    print("\n=== Part F: growth R^2 by construction cohort (NYC) ===")
+    spec = ces.CSA_CITIES["nyc"]
+    if not (Path(processed_dir) / spec.footprints_filename).exists():
+        print(f"  {spec.footprints_filename} not found — Part F skipped")
+        return None
+    years = sorted(years) if years else _available_years(results_dir) or list(YEARS)
+    thresholds = tuple(thresholds) if thresholds else ces.DEFAULT_THRESHOLDS
+    city_years = spec.years(years)
+    baseline_year = spec.baseline(CSA_BASELINE_YEAR)
+
+    per_building, tracts, construction_year = _csa_city_geometry(processed_dir, spec)
+    outcomes = _csa_city_outcomes(
+        results_dir, results_dir, processed_dir, spec, city_years, baseline_year,
+        tracts, construction_year, lambda: _csa_building_preds(results_dir, city_years))
+    labels = _load_tract_long(results_dir, city_years)
+    if outcomes.empty or labels.empty:
+        print("  no NYC predictions or tract labels — Part F skipped")
+        return None
+    tract = outcomes[["GEOID_str", "year", "pred_all"]].merge(
+        labels[["GEOID_str", "year", "Rel_Score"]], on=["GEOID_str", "year"])
+    tract = tract.rename(columns={"GEOID_str": "GEOID", "pred_all": "pred",
+                                  "Rel_Score": "label"}).dropna(subset=["pred", "label"])
+    tract["cbsa"] = "35620"
+    tract["pred_z"] = _zscore_within(tract, "pred")
+    pairs = _long_difference_pairs(tract, target_gap, value_cols=("label", "pred", "pred_z"))
+    windows = pairs.groupby(["t0", "t1"]).size()
+    print(f"  {len(pairs):,} tract pairs; windows "
+          + ", ".join(f"{a}-{b}: {n:,}" for (a, b), n in windows.items()))
+
+    cohorts_by_t = {
+        t: ces.build_tract_cohorts(
+            None, tracts, city_years, baseline_year=baseline_year, threshold=t,
+            year_col=spec.year_col, demolition_col=spec.demolition_col,
+            area_epsg=spec.area_epsg, control_threshold=ces.CONTROL_THRESHOLD,
+            per_building=per_building).cohorts
+        for t in thresholds}
+    groups = _construction_window_groups(pairs, cohorts_by_t)
+    split_of = _csa_split_of(processed_dir)
+    pairs["split_group"] = pairs["GEOID"].map(split_of)
+
+    rows = []
+    for split in [g for g in CSA_SPLIT_GROUPS if (pairs["split_group"] == g).any()]:
+        in_split = pairs["split_group"] == split
+        stable = pairs[in_split & groups["stable"]]
+        for gname, mask in groups.items():
+            sub = pairs[in_split & mask]
+            row = {"split": CSA_SPLIT_LABELS.get(split, split), "group": gname}
+            row.update(_construction_group_row(sub, stable, n_boot))
+            rows.append(row)
+    table = pd.DataFrame(rows)
+    table.to_csv(out / "tables" / "F_growth_by_construction.csv", index=False)
+    for r in table.itertuples(index=False):
+        line = (f"  {r.split:18s} {r.group:16s} n={r.n:5d} "
+                f"mean dlabel={r.mean_d_label:+.3f} (vs stable {r.d_label_vs_stable:+.3f})  "
+                f"mean dpred={r.mean_d_pred:+.3f} (vs stable {r.d_pred_vs_stable:+.3f})")
+        if pd.notna(getattr(r, "r2_oos", np.nan)):
+            line += (f"  R2_oos={r.r2_oos:+.3f} [{r.r2_oos_ci_lo:+.3f}, {r.r2_oos_ci_hi:+.3f}] "
+                     f"R2_ols={r.r2_ols:.4f} rho={r.spearman:+.3f} "
+                     f"sign={r.sign_agree:.3f} auc={r.auc_abs_vs_stable:.3f}")
+        print(line)
+    return table
+
+
+# ─── ACS-window growth scatter (NYC, construction groups) ─────────────────────
+# A 5-year ACS estimate labelled Y averages survey years Y-4..Y, so its change
+# is compared with the change in the tract's prediction averaged over the
+# imagery years inside the same two windows, not with two single flights.
+
+_ACS_WINDOW_SPAN = 5
+_GROUP_COLORS = {"stable": "#0072B2", "change": "#D55E00"}   # Okabe-Ito
+
+
+def _acs_window_years(acs_year: int, imagery_years, span: int = _ACS_WINDOW_SPAN) -> list[int]:
+    """Imagery years inside the survey window of the ``acs_year`` 5-year
+    estimate, i.e. in [acs_year - span + 1, acs_year]."""
+    return sorted(int(y) for y in imagery_years if acs_year - span < int(y) <= acs_year)
+
+
+def _window_average(tract: pd.DataFrame, years: list[int], col: str = "pred") -> pd.DataFrame:
+    """Per-tract mean of ``col`` over ``years`` -> [GEOID, mean, n_years]."""
+    sub = tract[tract["year"].isin(years)]
+    g = sub.groupby("GEOID")[col]
+    return pd.DataFrame({"mean": g.mean(), "n_years": g.size()}).reset_index()
+
+
+def _load_panel_scores(processed_dir: Path, indicator: str, years) -> pd.DataFrame:
+    """Long [GEOID, year, label] of the indicator's per-CBSA z-score straight
+    from the ACS panel — the 5-year vintage labelled ``year``."""
+    cols = [_PANEL_GEOID_COL] + [indicators.score_col(indicator, y) for y in years]
+    panel = pd.read_feather(processed_dir / _PANEL_FILENAME, columns=cols)
+    panel = panel.rename(columns={_PANEL_GEOID_COL: "GEOID"})
+    panel["GEOID"] = panel["GEOID"].astype(str).str.zfill(11)
+    panel = panel.drop_duplicates("GEOID")
+    return pd.concat([pd.DataFrame({"GEOID": panel["GEOID"].values, "year": int(y),
+                                    "label": panel[indicators.score_col(indicator, y)]
+                                    .values.astype(float)}) for y in years],
+                     ignore_index=True)
+
+
+def _acs_window_pairs(tract: pd.DataFrame, labels: pd.DataFrame, acs_pre: int, acs_post: int,
+                      imagery_years, span: int = _ACS_WINDOW_SPAN) -> pd.DataFrame:
+    """One row per tract: Δ label between the two ACS vintages and Δ of the
+    window-averaged prediction (each window average z-scored across tracts,
+    so both sides are in within-sample z units). Tracts need at least one
+    flight in each window. Also carries the single-flight Δ (last flight of
+    each window) for comparison."""
+    w_pre = _acs_window_years(acs_pre, imagery_years, span)
+    w_post = _acs_window_years(acs_post, imagery_years, span)
+    if not w_pre or not w_post:
+        raise ValueError(f"no imagery year inside an ACS window: {w_pre} / {w_post}")
+    a = _window_average(tract, w_pre).rename(columns={"mean": "pred_pre", "n_years": "n_pre"})
+    b = _window_average(tract, w_post).rename(columns={"mean": "pred_post", "n_years": "n_post"})
+    lab = labels.pivot(index="GEOID", columns="year", values="label")
+    out = a.merge(b, on="GEOID")
+    out["label_pre"] = lab[acs_pre].reindex(out["GEOID"]).values
+    out["label_post"] = lab[acs_post].reindex(out["GEOID"]).values
+    single = tract.pivot(index="GEOID", columns="year", values="pred")
+    out["pred_single_pre"] = single[max(w_pre)].reindex(out["GEOID"]).values
+    out["pred_single_post"] = single[max(w_post)].reindex(out["GEOID"]).values
+    out = out.dropna(subset=["label_pre", "label_post"]).reset_index(drop=True)
+    z = lambda s: (s - s.mean()) / s.std()
+    out["d_label"] = out["label_post"] - out["label_pre"]
+    out["d_pred_z"] = z(out["pred_post"]) - z(out["pred_pre"])
+    out["d_pred_single_z"] = z(out["pred_single_post"]) - z(out["pred_single_pre"])
+    out["d_pred"] = out["pred_post"] - out["pred_pre"]
+    out["t0"], out["t1"] = acs_pre, acs_post
+    out.attrs.update({"window_pre": w_pre, "window_post": w_post})
+    return out
+
+
+def _panel_group_scatter(ax: plt.Axes, groups: dict[str, tuple[pd.DataFrame, str]],
+                         x: str = "d_label", y: str = "d_pred_z") -> None:
+    """Δ label vs Δ prediction, one colour per group, with a per-group OLS
+    line, a shared 45-degree line and a per-group R^2 legend entry."""
+    allv = pd.concat([g[[x, y]] for g, _ in groups.values()])
+    lo, hi = np.nanpercentile(allv.values, [0.5, 99.5])
+    pad = 0.05 * (hi - lo)
+    ax.plot([lo, hi], [lo, hi], color="0.4", ls="--", lw=0.9, zorder=1, label=r"45$^\circ$")
+    for name, (g, color) in groups.items():
+        m = _growth_metrics(g[x].values, g[y].values)
+        ax.scatter(g[x], g[y], s=7, alpha=0.6, color=color, linewidths=0, zorder=2,
+                   label=(rf"{name} ($n$={m['n']}): $R^2_{{\mathrm{{oos}}}}$={m['r2_oos']:.2f}, "
+                          rf"$R^2_{{\mathrm{{OLS}}}}$={m['r2_ols']:.3f}"))
+        ok = np.isfinite(g[x]) & np.isfinite(g[y])
+        if ok.sum() >= 3 and np.ptp(g.loc[ok, x]) > 0:
+            b, a = np.polyfit(g.loc[ok, x], g.loc[ok, y], 1)
+            xs = np.array([lo, hi])
+            ax.plot(xs, a + b * xs, color=color, lw=1.6, zorder=3)
+    ax.axhline(0, color="0.85", lw=0.6, zorder=0)
+    ax.axvline(0, color="0.85", lw=0.6, zorder=0)
+    ax.set_xlim(lo - pad, hi + pad)
+    ax.set_ylim(lo - pad, hi + pad)
+    for spine in ("top", "right"):
+        ax.spines[spine].set_visible(False)
+    ax.legend(fontsize=6, loc="upper left", frameon=True, facecolor="white",
+              edgecolor="none", framealpha=0.85)
+
+
+def _winsorize(v: pd.Series | np.ndarray, frac: float) -> np.ndarray:
+    """Clip to the [frac, 1-frac] percentiles of its own finite values — Part C's
+    per-year P1/P99 rule for GB2 dollars."""
+    v = np.asarray(v, float)
+    fin = v[np.isfinite(v)]
+    if not len(fin):
+        return v
+    lo, hi = np.percentile(fin, [100 * frac, 100 * (1 - frac)])
+    return np.clip(v, lo, hi)
+
+
+def _add_window_gb2_dollars(pairs: pd.DataFrame, params_by_year: dict, acs_pre: int,
+                            acs_post: int, acs_usd: pd.DataFrame | None = None,
+                            winsor: float | None = 0.01) -> pd.DataFrame:
+    """Map each vintage's ranks to wealth dollars through that vintage's GB2.
+
+    Within a vintage only the ordering of the label is comparable (the draft's
+    Ψ_ct), so the label and the window-averaged prediction are converted to
+    Hazen ranks across the tracts of ``pairs`` and pushed through the GB2
+    fitted to that vintage's distribution: ``label_usd_*``, ``pred_usd_*``,
+    the single-flight ``pred_single_usd_*``, and ``frozen_usd_post`` (pre-window
+    predicted rank under the post vintage's GB2 — the change the maps alone
+    imply). Adds Δ ($) and Δlog columns for each. ``acs_usd`` ([GEOID, year,
+    usd]) adds the raw ACS dollars as an alternative actual.
+
+    ``winsor`` clips every dollar column at its own P1/P99 within the vintage
+    before differencing, as Part C does: GB2's power-law tail maps the top
+    Hazen ranks to tens of millions per capita (NYC 2023: $30.8M at rank
+    0.9998), and without the clip five Manhattan tracts swapping places near
+    the top carried 85% of the sum of squares of Δ label $.
+    """
+    out = pairs.copy()
+    out["_cell"] = 0
+    for side, pre_col, post_col in (("label", "label_pre", "label_post"),
+                                    ("pred", "pred_pre", "pred_post"),
+                                    ("pred_single", "pred_single_pre", "pred_single_post")):
+        for when, col, yr in (("pre", pre_col, acs_pre), ("post", post_col, acs_post)):
+            ok = out[col].notna()
+            prob = np.full(len(out), np.nan)
+            prob[ok.values] = _hazen_within(out.loc[ok].assign(_x=out.loc[ok, col]), "_x",
+                                            by=("_cell",)).values
+            out[f"{side}_prob_{when}"] = prob
+            out[f"{side}_usd_{when}"] = _gb2_quantile(prob, params_by_year[yr])
+    out["frozen_usd_post"] = _gb2_quantile(out["pred_prob_pre"].values, params_by_year[acs_post])
+    if acs_usd is not None:
+        a = acs_usd.set_index(["GEOID", "year"])["usd"]
+        for when, yr in (("pre", acs_pre), ("post", acs_post)):
+            out[f"acs_usd_{when}"] = a.reindex(
+                pd.MultiIndex.from_arrays([out["GEOID"], np.full(len(out), yr)])).values
+    if winsor:
+        usd_cols = [c for c in out.columns
+                    if c.endswith(("_usd_pre", "_usd_post")) and not c.startswith("d")]
+        for c in usd_cols:
+            out[c] = _winsorize(out[c], winsor)
+    pairs_cols = [("label", "label_usd_post", "label_usd_pre"),
+                  ("pred", "pred_usd_post", "pred_usd_pre"),
+                  ("pred_single", "pred_single_usd_post", "pred_single_usd_pre"),
+                  ("frozen", "frozen_usd_post", "pred_usd_pre")]
+    if acs_usd is not None:
+        pairs_cols.append(("acs", "acs_usd_post", "acs_usd_pre"))
+    with np.errstate(divide="ignore", invalid="ignore"):
+        for side, b, a in pairs_cols:
+            out[f"d_{side}_usd"] = out[b] - out[a]
+            ratio = out[b] / out[a]
+            out[f"dlog_{side}_usd"] = np.log(ratio.where(ratio > 0))
+    return out.drop(columns=["_cell"])
+
+
+def _direction_metrics(actual, predicted, n_boot: int = _GROWTH_N_BOOT, seed: int = 0) -> dict:
+    """Does the predicted change have the sign of the actual change?
+
+    ``accuracy`` is the share of tracts whose signs agree; ``majority`` is the
+    accuracy of always predicting the more common actual sign (the bar a
+    direction call must clear when most tracts move the same way);
+    ``balanced`` averages the hit rates on actual risers and fallers (0.5 =
+    chance whatever the base rate); ``kappa`` is Cohen's agreement beyond
+    chance. Tracts with a zero change on either side are dropped. The CI
+    resamples tracts.
+    """
+    a, p = np.asarray(actual, float), np.asarray(predicted, float)
+    ok = np.isfinite(a) & np.isfinite(p) & (a != 0) & (p != 0)
+    ua, up = a[ok] > 0, p[ok] > 0
+    n = int(ok.sum())
+    nan = float("nan")
+    if n == 0:
+        return {"n": 0, "accuracy": nan, "acc_ci_lo": nan, "acc_ci_hi": nan, "majority": nan,
+                "balanced": nan, "kappa": nan, "share_actual_up": nan, "share_pred_up": nan}
+
+    def stats(ua_, up_):
+        acc = float(np.mean(ua_ == up_))
+        tpr = float(np.mean(up_[ua_])) if ua_.any() else nan
+        tnr = float(np.mean(~up_[~ua_])) if (~ua_).any() else nan
+        bal = np.nanmean([tpr, tnr])
+        pa, pp = ua_.mean(), up_.mean()
+        pe = pa * pp + (1 - pa) * (1 - pp)
+        kappa = (acc - pe) / (1 - pe) if pe < 1 else nan
+        return acc, float(bal), float(kappa)
+
+    acc, bal, kappa = stats(ua, up)
+    rng = np.random.default_rng(seed)
+    boots = [stats(ua[i], up[i])[0] for i in (rng.integers(0, n, n) for _ in range(n_boot))]
+    lo, hi = np.percentile(boots, [2.5, 97.5])
+    return {"n": n, "accuracy": acc, "acc_ci_lo": float(lo), "acc_ci_hi": float(hi),
+            "majority": float(max(ua.mean(), 1 - ua.mean())), "balanced": bal,
+            "kappa": kappa, "share_actual_up": float(ua.mean()),
+            "share_pred_up": float(up.mean())}
+
+
+def _direction_table(pairs: pd.DataFrame, groups: dict[str, pd.Series], preds: dict[str, str],
+                     actual: str = "d_label_usd", n_boot: int = _GROWTH_N_BOOT) -> pd.DataFrame:
+    """Direction metrics per (split, group, prediction, definition).
+
+    ``absolute``: sign of the change itself. ``relative to city``: sign of the
+    change minus the city's median change over all tracts of ``pairs`` (the
+    whole cell, not the group) — did the tract gain more than the typical
+    tract? That strips the city-wide growth both sides share through the GB2
+    maps, which otherwise lets "everyone went up" pass for skill.
+    """
+    rel = {c: pairs[c] - pairs[c].median() for c in [actual, *preds.values()]}
+    rows = []
+    for split in [None, *[g for g in CSA_SPLIT_GROUPS if (pairs["split_group"] == g).any()]]:
+        in_split = (pairs["split_group"] == split) if split else pairs["split_group"].notna()
+        for gname, mask in groups.items():
+            m = in_split & mask
+            for kind, col in preds.items():
+                for definition, a, p in (("absolute", pairs[actual], pairs[col]),
+                                         ("relative to city", rel[actual], rel[col])):
+                    rows.append({"split": CSA_SPLIT_LABELS.get(split, "All (held out + train)"),
+                                 "group": gname, "prediction": kind, "definition": definition,
+                                 **_direction_metrics(a[m], p[m], n_boot=n_boot)})
+    return pd.DataFrame(rows)
+
+
+def _plot_direction(ax: plt.Axes, tbl: pd.DataFrame, groups: list[str], preds: list[str],
+                    colors: dict[str, str], letter: str, title: str) -> None:
+    """Grouped bars of direction accuracy (95% CI) per group x prediction, a
+    black tick at each group's majority-class baseline and a 0.5 line."""
+    width = 0.8 / len(preds)
+    for gi, g in enumerate(groups):
+        for pi, kind in enumerate(preds):
+            r = tbl[(tbl["group"] == g) & (tbl["prediction"] == kind)]
+            if r.empty:
+                continue
+            r = r.iloc[0]
+            x = gi - 0.4 + width * (pi + 0.5)
+            ax.bar(x, r["accuracy"], width * 0.92, color=colors[kind],
+                   label=kind.replace("->", r"$\to$") if gi == 0 else None, zorder=2)
+            ax.errorbar(x, r["accuracy"], yerr=[[r["accuracy"] - r["acc_ci_lo"]],
+                                                [r["acc_ci_hi"] - r["accuracy"]]],
+                        color="0.2", lw=0.8, capsize=2, zorder=3)
+        maj = tbl[tbl["group"] == g]["majority"].iloc[0]
+        ax.hlines(maj, gi - 0.42, gi + 0.42, color="black", lw=1.4, zorder=4,
+                  label="majority-class baseline" if gi == 0 else None)
+    ax.axhline(0.5, color="0.6", ls=":", lw=0.9, zorder=1)
+    ax.set_xticks(range(len(groups)))
+    tex = lambda g: g.replace(">=", r"$\geq$").replace("%", r"\%")   # usetex-safe
+    ax.set_xticklabels([f"{tex(g)}\n($n$={int(tbl[tbl['group'] == g]['n'].iloc[0])})"
+                        for g in groups], fontsize=7)
+    ax.set_ylim(0, 1)
+    ax.set_ylabel("Share of tracts with the right direction")
+    ax.set_title(title, fontsize=7.5)
+    _panel_title(ax, letter)
+    for spine in ("top", "right"):
+        ax.spines[spine].set_visible(False)
+
+
+def part_f_acs_window(results_dir: Path, processed_dir: Path, out: Path,
+                      years: list[int] | None = None, acs_pre: int = 2018,
+                      acs_post: int = 2023, threshold: float = 0.05,
+                      indicator: str = indicators.DEFAULT_INDICATOR,
+                      n_boot: int = _GROWTH_N_BOOT,
+                      wealth_long: pd.DataFrame | None = None) -> pd.DataFrame | None:
+    """NYC: 5-year change in GB2 wealth dollars between two ACS vintages vs
+    the change implied by the tract prediction averaged over each vintage's
+    survey window.
+
+    Per vintage, a GB2 is fitted (unsmoothed, constant 2023 dollars) to the
+    W2 per-capita wealth of the NYC tracts (the CSA city's county prefixes —
+    the same population whose ranks are mapped), and both label and
+    window-averaged prediction ranks are mapped through it
+    (``_add_window_gb2_dollars``). Comparing dollars, not z-scores, is what the
+    model licenses: a z-score is a cell-specific transform of the latent
+    position, so its change mixes movement with changes in the cell's scale.
+
+    Groups (Part D cohorts, control pinned at CONTROL_THRESHOLD): ``stable``
+    never crossed the control cut; ``change`` first crossed ``threshold``
+    after ``acs_pre`` and by ``acs_post``. Tracts that crossed earlier are
+    excluded. Writes figures/F_acs_window_scatter.pdf, tables/F_acs_window.csv
+    and tables/F_acs_window_pairs.csv.
+    """
+    from src import csa_event_study as ces
+
+    print(f"\n=== Part F (ACS window, GB2 dollars): ACS {acs_pre} -> {acs_post}, "
+          f"window-averaged predictions, stable vs {threshold:.0%} (NYC) ===")
+    spec = ces.CSA_CITIES["nyc"]
+    if not (Path(processed_dir) / spec.footprints_filename).exists():
+        print(f"  {spec.footprints_filename} not found — skipped")
+        return None
+    years = sorted(years) if years else _available_years(results_dir) or list(YEARS)
+    city_years = spec.years(years)
+    baseline_year = spec.baseline(CSA_BASELINE_YEAR)
+    per_building, tracts, construction_year = _csa_city_geometry(processed_dir, spec)
+    outcomes = _csa_city_outcomes(
+        results_dir, results_dir, processed_dir, spec, city_years, baseline_year,
+        tracts, construction_year, lambda: _csa_building_preds(results_dir, city_years))
+    if outcomes.empty:
+        print("  no NYC predictions — skipped")
+        return None
+    tract = outcomes[["GEOID_str", "year", "pred_all"]].rename(
+        columns={"GEOID_str": "GEOID", "pred_all": "pred"}).dropna()
+    labels = _load_panel_scores(processed_dir, indicator, [acs_pre, acs_post])
+    pairs = _acs_window_pairs(tract, labels, acs_pre, acs_post, city_years)
+    w_pre, w_post = pairs.attrs["window_pre"], pairs.attrs["window_post"]
+    print(f"  ACS {acs_pre} covers {acs_pre - _ACS_WINDOW_SPAN + 1}-{acs_pre}: flights {w_pre}; "
+          f"ACS {acs_post} covers {acs_post - _ACS_WINDOW_SPAN + 1}-{acs_post}: flights {w_post}; "
+          f"{len(pairs):,} tracts")
+
+    # ── GB2 per vintage on the NYC tract distribution ────────────────────────
+    if wealth_long is None:
+        wealth_long = _load_wealth_dollars_long(processed_dir, indicator, [acs_pre, acs_post])
+    city_w = wealth_long[wealth_long["GEOID"].str[:5].isin(spec.geoid_prefixes)].copy()
+    city_w["cbsa"] = "nyc"
+    params = _fit_city_gb2(city_w, ["nyc"]).get("nyc", {})
+    if acs_pre not in params or acs_post not in params:
+        print("  GB2 fit unavailable for a vintage — skipped")
+        return None
+    fit_err = _gb2_fit_error(city_w, {"nyc": params}, [("nyc", acs_pre), ("nyc", acs_post)])
+    print("  GB2 fit vs empirical P10/P50/P90 max|log err|: "
+          + ", ".join(f"{int(r.year)}={r.max_log_err:.3f}" for r in fit_err.itertuples()))
+    pairs = _add_window_gb2_dollars(pairs, params, acs_pre, acs_post, acs_usd=city_w)
+
+    thresholds = sorted({ces.CONTROL_THRESHOLD, threshold})
+    cohorts_by_t = {
+        t: ces.build_tract_cohorts(
+            None, tracts, city_years, baseline_year=baseline_year, threshold=t,
+            year_col=spec.year_col, demolition_col=spec.demolition_col,
+            area_epsg=spec.area_epsg, control_threshold=ces.CONTROL_THRESHOLD,
+            per_building=per_building).cohorts
+        for t in thresholds}
+    masks = _construction_window_groups(pairs, cohorts_by_t)
+    chg = f"change {threshold:.0%}"
+    pairs["split_group"] = pairs["GEOID"].map(_csa_split_of(processed_dir))
+
+    single = f"single flight ({max(w_pre)}->{max(w_post)})"
+    specs = (  # (target, actual col, [(prediction kind, predicted col), ...])
+        ("d wealth USD (GB2)", "d_label_usd",
+         [("window-averaged", "d_pred_usd"), (single, "d_pred_single_usd"),
+          ("rank-frozen", "d_frozen_usd")]),
+        ("dlog wealth USD (GB2)", "dlog_label_usd",
+         [("window-averaged", "dlog_pred_usd"), (single, "dlog_pred_single_usd"),
+          ("rank-frozen", "dlog_frozen_usd")]),
+        ("d wealth USD (raw ACS W2)", "d_acs_usd",
+         [("window-averaged", "d_pred_usd"), ("rank-frozen", "d_frozen_usd")]),
+        ("d W2 z-score (diagnostic only)", "d_label", [("window-averaged", "d_pred_z")]),
+    )
+    rows = []
+    for split in [None, *[g for g in CSA_SPLIT_GROUPS if (pairs["split_group"] == g).any()]]:
+        in_split = (pairs["split_group"] == split) if split else pairs["split_group"].notna()
+        for gname, mask in (("stable", masks["stable"]), (chg, masks[chg])):
+            sub = pairs[in_split & mask]
+            for target, actual, preds in specs:
+                for kind, pcol in preds:
+                    ok = np.isfinite(sub[actual]) & np.isfinite(sub[pcol])
+                    s = sub[ok]
+                    met = _growth_metrics(s[actual].values, s[pcol].values)
+                    lo_, hi_ = _cluster_bootstrap_ci(s[actual].values, s[pcol].values,
+                                                     s["GEOID"].values, _r2_oos, n_boot=n_boot)
+                    rows.append({"split": CSA_SPLIT_LABELS.get(split, "All (held out + train)"),
+                                 "group": gname, "target": target, "prediction": kind, **met,
+                                 "r2_oos_ci_lo": lo_, "r2_oos_ci_hi": hi_,
+                                 "mean_actual": float(s[actual].mean()),
+                                 "mean_predicted": float(s[pcol].mean())})
+    table = pd.DataFrame(rows)
+    table.to_csv(out / "tables" / "F_acs_window.csv", index=False)
+    pairs.to_csv(out / "tables" / "F_acs_window_pairs.csv", index=False)
+    for c in ("d_label_usd", "d_pred_usd", "d_acs_usd"):
+        v = pairs[c].dropna()
+        ss = ((v - v.mean()) ** 2).sort_values(ascending=False)
+        print(f"  leverage check {c}: top-5 tracts carry {ss.iloc[:5].sum() / ss.sum():.1%} "
+              f"of the sum of squares (n={len(v):,})")
+
+    # ── figure: Δ$ and Δlog$, stable vs built, one colour each ──────────────
+    in_any = pairs["split_group"].notna()
+    st, ch = pairs[in_any & masks["stable"]].copy(), pairs[in_any & masks[chg]].copy()
+    for d in (st, ch):
+        d["d_label_k"], d["d_pred_k"] = d["d_label_usd"] / 1e3, d["d_pred_usd"] / 1e3
+    built = f"Built $\\geq${_tex_pct(threshold)}"
+    fig, (ax_a, ax_b) = plt.subplots(1, 2, figsize=(FIG_SIZE_TWO_COL[0], FIG_SIZE_TWO_COL[0] * 0.52),
+                                     constrained_layout=True)
+    _panel_group_scatter(ax_a, {"Stable": (st, _GROUP_COLORS["stable"]),
+                                built: (ch, _GROUP_COLORS["change"])},
+                         x="d_label_k", y="d_pred_k")
+    ax_a.set_xlabel(rf"$\Delta$ wealth per capita, ACS {acs_pre}$\to${acs_post} (\$k, 2023)")
+    ax_a.set_ylabel(r"$\Delta$ predicted wealth per capita (\$k, 2023)")
+    _panel_title(ax_a, "A")
+    _panel_group_scatter(ax_b, {"Stable": (st, _GROUP_COLORS["stable"]),
+                                built: (ch, _GROUP_COLORS["change"])},
+                         x="dlog_label_usd", y="dlog_pred_usd")
+    ax_b.set_xlabel(rf"$\Delta$ log wealth per capita, ACS {acs_pre}$\to${acs_post}")
+    ax_b.set_ylabel(r"$\Delta$ log predicted wealth per capita")
+    _panel_title(ax_b, "B")
+    fig.suptitle(rf"NYC, GB2 wealth dollars per ACS vintage; predictions averaged over each "
+                 rf"survey window ({min(w_pre)}--{max(w_pre)} vs {min(w_post)}--{max(w_post)})",
+                 fontsize=7.5)
+    _savefig(fig, out / "figures" / "F_acs_window_scatter.pdf")
+
+    # ── direction accuracy: does the predicted change have the right sign? ──
+    preds = {"window-averaged": "d_pred_usd", single: "d_pred_single_usd",
+             "rank-frozen": "d_frozen_usd"}
+    dir_groups = {"Stable": masks["stable"], f"Built >={threshold:.0%}": masks[chg]}
+    direction = _direction_table(pairs, dir_groups, preds, n_boot=n_boot)
+    direction.to_csv(out / "tables" / "F_acs_window_direction.csv", index=False)
+    pooled = direction[direction["split"] == "All (held out + train)"]
+    colors = {"window-averaged": _GROUP_COLORS["change"], single: "#E69F00",
+              "rank-frozen": "#999999"}
+    fig, (ax_a, ax_b) = plt.subplots(1, 2, figsize=(FIG_SIZE_TWO_COL[0], FIG_SIZE_TWO_COL[0] * 0.42),
+                                     constrained_layout=True)
+    for ax, definition, letter, ttl in (
+            (ax_a, "absolute", "A", r"Sign of $\Delta$ wealth \$ (GB2)"),
+            (ax_b, "relative to city", "B",
+             r"Sign of $\Delta$ wealth \$ minus the city's median $\Delta$")):
+        _plot_direction(ax, pooled[pooled["definition"] == definition], list(dir_groups),
+                        list(preds), colors, letter, ttl)
+    ax_a.legend(fontsize=6, loc="lower left", frameon=True, facecolor="white",
+                edgecolor="none", framealpha=0.85)
+    fig.suptitle(rf"NYC direction accuracy, ACS {acs_pre}$\to${acs_post} "
+                 r"(held out + train; bars: 95\% CI; dotted: 0.5)", fontsize=7.5)
+    _savefig(fig, out / "figures" / "F_acs_window_direction.pdf")
+    for r in direction.itertuples(index=False):
+        print(f"  dir {r.split:22s} {r.group:10s} {r.prediction:26s} {r.definition:16s} n={r.n:4d} "
+              f"acc={r.accuracy:.3f} [{r.acc_ci_lo:.3f}, {r.acc_ci_hi:.3f}] "
+              f"majority={r.majority:.3f} balanced={r.balanced:.3f} kappa={r.kappa:+.3f} "
+              f"up actual/pred={r.share_actual_up:.2f}/{r.share_pred_up:.2f}")
+
+    for r in table.itertuples(index=False):
+        print(f"  {r.split:22s} {r.group:10s} {r.target[:28]:28s} {r.prediction:26s} n={r.n:4d} "
+              f"R2_oos={r.r2_oos:+.3f} [{r.r2_oos_ci_lo:+.3f}, {r.r2_oos_ci_hi:+.3f}] "
+              f"R2_ols={r.r2_ols:.4f} rho={r.spearman:+.3f} "
+              f"mean actual={r.mean_actual:+.3f} predicted={r.mean_predicted:+.3f}")
+    return table
+
+
+# ─── Khachiyan et al. (2022) per-capita benchmark ─────────────────────────────
+# Online appendix, Appendix Table 2: R^2 = 1 - SSR/TSS (appendix "Computing R2
+# Values") of the predicted vs actual 2000->2010 change in log total personal
+# income per person (log Y_2010 - log Y_2000, 2012 dollars), test urban areas,
+# from a differences model trained end-to-end on that change.
+_KHACHIYAN_PC_DIFF_R2 = (
+    ("2.4 km, without initial conditions", 0.0461),
+    ("2.4 km, with initial conditions", 0.0674),
+    ("1.2 km, without initial conditions", 0.0306),
+    ("1.2 km, with initial conditions", 0.0653),
+)
+
+
+def _window_pc_income_pairs(tract: pd.DataFrame, income_long: pd.DataFrame,
+                            params_by_city: dict, acs_pre: int, acs_post: int,
+                            imagery_years, winsor: float | None = 0.01,
+                            span: int = _ACS_WINDOW_SPAN) -> pd.DataFrame:
+    """Per-tract Δlog per-capita income, actual vs predicted, on ACS windows.
+
+    ``tract`` [GEOID, cbsa, year, pred]: each tract's prediction is averaged
+    over its flights inside each ACS vintage's survey window, ranked (Hazen)
+    within its city, mapped through that city-vintage's GB2 (``params_by_city
+    [cbsa][vintage]``) and clipped at P1/P99 within the city-vintage.
+    ``income_long`` [GEOID, year, usd] gives the actual per-capita income in
+    constant dollars. Returns GEOID, cbsa, pred/actual levels, ``dlog_actual``,
+    ``dlog_pred`` and ``dlog_frozen`` (pre rank under the post GB2 — no
+    post-window imagery). Tracts lacking a flight in either window, a GB2 fit
+    or a positive income are dropped.
+    """
+    w_pre = _acs_window_years(acs_pre, imagery_years, span)
+    w_post = _acs_window_years(acs_post, imagery_years, span)
+    pre = _window_average(tract, w_pre).rename(columns={"mean": "pred_pre", "n_years": "n_pre"})
+    post = _window_average(tract, w_post).rename(columns={"mean": "pred_post", "n_years": "n_post"})
+    out = pre.merge(post, on="GEOID")
+    out["cbsa"] = out["GEOID"].map(tract.drop_duplicates("GEOID").set_index("GEOID")["cbsa"]).astype(str)
+    out = out[out["cbsa"].isin(params_by_city.keys())].copy()
+    out = out[[acs_pre in params_by_city[c] and acs_post in params_by_city[c]
+               for c in out["cbsa"]]].reset_index(drop=True)
+    for when, col in (("pre", "pred_pre"), ("post", "pred_post")):
+        out[f"prob_{when}"] = _hazen_within(out.assign(year=0), col, by=("cbsa",)).values
+    usd = {"usd_pre": [], "usd_post": [], "usd_frozen": []}
+    for r in out.itertuples(index=False):
+        prm = params_by_city[r.cbsa]
+        usd["usd_pre"].append(_gb2_quantile(r.prob_pre, prm[acs_pre]))
+        usd["usd_post"].append(_gb2_quantile(r.prob_post, prm[acs_post]))
+        usd["usd_frozen"].append(_gb2_quantile(r.prob_pre, prm[acs_post]))
+    for k, v in usd.items():
+        out[k] = np.asarray(v, float)
+    if winsor:
+        for k in usd:
+            out[k] = out.groupby("cbsa")[k].transform(lambda s: _winsorize(s, winsor))
+    inc = income_long.set_index(["GEOID", "year"])["usd"]
+    for when, yr in (("pre", acs_pre), ("post", acs_post)):
+        out[f"actual_{when}"] = inc.reindex(
+            pd.MultiIndex.from_arrays([out["GEOID"], np.full(len(out), yr)])).values
+    ok = (out["actual_pre"] > 0) & (out["actual_post"] > 0)
+    out = out[ok].reset_index(drop=True)
+    out["dlog_actual"] = np.log(out["actual_post"] / out["actual_pre"])
+    out["dlog_pred"] = np.log(out["usd_post"] / out["usd_pre"])
+    out["dlog_frozen"] = np.log(out["usd_frozen"] / out["usd_pre"])
+    out.attrs.update({"window_pre": w_pre, "window_post": w_post})
+    return out
+
+
+def _cross_fitted_calibration(actual: pd.Series, pred: pd.Series, groups: pd.Series,
+                              fit_mask: pd.Series | None = None) -> pd.Series:
+    """Out-of-sample linear calibration of ``pred`` to ``actual``'s scale.
+
+    Khachiyan et al.'s differences model is trained by MSE on the change, so
+    its predictions arrive shrunk to the change's scale; ours are differences
+    of two level predictions and are not. This gives ours the same single
+    property without touching the scored rows: with ``fit_mask`` None, each
+    group (city) is scored with intercept and slope fitted on all OTHER groups
+    (leave-one-city-out); with ``fit_mask``, one fit on those rows is applied
+    to every row (NYC: fit on train tracts, score held-out tracts).
+    """
+    a, p = actual.astype(float), pred.astype(float)
+    ok = np.isfinite(a) & np.isfinite(p)
+    out = pd.Series(np.nan, index=a.index)
+    if fit_mask is not None:
+        m = ok & fit_mask
+        if m.sum() >= 3:
+            b, c = np.polyfit(p[m], a[m], 1)
+            out[ok] = c + b * p[ok]
+        return out
+    for g in pd.unique(groups[ok]):
+        train = ok & (groups != g)
+        if train.sum() >= 3:
+            b, c = np.polyfit(p[train], a[train], 1)
+            test = ok & (groups == g)
+            out[test] = c + b * p[test]
+    return out
+
+
+def _khachiyan_pc_rows(pairs: pd.DataFrame, label: str, n_boot: int = _GROWTH_N_BOOT,
+                       calibrated: pd.Series | None = None) -> list[dict]:
+    """R^2 = 1 - SSE/SST of Δlog per-capita income (Khachiyan's statistic),
+    pooled and within city, for the model and the rank-frozen benchmark, plus
+    the out-of-sample calibrated model when ``calibrated`` is given (rows where
+    it is NaN are left out of that row). CIs resample cities, or tracts when
+    there is a single city."""
+    clusters = pairs["cbsa"] if pairs["cbsa"].nunique() > 1 else pairs["GEOID"]
+    preds = [("model", pairs["dlog_pred"]), ("rank-frozen", pairs["dlog_frozen"])]
+    if calibrated is not None:
+        preds.append(("model, out-of-sample calibrated", calibrated))
+    rows = []
+    for who, col in preds:
+        for scope in ("pooled", "within-city"):
+            m = col.notna()
+            r = _metric_row(pairs.loc[m, "dlog_actual"], col[m], clusters[m],
+                            target="dlog per-capita income", predictor=who, scope=scope,
+                            period=label, n_boot=n_boot)
+            rows.append(r)
+    return rows
+
+
+def part_f_khachiyan(results_dir: Path, processed_dir: Path, out: Path,
+                     years: list[int] | None = None, acs_pre: int = 2018,
+                     acs_post: int = 2023, split_of: dict | None = None,
+                     n_boot: int = _GROWTH_N_BOOT, tag: str = "") -> pd.DataFrame | None:
+    """NYC: Khachiyan et al.'s per-capita change R^2 on the city's prediction pass.
+
+    Same construction as ``part_khachiyan_pc_us`` with one city: the GB2 is
+    fitted to the per-capita income of the NYC 5-borough tracts (the CSA
+    city's county prefixes) per ACS vintage. Rows for all tracts and for each
+    split group in ``split_of`` (GEOID -> group; defaults to the US split's
+    held-out / train grouping). Writes tables/F_khachiyan_pc{tag}.csv.
+    """
+    from src import csa_event_study as ces
+
+    print(f"\n=== Part F (Khachiyan per-capita benchmark): NYC, ACS {acs_pre}->{acs_post} {tag} ===")
+    spec = ces.CSA_CITIES["nyc"]
+    years = sorted(years) if years else _available_years(results_dir) or list(YEARS)
+    tl = _load_tract_long(results_dir, years)
+    if tl.empty:
+        print("  no NYC tract predictions — skipped")
+        return None
+    # _load_tract_long carries the raw GEOID beside the padded GEOID_str: drop the
+    # raw one first so the rename does not leave two GEOID columns.
+    tract = tl.drop(columns=["GEOID"], errors="ignore").rename(
+        columns={"GEOID_str": "GEOID", "predicted_value": "pred"})[["GEOID", "year", "pred"]].dropna()
+    tract = tract[tract["GEOID"].str[:5].isin(spec.geoid_prefixes)].assign(cbsa="nyc")
+    inc = _load_wealth_dollars_long(processed_dir, "inc", [acs_pre, acs_post])
+    inc = inc[inc["GEOID"].str[:5].isin(spec.geoid_prefixes)].assign(cbsa="nyc")
+    params = _fit_city_gb2(inc, ["nyc"])
+    pairs = _window_pc_income_pairs(tract, inc, params, acs_pre, acs_post, years)
+    print(f"  windows {pairs.attrs['window_pre']} vs {pairs.attrs['window_post']}; {len(pairs):,} tracts")
+    split_of = _csa_split_of(processed_dir) if split_of is None else split_of
+    pairs["split_group"] = pairs["GEOID"].map(split_of)
+    train_groups = [g for g in pairs["split_group"].dropna().unique() if str(g).startswith("train")]
+    fit_mask = pairs["split_group"].isin(train_groups)
+    cal = (_cross_fitted_calibration(pairs["dlog_actual"], pairs["dlog_pred"], pairs["cbsa"],
+                                     fit_mask=fit_mask) if fit_mask.sum() >= 3 else None)
+    rows = []
+    for group in [None, *sorted(pairs["split_group"].dropna().unique())]:
+        sub = pairs if group is None else pairs[pairs["split_group"] == group]
+        # Calibrated row only where it is out of sample: tracts outside the fit.
+        sub_cal = None if cal is None else cal[sub.index].where(~fit_mask[sub.index])
+        horizon = f"ACS {acs_pre}->{acs_post} ({acs_post - acs_pre}y)"
+        for r in _khachiyan_pc_rows(sub, horizon, n_boot, calibrated=sub_cal):
+            if r["scope"] == "pooled":
+                r["tracts"] = "all" if group is None else str(group)
+                rows.append(r)
+    table = pd.DataFrame(rows)
+    table.to_csv(out / "tables" / f"F_khachiyan_pc{tag}.csv", index=False)
+    for r in rows:
+        print(f"  {r['tracts']:12s} {r['predictor'][:32]:32s} n={r['n']:5d} R2={r['r2_oos']:+.4f} "
+              f"[{r['r2_oos_ci_lo']:+.4f}, {r['r2_oos_ci_hi']:+.4f}] R2_ols={r['r2_ols']:.4f} "
+              f"rho={r['spearman']:+.3f}")
+    return table
+
+
+def part_khachiyan_pc_us(ctx: _USContext, acs_pre: int = 2018, acs_post: int = 2023,
+                         n_boot: int = _GROWTH_N_BOOT,
+                         income_long: pd.DataFrame | None = None) -> dict:
+    """Khachiyan et al.'s per-capita change R^2 on the whole-city test sample.
+
+    5-year ACS vintages (``acs_pre`` vs ``acs_post``) against predictions
+    averaged over each survey window; per-capita income GB2 per test city and
+    vintage (unsmoothed). Writes tables/US_khachiyan_pc.csv with our rows and
+    Appendix Table 2's benchmark rows.
+    """
+    print(f"\n=== Khachiyan per-capita benchmark (US test cities, ACS {acs_pre}->{acs_post}) ===")
+    sample = _figure_test_sample(ctx, what="Khachiyan benchmark")
+    if sample is None:
+        return {}
+    tract = sample["tract_test"][["GEOID", "cbsa", "year", "pred"]].copy()
+    tract["cbsa"] = tract["cbsa"].astype(str)
+    if income_long is None:
+        income_long = _load_wealth_dollars_long(ctx.processed_dir, "inc", [acs_pre, acs_post])
+    params = _fit_city_gb2(income_long, tract["cbsa"].unique())
+    pairs = _window_pc_income_pairs(tract, income_long, params, acs_pre, acs_post,
+                                    sorted(tract["year"].unique()))
+    print(f"  windows {pairs.attrs['window_pre']} vs {pairs.attrs['window_post']}; "
+          f"{len(pairs):,} tracts in {pairs['cbsa'].nunique()} cities")
+    cal = _cross_fitted_calibration(pairs["dlog_actual"], pairs["dlog_pred"], pairs["cbsa"])
+    rows = _khachiyan_pc_rows(pairs, f"ACS {acs_pre}->{acs_post} (5y)", n_boot, calibrated=cal)
+    bench = [{"source": "Khachiyan et al. (2022) App. Table 2", "target": "dlog per-capita income",
+              "predictor": spec, "scope": "pooled (test urban areas)",
+              "period": "2000->2010 (10y)", "r2_oos": r2} for spec, r2 in _KHACHIYAN_PC_DIFF_R2]
+    table = pd.DataFrame(rows + bench)
+    table.to_csv(ctx.out / "tables" / "US_khachiyan_pc.csv", index=False)
+    pairs.to_csv(ctx.out / "tables" / "US_khachiyan_pc_pairs.csv", index=False)
+    for r in rows:
+        print(f"  {r['predictor'][:32]:32s} {r['scope']:11s} n={r['n']:5d} R2={r['r2_oos']:+.4f} "
+              f"[{r['r2_oos_ci_lo']:+.4f}, {r['r2_oos_ci_hi']:+.4f}] R2_ols={r['r2_ols']:.4f} "
+              f"rho={r['spearman']:+.3f}")
+    model = rows[0]
+    return {"khachiyan_pc/r2": model["r2_oos"], "khachiyan_pc/r2_ols": model["r2_ols"],
+            "khachiyan_pc/n": model["n"]}
+
+
 _US_PARTS = {
     "cross": part_a_us, "temporal": part_b_us, "dollars": part_c_us,
-    "main_figure": part_main_figure_us,
+    "main_figure": part_main_figure_us, "growth": part_growth_figure_us,
+    "khachiyan": part_khachiyan_pc_us,
 }
 # main_figure's Panel B carries a synthetic (non-measured) cardinal-baseline
 # line, clearly marked with an asterisk in the figure and caption. It is in the
 # 'both' default set (that figure is a deliverable) but NOT in the us-only
 # default, so an automated US run never emits it by accident.
 _DEFAULT_US_PARTS = ("cross", "temporal", "dollars")
-_ALL_US_PARTS = ("cross", "temporal", "dollars", "main_figure")
+_ALL_US_PARTS = ("cross", "temporal", "dollars", "main_figure", "growth", "khachiyan")
 
-_NYC_PARTS = ("A", "B", "C", "D", "E")
+_NYC_PARTS = ("A", "B", "C", "D", "E", "F")
 _DEFAULT_NYC_PARTS = ("A", "B", "C")
 
 # Sub-directory of a US run holding its NYC-only prediction pass
@@ -4011,7 +6021,7 @@ def _resolve_mode(results_dir: Path, params: dict | None, mode: str) -> str:
 def _split_parts(parts, mode: str) -> tuple[list[str], list[str]]:
     """Split a mixed ``--parts`` list into (us_parts, nyc_parts).
 
-    US parts are named ('cross', 'temporal', 'dollars', 'main_figure'); NYC parts
+    US parts are named ('cross', 'temporal', 'dollars', 'main_figure', 'growth'); NYC parts
     are single letters A–E. This lets one flag address both halves of a combined
     run, e.g. ``--parts cross main_figure D E``.
     """
@@ -4071,6 +6081,8 @@ def run_evaluation(
     mode: str = "auto",
     nyc_results_dir: Path | None = None,
     nyc_subdir: str | None = NYC_SUBDIR,
+    csa_screen: float | None = None,
+    csa_anticipation=CSA_ANTICIPATION_ARMS,
 ) -> dict:
     """Post-hoc evaluation callable from main.py or the CLI.
 
@@ -4153,7 +6165,14 @@ def run_evaluation(
                 _make_dirs(nyc_out)
                 print(f"\nNYC source: {nyc_dir}")
                 print(f"NYC output: {nyc_out}")
-                nyc_summary = _run_nyc_parts(nyc_dir, processed_dir, nyc_out, nyc_parts)
+                # The CSA cities' dense per-city predictions live under the RUN's
+                # results dir (csa/<city>/), not under nyc_zarr_check — different
+                # sensor, different sampling design, so a separate tree.
+                nyc_summary = _run_nyc_parts(nyc_dir, processed_dir, nyc_out,
+                                             nyc_parts,
+                                             csa_results_dir=results_dir,
+                                             csa_screen=csa_screen,
+                                             csa_anticipation=csa_anticipation)
                 summary.update({f"nyc/{k}": v for k, v in nyc_summary.items()})
                 summary["nyc/results_dir"] = str(nyc_dir)
             except Exception:
@@ -4180,14 +6199,16 @@ def run_evaluation(
     return summary
 
 
-def _run_nyc_parts(results_dir, processed_dir, out_dir, parts) -> dict:
-    """Dispatch the NYC parts A–E, each isolated so one failure is not fatal.
+def _run_nyc_parts(results_dir, processed_dir, out_dir, parts,
+                   csa_results_dir=None, csa_screen=None,
+                   csa_anticipation=CSA_ANTICIPATION_ARMS) -> dict:
+    """Dispatch the NYC parts A–F, each isolated so one failure is not fatal.
 
     Part C returns the GB2 quantile mapping that part E prefers for its tract
     chart, so C is run before E and its result threaded through; if C failed or
     was not requested, E falls back to the raw predictions.
     """
-    requested = [p for p in ("A", "B", "C", "D", "E") if p in
+    requested = [p for p in _NYC_PARTS if p in
                  {str(x).upper() for x in parts}]
     years = _set_nyc_years(Path(results_dir))
     summary: dict = {"results_dir": str(results_dir), "years": years}
@@ -4202,12 +6223,41 @@ def _run_nyc_parts(results_dir, processed_dir, out_dir, parts) -> dict:
             elif part == "C":
                 qmap_long = part_c(results_dir, processed_dir, out_dir)
             elif part == "D":
-                result = part_d(results_dir, processed_dir, out_dir, years=years)
-                if isinstance(result, dict):
-                    summary.update(result)
+                # The unrestricted arm always runs and keeps the untagged output
+                # paths. `csa_screen` adds a second, fully independent pass whose
+                # figures/tables/keys are suffixed — the two together are the
+                # robustness evidence for the sample restriction, so producing
+                # one without the other would defeat the point.
+                screens = [(None, "")]
+                if csa_screen is not None:
+                    screens.append((float(csa_screen),
+                                    f"_screen{int(csa_screen*100)}"))
+                # Anticipation is the outer loop so each folder is finished
+                # before the next starts, and a run interrupted partway leaves
+                # whole arms rather than half of each.
+                # The per-city footprint/prediction inputs are identical across
+                # every (arm, screen) pair, so they are computed on the first
+                # pass and reused; the cache is dropped once the last one is
+                # done, before part E starts allocating.
+                try:
+                    for antic in (csa_anticipation or (0,)):
+                        for screen, tag in screens:
+                            result = part_d(results_dir, processed_dir, out_dir,
+                                            years=years,
+                                            csa_results_dir=csa_results_dir,
+                                            max_undated_area_share=screen,
+                                            anticipation=int(antic), out_tag=tag)
+                            if isinstance(result, dict):
+                                summary.update(result)
+                finally:
+                    _csa_cache_clear()
             elif part == "E":
                 part_e(results_dir, processed_dir, out_dir,
                        qmap_long=qmap_long, years=years)
+            elif part == "F":
+                part_f(results_dir, processed_dir, out_dir, years=years)
+                part_f_acs_window(results_dir, processed_dir, out_dir, years=years)
+                part_f_khachiyan(results_dir, processed_dir, out_dir, years=years)
         except Exception:
             import traceback
             traceback.print_exc()
@@ -4240,9 +6290,9 @@ def main() -> None:
         "--parts", nargs="*", default=None,
         metavar="PART",
         help="Which parts to run; US and NYC tokens may be mixed. US: cross "
-             "temporal dollars main_figure. NYC: A (cross-section) B (temporal) "
+             "temporal dollars main_figure growth. NYC: A (cross-section) B (temporal) "
              "C (GB2 dollars) D (construction-cohort CSA event study) E (Hudson "
-             "Yards). Defaults: 'cross temporal dollars' (us), 'A B C' (nyc), "
+             "Yards) F (growth R2 by construction cohort). Defaults: 'cross temporal dollars' (us), 'A B C' (nyc), "
              "everything incl. main_figure and D/E (both)."
     )
     parser.add_argument(
@@ -4255,6 +6305,22 @@ def main() -> None:
         help="Sub-directory of --savename holding its NYC prediction pass "
              "(default: %(default)s). Pass '' to look in --savename itself."
     )
+    parser.add_argument(
+        "--csa-screen", type=float, default=None, metavar="SHARE",
+        help="Also run Part D a second time with the undated-area sample "
+             "restriction at SHARE (e.g. 0.20), writing a parallel set of "
+             "figures/tables suffixed _screen<NN>. The unrestricted arm always "
+             "runs; this adds the restricted one so the pair can be compared."
+    )
+    parser.add_argument(
+        "--csa-anticipation", type=int, nargs="*", default=None, metavar="PERIODS",
+        help="Anticipation arms for Part D, in panel periods (default: "
+             f"{' '.join(map(str, CSA_ANTICIPATION_ARMS))}). Each value runs a "
+             "complete, independent Part D into its own "
+             "<out>/csa_anticipation<N>/ folder. A period is not the same number "
+             "of years in every city — 2 in NYC, 2-3 in Tampa — so read the arms "
+             "against each city's cadence."
+    )
     args = parser.parse_args()
 
     run_evaluation(
@@ -4265,6 +6331,9 @@ def main() -> None:
         nyc_results_dir=(RESULTS_DIR / args.nyc_savename
                          if args.nyc_savename else None),
         nyc_subdir=args.nyc_subdir or None,
+        csa_screen=args.csa_screen,
+        csa_anticipation=(CSA_ANTICIPATION_ARMS if args.csa_anticipation is None
+                          else tuple(args.csa_anticipation)),
     )
 
 

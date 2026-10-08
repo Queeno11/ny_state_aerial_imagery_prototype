@@ -11,6 +11,11 @@ Ahlfeldt, G.~M., Redding, S.~J., Sturm, D.~M., and Wolf, N. (2015).
 \newblock The economics of density: {Evidence} from the {Berlin Wall}.
 \newblock {\em Econometrica}, 83(6):2127--2189.
 
+\bibitem[\protect\astroncite{Burges}{2010}]{burges2010ranknet}
+Burges, C. J.~C. (2010).
+\newblock From {RankNet} to {LambdaRank} to {LambdaMART}: An overview.
+\newblock Technical Report MSR-TR-2010-82, Microsoft Research.
+
 \bibitem[\protect\astroncite{Callaway and Sant'Anna}{2021a}]{csa}
 Callaway, B. and Sant'Anna, P.~H. (2021a).
 \newblock Difference-in-differences with multiple time periods.
@@ -45,6 +50,14 @@ Jean, N., Burke, M., Xie, M., Davis, W.~M., Lobell, D.~B., and Ermon, S.
 \newblock Combining satellite imagery and machine learning to predict poverty.
 \newblock {\em Science}, 353(6301):790--794.
 
+\bibitem[\protect\astroncite{Katharopoulos and
+  Fleuret}{2018}]{katharopoulos2018notall}
+Katharopoulos, A. and Fleuret, F. (2018).
+\newblock Not all samples are created equal: Deep learning with importance
+  sampling.
+\newblock In {\em Proceedings of the 35th International Conference on Machine
+  Learning (ICML)}, pages 2525--2534.
+
 \bibitem[\protect\astroncite{Khachiyan et~al.}{2022}]{kachiyian2022}
 Khachiyan, A., Thomas, A., Zhou, H., Hanson, G., Cloninger, A., Rosing, T., and
   Khandelwal, A.~K. (2022).
@@ -55,6 +68,15 @@ Khachiyan, A., Thomas, A., Zhou, H., Hanson, G., Cloninger, A., Rosing, T., and
 McDonald, J.~B. (1984).
 \newblock Some generalized functions for the size distribution of income.
 \newblock {\em Econometrica}, 52(3):647--663.
+
+\bibitem[\protect\astroncite{Mindermann
+  et~al.}{2022}]{mindermann2022prioritized}
+Mindermann, S., Brauner, J.~M., Razzak, M.~T., Sharma, M., Kirsch, A., Xu, W.,
+  H{\"o}ltgen, B., Gomez, A.~N., Morisot, A., Farquhar, S., and Gal, Y. (2022).
+\newblock Prioritized training on points that are learnable, worth learning,
+  and not yet learnt.
+\newblock In {\em Proceedings of the 39th International Conference on Machine
+  Learning (ICML)}, pages 15630--15649.
 
 \bibitem[\protect\astroncite{Parikh and Grauman}{2011}]{parikh2011relative}
 Parikh, D. and Grauman, K. (2011).
@@ -69,6 +91,14 @@ Reed, C.~J., Gupta, R., Li, S., Brockman, S., Funk, C., Clipp, B., Keutzer, K.,
   geospatial representation learning.
 \newblock In {\em Proceedings of the IEEE/CVF International Conference on
   Computer Vision (ICCV)}.
+
+\bibitem[\protect\astroncite{Shrivastava
+  et~al.}{2016}]{shrivastava2016training}
+Shrivastava, A., Gupta, A., and Girshick, R. (2016).
+\newblock Training region-based object detectors with online hard example
+  mining.
+\newblock In {\em Proceedings of the IEEE Conference on Computer Vision and
+  Pattern Recognition (CVPR)}, pages 761--769.
 
 \bibitem[\protect\astroncite{Yeh et~al.}{2020}]{yeh2020using}
 Yeh, C., Perez, A., Driscoll, A., Azzari, G., Tang, Z., Lobell, D., Ermon, S.,

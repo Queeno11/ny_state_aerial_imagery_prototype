@@ -116,6 +116,11 @@ def prediction_fingerprint(params: dict, model_path: Path) -> dict:
         # Exact-year runs must never mix chunks with substitution-era runs:
         # the same row can carry a prediction from different imagery.
         "predict_exact_year": bool(params.get("predict_exact_year", True)),
+        # Which sensor the crops came from. NAIP and a city's municipal ortho
+        # are different cameras at different native resolutions, so the same
+        # (building, year) yields a different prediction from each — chunks
+        # from the two must never share a cache directory.
+        "predict_sensor": str(params.get("predict_sensor", "naip")),
         # The sampling design changes which rows exist per chunk — sampled
         # and unsampled (or differently sampled) runs must never mix.
         "predict_tract_sample_frac": _knob(
@@ -135,6 +140,16 @@ def prediction_fingerprint(params: dict, model_path: Path) -> dict:
             if params.get("predict_cbsa_whitelist") else None),
         "predict_full_universe_buildings_per_tract": _knob(
             params, "predict_full_universe_buildings_per_tract", None, int),
+        # The nodata-hole guard changes which buildings get a prediction at all
+        # (see CyclicCacheManager._reject_for_zero_pixels), so it is part of a
+        # chunk's identity exactly like the sensor or the sampling design.
+        # REGRESSION: it was originally absent, and the failure mode is silent —
+        # adding the guard did not invalidate the chunks written before it, so a
+        # resumed run happily reused blank-crop predictions. That is how Harford
+        # County's NAIP 2013 hole survived into results/run_20260722 as 3,919
+        # buildings sharing the value 0.68359375 across 17 constant tracts.
+        "max_zero_pixel_share": _knob(
+            params, "max_zero_pixel_share", MAX_ZERO_PIXEL_SHARE_DEFAULT, float),
         # Deliberately NOT fingerprinted: the year SET. A chunk's content
         # depends only on its own year's frame (guarded per-year by
         # _check_year_meta), so ADDING years to a run must not invalidate
@@ -144,10 +159,54 @@ def prediction_fingerprint(params: dict, model_path: Path) -> dict:
     }
 
 
+def resolve_fetch_fn(params: dict, explicit=None):
+    """Pick the crop fetcher for this run: NAIP (default) or a city's own ortho.
+
+    ``params["predict_sensor"]``:
+
+    ``"naip"``
+        Returns ``None``, which selects the grouped Planetary Computer path in
+        :func:`fetch_prediction_chunk` (STAC resolve, then one COG handle per
+        (DOQQ, tract) run).
+    ``"ortho"``
+        Returns a per-row callable bound to ``params["predict_ortho_city"]``.
+        An ArcGIS image service has no catalogue and no COG to share, so the
+        grouped path buys nothing there — the existing per-row ``fetch_fn``
+        mechanism is exactly the right shape, and everything above it (retry
+        ladder, chunk parquets, resume manifest, GPU pipeline) is unchanged.
+
+    ``explicit`` wins when given, so tests and probes can still inject a fake.
+    """
+    if explicit is not None:
+        return explicit
+    sensor = str(params.get("predict_sensor", "naip"))
+    if sensor == "naip":
+        return None
+    if sensor != "ortho":
+        raise ValueError(f"unknown predict_sensor {sensor!r} (naip | ortho)")
+    city = params.get("predict_ortho_city")
+    if not city:
+        raise ValueError("predict_sensor='ortho' requires params['predict_ortho_city']")
+    from src.data.ortho_fetcher import make_fetch_fn
+    return make_fetch_fn(city, max_rps=params.get("predict_ortho_max_rps"))
+
+
 def _atomic_write_text(path: Path, text: str) -> None:
     tmp = path.with_name(path.name + ".tmp")
     tmp.write_text(text)
     os.replace(tmp, path)
+
+
+# Fingerprint keys added after chunk caches already existed in the wild, with
+# the value every pre-existing run implicitly had. A manifest written before the
+# key existed describes the same computation as one written after it with this
+# value, so treating its absence as a mismatch would orphan finished chunks for
+# no reason. Only put a key here when the legacy value is UNAMBIGUOUS: the point
+# of the fingerprint is that chunks computed differently never mix.
+LEGACY_FINGERPRINT_DEFAULTS = {
+    # Every chunk written before the ortho fetcher existed came from NAIP.
+    "predict_sensor": "naip",
+}
 
 
 def init_chunk_root(chunk_root: Path, fingerprint: dict) -> None:
@@ -156,6 +215,10 @@ def init_chunk_root(chunk_root: Path, fingerprint: dict) -> None:
     An existing manifest with a different fingerprint aborts: partial chunks
     from another config or another checkpoint must never be assembled into
     this run's CSVs.
+
+    Keys introduced after a cache was written are back-filled from
+    :data:`LEGACY_FINGERPRINT_DEFAULTS` before comparing, and the manifest is
+    then rewritten so later runs compare exactly.
     """
     chunk_root = Path(chunk_root)
     chunk_root.mkdir(parents=True, exist_ok=True)
@@ -166,6 +229,11 @@ def init_chunk_root(chunk_root: Path, fingerprint: dict) -> None:
         # chunk content (per-year identity is _check_year_meta's job), so
         # ignore it — otherwise adding years would orphan finished chunks.
         existing.pop("years", None)
+        upgraded = False
+        for key, legacy in LEGACY_FINGERPRINT_DEFAULTS.items():
+            if key not in existing and key in fingerprint:
+                existing[key] = legacy
+                upgraded = True
         if existing != fingerprint:
             diff = {k for k in set(existing) | set(fingerprint)
                     if existing.get(k) != fingerprint.get(k)}
@@ -174,6 +242,9 @@ def init_chunk_root(chunk_root: Path, fingerprint: dict) -> None:
                 f"run (mismatched: {sorted(diff)}). Delete that directory to "
                 f"start over, or restore the original config/model."
             )
+        if upgraded:
+            _atomic_write_text(manifest_path,
+                               json.dumps(fingerprint, indent=2, sort_keys=True))
         return
     _atomic_write_text(manifest_path, json.dumps(fingerprint, indent=2, sort_keys=True))
 
@@ -215,6 +286,21 @@ def assign_prediction_types(df_year: pd.DataFrame, year, split_map: dict | None,
 # --------------------------------------------------------------------------- #
 # Row selection: split filter + evaluation sampling design                      #
 # --------------------------------------------------------------------------- #
+
+# Must match the fallback in CyclicCacheManager._reject_for_zero_pixels and the
+# registered value in main.run()'s params — they are three statements of one
+# threshold, and a drift between them silently changes which crops are dropped.
+MAX_ZERO_PIXEL_SHARE_DEFAULT = 0.5
+
+# Second line of defence, applied at assembly (see blank_prediction_mask): a
+# single exact float shared by more than this share of a tract's buildings is a
+# nodata hole. Chosen from measurement, not taste — the largest within-tract
+# modal share in a clean city-year is 12.9%, while every contaminated Baltimore
+# year runs 93.2-100%. Anything in [0.25, 0.75] separates them; 0.5 is the
+# midpoint of that safe band.
+BLANK_MODAL_SHARE_DEFAULT = 0.5
+# Below this many buildings the modal rule is meaningless (3 of 4 is 75%).
+BLANK_MIN_TRACT_BUILDINGS = 20
 
 # Defaults enacting the evaluation design (see select_prediction_rows).
 TRACT_SAMPLE_FRAC_DEFAULT = 0.10       # per CBSA: ceil(frac * n_tracts) ...
@@ -655,6 +741,11 @@ def fetch_prediction_chunk(
     if n == 0:
         return crops, actual_years, failures
 
+    # Idempotent: predict_year_chunked has already resolved this, but a direct
+    # caller (the throughput probe, a notebook) reaches here with fetch_fn=None
+    # and still needs the ortho path when params say so.
+    fetch_fn = resolve_fetch_fn(params, fetch_fn)
+
     crop_size_meters = float(params.get("tau_meters", 100)) * 2
     nbands = int(params["nbands"])
     out_pixels = int(params["image_size"])
@@ -665,9 +756,25 @@ def fetch_prediction_chunk(
     exact_year = bool(params.get("predict_exact_year", True))
 
     def _perrow_pass(pending):
+        # Resolve lon/lat BEFORE entering the pool, for the same reason
+        # _grouped_fetch_pass does: pyproj Transformers are thread-affine and
+        # return garbage when used off their creation thread, which here would
+        # mean every crop coming from the wrong place on earth with nothing
+        # raising. Prefer the columns predict_year_chunked precomputes
+        # main-side; fall back to one batched call for direct callers.
+        if pending and "lon" in records[pending[0]]:
+            lonlat = {i: (float(records[i]["lon"]), float(records[i]["lat"]))
+                      for i in pending}
+        else:
+            xs = [records[i]["centroid_x"] for i in pending]
+            ys = [records[i]["centroid_y"] for i in pending]
+            _lons, _lats = to_4326.transform(xs, ys) if pending else ([], [])
+            lonlat = {i: (float(_lons[k]), float(_lats[k]))
+                      for k, i in enumerate(pending)}
+
         def _fetch_one(i):
             row = records[i]
-            lon, lat = to_4326.transform(row["centroid_x"], row["centroid_y"])
+            lon, lat = lonlat[i]
             res = fetch_fn(
                 lon=lon, lat=lat, crop_size_meters=crop_size_meters,
                 nbands=nbands, out_pixels=out_pixels, year_hint=int(row["year"]),
@@ -841,18 +948,104 @@ def _check_year_meta(year_dir: Path, n_rows: int, chunk_size: int) -> None:
     _atomic_write_text(meta_path, json.dumps(meta))
 
 
-def assemble_year_csv(year_dir: Path, bounds: list, output_csv: Path) -> pd.DataFrame:
+def blank_prediction_mask(df: pd.DataFrame, *,
+                          values=(),
+                          modal_share: float | None = BLANK_MODAL_SHARE_DEFAULT,
+                          min_buildings: int = BLANK_MIN_TRACT_BUILDINGS,
+                          pred_col: str = "predicted_value",
+                          geoid_col: str = "GEOID") -> pd.Series:
+    """Rows whose prediction came from a nodata (all-black) crop.
+
+    Two independent detectors, because they fail in opposite directions:
+
+    ``values``
+        Exact match against known blank scores. Precise, but the score a black
+        crop produces is a property of the *checkpoint and sensor*, not a
+        universal constant — Baltimore's NAIP blank is 0.68359375 while NYC's
+        zarr pass sits near -1.34 — so a hardcoded list only ever covers the
+        cases already discovered.
+    ``modal_share``
+        Distribution-free: inside a tract, a single exact float shared by more
+        than this share of buildings is a nodata hole, not a coincidence. Real
+        imagery does not do this. Measured across the registered cities, the
+        largest within-tract modal share in a *clean* city-year is 12.9%
+        (San Antonio 6.0%, Tampa 4.3%, Seattle 9.1%), against 93.2-100% in
+        every contaminated Baltimore year — two disjoint populations with an
+        80-point gap, so the 0.5 default sits nowhere near either edge.
+
+    ``min_buildings`` keeps the modal rule off small tracts, where a high share
+    is ordinary: 3 of 4 buildings sharing a value is 75% and means nothing.
+    """
+    mask = pd.Series(False, index=df.index)
+    if df.empty:
+        return mask
+
+    pred = pd.to_numeric(df[pred_col], errors="coerce")
+    for v in values or ():
+        mask |= pred.eq(float(v))
+
+    if modal_share is not None and geoid_col in df.columns:
+        share = float(modal_share)
+        for _, idx in df.groupby(geoid_col, sort=False).groups.items():
+            if len(idx) < int(min_buildings):
+                continue
+            sub = pred.loc[idx]
+            counts = sub.value_counts()
+            if counts.empty:
+                continue
+            if counts.iloc[0] / len(sub) > share:
+                mask.loc[idx] |= sub.eq(counts.index[0])
+    return mask
+
+
+def drop_blank_predictions(df: pd.DataFrame, *, verbose: bool = True,
+                           label: str = "", **kw) -> tuple[pd.DataFrame, dict]:
+    """Apply :func:`blank_prediction_mask` and report what it removed.
+
+    Returns ``(kept, stats)``. The drop is reported rather than silent: a
+    nodata hole that reaches here is a *fetch* bug, and a filter that quietly
+    absorbs it would hide the thing that needs fixing upstream.
+    """
+    mask = blank_prediction_mask(df, **kw)
+    n = int(mask.sum())
+    stats = {"n_blank_dropped": n, "n_rows_in": len(df),
+             "blank_share": (n / len(df)) if len(df) else 0.0}
+    if n and verbose:
+        geoid_col = kw.get("geoid_col", "GEOID")
+        tracts = (df.loc[mask, geoid_col].nunique()
+                  if geoid_col in df.columns else 0)
+        print(f"    ⚠️ {label}dropped {n:,} blank-crop predictions "
+              f"({stats['blank_share']:.2%} of rows) across {tracts:,} tracts — "
+              f"these came from all-black imagery; check the fetch stats for "
+              f"this (city, year).")
+    return df[~mask], stats
+
+
+def assemble_year_csv(year_dir: Path, bounds: list, output_csv: Path,
+                      *, blank_values=(),
+                      blank_modal_share: float | None = BLANK_MODAL_SHARE_DEFAULT,
+                      verbose: bool = True) -> pd.DataFrame:
     """Concatenate the year's chunk parquets into the legacy CSV (atomic).
 
     Rows whose fetch permanently failed are dropped (they have no
     prediction); the ``fetch_failure`` column stays in the chunk parquets for
     diagnostics but not in the CSV. Column order: legacy six + actual_year.
+
+    Blank-crop predictions are dropped here too — at ASSEMBLY rather than at
+    fetch time, deliberately. The fetch-side guard
+    (``CyclicCacheManager._reject_for_zero_pixels``) is the primary defence, but
+    it only protects chunks written after it existed; filtering here also
+    cleans chunks already on disk, so a contaminated year can be repaired by
+    deleting its CSV and re-assembling instead of re-predicting it.
     """
     parts = [pd.read_parquet(_chunk_path(year_dir, s, e)) for s, e in bounds]
     df = pd.concat(parts, ignore_index=True) if parts else pd.DataFrame(
         columns=LEGACY_CSV_COLUMNS + ["actual_year", "fetch_failure"])
     df = df[df["fetch_failure"].isna()].drop(columns=["fetch_failure"])
     df = df[LEGACY_CSV_COLUMNS + ["actual_year"]]
+    df, _ = drop_blank_predictions(
+        df, values=blank_values, modal_share=blank_modal_share,
+        verbose=verbose, label=f"{output_csv.name}: ")
     output_csv = Path(output_csv)
     output_csv.parent.mkdir(parents=True, exist_ok=True)
     tmp = output_csv.with_name(output_csv.name + ".tmp")
@@ -885,7 +1078,11 @@ def predict_year_chunked(
     sleep_fn=time.sleep,
     verbose: bool = True,
 ) -> bool:
-    """Predict one year's buildings via NAIP, chunk by chunk, resumably.
+    """Predict one year's buildings, chunk by chunk, resumably.
+
+    Crops come from NAIP by default, or from a city's own municipal ortho when
+    ``params["predict_sensor"] == "ortho"`` (see :func:`resolve_fetch_fn`);
+    everything downstream of the fetch is sensor-agnostic.
 
     Returns True when ``output_csv`` exists at the end (year complete —
     possibly from a previous run), False when the year has no predictable
@@ -893,6 +1090,7 @@ def predict_year_chunked(
     """
     output_csv = Path(output_csv)
     year = int(year)
+    fetch_fn = resolve_fetch_fn(params, fetch_fn)
     if output_csv.exists():
         if verbose:
             print(f"✅ {output_csv.name} already exists — year {year} complete, skipping.")
@@ -1048,7 +1246,12 @@ def predict_year_chunked(
                     since = 0
             pbar.close()
 
-    df_result = assemble_year_csv(year_dir, bounds, output_csv)
+    df_result = assemble_year_csv(
+        year_dir, bounds, output_csv,
+        blank_values=params.get("blank_prediction_values", ()),
+        blank_modal_share=params.get("blank_modal_share",
+                                     BLANK_MODAL_SHARE_DEFAULT),
+        verbose=verbose)
     if verbose:
         print(f"✅ Year {year}: {len(df_result):,} predictions "
               f"({n - len(df_result):,} rows dropped for failed fetches) "

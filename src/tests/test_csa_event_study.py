@@ -207,6 +207,103 @@ def test_build_cohorts_rejects_a_baseline_after_the_panel():
         ces.build_tract_cohorts(fp, tr, BIENNIAL, baseline_year=2024, area_epsg=EPSG)
 
 
+# ─── per-building reuse (the expensive geometry step, hoisted) ────────────────
+
+def _messy_city(seed: int = 0, n_tracts: int = 12):
+    """A city with undated stock, demolitions and off-grid completion years."""
+    rng = np.random.default_rng(seed)
+    tr = _tracts(n_tracts)
+    spec, demolition = {}, {}
+    bid = 1000
+    for geoid in tr["GEOID_str"]:
+        blds = [(1950, float(rng.integers(40, 120)))]          # baseline stock
+        for _ in range(int(rng.integers(0, 4))):
+            blds.append((0, float(rng.integers(10, 40))))      # undated baseline
+        for _ in range(int(rng.integers(0, 6))):
+            # completion years deliberately land between panel years too
+            blds.append((int(rng.integers(2010, 2025)),
+                         float(rng.integers(10, 70))))
+        spec[geoid] = blds
+        for j in range(len(blds)):
+            if rng.random() < 0.1:
+                demolition[bid + j] = 2005
+        bid += len(blds)
+    return tr, _footprints(spec, tr, demolition=demolition)
+
+
+@pytest.mark.parametrize("years", [BIENNIAL, ANNUAL, [2010, 2011, 2014, 2019, 2024]])
+def test_per_building_table_reproduces_the_footprint_path(years):
+    """Passing a pre-computed per-building table changes nothing but the cost.
+
+    ``footprint_tract_areas`` exists so a threshold sweep reprojects the city's
+    footprints once instead of once per column; that is only safe if the two
+    routes are bit-for-bit the same cohort assignment.
+    """
+    tr, fp = _messy_city()
+    per_bldg = ces.footprint_tract_areas(
+        fp, tr, year_col="CONSTRUCTION_YEAR",
+        demolition_col="DEMOLITION_YEAR", area_epsg=EPSG,
+    )
+    kw = dict(baseline_year=2009, area_epsg=EPSG,
+              demolition_col="DEMOLITION_YEAR", control_threshold=0.01)
+    for threshold in (0.01, 0.05, 0.10):
+        direct = ces.build_tract_cohorts(fp, tr, years, threshold=threshold, **kw)
+        reused = ces.build_tract_cohorts(None, tr, years, threshold=threshold,
+                                         per_building=per_bldg, **kw)
+        pd.testing.assert_frame_equal(direct.cohorts, reused.cohorts)
+        pd.testing.assert_frame_equal(direct.shares, reused.shares)
+        assert direct.summary() == reused.summary()
+
+
+@pytest.mark.parametrize("years", [BIENNIAL, ANNUAL, [2010, 2011, 2014, 2019, 2024]])
+def test_cumulative_new_area_matches_the_reference_loop(years):
+    """The vectorised cumulation is the old per-tract loop, exactly.
+
+    Reference implementation below is the original row-by-row accumulation:
+    walk the panel, credit each building to the first panel year at or after its
+    completion, carry the running total forward.
+    """
+    tr, fp = _messy_city(seed=3)
+    per_bldg = ces.footprint_tract_areas(
+        fp, tr, year_col="CONSTRUCTION_YEAR",
+        demolition_col="DEMOLITION_YEAR", area_epsg=EPSG,
+    )
+    baseline_year = 2009
+    tract_ids = sorted(tr["GEOID_str"].astype(str).unique())
+
+    yb = per_bldg["year_built"]
+    is_new = yb.notna() & (yb > baseline_year) & (yb <= years[-1])
+    new = per_bldg.loc[is_new, ["GEOID_str", "area", "year_built"]].copy()
+    new["year_built"] = new["year_built"].astype(int)
+    new_by_year = (new.groupby(["GEOID_str", "year_built"])["area"].sum()
+                   if len(new) else pd.Series(dtype=float))
+    rows = []
+    for tid in tract_ids:
+        cum = 0.0
+        per_year = (new_by_year.loc[tid] if len(new_by_year) and tid in
+                    new_by_year.index.get_level_values(0) else None)
+        prev = baseline_year
+        for yr in years:
+            if per_year is not None:
+                built = per_year[(per_year.index > prev) & (per_year.index <= yr)]
+                cum += float(built.sum())
+            rows.append((tid, yr, cum))
+            prev = yr
+    expected = pd.DataFrame(rows, columns=["GEOID_str", "year", "cum_new_area"])
+
+    # control_threshold=None and threshold=0 keep every tract in `shares`, so the
+    # comparison sees the full tract x year grid rather than a filtered subset.
+    got = ces.build_tract_cohorts(
+        None, tr, years, baseline_year=baseline_year, threshold=0.0,
+        demolition_col="DEMOLITION_YEAR", area_epsg=EPSG, per_building=per_bldg,
+    ).shares
+    merged = expected.merge(got[["GEOID_str", "year", "cum_new_area"]],
+                            on=["GEOID_str", "year"], suffixes=("_ref", "_got"))
+    assert len(merged) == len(expected)
+    np.testing.assert_allclose(merged["cum_new_area_got"],
+                               merged["cum_new_area_ref"], rtol=0, atol=1e-9)
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # Outcomes
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -315,6 +412,35 @@ def test_anticipation_shifts_adoption_earlier():
     # never-treated units stay never-treated, never shifted into a cohort
     for g in geoids[3:]:
         assert coh(shifted)[g] == 0
+
+
+@pytest.mark.parametrize("anticipation", [1, 2, 3])
+def test_anticipation_never_turns_a_treated_tract_into_a_control(anticipation):
+    """REGRESSION: the shift used to be followed by `cohort > 0`, so a cohort
+    landing exactly on 0 was read as never-treated and a cohort landing below 0
+    reached csa as a negative group. Both must be dropped instead.
+
+    Concretely, with BIENNIAL the 2010 cohort is period 1: shifted by 1 it is 0
+    (csa's never-treated sentinel) and shifted by 2 it is -1.
+    """
+    geoids = [f"36061{i:06d}" for i in range(6)]
+    outcomes = _outcomes(geoids, BIENNIAL)
+    cohorts = pd.DataFrame({
+        "GEOID_str": geoids,
+        # periods 1, 2, 3 treated; three genuine never-treated
+        "cohort_year": [2010, 2012, 2014, 0, 0, 0],
+    })
+    panel = ces.build_event_panel(outcomes, cohorts, panel_years=BIENNIAL,
+                                  anticipation=anticipation)
+    # the control group is exactly the three tracts that never built
+    assert panel.n_never_treated == 3
+    surviving = panel.data.drop_duplicates("GEOID_str").set_index("GEOID_str")["cohort"]
+    assert set(surviving[surviving == 0].index) == set(geoids[3:])
+    # no cohort value is ever negative, and every treated unit kept a pre-period
+    assert (surviving >= 0).all()
+    assert (surviving[surviving > 0] >= 2).all()
+    # treated tracts left with no pre-period are dropped, not relabelled
+    assert panel.n_treated + panel.dropped_first_period_cohort == 3
 
 
 def test_anticipation_clears_a_timing_induced_pretrend():
@@ -539,6 +665,56 @@ def test_available_cities_splits_ready_from_missing(tmp_path):
     assert "issue #36" in reasons["chicago"]
 
 
+def test_every_city_declares_its_own_panel_and_baseline():
+    """Cadence is a per-city property, not a global. A shared year list would
+    silently empty most cities' panels: under predict_exact_year a year with no
+    flight yields no_year_match -> NaN, and the four states' NAIP grids intersect
+    in only {2021, 2023}."""
+    for key, spec in ces.CSA_CITIES.items():
+        assert spec.panel_years, f"{key} has no panel_years"
+        assert spec.baseline() < min(spec.panel_years), key
+        assert spec.sensor in {"zarr", "naip", "ortho"}, key
+
+
+def test_baseline_defaults_to_the_year_before_the_panel_opens():
+    spec = ces.CityCohortSpec(key="x", label="X", geoid_prefixes=("1",),
+                              footprints_filename="x.parquet",
+                              panel_years=(2014, 2016, 2018))
+    assert spec.baseline() == 2013
+    assert spec.years() == [2014, 2016, 2018]
+
+
+def test_city_without_a_panel_falls_back_to_the_callers_grid():
+    spec = ces.CityCohortSpec(key="x", label="X", geoid_prefixes=("1",),
+                              footprints_filename="x.parquet")
+    assert spec.years([2020, 2018]) == [2018, 2020]
+    assert spec.baseline(2009) == 2009
+    with pytest.raises(ValueError):
+        spec.years()
+
+
+def test_chicago_is_annual_ortho_scoped_by_footprint_coverage():
+    """The three choices that make Chicago the second main-figure city: annual
+    Cook County ortho (15 periods vs Illinois NAIP's 8), an out-of-sensor
+    holdout, and a tract set derived from footprint coverage because the
+    municipal footprint layer stops at the city line inside Cook County."""
+    spec = ces.CSA_CITIES["chicago"]
+    assert spec.sensor == "ortho"
+    assert spec.panel_years == tuple(range(2010, 2025))
+    assert spec.tract_source == "footprints"
+    assert spec.geoid_prefixes == ("17031",)
+    # Predictions join footprints -> the composition-fixed outcome is available.
+    assert spec.id_index == "building_id"
+
+
+def test_nashville_stays_on_naip_because_tn_has_no_ortho_archive():
+    """TNMap's IMAGERY service is a current mosaic refreshed county-by-county,
+    not a year-indexed archive — there is no local time series to panel."""
+    from src.data import ortho_fetcher as of
+    assert ces.CSA_CITIES["nashville"].sensor == "naip"
+    assert of.available_years("nashville") == ()
+
+
 def test_pooled_common_window():
     a = ces.EventStudyResult(np.array([-3, -2, -1, 0, 1]), *[np.zeros(5)] * 4,
                              n_units=1, n_treated=1, n_never_treated=1,
@@ -548,3 +724,226 @@ def test_pooled_common_window():
                              overall_att=0.0, overall_se=0.0)
     assert ces.pooled_common_window({"a": a, "b": b}) == (-2, 1)
     assert ces.pooled_common_window({}) is None
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Undated-area screen
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _screen_case():
+    """Three tracts differing only in how much of their baseline area is undated.
+
+    Each has 10,000 m2 of dated 1950 stock plus one 2015 building at 36% of it,
+    so all three are treated at 5% and identical in every respect the estimator
+    cares about — except the undated mass, which is what the screen keys on.
+    """
+    tr = _tracts(3)
+    a, b, c = tr["GEOID_str"].tolist()
+    spec = {
+        # clean: no undated stock at all
+        a: [(1950, 100.0), (2015, 60.0)],
+        # 100x100 dated + 50x50 undated = 2,500/12,500 = 20.0% (NOT over 20%)
+        b: [(1950, 100.0), (np.nan, 50.0), (2015, 60.0)],
+        # 100x100 dated + 80x80 undated = 6,400/16,400 = 39% -> over 20%
+        c: [(1950, 100.0), (np.nan, 80.0), (2015, 60.0)],
+    }
+    return tr, _footprints(spec, tr), (a, b, c)
+
+
+def test_undated_buildings_land_in_the_baseline_denominator():
+    """The premise of the screen: an unknown year is read as 'standing at
+    baseline', so undated area inflates the denominator instead of being ignored.
+    Tract c must therefore show a LOWER treatment share than clean tract a even
+    though both gained the identical 2015 building."""
+    tr, fp, (a, b, c) = _screen_case()
+    res = ces.build_tract_cohorts(fp, tr, BIENNIAL, baseline_year=2009,
+                                  threshold=0.05, area_epsg=EPSG)
+    base = res.cohorts.set_index("GEOID_str")["base_area"].to_dict()
+    assert base[a] == pytest.approx(10_000, rel=1e-3)
+    assert base[c] == pytest.approx(16_400, rel=1e-3)   # 6,400 undated added in
+    final = (res.shares[res.shares["year"] == max(BIENNIAL)]
+             .set_index("GEOID_str")["share"].to_dict())
+    assert final[c] < final[a]
+
+
+def test_screen_is_off_by_default():
+    """Enabling it must be an explicit decision — it is a sample restriction."""
+    tr, fp, _ = _screen_case()
+    res = ces.build_tract_cohorts(fp, tr, BIENNIAL, baseline_year=2009,
+                                  area_epsg=EPSG)
+    assert res.max_undated_area_share is None
+    assert res.n_dropped_undated == 0
+    assert res.n_treated + res.n_never_treated == 3
+
+
+def test_screen_drops_only_tracts_over_the_threshold():
+    tr, fp, (a, b, c) = _screen_case()
+    res = ces.build_tract_cohorts(fp, tr, BIENNIAL, baseline_year=2009,
+                                  threshold=0.05, area_epsg=EPSG,
+                                  max_undated_area_share=0.20)
+    kept = set(res.cohorts["GEOID_str"])
+    assert kept == {a, b}          # b is exactly at 20%, not over it
+    assert res.n_dropped_undated == 1
+    assert res.max_undated_area_share == 0.20
+
+
+def test_screen_scores_every_tract_even_when_disabled():
+    """The per-tract share is reported whether or not the screen runs, so the
+    restricted/unrestricted comparison can be tabulated from one pass."""
+    tr, fp, (a, b, c) = _screen_case()
+    res = ces.build_tract_cohorts(fp, tr, BIENNIAL, baseline_year=2009,
+                                  area_epsg=EPSG)
+    s = res.undated_area_share
+    assert s is not None and len(s) == 3
+    assert s[a] == pytest.approx(0.0, abs=1e-9)
+    assert s[b] == pytest.approx(2_500 / 12_500, rel=1e-3)
+    assert s[c] == pytest.approx(6_400 / 16_400, rel=1e-3)
+
+
+def test_screen_never_drops_a_fully_dated_city():
+    """A city whose assessor dates everything must be untouched by the screen,
+    so applying it uniformly costs nothing where it is not needed."""
+    tr, fp, _ = _screen_case()
+    clean = fp[fp["CONSTRUCTION_YEAR"].notna()].copy()
+    on = ces.build_tract_cohorts(clean, tr, BIENNIAL, baseline_year=2009,
+                                 threshold=0.05, area_epsg=EPSG,
+                                 max_undated_area_share=0.20)
+    off = ces.build_tract_cohorts(clean, tr, BIENNIAL, baseline_year=2009,
+                                  threshold=0.05, area_epsg=EPSG)
+    assert on.n_dropped_undated == 0
+    assert on.n_treated == off.n_treated
+    assert on.n_never_treated == off.n_never_treated
+
+
+def test_screen_summary_distinguishes_off_from_dropped_nothing():
+    """`None` (not applied) and 0.20-with-no-drops are different facts and must
+    not render identically in the robustness table."""
+    tr, fp, _ = _screen_case()
+    off = ces.build_tract_cohorts(fp, tr, BIENNIAL, baseline_year=2009,
+                                  area_epsg=EPSG).summary()
+    on = ces.build_tract_cohorts(fp, tr, BIENNIAL, baseline_year=2009,
+                                 area_epsg=EPSG,
+                                 max_undated_area_share=0.99).summary()
+    assert off["max_undated_area_share"] is None
+    assert on["max_undated_area_share"] == 0.99
+    assert off["n_dropped_undated"] == on["n_dropped_undated"] == 0
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Pinned control group (CONTROL_THRESHOLD)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _control_case():
+    """Four tracts spanning the intensity range, all with 10,000 m^2 baseline.
+
+    Final new-area share, by construction: none 0%, light 4%, mid 9%, heavy 25%.
+    Against a 5% treated cut, `light` is the ambiguous tract — it built, but not
+    enough to be treated — and `mid`/`heavy` are treated.
+    """
+    tr = _tracts(4)
+    none_, light, mid, heavy = tr["GEOID_str"].tolist()
+    spec = {
+        # baseline 100x100 = 10,000 m^2 everywhere
+        none_: [(1950, 100.0)],
+        light: [(1950, 100.0), (2012, 20.0)],            #   400 ->  4%
+        mid:   [(1950, 100.0), (2012, 30.0)],            #   900 ->  9%
+        heavy: [(1950, 100.0), (2012, 50.0)],            # 2,500 -> 25%
+    }
+    return tr, _footprints(spec, tr), (none_, light, mid, heavy)
+
+
+def test_control_cut_is_off_by_default():
+    """Pinning changes the estimand, so it must be an explicit decision."""
+    tr, fp, (none_, light, mid, heavy) = _control_case()
+    res = ces.build_tract_cohorts(fp, tr, BIENNIAL, baseline_year=2009,
+                                  threshold=0.05, area_epsg=EPSG)
+    assert res.control_threshold is None
+    assert res.n_dropped_ambiguous == 0
+    # the old behaviour: `light` built, but is handed to the control group
+    coh = res.cohorts.set_index("GEOID_str")["cohort_year"].to_dict()
+    assert coh[light] == 0 and coh[none_] == 0
+    assert res.n_never_treated == 2
+
+
+def test_control_cut_drops_the_ambiguous_middle_instead_of_calling_it_a_control():
+    """The fix: a tract between the control cut and the treated cut leaves the
+    sample. It is neither a clean control nor treated at this threshold."""
+    tr, fp, (none_, light, mid, heavy) = _control_case()
+    res = ces.build_tract_cohorts(fp, tr, BIENNIAL, baseline_year=2009,
+                                  threshold=0.05, area_epsg=EPSG,
+                                  control_threshold=0.01)
+    kept = set(res.cohorts["GEOID_str"])
+    assert light not in kept                      # 4% is in (1%, 5%]
+    assert kept == {none_, mid, heavy}
+    assert res.n_dropped_ambiguous == 1
+    assert res.control_threshold == 0.01
+    assert res.n_treated == 2 and res.n_never_treated == 1
+    # and it is gone from the long share frame too, not merely from `cohorts`
+    assert light not in set(res.shares["GEOID_str"])
+
+
+def test_control_group_is_identical_across_the_threshold_grid():
+    """The point of the whole change: every column compares against the SAME
+    tracts. Unpinned, the never-treated set grows with the threshold."""
+    tr, fp, (none_, light, mid, heavy) = _control_case()
+
+    def never(threshold, control_threshold):
+        res = ces.build_tract_cohorts(fp, tr, BIENNIAL, baseline_year=2009,
+                                      threshold=threshold, area_epsg=EPSG,
+                                      control_threshold=control_threshold)
+        c = res.cohorts.set_index("GEOID_str")["cohort_year"]
+        return set(c.index[c == 0])
+
+    pinned = [never(t, 0.01) for t in (0.01, 0.05, 0.10)]
+    assert pinned[0] == pinned[1] == pinned[2] == {none_}
+
+    unpinned = [never(t, None) for t in (0.01, 0.05, 0.10)]
+    assert unpinned == [{none_}, {none_, light}, {none_, light, mid}]
+
+
+def test_control_cut_leaves_the_lowest_threshold_untouched():
+    """Pinning at the smallest cut in the grid must be a no-op for that column,
+    so the grid stays nested and the 1% result is unchanged by the fix."""
+    tr, fp, _ = _control_case()
+    kw = dict(baseline_year=2009, threshold=0.01, area_epsg=EPSG)
+    pinned = ces.build_tract_cohorts(fp, tr, BIENNIAL, control_threshold=0.01, **kw)
+    plain = ces.build_tract_cohorts(fp, tr, BIENNIAL, **kw)
+    assert pinned.n_dropped_ambiguous == 0
+    assert pinned.n_treated == plain.n_treated
+    assert pinned.n_never_treated == plain.n_never_treated
+    pd.testing.assert_frame_equal(
+        pinned.cohorts.reset_index(drop=True), plain.cohorts.reset_index(drop=True)
+    )
+
+
+def test_control_cut_uses_the_final_share_not_the_share_at_each_year():
+    """A tract's share only grows, so membership must be decided once on the
+    final share. Deciding year by year would let a tract be a control early and
+    vanish later, unbalancing the panel."""
+    tr = _tracts(2)
+    a, b = tr["GEOID_str"].tolist()
+    # `b` crosses 1% in 2012 but only reaches 9% by the end of the panel: it is
+    # ambiguous against a 10% cut for the WHOLE panel, not just its later years.
+    fp = _footprints({a: [(1950, 100.0)],
+                      b: [(1950, 100.0), (2012, 20.0), (2020, 22.0)]}, tr)
+    res = ces.build_tract_cohorts(fp, tr, BIENNIAL, baseline_year=2009,
+                                  threshold=0.10, area_epsg=EPSG,
+                                  control_threshold=0.01)
+    assert set(res.shares["GEOID_str"]) == {a}
+    assert res.n_dropped_ambiguous == 1
+
+
+def test_control_cut_above_the_treated_cut_is_rejected():
+    """Would make a tract both treated and never-treated."""
+    tr, fp, _ = _control_case()
+    with pytest.raises(ValueError, match="control_threshold"):
+        ces.build_tract_cohorts(fp, tr, BIENNIAL, baseline_year=2009,
+                                threshold=0.05, area_epsg=EPSG,
+                                control_threshold=0.10)
+
+
+def test_control_threshold_is_the_smallest_default_threshold():
+    """CONTROL_THRESHOLD has to sit at or below every column of the grid, or
+    part_d's own validation would reject its default."""
+    assert ces.CONTROL_THRESHOLD <= min(ces.DEFAULT_THRESHOLDS)
+    assert ces.CONTROL_THRESHOLD == min(ces.DEFAULT_THRESHOLDS)

@@ -1,0 +1,396 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage[utf8]{inputenc}
+\usepackage{amsmath,amssymb,amsthm,mathtools}
+\usepackage{microtype}
+\usepackage{booktabs,tabularx,array}
+\usepackage{enumitem}
+\usepackage[round,authoryear]{natbib}
+\usepackage{titlesec}
+\usepackage[colorlinks,allcolors=black]{hyperref}
+
+% ---------- layout ----------
+\titleformat{\section}{\large\bfseries}{\thesection}{0.6em}{}
+\titlespacing*{\section}{0pt}{1.6ex plus .4ex minus .2ex}{0.7ex}
+\titleformat{\paragraph}[runin]{\normalsize\bfseries}{}{0pt}{}[.]
+\titlespacing*{\paragraph}{0pt}{1.1ex plus .3ex minus .2ex}{0.6em}
+\setlist{nosep,leftmargin=2.1em}
+\setlength{\bibsep}{2pt}
+\newcolumntype{Y}{>{\raggedright\arraybackslash}X}
+\setlength{\intextsep}{8pt plus 2pt minus 2pt}
+\setlength{\abovecaptionskip}{4pt}
+\setlength{\belowcaptionskip}{0pt}
+
+% ---------- theorem environments ----------
+\newtheoremstyle{tight}{5pt}{5pt}{\itshape}{}{\bfseries}{.}{0.5em}{}
+\theoremstyle{tight}
+\newtheorem{proposition}{Proposition}
+\newtheorem{assumption}{Assumption}
+\renewcommand{\theassumption}{A\arabic{assumption}}
+
+% ---------- macros ----------
+\newcommand{\E}{\mathbb{E}}
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\Sset}{\mathcal{S}}
+\newcommand{\one}{\mathbf{1}}
+\DeclareMathOperator{\med}{med}
+
+\begin{document}
+\begin{center}
+{\Large\bfseries Learning a Common Index from Outcomes Measured\\[0.15em] on Non-Comparable Scales}\\[0.5em]
+Project proposal \quad$\cdot$\quad Nicolas Abbate \quad$\cdot$\quad October 5, 2026
+\end{center}
+\vspace{-0.6em}
+
+% =====================================================================
+\section{Motivation}
+% =====================================================================
+
+Aerial imagery now covers most of the United States at building-level resolution and annual
+frequency, while the American Community Survey reports five-year averages for census tracts
+with margins of error that are wide for small areas. A model that reads wealth from imagery
+could close that gap. It would help target programs at a geography the survey cannot support,
+sharpen small-area estimates by combining the two signals, and measure change between survey
+rounds. It would also make impact evaluation possible where no survey covers the affected
+places or years: after a rezoning or a transit extension, the units of interest are blocks and
+the window is shorter than a survey cycle.
+
+Remote wealth estimation has a fundamental problem that remains unresolved. Detection
+models scale because a building is a building in Dallas and in Lagos, so every labeled image
+is one more example of a single relationship. Wealth labels lack that property. Surveys report
+wealth in dollars, and the same visual bundle carries different dollar values in two cities or
+in two years, because each local wealth distribution is shifted, stretched and reshaped by
+forces unrelated to the built environment. Pooling dollar labels across places and periods
+therefore mixes incompatible relationships, and a new city can add an inconsistent example
+rather than another instance of the same one.\footnote{As an illustration, \citet{khachiyan2022} report $R^2\approx 0.90$
+for income levels pooled over 2000 and 2010 and $R^2\approx 0.40$ for the 2000--2010 change. While they do not work with wealth, 
+the same label distortion problem arises in their setting.}
+
+One reading of this evidence is that the map from features to wealth is inherently local, so
+every city and year needs its own model. We read it differently: the locality is in the dollar
+labels, not in the ordering. Wealth buys amenities that look much the same everywhere---space,
+light, quiet, greenery, quality of construction, height, centrality. Because of this, we believe 
+that there exists a global relation between the features and wealth; what is not global, and changes
+from city to city and year to year, is the number of dollars attached to each feature bundle.
+
+The problem is not specific to imagery or to wealth. It arises wherever outcomes are comparable
+within groups but not across them: a fixed income affords different housing across cities, exams
+vary in difficulty, and credit ratings depend on the rating system. The same structure appears
+in preference and reward data with annotator-specific scales, test scores across forms and
+graders, credit risk across vintages, severity graded from medical images across sites and
+scanners, and hedonic quality across markets whose price levels differ. In each case covariates
+determine a shared unobservable index that every group reports through its own unknown monotone rescaling.
+
+This project studies how to learn this latent shared index---or equivalently, learning the function 
+that maps the covariates to the index---, without estimating the group-specific rescalings, using external data
+on . Within a group, 
+the labels order units as the index does. Across
+groups,  known from outside the labels to be nearly the same, such as one location
+photographed in two years with no structural change, must receive nearly the same index, a
+restriction that uses no label. We combine them in one training criterion: a pairwise ranking
+loss within groups plus a scale-free penalty on how much the score moves over such pairs. We
+then prove consistency of the estimator under three assumptions on the comparison errors, and
+run a Monte Carlo study of when each version works, when it fails, and whether the unlabeled
+pairs improve prediction.
+
+% =====================================================================
+\section{Framework}
+% =====================================================================
+
+Units are indexed by $i$, groups by $c$ (cities) and dates by $t$; the pair $(c,t)$ is a
+\emph{cell}. We observe a label $W_{ict}\in\R$ and covariates $X_{ict}$, an image tile in the
+application. The model is
+\begin{equation}\label{eq:model}
+  W_{ict} \;=\; \xi_{ct}(X_{ict}) + e_{ict},
+  \qquad
+  \xi_{ct} \;=\; \psi_{ct}\circ f .
+\end{equation}
+The \emph{global function} $f$ maps covariates into a latent index and is the same in every
+cell. The \emph{cell-specific function} $\psi_{ct}$ converts the index into the units in which
+the cell reports it (dollars in city $c$ in year $t$) and carries that cell's level, spread and
+shape. A model fitted cell by cell learns $\xi_{ct}$, which says nothing about a cell without
+labels. The goal is to estimate $f$ without estimating $\psi_{ct}$.
+
+Let $\Sset$ be a set of \emph{stable pairs} $(x,x')$: covariate values observed in two
+different cells and selected, without reference to the labels, as nearly the same unit.
+
+\begin{assumption}[Monotonicity]\label{a:mono}
+$\psi_{ct}$ is strictly increasing for every $(c,t)$.
+\end{assumption}
+\begin{assumption}[Invariance]\label{a:inv}
+$f$ does not depend on $c$ or $t$.
+\end{assumption}
+\begin{assumption}[Regularity]\label{a:lip}
+There is a factorization $f=g\circ\phi$, with the coordinates of $H=\phi(X)\in\R^K$
+standardized, such that $|g(h)-g(h')|\le L\,\|h-h'\|$ on the support of $H$, and every stable
+pair $(x,x')\in\Sset$ satisfies $\|\phi(x')-\phi(x)\|\le\delta$. The index is not constant
+within cells.
+\end{assumption}
+
+\ref{a:inv} is the substantive assumption: all variation across cells is assigned to
+$\psi_{ct}$. In \ref{a:lip}, $H$ is the embedding before the final scalar layer of a network,
+and $L$ and $\delta$ matter only through their product.
+
+\begin{proposition}[Pooled levels estimate a mixture]\label{p:mix}
+Suppose \eqref{eq:model} holds with $\E[e_{ict}\mid X_{ict},c,t]=0$ and $\E|W|<\infty$, and $W$ is
+regressed on $X$ pooling all cells. Then
+\[
+  \E[W\mid X=x] \;=\; \sum_{c,t}\Pr(c,t\mid X=x)\;\psi_{ct}\bigl(f(x)\bigr).
+\]
+\end{proposition}
+
+The weights reflect which cells are in the sample, and they can reverse the ranking. If public
+housing towers appear only in New York and single-family houses mostly in Dallas, a large enough
+dollar gap between the cities makes the pooled fit rank the towers above the houses, although
+they are poorer in each city: the model has learned that public housing signals New York.
+
+\begin{proposition}[What the data reveal about $f$]\label{p:reveal}
+Let \ref{a:mono}--\ref{a:lip} hold.
+\begin{enumerate}[label=\textup{(\roman*)}]
+\item \textup{Ordering within a cell.} For every cell $(c,t)$ and any $x,x'$:\;
+      $\xi_{ct}(x')>\xi_{ct}(x)\iff f(x')>f(x)$.
+\item \textup{Stability across cells.} For every stable pair $(x,x')\in\Sset$, with $x$ observed
+      in cell $(c,t)$ and $x'$ in cell $(c',t')\neq(c,t)$:\; $|f(x')-f(x)|\le L\delta$.
+\end{enumerate}
+\end{proposition}
+\begin{proof}
+(i) $\xi_{ct}=\psi_{ct}\circ f$ and $\psi_{ct}$ is strictly increasing by \ref{a:mono}.
+(ii) By \ref{a:inv} the same $f=g\circ\phi$ applies in both cells, so
+$|f(x')-f(x)|\le L\,\|\phi(x')-\phi(x)\|\le L\delta$ by \ref{a:lip}.
+\end{proof}
+
+Part (ii) holds for any two cells, so a stable pair may join two dates of one group
+($c=c'$, $t\neq t'$) or two different groups ($c\neq c'$). In satellite and aerial imagery only
+the first kind arises on its own: one location, two years, no recorded structural change.
+Nothing physical ties a tile in one city to a tile in another, so cross-city pairs require an
+already pretrained model, in whose representation near neighbours can be defined before training.
+
+Proposition~\ref{p:reveal} establishes what is observable about $f$: orderings within cells and
+near-equalities across cells, neither involving $\psi_{ct}$. But the labels are $W$, not
+$\xi_{ct}(X)$: whether a noisy comparison still reveals the ordering of $f$ depends on the
+errors, and the assumption made about them determines the loss. For two units $i\neq j$
+of one cell write $y_{ij}=\one\{W_j>W_i\}$, $p_{ij}=\Pr(y_{ij}=1\mid X_i,X_j,c,t)$ and
+$\Delta_{ij}s=s(X_j)-s(X_i)$ for a score function $s$.
+
+\begin{assumption}[Comparison errors, one of three versions]\label{a:err}\leavevmode
+\begin{enumerate}[label=\textup{(\alph*)}]
+\item \textup{Median zero.} Given $(X_i,X_j,c,t)$, $e_i-e_j$ has median zero and a distribution
+      function strictly increasing at zero. By Proposition~\ref{p:reveal}\textup{(i)},
+      $p_{ij}>\tfrac12\iff\Delta_{ij}f>0$.
+\item \textup{Heterogeneous logistic.} $p_{ij}=\Lambda(\rho_{ct}\,\Delta_{ij}f)$ with
+      $\rho_{ct}>0$ and $\Lambda(z)=1/(1+e^{-z})$.
+\item \textup{Homogeneous logistic.} Version \textup{(b)} with $\rho_{ct}=\rho$ in every cell.
+\end{enumerate}
+\end{assumption}
+
+Version (a) restricts only the sign of $p_{ij}-\tfrac12$ and lets the noise depend on the
+features; (b) and (c) also fix its shape, with and without a reliability that differs by
+cell.\footnote{Versions (b) and (c) place the noise on the scale of the index. They hold when
+$W=\Psi_{ct}(f(X)+\varepsilon)$ with logistic differences of $\varepsilon$, a model whose
+regression form is \eqref{eq:model} if $\varepsilon$ is independent of $X$ within a cell; with
+logistic differences of the additive $e$ they hold when $\psi_{ct}$ is affine.} All three lead to one criterion,
+\begin{equation}\label{eq:crit}
+  Q_k(s,\eta) \;=\; Q^{\mathrm{cross}}_k(s,\eta)
+  \;+\;\lambda_t\,\frac{S_t(s)}{V(s)}
+  \;+\;\lambda_c\,\frac{S_c(s)}{V(s)},
+  \qquad k\in\{\mathrm{a},\mathrm{b},\mathrm{c}\},
+\end{equation}
+where $S_t(s)$ and $S_c(s)$ are the mean squared score differences $\E[(s(x')-s(x))^2]$ over
+temporal and cross-group stable pairs, and $V(s)=\tfrac12\E[(\Delta_{ij}s)^2]$ is the within-cell
+dispersion of the score. Dividing by $V$ makes the penalties scale-free, so shrinking the
+scores cannot satisfy them; a weight is zero when that kind of pair is unavailable. The
+criterion uses the labels only through $y_{ij}$, so it is unchanged by any strictly increasing
+relabeling within a cell: it never sees $\psi_{ct}$.
+
+Only the first term depends on the error assumption. Under median zero an ordinal loss makes
+sense: the probability of misordering a pair,
+$Q^{\mathrm{cross}}_{\mathrm a}(s)=\Pr\bigl((2y_{ij}-1)\Delta_{ij}s<0\bigr)+\tfrac12\Pr(\Delta_{ij}s=0)$,
+trained through a smooth surrogate. Under heterogeneous logistic errors it is a RankNet loss
+parametrized at the city-year level,
+$Q^{\mathrm{cross}}_{\mathrm b}(s,\eta)=\E[\ell(\rho_{ct}\Delta_{ij}s,\,y_{ij})]$ with
+$\ell(z,y)=\log(1+e^{z})-yz$, $\eta=\{\rho_{ct}\}$ and the scale of $s$ fixed by $V(s)=1$. Under
+homogeneous logistic errors it is the RankNet loss of \citet{burges2005},
+$Q^{\mathrm{cross}}_{\mathrm c}(s)=\E[\ell(\Delta_{ij}s,\,y_{ij})]$, with the scale absorbed
+into $s$.
+
+% =====================================================================
+\section{Related work}
+% =====================================================================
+
+Rank estimation removes an unknown monotone transformation by comparing pairs
+\citep{han1987}, and \citet{abrevaya2000} lets it differ across groups; both keep a
+finite-dimensional index. \citet{wang2024} place a deep network inside a rank objective, with
+one transformation and independent observations. In learning to rank, \citet{burges2005}
+introduce the pairwise logistic loss, and \citet{duchi2010} show that commonly used surrogates
+can be inconsistent for the ranking risk, which is why we compare an ordinal loss with the
+logistic ones. The stability terms relate to manifold regularization \citep{belkin2006}, slow
+feature analysis \citep{wiskott2002} and self-supervised invariance objectives
+\citep{bardes2022,jean2019}; neither a pair penalty nor its normalization is new in isolation.
+Invariant risk minimization \citep{arjovsky2019} also seeks one predictor across environments
+but takes labels to be on a common scale. Wealth prediction from imagery fits one model per
+cell \citep{jean2016} or pools dollars \citep{khachiyan2022}, as in Proposition~\ref{p:mix}.
+
+% =====================================================================
+\section{Intended results and evaluation}
+% =====================================================================
+
+\paragraph{Theory}
+The estimator is $\hat f=s_{\hat\theta}$, where $\hat\theta$ minimizes the sample analogue of
+\eqref{eq:crit} over a neural network class. Groups are independent clusters with arbitrary
+dependence inside each, and asymptotics are in the number of groups. We intend to prove that
+$\hat f$ is consistent for $f$ under each version of \ref{a:err}: first what the minimizers of
+the population criterion recover, then uniform convergence of the sample criterion. What
+consistency means differs by version. Under (c) the index is recovered up to scale and a
+constant per cell (a preliminary proof exists). Under (b) the same holds jointly with the scales
+$\rho_{ct}$, whose number grows with the sample: the main technical difficulty. Under (a) only
+the ordering is recovered, so excess misranking risk vanishes up to the smoothing error of the
+surrogate.
+
+\paragraph{Monte Carlo}
+The design follows \citet{morris2019} and \citet{kiviet2012}: aims, data-generating processes,
+estimands, methods and performance measures are fixed before any run, every method is applied to
+the same simulated datasets, and one factor moves at a time from a common baseline. In that
+baseline the covariates have three blocks: signal that enters $f$, acquisition noise that is
+redrawn at every date, and a group cue that reveals the group; neither of the last two enters
+$f$. Labels are generated at the unit level and then transformed by $\psi_{ct}$, never as
+independent pair outcomes. Every $f$ is rescaled so that $V(f)=1$ and the best attainable
+misranking rate is equal across designs, which holds the difficulty of the task fixed.
+
+\begin{table}[h]
+\centering\footnotesize
+\renewcommand{\arraystretch}{1.12}
+\begin{tabularx}{\textwidth}{@{}>{\raggedright\arraybackslash}p{0.30\textwidth} Y >{\raggedright\arraybackslash}p{0.22\textwidth}@{}}
+\toprule
+Question & What varies & What is held fixed \\
+\midrule
+\textbf{Q1. Efficiency against misspecification of $\psi_{ct}$.} When a parametric correction
+$\psi_{ct}^{-1}(W)$ is feasible, what does it gain if correct and lose if wrong?
+& Shape of $\psi_{ct}$ along one dial (common, cell multiplier, location and scale, shape);
+cross-cell differences in the distribution of $f(X)$; number of labeled groups. Competitors:
+pooled levels, logs with cell effects, within-cell $z$-scores and percentile ranks, and an
+oracle fitted to the latent index.
+& $f$; links; errors at (c), where our loss and a correct level regression are both well
+specified. \\
+\addlinespace
+\textbf{Q2. Misspecified errors.} How does each of the three losses behave when its version of
+\ref{a:err} fails?
+& One departure at a time, each with one dial: tail weight of $e_i-e_j$; dispersion of
+$\rho_{ct}$ across cells; dependence of the noise scale on $X$; skewness with a scale that
+depends on $X$, which violates (a).
+& $\psi_{ct}$; $f$; sample size; links. \\
+\addlinespace
+\textbf{Q3. Value of stable pairs.} Within each loss, do the links improve on a well-trained
+fit without them?
+& Link arm: none, temporal only, cross-group only, both. Strength of the acquisition noise and
+of the group cue.
+& Labels; architecture; tuning budget; errors; $\psi_{ct}$. \\
+\addlinespace
+\textbf{Q4. Approximate and false links.} How fast do gains erode, and does tuning the
+penalty weight prevent harm?
+& A drift in $f$ on every link; a share of entirely false links, random or one-sided; penalty
+weight fixed or chosen on held-out ranking loss.
+& The design of Q3 with both kinds of link. \\
+\bottomrule
+\end{tabularx}
+\caption{Monte Carlo questions, each run for the three losses and for a linear and a nonlinear
+$f$.}
+\label{tab:mc}
+\end{table}
+
+Q1 and Q3 are read from held-out error against the number of labeled groups: a correct
+competitor appears as a horizontal gap, the extra labels our method needs, and a misspecified
+one as a floor that more data does not remove. Q2 and Q4 are read from error against the dial.
+
+\paragraph{Performance measures}
+All are computed in held-out groups and reported with Monte Carlo standard errors: (i) the share
+of within-cell pairs ordered differently from the true $f$, comparable across the three losses;
+(ii) the same share for pairs across dates and across groups, which a simulation allows because
+$f$ is known; and (iii) error in within-cell index differences with $V=1$, for the logistic
+losses only, since the ordinal loss identifies no spacing.
+
+% =====================================================================
+\section{Execution plan and expected contribution}
+% =====================================================================
+
+The work has five steps. (1) Derive the population result for the three versions of
+\ref{a:err}. (2) Build the simulator and the three losses from scratch, including the smooth
+ordinal surrogate and the minibatch estimate of the ratio penalties, with a linear head on fixed
+features and with a small network. (3) Run Q3 first: if links do not help against a well-trained
+fit without them, that is the finding we report. (4) Run Q1, Q2 and Q4. (5) Prove sample
+consistency for the versions that survive and formalize the regularities the simulations show.
+Time permitting, we illustrate the method on U.S.\ aerial imagery and tract incomes.
+
+We expect three contributions: a training criterion that learns one predictor from labels
+comparable only within groups, invariant to the label scale by construction; consistency results
+that state what each error assumption identifies, from an ordering to an index with
+cell-specific reliabilities; and evidence on when unlabeled stable pairs improve prediction,
+when they harm it, and what is lost relative to a correct parametric correction.
+
+% =====================================================================
+\begin{thebibliography}{99}\small
+
+\bibitem[Abrevaya(2000)]{abrevaya2000}
+Abrevaya, J. (2000). Rank estimation of a generalized fixed-effects regression model.
+\emph{Journal of Econometrics}, 95(1):1--23.
+
+\bibitem[Arjovsky et~al.(2019)]{arjovsky2019}
+Arjovsky, M., Bottou, L., Gulrajani, I., and Lopez-Paz, D. (2019). Invariant risk minimization.
+Working paper 1907.02893, arXiv.
+
+\bibitem[Bardes et~al.(2022)]{bardes2022}
+Bardes, A., Ponce, J., and LeCun, Y. (2022). VICReg: Variance-invariance-covariance
+regularization for self-supervised learning. In \emph{International Conference on Learning
+Representations (ICLR)}.
+
+\bibitem[Belkin et~al.(2006)]{belkin2006}
+Belkin, M., Niyogi, P., and Sindhwani, V. (2006). Manifold regularization: A geometric framework
+for learning from labeled and unlabeled examples. \emph{Journal of Machine Learning Research},
+7:2399--2434.
+
+\bibitem[Burges et~al.(2005)]{burges2005}
+Burges, C. J.~C., Shaked, T., Renshaw, E., Lazier, A., Deeds, M., Hamilton, N., and Hullender, G.
+(2005). Learning to rank using gradient descent. In \emph{Proceedings of the 22nd International
+Conference on Machine Learning (ICML)}, pages 89--96.
+
+\bibitem[Duchi et~al.(2010)]{duchi2010}
+Duchi, J.~C., Mackey, L.~W., and Jordan, M.~I. (2010). On the consistency of ranking algorithms.
+In \emph{Proceedings of the 27th International Conference on Machine Learning (ICML)}.
+
+\bibitem[Han(1987)]{han1987}
+Han, A.~K. (1987). Non-parametric analysis of a generalized regression model: The maximum rank
+correlation estimator. \emph{Journal of Econometrics}, 35(2--3):303--316.
+
+\bibitem[Jean et~al.(2016)]{jean2016}
+Jean, N., Burke, M., Xie, M., Davis, W.~M., Lobell, D.~B., and Ermon, S. (2016). Combining
+satellite imagery and machine learning to predict poverty. \emph{Science}, 353(6301):790--794.
+
+\bibitem[Jean et~al.(2019)]{jean2019}
+Jean, N., Wang, S., Samar, A., Azzari, G., Lobell, D., and Ermon, S. (2019). Tile2Vec:
+Unsupervised representation learning for spatially distributed data. In \emph{Proceedings of the
+AAAI Conference on Artificial Intelligence}, 33.
+
+\bibitem[Khachiyan et~al.(2022)]{khachiyan2022}
+Khachiyan, A., Thomas, A., Zhou, H., Hanson, G., Cloninger, A., Rosing, T., and Khandelwal,
+A.~K. (2022). Using neural networks to predict microspatial economic growth. \emph{American
+Economic Review: Insights}, 4(4):491--506.
+
+\bibitem[Kiviet(2012)]{kiviet2012}
+Kiviet, J.~F. (2012). Monte Carlo simulation for econometricians. \emph{Foundations and Trends in
+Econometrics}, 5(1--2):1--181.
+
+\bibitem[Morris et~al.(2019)]{morris2019}
+Morris, T.~P., White, I.~R., and Crowther, M.~J. (2019). Using simulation studies to evaluate
+statistical methods. \emph{Statistics in Medicine}, 38(11):2074--2102.
+
+\bibitem[Wang et~al.(2024)]{wang2024}
+Wang, T., Zhang, S., Zhang, S., Huang, J., and Ma, S. (2024). Deep transformation model.
+Working paper 2410.19226, arXiv.
+
+\bibitem[Wiskott and Sejnowski(2002)]{wiskott2002}
+Wiskott, L. and Sejnowski, T.~J. (2002). Slow feature analysis: Unsupervised learning of
+invariances. \emph{Neural Computation}, 14(4):715--770.
+
+\end{thebibliography}
+
+\end{document}

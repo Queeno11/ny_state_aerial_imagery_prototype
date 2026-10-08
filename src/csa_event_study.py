@@ -31,6 +31,15 @@ Design notes that matter statistically
 * **Undefined treatment intensity is dropped, not called a control.** A tract
   with no baseline building stock has an undefined "share of stock replaced";
   the previous code gave it ``base_area = inf`` → ``share = 0`` → never-treated.
+* **The threshold grid holds its control group fixed.** Each column compares
+  "built more than ``threshold``" against one pinned comparison group — tracts
+  that never crossed :data:`CONTROL_THRESHOLD` — and drops the tracts in
+  between. Letting the never-treated group be the complement of the treated
+  group, as it was, means the comparison group changes with every column, so
+  the grid varies dose *and* control composition at once and cannot be read as
+  a dose-response. Same reasoning as the sentence above, one level up: a tract
+  that built 3% of its stock is not a valid counterfactual for one that built
+  20%, and calling it one is a measurement choice, not a robustness check.
 * **Composition.** The all-buildings tract mean moves mechanically when new
   buildings enter it. ``tract_outcomes`` therefore also emits an
   *incumbent-only* mean (buildings existing at the baseline year), which holds
@@ -53,8 +62,10 @@ import pandas as pd
 __all__ = [
     "CityCohortSpec",
     "CSA_CITIES",
+    "CONTROL_THRESHOLD",
     "DEFAULT_THRESHOLDS",
     "HEADLINE_THRESHOLD",
+    "MAX_UNDATED_AREA_SHARE",
     "PeriodMap",
     "CohortResult",
     "EventPanel",
@@ -63,6 +74,7 @@ __all__ = [
     "build_tract_cohorts",
     "build_event_panel",
     "estimate_event_study",
+    "footprint_tract_areas",
     "pretrend_test",
     "tract_outcomes",
 ]
@@ -72,6 +84,33 @@ __all__ = [
 DEFAULT_THRESHOLDS: tuple[float, ...] = (0.01, 0.05, 0.10)
 HEADLINE_THRESHOLD: float = 0.05
 
+# Every cell of that grid compares ">threshold" against this ONE control
+# definition, and drops the tracts in between. Without it the grid is not a
+# robustness check at all: raising the threshold moves a tract out of the
+# treated group and straight into the *never-treated* group, so the comparison
+# group changes with every column. Measured on the run_20260722 held-out panels,
+# pinning the control cut here is worth about half of the difference between the
+# 1% and 5% columns:
+#
+#   Seattle, overall ATT, treated cut across / control cut down
+#            >1%      >5%     >10%
+#     <=1%  +0.089   +0.049   +0.092      <- control pinned (this constant)
+#     <=5%     --    -0.001   +0.045
+#     <=10%    --       --    +0.040      <- the old diagonal
+#
+# The old diagonal reads 1%: +0.089, 5%: -0.001, 10%: +0.040 and looks like the
+# model failing at 5%; the pinned row is +0.089 / +0.049 / +0.092 against one
+# fixed comparison group. The reason the contamination bites so much harder in
+# Seattle than in Tampa is the shape of the dose-response: Seattle's raw
+# tract-mean change steps up at ~2% of baseline area and is flat above it, so
+# the 5% cut splits a homogeneous plateau into "treated" and "control" halves
+# that move identically, whereas Tampa's is a smooth monotone gradient over the
+# whole range and any cut separates it. See issue #36.
+#
+# 1% is the natural pin because it is the lowest cut in DEFAULT_THRESHOLDS, so
+# the 1% column is unchanged by the restriction and the grid stays nested.
+CONTROL_THRESHOLD: float = 0.01
+
 # Event-time horizons tabulated in the coefficient table (issue #36 asks for
 # post-ATTs at a couple of horizons, not one lumped number).
 POST_HORIZONS: tuple[int, ...] = (0, 1, 2, 3)
@@ -80,6 +119,24 @@ POST_HORIZONS: tuple[int, ...] = (0, 1, 2, 3)
 # worth plotting — the sup-t critical value blows up and the curve is noise.
 MIN_TREATED_UNITS = 20
 MIN_CONTROL_UNITS = 20
+
+# Tracts whose UNDATED buildings exceed this share of baseline footprint area are
+# dropped when the screen is enabled. An undated building is not ignored by
+# `build_tract_cohorts` — "unknown year" is read as "standing at baseline", so its
+# area is simultaneously missing from the numerator and inflating the denominator.
+# Both push treatment intensity down, which is why the screen is on AREA and not
+# on a count or a land-use class: undated buildings run about twice average size
+# (measured undated area shares of 3.0% Tampa / 8.7% Seattle / 10.8% San Antonio
+# against count shares roughly half those), so a count-based rule would not bound
+# the quantity that actually biases the estimate.
+#
+# 0.20 is chosen from that same measurement: it drops 0.8% of Tampa's tracts,
+# 8.9% of Seattle's and 11.2% of San Antonio's, where 0.05 would have dropped
+# 12.5%/57.5%/58.9% and 0.10 still 3.7%/27.3%/30.9%. The screen exists so that a
+# city whose assessor dates only residential improvements can be used at all; it
+# must be reported as a sample restriction, and validated by comparing the
+# restricted and unrestricted ATT wherever the unrestricted one is available.
+MAX_UNDATED_AREA_SHARE = 0.20
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -109,6 +166,38 @@ class CityCohortSpec:
         which disables the incumbent-only outcome for that city.
     area_epsg
         Projected CRS used for footprint areas.
+    panel_years
+        The city's own panel grid, or ``None`` to inherit the caller's. Cadence
+        is a *per-city* property and cannot be a global: NYC's zarr is biennial,
+        Cook County ortho is annual 2009-2025, and each state's NAIP grid
+        differs (IL 2011/12/14/15/17/19/21/23, WA 2011/13/15/17/19/21/23,
+        FL 2010/13/15/17/19/21/23, TN 2012/14/16/18/21/23 — a four-way
+        intersection of just {2021, 2023}). Predicting a year off-grid yields
+        ``no_year_match`` -> NaN under ``predict_exact_year``, so a shared year
+        list would silently empty most cities' panels.
+    baseline_year
+        Year whose building stock is the treatment-intensity denominator.
+        ``None`` -> ``min(panel_years) - 1``, i.e. the last year before the
+        panel opens, so the whole panel is post-baseline.
+    sensor
+        Which imagery the city's predictions come from: ``"zarr"`` (NYC legacy),
+        ``"naip"``, or ``"ortho"`` (the city's own municipal orthoimagery — a
+        sensor never seen in fine-tuning, which makes the holdout spatial *and*
+        out-of-sensor; see :mod:`src.data.ortho_fetcher`).
+    state
+        State name for the ``buildings_index`` / ``buildings_polygons``
+        partition, when the city's footprints come from the national index.
+    tract_source
+        How the city's tract set is defined. ``"prefix"`` uses
+        ``geoid_prefixes``; ``"footprints"`` derives it from actual footprint
+        coverage, which is what a sub-county source needs — Chicago's municipal
+        footprint layer stops at the city line, well inside Cook County, so a
+        FIPS prefix would pull in ~500 suburban tracts with no year-built data
+        and no way to distinguish them from genuinely undeveloped ones.
+    min_tract_footprints
+        Under ``tract_source="footprints"``, the count below which a tract is
+        treated as outside coverage rather than as a real tract with few
+        buildings.
     note
         Free text surfaced when the city is unavailable.
     """
@@ -121,7 +210,37 @@ class CityCohortSpec:
     demolition_col: str | None = "DEMOLITION_YEAR"
     id_index: str | None = None
     area_epsg: int = 5070
+    panel_years: tuple[int, ...] | None = None
+    baseline_year: int | None = None
+    sensor: str = "naip"
+    state: str | None = None
+    tract_source: str = "prefix"
+    min_tract_footprints: int = 50
     note: str = ""
+
+    def years(self, fallback: list[int] | tuple[int, ...] | None = None) -> list[int]:
+        """This city's panel years, falling back to the caller's grid."""
+        if self.panel_years:
+            return sorted(self.panel_years)
+        if not fallback:
+            raise ValueError(f"{self.key}: no panel_years and no fallback given")
+        return sorted(fallback)
+
+    def baseline(self, fallback: int | None = None) -> int:
+        """Baseline year: explicit, else the year before the panel opens.
+
+        Falls back to the caller's global only when the city has no panel of its
+        own — a city with annual ortho from 2010 must not inherit NYC's 2009
+        baseline, which would put a year of construction before the first
+        observed period and mis-date its cohorts.
+        """
+        if self.baseline_year is not None:
+            return int(self.baseline_year)
+        if self.panel_years:
+            return int(min(self.panel_years)) - 1
+        if fallback is None:
+            raise ValueError(f"{self.key}: no baseline_year and no fallback given")
+        return int(fallback)
 
 
 # NYC is wired; the other four are the whole-CBSA CSA holdouts from issue #36,
@@ -142,16 +261,48 @@ CSA_CITIES: dict[str, CityCohortSpec] = {
         # conformal (preserves shape, distorts area). It is also the CRS the tract
         # geometries are already stored in, and the one every other city uses.
         area_epsg=5070,
+        panel_years=(2010, 2012, 2014, 2016, 2018, 2020, 2022, 2024),
+        baseline_year=2009,
+        sensor="zarr",
+        state="NewYork",
     ),
     "chicago": CityCohortSpec(
         key="chicago",
         label="Chicago",
-        geoid_prefixes=("17031", "17043", "17089", "17093", "17097", "17111", "17197"),
+        # Cook County only, and within it the tract set is derived from footprint
+        # coverage (tract_source="footprints"): the City of Chicago footprint
+        # layer — the one source covering ALL building types with a year — stops
+        # at the city line. The other six CBSA counties have no year-built source
+        # at all, so listing them would add tracts that can never be dated.
+        geoid_prefixes=("17031",),
         footprints_filename="buildings_chicago.parquet",
         year_col="year_built",
+        # No usable demolition data. The municipal layer's `demolished` column is
+        # a sentinel: all 124 non-null values are the year 1899, and bldg_statu
+        # has exactly 1 DEMOLISHED row in 820,606 — implausible for 15 years of
+        # Chicago. Declaring it would date those 124 as an 1899 cohort.
         demolition_col=None,
+        # Predictions are keyed on the Microsoft building_id, which
+        # build_year_built recomputes onto the dated footprints — so unlike the
+        # other holdout cities Chicago gets the composition-fixed
+        # incumbent-only outcome as well as the all-buildings one.
+        id_index="building_id",
         area_epsg=5070,
-        note="needs the Cook County assessor year-built join (issue #36 follow-up)",
+        # Cook County flies the whole county every year and publishes each year
+        # as its own 4-band 6-inch ImageServer (2009-2025). That is why Chicago
+        # runs on ortho rather than NAIP: 15 annual periods instead of Illinois
+        # NAIP's 8, and a sensor the model never saw in fine-tuning.
+        panel_years=tuple(range(2010, 2025)),
+        baseline_year=2009,
+        sensor="ortho",
+        state="Illinois",
+        tract_source="footprints",
+        note="BLOCKED: the City of Chicago footprint layer is a frozen 2015 "
+             "snapshot (year_built maxes at 2015, 46% zeros, no post-2015 "
+             "polygons), so construction cohorts cannot be dated over the panel. "
+             "The Cook ortho panel itself is fine — this needs a maintained "
+             "year-built source (Cook Assessor char_yrblt covers only "
+             "residential <7 units, which misses the towers). See issue #36.",
     ),
     "seattle": CityCohortSpec(
         key="seattle",
@@ -160,8 +311,27 @@ CSA_CITIES: dict[str, CityCohortSpec] = {
         footprints_filename="buildings_king_county.parquet",
         year_col="year_built",
         demolition_col=None,
+        id_index="building_id",
         area_epsg=5070,
-        note="needs the King County assessor year-built join (issue #36 follow-up)",
+        # King County publishes discrete flights (2007/2017/2021) rather than an
+        # annual panel, so the ortho cadence is too sparse for an event study on
+        # its own; Washington NAIP (odd years 2011-2023) is the panel, and the
+        # ortho years are available as a cross-sensor check.
+        # Stops at 2019 for the same reason as Tampa: cohorts come from
+        # Microsoft footprints, which are a static ~2019 snapshot, so post-2019
+        # construction is invisible and later panel years would put developed
+        # tracts in the control group. Verify with the coverage report's
+        # `footprint_coverage_cliff_year` before extending this.
+        panel_years=(2011, 2013, 2015, 2017, 2019),
+        baseline_year=2010,
+        sensor="naip",
+        state="Washington",
+        note="build it with `python -m src.data.build_year_built seattle "
+             "--state Washington` (King County Assessor residential + commercial "
+             "building extracts joined on PIN to the county parcel layer, then "
+             "to Microsoft footprints; issue #36). Panel years verified against "
+             "the Planetary Computer NAIP inventory: Washington NAIP exists only "
+             "in odd years 2011-2023, so the biennial cadence is the data.",
     ),
     "tampa": CityCohortSpec(
         key="tampa",
@@ -173,8 +343,115 @@ CSA_CITIES: dict[str, CityCohortSpec] = {
         footprints_filename="buildings_fl_fgdl.parquet",
         year_col="year_built",
         demolition_col=None,
+        id_index="building_id",
         area_epsg=5070,
-        note="needs the FL FGDL parcel year-built join (issue #36 follow-up)",
+        # Florida NAIP runs 2010/2013/2015/2017/2019/2021/2023, but the panel
+        # STOPS AT 2019 because the treatment is only observable to then. The
+        # Microsoft footprint universe is a static ~2019-vintage snapshot:
+        # measured footprint coverage of Tampa construction is 0.91-1.00 for
+        # 2010-2018, 0.68 in 2019, and 0.08-0.24 for 2020-2024 (86,658 parcels
+        # built 2020+ have only 10,982 footprints). Extending the panel past
+        # 2019 would leave tracts that developed after the snapshot looking
+        # never-treated — control-group contamination that attenuates the ATT
+        # toward zero, in the one direction that would make the model look
+        # unresponsive. At 5% this still gives 340 treated / 442 never-treated.
+        panel_years=(2010, 2013, 2015, 2017, 2019),
+        baseline_year=2009,
+        sensor="naip",
+        state="Florida",
+        note="build it with `python -m src.data.build_year_built tampa "
+             "--state Florida` (Florida statewide cadastral ACT_YR_BLT joined to "
+             "Microsoft footprints; issue #36)",
+    ),
+    "san_antonio": CityCohortSpec(
+        key="san_antonio",
+        label="San Antonio (Bexar County)",
+        # Bexar alone, not the 8-county CBSA: Texas has no statewide parcel
+        # programme and each of the other seven counties runs its own appraisal
+        # district. Bexar is 2.01M of 2.61M, and the sub-CBSA scope is the same
+        # compromise Seattle makes with King County. Unlike Chicago the coverage
+        # edge is a COUNTY line, which is also a tract boundary, so a FIPS prefix
+        # is exact and `tract_source="footprints"` is unnecessary.
+        geoid_prefixes=("48029",),
+        footprints_filename="buildings_bexar.parquet",
+        year_col="year_built",
+        demolition_col=None,
+        id_index="building_id",
+        area_epsg=5070,
+        # Texas NAIP is biennial EVEN years (2012/2014/2016/2018/2020/2022,
+        # verified against the Planetary Computer inventory over a San Antonio
+        # bbox) — the opposite parity to Washington's odd-year grid, which is
+        # exactly why panel cadence cannot be a global. Stops at 2018 for the
+        # Tampa/Seattle/Baltimore reason: the static ~2019 Microsoft footprint
+        # snapshot cannot see later construction, so 2020 and 2022 would put
+        # developed tracts in the never-treated control group. Four periods makes
+        # this the thinnest panel in the registry — check the coverage report's
+        # `footprint_coverage_cliff_year` before trimming it further.
+        panel_years=(2012, 2014, 2016, 2018),
+        baseline_year=2011,
+        sensor="naip",
+        state="Texas",
+        note="build it with `python -m src.data.build_year_built san_antonio "
+             "--state Texas` (Bexar County BCAD roll joined to Microsoft "
+             "footprints; issue #36). Carries the South Central region: with NYC, "
+             "Baltimore, Tampa and Seattle the holdout set spans five census "
+             "divisions. Best all-class coverage measured anywhere — 84% of "
+             "commercial (F1) parcels dated, against Baltimore's 65%, "
+             "Allegheny's 1.7% and Cook's 0%.",
+    ),
+    "baltimore": CityCohortSpec(
+        key="baltimore",
+        label="Baltimore",
+        # The whole CBSA, not a core county: Anne Arundel, Baltimore County,
+        # Carroll, Harford, Howard, Queen Anne's and Baltimore City. Maryland's
+        # parcel layer is genuinely statewide, so unlike Chicago there is no
+        # sub-county coverage edge and `tract_source="prefix"` is exact.
+        geoid_prefixes=("24003", "24005", "24013", "24025", "24027", "24035",
+                        "24510"),
+        footprints_filename="buildings_md_mdp.parquet",
+        year_col="year_built",
+        # MD_ParcelBoundaries carries no demolition column. Unlike Chicago's
+        # `demolished` — which is a 1899 sentinel masquerading as data — this is
+        # an honest absence, so the baseline stock is simply never decremented.
+        demolition_col=None,
+        id_index="building_id",
+        area_epsg=5070,
+        # Maryland NAIP on the Planetary Computer is 2011/2013/2015/2017/2018/
+        # 2021/2023 (verified against the STAC inventory over a Baltimore bbox).
+        # The panel stops before 2021 for the Tampa/Seattle reason, not a NAIP
+        # one: cohorts come from the static ~2019-vintage Microsoft footprint
+        # snapshot, so 2021 and 2023 would put post-snapshot development in the
+        # never-treated control group and attenuate the ATT toward zero. Confirm
+        # against the coverage report's `footprint_coverage_cliff_year` before
+        # extending — that diagnostic exists precisely to set this bound.
+        #
+        # 2018 is DROPPED even though the imagery exists, because it is one year
+        # after 2017 while every other gap in this panel is two. That single
+        # irregular gap does real damage:
+        #   * the 2018 cohort is "first crossed the threshold between 2017 and
+        #     2018", a ONE-year window against everyone else's two, so it is
+        #     mechanically about half the size — 9 / 4 / 2 tracts at the 1 / 5 /
+        #     10% thresholds;
+        #   * and because csa's varying base period needs t >= 2, that cohort is
+        #     the ONLY one that can be observed at event time k = -3. The
+        #     measured dynamic ATT at k = -3 is a single ATT(g,t) cell with
+        #     weight pge = 1.0000 at every threshold — two tracts carrying a
+        #     plotted coefficient and a pre-trend test at the 10% cut.
+        # Dropping it moves the sup-t pre-trend p from 0.0005 to 0.018 (1%) and
+        # from 0.0000 to 0.047 (10%), while the post-treatment ATT is unchanged
+        # (0.086 -> 0.087 at the headline 5%). The 2018 flight is fine; a
+        # one-year period on a biennial panel is not. See issue #36.
+        panel_years=(2011, 2013, 2015, 2017),  # 2018 dropped: see above
+        baseline_year=2010,
+        sensor="naip",
+        state="Maryland",
+        note="build it with `python -m src.data.build_year_built baltimore "
+             "--state Maryland` (Maryland statewide parcel YEARBLT joined to "
+             "Microsoft footprints; issue #36). Chosen over the other test-split "
+             "holdouts because its year built covers ALL property classes: "
+             "18,870/29,147 commercial parcels dated (64.7%) against 1.7% for "
+             "Allegheny/Pittsburgh and 0% for Cook, and 34,327 parcels built "
+             "2012-2018 against 394 for Chicago's whole 2010-2015.",
     ),
     "nashville": CityCohortSpec(
         key="nashville",
@@ -183,13 +460,41 @@ CSA_CITIES: dict[str, CityCohortSpec] = {
         footprints_filename="buildings_tn_tnmap.parquet",
         year_col="year_built",
         demolition_col=None,
+        id_index="building_id",
         area_epsg=5070,
-        note="needs the TN TNMap parcel year-built join (issue #36 follow-up)",
+        # Stops at 2018: same Microsoft-snapshot limit as Tampa and Seattle.
+        panel_years=(2012, 2014, 2016, 2018),
+        baseline_year=2011,
+        # NAIP, not local ortho: TNMap's BASEMAPS/IMAGERY is a *current* mosaic
+        # refreshed county-by-county as TDOT flies one region per year, not a
+        # year-indexed archive, so there is no local time series to build a
+        # panel from.
+        sensor="naip",
+        state="Tennessee",
+        note="BLOCKED: no public bulk year-built source covers Davidson County. "
+             "The TN Comptroller publishes per-county assessment tables, but only "
+             "for the 86 counties in the state IMPACT CAMA system — Davidson, "
+             "Rutherford and Williamson run their own and are excluded, which is "
+             "3 of the 5 CBSA counties including the core. Metro Nashville's own "
+             "parcel service carries ownership, land use and appraised values but "
+             "no construction year, and its building-permits layer is a rolling "
+             "3-year window that cannot reach a 2012-2018 panel. Unblocking is "
+             "administrative: a PIN-keyed year extract from the Davidson County "
+             "Assessor needs no new code — it is the same `year_from` table join "
+             "Seattle uses. See src/data/parcel_sources.py and issue #36.",
     ),
 }
 
-# Cities whose panel is deep enough to carry the main-body figure, in order.
-MAIN_FIGURE_CITIES: tuple[str, ...] = ("nyc", "chicago")
+# Cities that carry the main-body figure, in order: the deep-dive city plus a
+# clean zero-shot one. Chicago was the intended second city (annual county ortho,
+# Midwest mega) but its only all-building dated-footprint source — the City of
+# Chicago layer — is a frozen 2015 snapshot (rowsUpdatedAt == createdAt ==
+# 2015-08-14): year_built maxes at 2015, 46% of rows are 0, and post-2015
+# buildings have no polygon at all, so essentially no tract crosses even the 1%
+# threshold over a 2010-2024 panel. Tampa takes the slot: Florida's statewide
+# cadastral carries ACT_YR_BLT for ALL property classes and is refreshed from the
+# county appraisers' annual roll (verified carrying 2021/2022 construction).
+MAIN_FIGURE_CITIES: tuple[str, ...] = ("nyc", "tampa")
 
 
 def available_cities(processed_dir: Path,
@@ -288,12 +593,28 @@ class CohortResult:
     n_treated: int = 0
     n_never_treated: int = 0
     threshold: float = HEADLINE_THRESHOLD
+    # Undated-area screen (see MAX_UNDATED_AREA_SHARE). `None` means not applied,
+    # which is NOT the same as applied-and-dropped-nothing: the distinction is
+    # what makes the restricted/unrestricted comparison legible in a table.
+    max_undated_area_share: float | None = None
+    n_dropped_undated: int = 0
+    undated_area_share: pd.Series | None = None   # per tract, all tracts scored
+    # Control cut (see CONTROL_THRESHOLD). `None` means the never-treated group
+    # is "everything that did not cross `threshold`", which makes the comparison
+    # group move with the threshold; a float pins it and drops the tracts whose
+    # final share falls in (control_threshold, threshold].
+    control_threshold: float | None = None
+    n_dropped_ambiguous: int = 0
 
     def summary(self) -> dict:
         return {
             "threshold": self.threshold,
+            "control_threshold": self.control_threshold,
             "n_tracts": int(self.n_tracts_in),
             "n_dropped_no_baseline": int(self.n_dropped_no_baseline),
+            "max_undated_area_share": self.max_undated_area_share,
+            "n_dropped_undated": int(self.n_dropped_undated),
+            "n_dropped_ambiguous": int(self.n_dropped_ambiguous),
             "n_treated": int(self.n_treated),
             "n_never_treated": int(self.n_never_treated),
         }
@@ -359,6 +680,42 @@ def _tract_of_footprints(footprints, tracts, area_epsg: int) -> pd.DataFrame:
     return pd.DataFrame(joined[keep])
 
 
+def footprint_tract_areas(
+    footprints,
+    tracts,
+    year_col: str = "CONSTRUCTION_YEAR",
+    demolition_col: str | None = None,
+    area_epsg: int = 5070,
+) -> pd.DataFrame:
+    """Per-building ``(GEOID_str, area, year_built, demolition_year)`` table.
+
+    This is the only geometry-bound step in :func:`build_tract_cohorts`, and by
+    far its most expensive: it reprojects every footprint polygon to
+    ``area_epsg``, takes areas and centroids, and point-in-polygon joins those
+    centroids to tracts. For a city like NYC that is ~1.1M polygons reprojected
+    twice over (polygon + centroid) — around a gigabyte of transient GEOS
+    allocation per call.
+
+    None of it depends on ``threshold``, ``max_undated_area_share`` or
+    ``control_threshold``, so it is exposed separately: a caller sweeping a
+    threshold grid — or re-running the same city under several anticipation arms
+    — computes this once and passes the result to ``build_tract_cohorts`` via
+    ``per_building``. The returned frame is a few tens of MB and holds no
+    geometry, so it can be kept alive while the footprint GeoDataFrame is
+    released.
+    """
+    fp = footprints
+    cols = [c for c in (year_col, demolition_col) if c and c in fp.columns]
+    # Carry only geometry + the two year columns into the reprojection; a full
+    # `.copy()` of a wide footprint table drags every unused attribute column
+    # through `to_crs` for nothing.
+    fp = fp[cols + [fp.geometry.name]].copy()
+    fp["year_built"] = pd.to_numeric(fp[year_col], errors="coerce")
+    if demolition_col is not None and demolition_col in fp.columns:
+        fp["demolition_year"] = pd.to_numeric(fp[demolition_col], errors="coerce")
+    return _tract_of_footprints(fp, tracts, area_epsg)
+
+
 def build_tract_cohorts(
     footprints,
     tracts,
@@ -369,6 +726,9 @@ def build_tract_cohorts(
     demolition_col: str | None = None,
     area_epsg: int = 5070,
     min_baseline_area: float = 0.0,
+    max_undated_area_share: float | None = None,
+    control_threshold: float | None = None,
+    per_building: pd.DataFrame | None = None,
 ) -> CohortResult:
     """Tract-level construction cohorts from footprint polygons + year built.
 
@@ -382,6 +742,11 @@ def build_tract_cohorts(
     pre-period building stock) have an undefined share and are **dropped**, not
     recorded as controls.
 
+    With ``control_threshold`` set, "never-treated" stops meaning "did not cross
+    ``threshold``" and becomes "did not cross ``control_threshold``"; the tracts
+    in between are dropped from the sample instead of being handed to the
+    control group. See :data:`CONTROL_THRESHOLD`.
+
     Parameters
     ----------
     footprints
@@ -394,6 +759,26 @@ def build_tract_cohorts(
     baseline_year
         Last pre-treatment year: buildings built ``<= baseline_year`` form the
         denominator; anything later is potential treatment.
+    max_undated_area_share
+        Drop tracts whose *undated* buildings exceed this share of baseline
+        footprint area; ``None`` disables the screen. See
+        :data:`MAX_UNDATED_AREA_SHARE`. This exists for cities whose assessor
+        records a construction year only for residential improvements — there the
+        undated area is concentrated in commercial and large multifamily stock,
+        and the intensity of an unscreened tract is biased toward zero in both
+        the numerator and the denominator at once.
+    control_threshold
+        Share below which a tract is a valid never-treated control. Must not
+        exceed ``threshold``. ``None`` (the default) reproduces the old
+        behaviour, where the control group is the complement of the treated
+        group and therefore changes whenever ``threshold`` does.
+    per_building
+        A pre-computed :func:`footprint_tract_areas` table. Supplying it skips
+        the reprojection / centroid / spatial join entirely, which is the whole
+        cost of this function and does not depend on any of the sample-design
+        arguments; ``footprints`` is then unused and may be ``None``. Callers
+        that sweep the threshold grid should build it once — see
+        :func:`footprint_tract_areas`.
     """
     years = sorted({int(y) for y in panel_years})
     if not years:
@@ -402,13 +787,18 @@ def build_tract_cohorts(
         raise ValueError(
             f"baseline_year {baseline_year} leaves no post-baseline panel year"
         )
+    if control_threshold is not None and control_threshold > threshold:
+        raise ValueError(
+            f"control_threshold {control_threshold} exceeds threshold {threshold}: "
+            "the control cut must sit at or below the treated cut, or treated and "
+            "never-treated tracts overlap"
+        )
 
-    fp = footprints.copy()
-    fp["year_built"] = pd.to_numeric(fp[year_col], errors="coerce")
-    if demolition_col is not None and demolition_col in fp.columns:
-        fp["demolition_year"] = pd.to_numeric(fp[demolition_col], errors="coerce")
-
-    per_bldg = _tract_of_footprints(fp, tracts, area_epsg)
+    per_bldg = (
+        footprint_tract_areas(footprints, tracts, year_col=year_col,
+                              demolition_col=demolition_col, area_epsg=area_epsg)
+        if per_building is None else per_building
+    )
     tract_ids = sorted(tracts["GEOID_str"].astype(str).unique())
 
     yb = per_bldg["year_built"]
@@ -428,32 +818,51 @@ def build_tract_cohorts(
         per_bldg.loc[is_base].groupby("GEOID_str")["area"].sum()
         .reindex(tract_ids).fillna(0.0)
     )
-
-    new = per_bldg.loc[is_new, ["GEOID_str", "area", "year_built"]].copy()
-    new["year_built"] = new["year_built"].astype(int)
-    new_by_year = (
-        new.groupby(["GEOID_str", "year_built"])["area"].sum()
-        if len(new) else pd.Series(dtype=float)
+    # Undated buildings are a SUBSET of the baseline by construction: an unknown
+    # year cannot satisfy `yb > baseline_year`, so `is_new` is False and the
+    # building lands in `is_base`. Scoring the share here — for every tract,
+    # whether or not the screen is enabled — is what lets the caller report the
+    # restriction rather than merely apply it.
+    undated_base_area = (
+        per_bldg.loc[is_base & yb.isna()].groupby("GEOID_str")["area"].sum()
+        .reindex(tract_ids).fillna(0.0)
     )
+    undated_share = undated_base_area / base_area.replace(0.0, np.nan)
+
+    new = per_bldg.loc[is_new, ["GEOID_str", "area", "year_built"]]
 
     # Cumulative new area *as visible at each panel year*: a building finished
     # in 2011 shows up in the 2012 image, so a biennial panel credits it to
     # 2012. Attributing by "<= panel year" is what makes this cadence-agnostic.
-    rows = []
-    for tid in tract_ids:
-        cum = 0.0
-        per_year = (
-            new_by_year.loc[tid] if len(new_by_year) and tid in
-            new_by_year.index.get_level_values(0) else None
-        )
-        prev = baseline_year
-        for yr in years:
-            if per_year is not None:
-                built = per_year[(per_year.index > prev) & (per_year.index <= yr)]
-                cum += float(built.sum())
-            rows.append((tid, yr, cum))
-            prev = yr
-    shares = pd.DataFrame(rows, columns=["GEOID_str", "year", "cum_new_area"])
+    #
+    # Each new building is credited to exactly one panel year — the earliest one
+    # at or after its completion — so the whole tract x year cumulation is a
+    # scatter-add into a (tract, year) matrix followed by a cumulative sum along
+    # the year axis. `is_new` already guarantees baseline_year < year_built <=
+    # years[-1], so every building lands inside the grid. The row-wise loop this
+    # replaces re-derived `new_by_year.index.get_level_values(0)` once per tract,
+    # making it quadratic in the number of tracts and allocating an array the
+    # size of the whole tract x year table on every iteration.
+    year_arr = np.asarray(years)
+    tract_pos = {t: i for i, t in enumerate(tract_ids)}
+    cum_new = np.zeros((len(tract_ids), len(years)), dtype=float)
+    if len(new):
+        rows_i = new["GEOID_str"].map(tract_pos).to_numpy()
+        cols_i = np.searchsorted(year_arr, new["year_built"].to_numpy(),
+                                 side="left")
+        # A footprint whose centroid fell in a tract outside `tract_ids` cannot
+        # be placed; dropping it here matches the old loop, which only ever
+        # visited tracts in `tract_ids`.
+        ok = pd.notna(rows_i) & (cols_i < len(years))
+        np.add.at(cum_new,
+                  (rows_i[ok].astype(np.intp), cols_i[ok].astype(np.intp)),
+                  new["area"].to_numpy(dtype=float)[ok])
+    cum_new = np.cumsum(cum_new, axis=1)
+    shares = pd.DataFrame({
+        "GEOID_str": np.repeat(np.asarray(tract_ids, dtype=object), len(years)),
+        "year": np.tile(year_arr, len(tract_ids)),
+        "cum_new_area": cum_new.ravel(),
+    })
     shares = shares.merge(
         base_area.rename("base_area"), left_on="GEOID_str", right_index=True, how="left"
     )
@@ -462,7 +871,31 @@ def build_tract_cohorts(
     undefined = shares["base_area"] <= min_baseline_area
     dropped_ids = sorted(shares.loc[undefined, "GEOID_str"].unique())
     shares = shares[~undefined].copy()
+
+    n_dropped_undated = 0
+    if max_undated_area_share is not None:
+        over = (shares["GEOID_str"].map(undated_share).fillna(0.0)
+                > float(max_undated_area_share))
+        n_dropped_undated = int(shares.loc[over, "GEOID_str"].nunique())
+        shares = shares[~over].copy()
+
     shares["share"] = shares["cum_new_area"] / shares["base_area"]
+
+    # Drop the ambiguous middle. `cum_new_area` is non-decreasing over the
+    # panel, so a tract's final share is its max; a tract sitting in
+    # (control_threshold, threshold] never becomes treated at this cut yet did
+    # build, and handing it to the control group is what makes the threshold
+    # grid move its own comparison group. Done AFTER the undated screen so the
+    # two restrictions compose in a fixed order and their counts stay additive.
+    n_dropped_ambiguous = 0
+    if control_threshold is not None and len(shares):
+        final_share = shares.groupby("GEOID_str")["share"].max()
+        ambiguous = final_share.index[
+            (final_share > float(control_threshold)) & (final_share <= threshold)
+        ]
+        n_dropped_ambiguous = int(len(ambiguous))
+        if n_dropped_ambiguous:
+            shares = shares[~shares["GEOID_str"].isin(set(ambiguous))].copy()
 
     treated = shares[shares["share"] > threshold]
     cohort_year = (
@@ -487,6 +920,13 @@ def build_tract_cohorts(
         n_treated=int((cohorts["cohort_year"] > 0).sum()),
         n_never_treated=int((cohorts["cohort_year"] == 0).sum()),
         threshold=float(threshold),
+        max_undated_area_share=(None if max_undated_area_share is None
+                                else float(max_undated_area_share)),
+        n_dropped_undated=n_dropped_undated,
+        undated_area_share=undated_share,
+        control_threshold=(None if control_threshold is None
+                           else float(control_threshold)),
+        n_dropped_ambiguous=n_dropped_ambiguous,
     )
 
 
@@ -656,16 +1096,23 @@ def build_event_panel(
         lambda y: pmap.period(y) if int(y) in pmap.years else 0
     )
     df["cohort"] = np.where(df["cohort_year"] > 0, cohort_period, 0).astype(int)
+    # Who was treated is decided BEFORE the shift and carried through it. Asking
+    # `cohort > 0` afterwards silently reclassifies: a period-1 cohort shifted by
+    # 1 lands on 0, which is csa's never-treated sentinel, so a treated tract
+    # becomes a control — the same failure this function was written to stop for
+    # first-period cohorts, one step later in the pipeline. Shifted by 2 it lands
+    # on -1 and is neither treated nor control, and a negative group reaches csa.
+    was_treated = df["cohort"] > 0
     if anticipation:
-        # Shift adoption earlier for treated units only; 0 stays never-treated.
         df["cohort"] = np.where(
-            df["cohort"] > 0, df["cohort"] - int(anticipation), 0
+            was_treated, df["cohort"] - int(anticipation), 0
         ).astype(int)
 
     # 4. cohorts in (or before) the first period have no pre-period to serve as
-    #    csa's base year. An anticipation shift can push a cohort to <= 1 too.
+    #    csa's base year. An anticipation shift can push a cohort to <= 1, and to
+    #    <= 0, so the test is on the shifted value for anything that was treated.
     first_period = 1
-    bad = (df["cohort"] > 0) & (df["cohort"] <= first_period)
+    bad = was_treated & (df["cohort"] <= first_period)
     dropped_first = int(df.loc[bad, "GEOID_str"].nunique())
     df = df[~bad].copy()
 

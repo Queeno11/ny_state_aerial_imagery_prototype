@@ -402,6 +402,45 @@ def test_fingerprint_pins_exact_year(tmp_path):
     assert fp_default != fp_legacy
 
 
+def test_fingerprint_pins_the_nodata_guard(tmp_path):
+    """REGRESSION: the nodata-hole guard decides which buildings get a
+    prediction at all, so it belongs to a chunk's identity. It was originally
+    absent from the fingerprint, and the consequence was silent — adding the
+    guard did not invalidate chunks written before it, so a resumed run reused
+    blank-crop predictions. That is how Harford County's NAIP 2013 hole survived
+    as 3,919 buildings sharing 0.68359375 across 17 constant tracts."""
+    model_path = tmp_path / "best.pth"
+    model_path.write_bytes(b"w")
+
+    fp_default = prediction.prediction_fingerprint(PARAMS, model_path)
+    assert fp_default["max_zero_pixel_share"] == 0.5      # guard on by default
+
+    fp_strict = prediction.prediction_fingerprint(
+        dict(PARAMS, max_zero_pixel_share=0.1), model_path)
+    fp_off = prediction.prediction_fingerprint(
+        dict(PARAMS, max_zero_pixel_share=None), model_path)
+
+    # All three select different crops, so none may share a chunk cache.
+    assert fp_default != fp_strict != fp_off
+    assert fp_default != fp_off
+    # Disabled must stay None, not collapse to 0.0 — a 0.0 threshold would
+    # reject any crop with a single nodata pixel, the opposite of "off".
+    assert fp_off["max_zero_pixel_share"] is None
+
+
+def test_fingerprint_guard_default_matches_the_manager_fallback():
+    """Three copies of one threshold: the fingerprint default, the guard's
+    .get() fallback, and main.run()'s registered params. Drift between them
+    changes which crops are dropped without changing the cache identity."""
+    import inspect
+
+    from src import main
+
+    assert prediction.MAX_ZERO_PIXEL_SHARE_DEFAULT == 0.5
+    src = inspect.getsource(main.CyclicCacheManager._reject_for_zero_pixels)
+    assert '"max_zero_pixel_share", 0.5' in src
+
+
 # ── select_prediction_rows (evaluation sampling design) ──────────────────────
 
 def make_sel_df(spec, year=2020):
@@ -1042,3 +1081,80 @@ def test_assign_prediction_types(categorical):
     # No split map -> untouched (no type column added).
     out = prediction.assign_prediction_types(df.copy(), 2020, None, holdout)
     assert "type" not in out.columns
+
+
+# ── blank-crop prediction filter (second line of defence) ────────────────────
+
+def _pred_frame(spec):
+    """{GEOID: [predicted_value, ...]} -> a prediction frame."""
+    rows = []
+    for geoid, vals in spec.items():
+        rows += [{"GEOID": geoid, "predicted_value": v} for v in vals]
+    return pd.DataFrame(rows)
+
+
+def test_explicit_sentinel_values_are_dropped():
+    """The manual arm: a known blank score is removed wherever it appears."""
+    df = _pred_frame({"A": [0.68359375, 0.1, 0.2], "B": [0.3, 0.68359375]})
+    kept, stats = prediction.drop_blank_predictions(
+        df, values=(0.68359375,), modal_share=None, verbose=False)
+    assert stats["n_blank_dropped"] == 2
+    assert 0.68359375 not in set(kept["predicted_value"])
+
+
+def test_modal_rule_drops_a_nodata_tract_without_knowing_the_value():
+    """The distribution-free arm — this is what catches a sentinel nobody has
+    catalogued yet, which is the normal case for a new city or sensor."""
+    blank = 0.68359375
+    df = _pred_frame({
+        "bad": [blank] * 24 + [0.1, 0.2, 0.3],       # 24/27 = 89%
+        "good": [0.1 * i for i in range(30)],
+    })
+    kept, stats = prediction.drop_blank_predictions(df, modal_share=0.5,
+                                                    verbose=False)
+    assert stats["n_blank_dropped"] == 24
+    assert set(kept[kept["GEOID"] == "bad"]["predicted_value"]) == {0.1, 0.2, 0.3}
+    assert len(kept[kept["GEOID"] == "good"]) == 30
+
+
+def test_modal_rule_leaves_clean_cities_untouched():
+    """CALIBRATION: the largest within-tract modal share measured in a clean
+    city-year is 12.9% (San Antonio 6.0%, Tampa 4.3%, Seattle 9.1%). A tract at
+    that level must survive, or the filter would silently thin every city."""
+    df = _pred_frame({"t": [0.5] * 13 + [0.01 * i for i in range(87)]})   # 13%
+    _, stats = prediction.drop_blank_predictions(df, modal_share=0.5,
+                                                 verbose=False)
+    assert stats["n_blank_dropped"] == 0
+
+
+def test_modal_rule_ignores_small_tracts():
+    """3 of 4 buildings sharing a value is 75% and means nothing."""
+    df = _pred_frame({"tiny": [0.5, 0.5, 0.5, 0.9]})
+    _, stats = prediction.drop_blank_predictions(df, modal_share=0.5,
+                                                 verbose=False)
+    assert stats["n_blank_dropped"] == 0
+
+
+def test_modal_rule_can_be_disabled_without_disabling_the_value_list():
+    """The two detectors are independent; a caller pinning exact values must be
+    able to opt out of the statistical one."""
+    df = _pred_frame({"bad": [0.68359375] * 25 + [0.1, 0.2]})
+    _, off = prediction.drop_blank_predictions(df, modal_share=None,
+                                               verbose=False)
+    assert off["n_blank_dropped"] == 0
+    _, on = prediction.drop_blank_predictions(
+        df, values=(0.68359375,), modal_share=None, verbose=False)
+    assert on["n_blank_dropped"] == 25
+
+
+def test_blank_filter_survives_an_empty_frame():
+    df = pd.DataFrame(columns=["GEOID", "predicted_value"])
+    kept, stats = prediction.drop_blank_predictions(df, verbose=False)
+    assert kept.empty and stats["n_blank_dropped"] == 0
+
+
+def test_default_modal_share_sits_inside_the_measured_safe_band():
+    """Clean cities top out at 12.9%, contaminated ones start at 93.2%; the
+    default must not drift to either edge of that gap."""
+    assert 0.25 <= prediction.BLANK_MODAL_SHARE_DEFAULT <= 0.75
+    assert prediction.BLANK_MIN_TRACT_BUILDINGS >= 10

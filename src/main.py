@@ -683,6 +683,34 @@ class CyclicCacheManager:
             int(p.stem.split("_")[1]) for p in existing_shards
         ) + 1
  
+    def _zero_pixel_share(self, arr) -> float:
+        """Share of pixel positions that are zero in EVERY band.
+
+        A nodata hole reads back as a perfectly valid array of zeros: the STAC
+        item is present, the window sits inside the raster, the dtype and shape
+        are right, and no failure or flag is set. Nothing but the pixels reveals
+        it. Measured in Harford County (MD) NAIP 2013, where a hole produced
+        ~3,900 buildings all scoring the identical 0.68359375 — the model's
+        response to a black image — with every existing diagnostic reporting
+        success. See issue #36 and notebooks/harford_2013_naip_check.ipynb.
+
+        Counts positions where all bands are zero, not zero values anywhere: a
+        genuinely dark pixel is zero in one band routinely, and a zero-padded
+        NIR band would otherwise register the whole crop as missing (that case
+        is `reject_padded_nir`'s, and the two guards must stay independent).
+        """
+        a = np.asarray(arr)
+        if a.ndim != 3 or a.size == 0:
+            return 0.0
+        return float((a == 0).all(axis=0).mean())
+
+    def _reject_for_zero_pixels(self, arr) -> bool:
+        """True when `arr` is more zero-fill than imagery."""
+        limit = self.params.get("max_zero_pixel_share", 0.5)
+        if limit is None:
+            return False
+        return self._zero_pixel_share(arr) > float(limit)
+
     def _extract_raw_image(self, row, n_bands=None, pad=0):
         if self.sat_data == "NAIP":
             from src.data.naip_fetcher import fetch_naip
@@ -711,6 +739,10 @@ class CyclicCacheManager:
                 return None
             if res.nir_padded and self.params.get("reject_padded_nir", False):
                 return None
+            if self._reject_for_zero_pixels(res.crop):
+                from src.data.naip_fetcher import record_failure
+                record_failure("blank_crop")
+                return None
             return (res.crop, res.actual_year)
 
         dataset_name = row.get("dataset")
@@ -729,8 +761,14 @@ class CyclicCacheManager:
                 tile.shape[0] == self.nbands and
                 tile.shape[1] == tile_size and
                 tile.shape[2] == tile_size
-            ):                
-                return tile.to_numpy()  # Convert from zarr array to numpy array for processing
+            ):
+                arr = tile.to_numpy()  # Convert from zarr array to numpy for processing
+                # Same guard as the NAIP branch — the zarr store has holes too.
+                # NYC 2022 shows the identical signature: 80,605 of 1,079,005
+                # buildings at the same constant, 146 Bronx tracts entirely so.
+                if self._reject_for_zero_pixels(arr):
+                    return None
+                return arr
             else:
                 raise ValueError(f"Extracted tile has invalid shape: {tile.shape}. Expected ({self.nbands}, {tile_size}, {tile_size}).")
             
@@ -1652,8 +1690,29 @@ def fill_params_defaults(params):
         "footprints_source": "ms_us",  # "ms_us" (national MS index) | "doitt_nyc" (legacy)
         "states": None,       # optional list of state stems to subset the MS index
         "reject_padded_nir": False,  # drop NAIP crops whose NIR band is zero-padded
+        # Drop a crop when more than this share of its pixel positions are zero
+        # in every band — i.e. it is more nodata hole than imagery. Applies to
+        # BOTH the NAIP and zarr branches of _extract_raw_image. None disables.
+        # A hole returns a structurally valid array with no error and no flag,
+        # so without this the model scores a black image and writes the result
+        # out as a real, finite, plausible-looking prediction (issue #36).
+        "max_zero_pixel_share": 0.5,
         "predict_split": "test",     # "test" (main run) | "all" (every selected city: train+val+test)
         "predict_chunk_size": 4096,  # rows per resumable prediction chunk (NAIP path)
+        # Crop source for the prediction pass. "naip" = Planetary Computer (the
+        # training sensor). "ortho" = the city's own municipal imagery via
+        # src/data/ortho_fetcher.py, which makes a holdout out-of-sensor as well
+        # as spatial. In the fingerprint: the two sensors give different
+        # predictions for the same (building, year), so their chunks must never
+        # share a resume cache. Set per city by src/csa_predict.py, not globally.
+        "predict_sensor": "naip",
+        "predict_ortho_city": None,  # required when predict_sensor == "ortho"
+        "predict_ortho_max_rps": None,  # per-process request cap; None = ortho_fetcher's polite default
+        # ── CSA event-study per-city passes (issue #36; see src/csa_predict.py) ──
+        "csa_cities": None,          # registry keys to run; None = every city with a footprint+year-built table
+        "csa_buildings_per_tract": 200,  # every tract, this many buildings each: tract-mean 95% CI +-0.069 at sigma_within=0.5. Outcome sampling inflates ATT standard errors, it does not bias them.
+        "csa_shard": (0, 1),         # (i, n) tract shard for parallel processes. NOTE: the ortho rate limiter is PER PROCESS, so n shards multiply the load a municipal server sees by n — divide csa_max_rps accordingly.
+        "csa_max_rps": None,         # request cap for municipal ortho services; None = polite default (10/s)
         "predict_exact_year": True,  # forbid flight-year substitution: no same-year NAIP flight => no_year_match -> NaN, never the closest year's imagery. In the fingerprint (exact/substituted chunks never mix).
         "predict_tract_sample_frac": 0.10,   # per CBSA: sample max(ceil(frac*n_tracts), min) tracts (None = all tracts). Deterministic hash of GEOID — same tracts every year/rerun.
         "predict_tract_sample_min": 100,     # tract floor per CBSA: bounds small-city 95% CIs
@@ -2857,6 +2916,50 @@ def predict_buildings_chunked(model, df, all_years_datasets, params,
               f"loads: {stats['loads']}")
 
 
+def run_csa_city_predictions(model, device, eval_transform, savename, params,
+                             best_model_path):
+    """Dense per-city prediction passes for the CSA event study (issue #36).
+
+    The sibling of :func:`run_nyc_zarr_validation_predictions` for every *other*
+    holdout city. Same motivation — the event study needs a tract cross-section
+    the 10% sample cannot give (Chicago had ~208 of 2,070 tracts) — but a
+    different economy: NYC could afford the full building universe because its
+    crops come off a local zarr store, whereas these cities fetch over the
+    network, so it is **every tract, capped buildings per tract** instead. That
+    trade adds classical measurement error to the tract mean, which inflates the
+    ATT's standard errors without biasing it.
+
+    Each city runs on its own sensor and its own panel years (see
+    ``CityCohortSpec``): Chicago on Cook County's annual 6-inch municipal ortho —
+    a camera absent from fine-tuning, making that holdout spatial *and*
+    out-of-sensor — and the rest on NAIP.
+
+    Knobs (params): ``csa_buildings_per_tract`` (default 200), ``csa_cities``
+    (None = every city with a footprint+year-built table on disk),
+    ``csa_shard`` as ``(i, n)``, ``csa_max_rps`` for the municipal services.
+    Outputs land in ``RESULTS_DIR/savename/csa/<city>/{year}_predictions.csv``,
+    which is where ``evaluation.part_d`` looks for them.
+    """
+    from src.csa_predict import BUILDINGS_PER_TRACT_DEFAULT, CSAPredictionRunner
+
+    runner = CSAPredictionRunner(
+        savename, params,
+        cities=params.get("csa_cities"),
+        buildings_per_tract=params.get("csa_buildings_per_tract",
+                                       BUILDINGS_PER_TRACT_DEFAULT),
+        shard=tuple(params.get("csa_shard", (0, 1))),
+        max_rps=params.get("csa_max_rps"),
+    )
+    print("\n" + "=" * 80)
+    print("🏙️  CSA per-city prediction passes (issue #36)")
+    print("=" * 80)
+    plan = runner.plan()
+    if len(plan):
+        print(plan.to_string(index=False))
+    return runner.run(model=model, device=device, eval_transform=eval_transform,
+                      model_path=best_model_path)
+
+
 def run_nyc_zarr_validation_predictions(model, device, eval_transform, savename, params):
     """NYC evaluation pass: the **whole city, unsampled**, predicted from the legacy
     zarr aerial imagery (not NAIP) — reproducing the NYC-only model's coverage so the
@@ -3007,6 +3110,11 @@ def run(
     generate_predictions_nyc=False,   # TEMPORARY — NYC/zarr validation pass, see
                                       # run_nyc_zarr_validation_predictions; only fires
                                       # inside `if generate_predictions:`.
+    generate_predictions_csa=False,   # Dense per-city passes for the CSA event study
+                                      # (issue #36): every tract of each holdout city,
+                                      # <=predict_buildings_per_tract buildings each,
+                                      # on that city's own sensor. See src/csa_predict.py.
+                                      # Also only fires inside `if generate_predictions:`.
 ):
     """Run all the code of this file.
 
@@ -3550,6 +3658,10 @@ def run(
         if generate_predictions_nyc:
             run_nyc_zarr_validation_predictions(model, device, eval_transform, savename, params)
 
+        if generate_predictions_csa:
+            run_csa_city_predictions(model, device, eval_transform, savename, params,
+                                     best_model_path)
+
     if evaluate:
         # Must run AFTER generate_predictions — it consumes the per-year
         # prediction CSVs / tract parquets written above. Imported lazily so an
@@ -3646,4 +3758,9 @@ if __name__ == "__main__":
     }
 
     # Run full pipeline
-    run(params, train=False, retrain=False, compute_loss=False, generate_predictions=True, generate_predictions_nyc=True, evaluate=True)
+    # generate_predictions_csa: the dense per-city passes the CSA event study
+    # needs (issue #36). Tampa is the second main-figure city; ~770k crops over
+    # 2010/2013/2015/2017/2019, resumable per chunk. Without this flag part_d
+    # finds no predictions for it and reports only NYC.
+    run(params, train=False, retrain=False, compute_loss=False, generate_predictions=True,
+        generate_predictions_nyc=True, generate_predictions_csa=True, evaluate=True)

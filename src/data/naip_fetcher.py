@@ -160,7 +160,7 @@ def backoff_sleep(attempt: int, base_s: float = 30.0, cap_s: float = 900.0,
 # Process-wide fetch statistics (thread-safe). Reset with reset_fetch_stats().
 _STATS_LOCK = threading.Lock()
 _FETCH_STATS = {"ok": 0, "no_items": 0, "no_year_match": 0, "asset_missing": 0,
-                "read_error": 0,
+                "read_error": 0, "blank_crop": 0,
                 "search_error": 0, "nir_padded": 0, "partial_coverage": 0,
                 "search_cache_hit": 0, "search_cache_miss": 0,
                 "search_cache_expand": 0, "search_cache_disk_hit": 0,

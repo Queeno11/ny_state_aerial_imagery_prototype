@@ -1,0 +1,30 @@
+{
+  "out": "rho_full",
+  "seed": 20260925,
+  "reps": 3,
+  "cities": 120,
+  "years": 4,
+  "log_rho_sds": [
+    0.0,
+    0.9
+  ],
+  "steps": 1500,
+  "eval_every": 250,
+  "groups_per_step": 16,
+  "units_per_group": 32,
+  "reference_size": 2048,
+  "val_per_cell": 32,
+  "test_per_cell": 128,
+  "eval_pairs_per_cell": 128,
+  "width": 96,
+  "lr": 0.001,
+  "rho_lr": 0.015,
+  "shrinkage": 0.0,
+  "weighting": "city",
+  "device": "cuda",
+  "threads": 4,
+  "python": "3.10.20",
+  "torch": "2.5.1",
+  "numpy": "2.2.6",
+  "gpu": "NVIDIA GeForce RTX 3070"
+}

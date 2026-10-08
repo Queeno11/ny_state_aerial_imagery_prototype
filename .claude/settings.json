@@ -65,7 +65,26 @@
         "download.pytorch.org",
         "github.com",
         "api.github.com",
-        "*.githubusercontent.com"
+        "*.githubusercontent.com",
+        "gis.cookcountyil.gov",
+        "data.cityofchicago.org",
+        "datacatalog.cookcountyil.gov",
+        "gismaps.kingcounty.gov", 
+        "gis.seattle.gov",
+        "info.kingcounty.gov", 
+        "www5.kingcounty.gov", 
+        "gis-kingcounty.opendata.arcgis.com",
+        "fgdl.org", 
+        "geodata.floridagio.gov", 
+        "*.arcgis.com; tnmap.tn.gov",
+        "tn-tnmap.opendata.arcgis.com", 
+        "comptroller.tn.gov", 
+        "data.nashville.gov",
+        "*.arcgis.com",
+        "tnmap.tn.gov",
+        "gis.franklincountyohio.gov",
+        "epcad.org",
+        "blob.epcad.org"
       ]
     },
     "credentials": {
