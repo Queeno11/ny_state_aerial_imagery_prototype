@@ -540,6 +540,36 @@ def preload_zarr_chunks_async(df_group, all_years_datasets, cache, chunk_dims,
     return cache
 
 
+def substitution_label_columns(panel, indicator, acs_years, label_target="rel_score",
+                               level_stats=None):
+    """{acs_year: per-tract label array (panel row order)} for the NAIP
+    actual-year relabeling in CyclicCacheManager, in the run's own target.
+
+    ``rel_score``: the indicator's per-CBSA z-score columns (years whose column
+    is absent are skipped). ``log_level``: the L2 baseline's standardized log
+    real-dollar level, using the train-only ``level_stats`` {mu, sd} fitted by
+    build_dataset.apply_label_target — required, so a missing scale fails loudly.
+    """
+    from src.data import indicators, level_labels
+    if label_target == "rel_score":
+        return {
+            yr: panel[indicators.score_col(indicator, yr)].to_numpy()
+            for yr in acs_years if indicators.score_col(indicator, yr) in panel.columns
+        }
+    if label_target != "log_level":
+        raise ValueError(f"Unknown label_target {label_target!r}")
+    if not level_stats or "mu" not in level_stats or "sd" not in level_stats:
+        raise ValueError("label_target='log_level' needs params['level_label_stats'] "
+                         "({mu, sd}) for the actual-year relabeling.")
+    out = {}
+    for yr in acs_years:
+        col = level_labels.wealth_dollar_column(indicator, yr)
+        if col in panel.columns and int(yr) in level_labels.CPI_U_ANNUAL:
+            logw = level_labels.log_real_dollars(panel[col].to_numpy(), yr)
+            out[yr] = ((logw - level_stats["mu"]) / level_stats["sd"]).astype("float32")
+    return out
+
+
 class CyclicCacheManager:
     def __init__(
         self,
@@ -606,13 +636,16 @@ class CyclicCacheManager:
             self.indicator = params.get("indicator", indicators.DEFAULT_INDICATOR)
             panel = process_acs_panel()
             geoids = panel[PANEL_GEOID_COL].to_numpy()
-            self.panel_years = sorted(
-                yr for yr in ACS_PANEL_YEARS
-                if indicators.score_col(self.indicator, yr) in panel.columns
+            # Substituted crops must be relabeled in the run's OWN target: the
+            # L2 baseline's level label, not the z-score (else a share of its
+            # training rows would silently carry the ordinal label).
+            label_columns = substitution_label_columns(
+                panel, self.indicator, ACS_PANEL_YEARS,
+                params.get("label_target", "rel_score"), params.get("level_label_stats"),
             )
+            self.panel_years = sorted(label_columns)
             self.acs_lookup = {}
-            for yr in self.panel_years:
-                vals = panel[indicators.score_col(self.indicator, yr)].to_numpy()
+            for yr, vals in label_columns.items():
                 self.acs_lookup.update({(g, yr): v for g, v in zip(geoids, vals)})
             # Counters for the actual-year -> panel-year label substitution
             # (+ crops rejected by the temporal-holdout guards)
@@ -1289,14 +1322,27 @@ class HybridBatchSampler(torch.utils.data.Sampler):
 
     Old shards without cbsa_ids collapse to cbsa=0 pools == the previous
     per-year (single-city) behavior.
+
+    ``mix_pools=True`` (L2 baseline only — see run_L2_model.py) draws the
+    cross-sectional core uniformly from the union of the eligible pools, so a
+    batch mixes cities AND years. Each image's marginal draw probability is
+    the same as above (uniform over eligible images, for pools holding at
+    least ``batch_size_cs`` images; the core keeps one image per building, a
+    rejection that is symmetric across a building's years) — only the
+    grouping changes, which a pointwise loss needs to see between-city level
+    differences within a step.
+    Twins are drawn exactly as above, relative to each anchor's own year.
+    Never use it with the ranking loss: cross-metro pairs compare z-scores
+    from different reference distributions (validate_loss_config enforces it).
     """
     def __init__(self, dataset: InBatchRankingDataset, batch_size_cs: int, max_temporal_per_batch: int = 32,
-                 batch_dumper=None):
+                 batch_dumper=None, mix_pools=False):
         self.dataset = dataset
         self.batch_size_cs = batch_size_cs
         self.max_temporal = max_temporal_per_batch
         self.num_batches = max(1, len(dataset) // batch_size_cs)
         self._warned_fallback = False
+        self.mix_pools = bool(mix_pools)
         # Optional BatchImageDumper (fresh runs only): persists the first N yielded
         # batches for the visual QA notebook. None on resumed runs.
         self.batch_dumper = batch_dumper
@@ -1318,52 +1364,82 @@ class HybridBatchSampler(torch.utils.data.Sampler):
                 )
         return pools
 
+    def _twins_for(self, cs_idxs):
+        """Temporal twins (same building, different year) for a CS core.
+
+        Budget split 50/50 between stable and change buildings; backfill if
+        one side is short. "Different year" is relative to each anchor's own
+        year, which equals the pool year for single-pool batches.
+        """
+        stable_budget = self.max_temporal // 2
+        change_budget = self.max_temporal - stable_budget
+        stable_twins, change_twins = [], []
+        for idx in cs_idxs:
+            if len(stable_twins) + len(change_twins) >= self.max_temporal:
+                break
+            bid = self.dataset.building_ids[idx].item()
+            anchor_year = self.dataset.years[idx].item()
+            twin_candidates = [
+                i for i in self.dataset.building_to_idxs.get(bid, [])
+                if i != idx and self.dataset.years[i].item() != anchor_year
+            ]
+            if not twin_candidates:
+                continue
+            twin = random.choice(twin_candidates)
+            if self.dataset.structural_change[idx].item() == 0:
+                stable_twins.append(twin)
+            else:
+                change_twins.append(twin)
+
+        n_stable = min(len(stable_twins), stable_budget)
+        n_change = min(len(change_twins), change_budget)
+        spare = self.max_temporal - n_stable - n_change
+        if spare > 0:   # backfill unused budget from whichever side has extras
+            extra = min(len(stable_twins) - n_stable, spare)
+            n_stable += extra
+            spare -= extra
+            n_change += min(len(change_twins) - n_change, spare)
+        return stable_twins[:n_stable] + change_twins[:n_change]
+
+    def _mixed_core(self, eligible):
+        """Cross-sectional core drawn across every eligible (year, CBSA) pool,
+        one image per building. Shards hold a building's years side by side,
+        so an unconstrained draw often takes one building twice (two years) —
+        its "twin" could then duplicate an image already in the core. A
+        single-pool core can't collide: it shares one year."""
+        picked, seen = [], set()
+        for i in random.sample(eligible, min(len(eligible), 4 * self.batch_size_cs)):
+            bid = self.dataset.building_ids[i].item()
+            if bid in seen:
+                continue
+            seen.add(bid)
+            picked.append(i)
+            if len(picked) == self.batch_size_cs:
+                break
+        return picked
+
     def __iter__(self):
         pools = self._pools()
         keys = list(pools.keys())
         weights = [len(pools[k]) for k in keys]
+        eligible = [i for k in keys for i in pools[k]] if self.mix_pools else None
 
         for _ in range(self.num_batches):
-            year, _cbsa = key = random.choices(keys, weights=weights, k=1)[0]
-            pool = pools[key]
+            if self.mix_pools:
+                cs_idxs = self._mixed_core(eligible)
+                cs_size = len(cs_idxs)
+                year = self.dataset.years[cs_idxs[0]].item()
+                _cbsa = self.dataset.cbsa_ids[cs_idxs[0]].item()
+            else:
+                year, _cbsa = key = random.choices(keys, weights=weights, k=1)[0]
+                pool = pools[key]
 
-            # Sample cross-sectional core (single year x single CBSA)
-            cs_size = min(self.batch_size_cs, len(pool))
-            cs_idxs = random.sample(pool, cs_size)
+                # Sample cross-sectional core (single year x single CBSA)
+                cs_size = min(self.batch_size_cs, len(pool))
+                cs_idxs = random.sample(pool, cs_size)
 
             batch = list(cs_idxs)
-
-            # Temporal twins: same building, different year. Budget split 50/50
-            # between stable and change buildings; backfill if one side is short.
-            stable_budget = self.max_temporal // 2
-            change_budget = self.max_temporal - stable_budget
-            stable_twins, change_twins = [], []
-            for idx in cs_idxs:
-                if len(stable_twins) + len(change_twins) >= self.max_temporal:
-                    break
-                bid = self.dataset.building_ids[idx].item()
-                twin_candidates = [
-                    i for i in self.dataset.building_to_idxs.get(bid, [])
-                    if i != idx and self.dataset.years[i].item() != year
-                ]
-                if not twin_candidates:
-                    continue
-                twin = random.choice(twin_candidates)
-                if self.dataset.structural_change[idx].item() == 0:
-                    stable_twins.append(twin)
-                else:
-                    change_twins.append(twin)
-
-            n_stable = min(len(stable_twins), stable_budget)
-            n_change = min(len(change_twins), change_budget)
-            spare = self.max_temporal - n_stable - n_change
-            if spare > 0:   # backfill unused budget from whichever side has extras
-                extra = min(len(stable_twins) - n_stable, spare)
-                n_stable += extra
-                spare -= extra
-                n_change += min(len(change_twins) - n_change, spare)
-            batch.extend(stable_twins[:n_stable])
-            batch.extend(change_twins[:n_change])
+            batch.extend(self._twins_for(cs_idxs))
 
             if self.batch_dumper is not None and not self.batch_dumper.finished:
                 self.batch_dumper.dump_batch(
@@ -1591,6 +1667,7 @@ def setup_dataloaders(df_train, dfs_val_dict, df_test, all_years_datasets, param
         batch_size_cs=batch_size,
         max_temporal_per_batch=max(1, int(batch_size * params.get("temporal_fraction", 0.20))),
         batch_dumper=batch_dumper,
+        mix_pools=params.get("mix_pools", False),
     )
     train_loader = DataLoader(train_dataset, batch_sampler=hybrid_sampler, num_workers=0)
     train_loader.gpu_transform = train_transform_gpu
@@ -1665,6 +1742,40 @@ def validate_parameters(params, default_params):
             )
 
     return
+
+
+def validate_loss_config(params):
+    """Reject loss / label / sampler combinations that would corrupt a run.
+
+    * ``mix_pools`` with the ranking loss: cross-metro pairs compare z-scores
+      from different reference distributions.
+    * ``label_target='log_level'`` with the ranking loss: within a (CBSA, year)
+      the level and the z-score have the same order, so it is the ordinal
+      model under a misleading name — the level target is the L2 baseline's.
+    * gradient mining with MSE: tract hardness is defined by ranking-loss
+      gradients, so the registry would never update and the "mined" weights
+      would be stale noise.
+    """
+    loss_type = params.get("loss_type", "ranking")
+    label_target = params.get("label_target", "rel_score")
+    if loss_type not in ("ranking", "mse"):
+        raise ValueError(f"loss_type must be 'ranking' or 'mse', got {loss_type!r}")
+    if label_target not in ("rel_score", "log_level"):
+        raise ValueError(f"label_target must be 'rel_score' or 'log_level', got {label_target!r}")
+    if loss_type == "ranking":
+        if params.get("mix_pools", False):
+            raise ValueError("mix_pools=True requires loss_type='mse': ranking pairs "
+                             "must stay within one (year, CBSA).")
+        if label_target != "rel_score":
+            raise ValueError("label_target='log_level' requires loss_type='mse' "
+                             "(the cardinal L2 baseline).")
+    elif params.get("tract_sampling", False):
+        alphas = (params.get("grad_mining_alpha", 0.0),
+                  params.get("grad_mining_alpha_final", params.get("grad_mining_alpha", 0.0)))
+        if any(a for a in alphas):
+            raise ValueError("loss_type='mse' needs grad_mining_alpha = "
+                             "grad_mining_alpha_final = 0: hardness is defined by "
+                             "ranking-loss gradients.")
 
 
 def fill_params_defaults(params):
@@ -1755,11 +1866,19 @@ def fill_params_defaults(params):
         # from selection). See src/data/pair_table.py sampler docstrings.
         "val_years_per_city": 1,
         "val_stability_buildings_per_cbsa": 25,
+        # Cardinal L2 baseline (B1; launched by src/run_L2_model.py). The
+        # defaults are the ordinal model; validate_loss_config guards the combos.
+        "loss_type": "ranking",      # "ranking" (InBatchPairwiseRankingLoss) | "mse" (PointwiseMSELoss)
+        "label_target": "rel_score", # "rel_score" (per-CBSA z-score) | "log_level" (pooled log real $, train-only scale)
+        "mix_pools": False,          # True: batches mix cities/years (mse only)
+        "cache_subdir": None,        # shard cache under CACHE_DIR/<this>; keeps a baseline from clearing the ordinal run's shards
+        "level_label_stats": None,   # {mu, sd, ...} of the log_level target; set by run() from generate_datasets' fit
     }
     validate_parameters(params, default_params)
 
     # Merge default and provided hyperparameters (keep from params)
     updated_params = {**default_params, **params}
+    validate_loss_config(updated_params)
     print("-" * 40)
     print("Runtime Parameters:")
     for k, v in updated_params.items():
@@ -1988,10 +2107,65 @@ class InBatchPairwiseRankingLoss(nn.Module):
         return loss, diag
 
 
+def repeat_occurrence_mask(ids):
+    """True for each element whose id already appeared EARLIER in ``ids``.
+
+    In a hybrid batch the cross-sectional core comes first and each temporal
+    twin repeats its anchor's building_id, so this flags exactly the twins —
+    for both the single-pool and the mixed-pool sampler.
+    """
+    same = ids.unsqueeze(0) == ids.unsqueeze(1)          # same[i, j]: ids[i] == ids[j]
+    return torch.tril(same, diagonal=-1).any(dim=1)      # any j < i
+
+
+class PointwiseMSELoss(nn.Module):
+    """Cardinal L2 baseline loss (B1): plain MSE on every image in the batch.
+
+    Same call signature and ``(loss, diag)`` return as
+    InBatchPairwiseRankingLoss so train_model is untouched. Cross-sectional
+    anchors and temporal twins are each regressed on their own (tract, year)
+    label — no pairing, no stability term, no variance regularizer, no SE
+    weighting, no score-bin curriculum. The extra arguments are used only for
+    the anchor/twin diagnostics.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.hardness_registry = None  # no ranking gradients to mine (train_model reads this attr)
+
+    def forward(self, scores, labels, geoids, years, building_ids, structural_change,
+                score_bins=None, current_epoch=None, current_step=None, se_values=None):
+        scores = scores.squeeze(-1).float()   # autocast hands back fp16
+        labels = labels.float()
+        sq = (scores - labels) ** 2
+        loss = sq.mean()
+
+        with torch.no_grad():
+            twin = repeat_occurrence_mask(building_ids)
+            cs = ~twin
+            n_twin = int(twin.sum().item())
+            change = structural_change.to(torch.bool)
+            diag = {
+                "loss/mse":            loss.item(),
+                "loss/mse_cs":         sq[cs].mean().item() if cs.any() else 0.0,
+                "loss/mse_temporal":   sq[twin].mean().item() if n_twin else 0.0,
+                "loss/n_temporal":     n_twin,
+                "loss/n_stable":       int((twin & ~change).sum().item()),
+                "loss/n_change":       int((twin & change).sum().item()),
+                "loss/n_tracts":       int(torch.unique(geoids[cs]).numel()) if cs.any() else 0,
+                "loss/n_years":        int(torch.unique(years[cs]).numel()) if cs.any() else 0,
+                "loss/score_std":      scores.std().item() if scores.shape[0] > 1 else 0.0,
+                "loss/score_mean":     scores.mean().item(),
+                "loss/label_mean":     labels.mean().item(),
+                "loss/label_std":      labels.std().item() if labels.shape[0] > 1 else 0.0,
+            }
+        return loss, diag
+
+
 def set_model_and_loss_function(
     model_name: str, kind: str, image_size: int, bands: int = 4, weights: str = None, meta_dim: int = 0,
     m_base: float = 1.0, m_min: float = 0.1, lambda_s: float = 1.0, lambda_var: float = 1.0,
-    hardness_registry=None,
+    hardness_registry=None, loss_type: str = "ranking",
 ):
     """
     Initializes the PyTorch model and appropriate loss function.
@@ -2017,7 +2191,12 @@ def set_model_and_loss_function(
         print(f"\n--- 🚀 Successfully loaded custom weights from: {weights} ---")
 
     # 2. Set loss functions
-    if kind == "reg":
+    if kind == "reg" and loss_type == "mse":
+        # Cardinal L2 baseline (B1): pointwise regression, see PointwiseMSELoss.
+        loss_fn = PointwiseMSELoss()
+    elif kind == "reg":
+        if loss_type != "ranking":
+            raise ValueError(f"loss_type must be 'ranking' or 'mse', got {loss_type!r}")
         # In-Batch Pairwise Ranking Loss with economic-distance-proportional margins.
         loss_fn = InBatchPairwiseRankingLoss(
             m_base=m_base, m_min=m_min, lambda_s=lambda_s, lambda_var=lambda_var,
@@ -2305,9 +2484,12 @@ def train_model(
         if diag_steps > 0:
             epoch_diag = {k: v / diag_steps for k, v in diag_accum.items()}
             epoch_diag["loss/total_pairs_epoch"] = total_pairs_epoch
-            # Check health and warn in console
-            har = epoch_diag.get("loss/cross_hinge_active", 0)
-            if har < 0.30:
+            # Check health and warn in console (ranking loss only — the
+            # pointwise MSE baseline has no hinge, so there is nothing to check)
+            har = epoch_diag.get("loss/cross_hinge_active")
+            if har is None:
+                pass
+            elif har < 0.30:
                 tqdm.write(f"⚠️  Cross hinge active rate {har:.2f} < 0.30 — m_base may be too low.")
             elif har > 0.80:
                 tqdm.write(f"⚠️  Cross hinge active rate {har:.2f} > 0.80 — m_base may be too high, training may be unstable.")
@@ -2478,7 +2660,10 @@ def train_model(
         # Model Checkpoint logic (Maximize Spearman)
         if epoch_val_spearman > best_val_spearman:
             tqdm.write(f"⭐ Val Spearman improved from {best_val_spearman:.4f} to {epoch_val_spearman:.4f}. Saving...")
-            tqdm.write(f"   📊 [Loss Components] L_cross: {epoch_diag.get('loss/L_cross', 0.0):.4f} | L_stable: {epoch_diag.get('loss/L_stable', 0.0):.4f}")
+            if "loss/mse" in epoch_diag:
+                tqdm.write(f"   📊 [Loss Components] MSE: {epoch_diag['loss/mse']:.4f} | anchors: {epoch_diag.get('loss/mse_cs', 0.0):.4f} | twins: {epoch_diag.get('loss/mse_temporal', 0.0):.4f}")
+            else:
+                tqdm.write(f"   📊 [Loss Components] L_cross: {epoch_diag.get('loss/L_cross', 0.0):.4f} | L_stable: {epoch_diag.get('loss/L_stable', 0.0):.4f}")
             best_val_spearman = epoch_val_spearman
             
             model_path = save_dir / f"{savename}_best.pth"
@@ -3100,6 +3285,82 @@ def run_nyc_zarr_validation_predictions(model, device, eval_transform, savename,
         print(f"Finished NYC zarr check: {len(df_result)} buildings for {year} -> {output_dir}")
 
 
+def resolve_runtime_params(params):
+    """Defaults + the exact-tau snap every pass needs (training and prediction).
+
+    Overrides tau_meters with the exact value that makes the raw tile an exact
+    multiple of image_size, so crops subsample every Nth pixel instead of
+    interpolating (no antialiasing artifacts). Call once per params dict: the
+    snapped tau is not a valid *request* for a second snap.
+    """
+    params = fill_params_defaults(params)
+    image_size = params["image_size"]
+    tau_meters_requested = params.get("tau_meters", 100)
+    tau_meters, subsample_step = geo_utils.calculate_exact_tau(
+        tau_meters_requested, image_size
+    )
+    params["tau_meters"] = tau_meters
+    params["subsample_step"] = subsample_step
+    # Keep the pre-override request: any pass running on a different raster grid
+    # (e.g. the NYC zarr check, 0.5 ftUS/px) has to redo this snap on its own grid.
+    params["tau_meters_requested"] = tau_meters_requested
+    print(f"📐 Exact tau override: {tau_meters_requested}m → {tau_meters:.2f}m  "
+          f"(subsample step N={subsample_step}, raw tile = {subsample_step * image_size}px)")
+    return params
+
+
+def run_cache_root(params):
+    """Shard-cache root for this run: CACHE_DIR, or CACHE_DIR/<cache_subdir>.
+
+    The cache marker lives here too, so a run with its own subdir (the L2
+    baseline) never clears another run's shards when its savename differs.
+    """
+    sub = params.get("cache_subdir")
+    return Path(CACHE_DIR) / sub if sub else Path(CACHE_DIR)
+
+
+def make_eval_transform(nbands):
+    """Prediction/validation transform. MUST match training exactly: scale
+    uint16→float32, then ImageNet normalization (0.5 for extra bands)."""
+    mean = [0.485, 0.456, 0.406] + [0.5] * max(0, nbands - 3)
+    std = [0.229, 0.224, 0.225] + [0.5] * max(0, nbands - 3)
+    return transforms.Compose([
+        transforms.ToDtype(torch.float32, scale=True),
+        transforms.Normalize(mean=mean, std=std)  # 🔴 ImageNet Normalization — must match training
+    ])
+
+
+def load_best_model(params, savename, device):
+    """Model with ``savename``'s best checkpoint loaded (head + LoRA adapter).
+
+    Returns ``(model, best_model_path)``; raises FileNotFoundError when the run
+    never wrote a best checkpoint.
+    """
+    model, _ = set_model_and_loss_function(
+        model_name=params["model_name"],
+        kind=params["kind"],
+        bands=params["nbands"],
+        image_size=params["image_size"],
+        meta_dim=0,  # Must match training (dist_to_center covariate disabled)
+    )
+
+    best_model_path = MODELS_DIR / "models_by_epoch" / savename / f"{savename}_best.pth"
+    if not best_model_path.exists():
+        raise FileNotFoundError(f"Cannot generate predictions: The best model weights at {best_model_path} do not exist. Did the model finish training?")
+
+    # Best-model loading: Load head + Load LoRA separately
+    model.head.load_state_dict(torch.load(best_model_path, map_location=device, weights_only=True))
+    lora_dir = best_model_path.parent / f"{best_model_path.stem}_lora"
+    if lora_dir.exists():
+        from peft import PeftModel
+        # Wrap the base model (unwrapped backbone) with the best lora adapter
+        model.backbone = PeftModel.from_pretrained(model.backbone.base_model.model, lora_dir)
+        print(f"✅ Best LoRA adapter loaded from {lora_dir}")
+
+    model.to(device)
+    return model, best_model_path
+
+
 def run(
     params=None,
     train=True,
@@ -3124,7 +3385,7 @@ def run(
         If you just want to check if the code is working, set small_sample to True, by default False
     """
 
-    params = fill_params_defaults(params)
+    params = resolve_runtime_params(params)
 
     model_name = params["model_name"]
     kind = params["kind"]
@@ -3137,22 +3398,9 @@ def run(
     sat_data = params["sat_data"]
     years = params["years"]
     batch_size = params["batch_size"]
-    tau_meters_requested = params.get("tau_meters", 100)
+    tau_meters = params["tau_meters"]
     max_jitter = params.get("max_jitter", 10)
-
-    # Override tau_meters with the exact value that makes the raw zarr tile an exact
-    # multiple of image_size.  This lets us subsample every Nth pixel instead of
-    # interpolating, completely eliminating antialiasing artifacts.
-    tau_meters, subsample_step = geo_utils.calculate_exact_tau(
-        tau_meters_requested, image_size
-    )
-    params["tau_meters"] = tau_meters
-    params["subsample_step"] = subsample_step
-    # Keep the pre-override request: any pass running on a different raster grid
-    # (e.g. the NYC zarr check, 0.5 ftUS/px) has to redo this snap on its own grid.
-    params["tau_meters_requested"] = tau_meters_requested
-    print(f"📐 Exact tau override: {tau_meters_requested}m → {tau_meters:.2f}m  "
-          f"(subsample step N={subsample_step}, raw tile = {subsample_step * image_size}px)")
+    run_cache_dir = run_cache_root(params)
 
     savename = generate_savename(params.get("run_id"))
     log_dir = f"{LOGS_DIR}/{model_name}_{datetime.now().strftime('%Y%m%d-%H%M%S')}"
@@ -3173,7 +3421,12 @@ def run(
             naip_coverage_csv=params.get("naip_coverage_csv"),
             val_years_per_city=params.get("val_years_per_city", 1),
             val_stability_buildings_per_cbsa=params.get("val_stability_buildings_per_cbsa", 25),
+            label_target=params["label_target"],
         )
+        if params["label_target"] == "log_level":
+            # Train-only label scale, fitted inside generate_datasets; the shard
+            # generators need it to relabel NAIP flight-year substitutions.
+            params["level_label_stats"] = build_dataset.load_level_label_stats(savename)
 
         # Per-city split metadata (#28/#31): temporal-holdout years feed the NAIP
         # actual-year guards below; brackets/populations feed the val metrics.
@@ -3194,11 +3447,11 @@ def run(
         # if it matches, keep them and let build_initial_cache() top up the missing
         # ones instead of refetching everything. retrain=True still forces a full
         # rebuild, and a different savename (new run_id / split) clears as before.
-        if not retrain and not resume_cache and read_cache_marker() == savename:
+        if not retrain and not resume_cache and read_cache_marker(run_cache_dir) == savename:
             resume_cache = True
             print(f"🟡 No model checkpoint, but cache marker matches '{savename}': "
                   f"resuming partial shard cache instead of rebuilding.")
-        write_cache_marker(savename)
+        write_cache_marker(savename, run_cache_dir)
 
         print("Building Initial Cache...")
         if small_sample:
@@ -3251,7 +3504,7 @@ def run(
             df=df_train,
             all_years_datasets=all_years_datasets,
             params=params,
-            cache_dir=CACHE_DIR,
+            cache_dir=run_cache_dir,
             single_shard_mode=small_sample, # If small_sample is True, keep only one shard to speed up testing
             num_shards=num_shards,
             shard_size=current_shard_size,
@@ -3291,7 +3544,7 @@ def run(
                     df=df_val, # Or full df_val
                     all_years_datasets=all_years_datasets,
                     params=params,
-                    cache_dir=CACHE_DIR,
+                    cache_dir=run_cache_dir,
                     num_shards=val_num_shards,  # Build multiple shards to cover the whole val set
                     shard_size=current_shard_size,  # Smaller shard size avoids RAM explosion during generation
                     single_shard_mode=True,     # IMPORTANT: This disables active rotation / generation
@@ -3351,6 +3604,7 @@ def run(
             lambda_s=params.get("lambda_s", 1.0),
             lambda_var=params.get("lambda_var", 1.0),
             hardness_registry=hardness_registry,
+            loss_type=params["loss_type"],
         )
 
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -3493,42 +3747,12 @@ def run(
             gc.collect()
 
         # 1. Load the Best PyTorch Model
-        model, _ = set_model_and_loss_function(
-            model_name=model_name,
-            kind=kind,
-            bands=nbands, 
-            image_size=image_size,
-            meta_dim=0,  # Must match training (dist_to_center covariate disabled)
-        )
-        
-        best_model_path = MODELS_DIR / "models_by_epoch" / savename / f"{savename}_best.pth"
-        if not best_model_path.exists():
-            raise FileNotFoundError(f"Cannot generate predictions: The best model weights at {best_model_path} do not exist. Did the model finish training?")
-            
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        
-        # Best-model loading: Load head + Load LoRA separately
-        model.head.load_state_dict(torch.load(best_model_path, map_location=device, weights_only=True))
-        lora_dir = best_model_path.parent / f"{best_model_path.stem}_lora"
-        if lora_dir.exists():
-            from peft import PeftModel
-            # Wrap the base model (unwrapped backbone) with the best lora adapter
-            model.backbone = PeftModel.from_pretrained(model.backbone.base_model.model, lora_dir)
-            print(f"✅ Best LoRA adapter loaded from {lora_dir}")
-        
-        model.to(device)
+        model, best_model_path = load_best_model(params, savename, device)
 
-        # 3. Setup the Evaluation Transforms
-        # MUST match the pipeline used during training/validation exactly:
-        # scale uint16→float32, then apply ImageNet normalization.
-        nbands = params.get("nbands", 4)
-        mean = [0.485, 0.456, 0.406] + [0.5] * max(0, nbands - 3)
-        std = [0.229, 0.224, 0.225] + [0.5] * max(0, nbands - 3)
-        eval_transform = transforms.Compose([
-            transforms.ToDtype(torch.float32, scale=True),
-            transforms.Normalize(mean=mean, std=std)  # 🔴 ImageNet Normalization — must match training
-        ])
-        
+        # 3. Setup the Evaluation Transforms (must match training exactly)
+        eval_transform = make_eval_transform(params.get("nbands", 4))
+
         # 4. Process each year. NAIP path: resumable chunked prediction with
         # one manifest-guarded chunk cache per predict_split (src/prediction.py).
         if pred_pair_table is not None:

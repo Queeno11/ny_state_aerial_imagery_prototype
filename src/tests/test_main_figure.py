@@ -8,29 +8,12 @@ fast and self-contained.
 
 import numpy as np
 import pandas as pd
+import pytest
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 import src.evaluation as ev
-
-
-# ─── _synthetic_cardinal_baseline ──────────────────────────────────────────
-
-def test_synthetic_cardinal_baseline_deterministic_and_bounded():
-    years = np.array([2010, 2012, 2014, 2016, 2018, 2020, 2022, 2024])
-    ordinal = np.full(len(years), 0.82)
-    b1 = ev._synthetic_cardinal_baseline(years, ordinal, seed=7)
-    b2 = ev._synthetic_cardinal_baseline(years, ordinal, seed=7)
-    np.testing.assert_array_equal(b1, b2)
-    assert b1.shape == years.shape
-    assert np.all(b1 >= 0.05) and np.all(b1 <= 0.95)
-    assert b1[-1] < b1[0]  # decays away from the first year
-
-
-def test_synthetic_cardinal_baseline_single_year():
-    out = ev._synthetic_cardinal_baseline(np.array([2016]), np.array([0.8]))
-    assert out.shape == (1,)
 
 
 # ─── Panel A: raincloud ─────────────────────────────────────────────────────
@@ -74,18 +57,48 @@ def test_panel_a_raincloud_empty_data_does_not_crash():
 
 # ─── Panel B: kill shot ─────────────────────────────────────────────────────
 
-def test_panel_b_kill_shot_plots_two_lines_with_legend():
+def test_panel_b_kill_shot_without_baseline_plots_only_the_ordinal_line():
     cells, _ = _make_cells()
     fig, ax = plt.subplots()
     ev._panel_b_kill_shot(ax, cells, holdout_year=2016)
+    assert len(ax.get_lines()) == 1
+    labels = {t.get_text() for t in ax.get_legend().get_texts()}
+    assert any("Ordinal" in l for l in labels)
+    assert not any("baseline" in l for l in labels)   # no synthetic stand-in
+    plt.close(fig)
+
+
+def test_panel_b_kill_shot_plots_measured_baseline_with_bands():
+    cells, _ = _make_cells()
+    base, _ = _make_cells(seed=5)
+    base["rho"] -= 0.2
+    fig, ax = plt.subplots()
+    ev._panel_b_kill_shot(ax, cells, holdout_year=2016, baseline_cells=base, bands=True)
     lines = ax.get_lines()
     assert len(lines) == 2
-    legend = ax.get_legend()
-    assert legend is not None
-    labels = {t.get_text() for t in legend.get_texts()}
-    assert any("Ordinal" in l for l in labels)
-    assert any("baseline" in l for l in labels)
+    labels = {t.get_text() for t in ax.get_legend().get_texts()}
+    assert any("Ordinal" in l for l in labels) and any("L2 baseline" in l for l in labels)
+    by_label = {l.get_label(): l for l in lines}
+    ord_y = by_label["Ordinal model (this paper)"].get_ydata()
+    base_y = by_label["Cardinal L2 baseline"].get_ydata()
+    assert np.all(np.asarray(base_y) < np.asarray(ord_y))   # the measured curve, not a stand-in
+    assert np.asarray(base_y) == pytest.approx(ev._yearly_weighted_rho(base)["rho"].to_numpy())
+    assert len(ax.collections) >= 2                      # one band per line
     plt.close(fig)
+
+
+def test_yearly_weighted_rho_and_band():
+    cells = pd.DataFrame([
+        {"cbsa": "A", "year": 2020, "n": 5, "n_tracts": 10, "rho": 0.2},
+        {"cbsa": "B", "year": 2020, "n": 5, "n_tracts": 30, "rho": 0.6},
+        {"cbsa": "A", "year": 2021, "n": 5, "n_tracts": 10, "rho": 0.5},
+    ])
+    curve = ev._yearly_weighted_rho(cells)
+    assert curve["rho"].tolist() == pytest.approx([0.5, 0.5])
+    band = ev._yearly_rho_band(cells, n_boot=200)
+    lo, hi = band.loc[band["year"] == 2020, ["lo", "hi"]].iloc[0]
+    assert 0.2 - 1e-9 <= lo <= 0.5 <= hi <= 0.6 + 1e-9
+    assert band.loc[band["year"] == 2021, ["lo", "hi"]].isna().all(axis=None)  # 1 city
 
 
 def test_panel_b_kill_shot_empty_data_does_not_crash():
@@ -302,11 +315,13 @@ def test_part_main_figure_us_explicit_year_uses_single_cross_section(tmp_path):
         assert f"main_figure/panel_c_rho_year_{yr}" in headline
 
 
-def test_part_main_figure_us_panel_a_uses_tract_level_rho(tmp_path, monkeypatch):
-    """Panel A must be fed tract-level cells (one row per tract), not
+def test_part_main_figure_us_panels_a_and_b_use_tract_level_rho(tmp_path, monkeypatch):
+    """Panels A and B must be fed tract-level cells (one row per tract), not
     building-level cells (one row per building, tract label repeated) — the
     two diverge here on purpose so a regression to building-level data would
-    be caught."""
+    be caught. (Panel B was building-level until it was aligned with A: the
+    label only exists per tract, so building-level rho is attenuated by
+    within-tract spread.)"""
     out = tmp_path / "evaluation"
     (out / "figures").mkdir(parents=True)
     (out / "tables").mkdir(parents=True)
@@ -342,9 +357,9 @@ def test_part_main_figure_us_panel_a_uses_tract_level_rho(tmp_path, monkeypatch)
         captured["a"] = cells.copy()
         return orig_panel_a(ax, cells, bracket_of)
 
-    def spy_panel_b(ax, cells, holdout_year=None):
+    def spy_panel_b(ax, cells, holdout_year=None, **kw):
         captured["b"] = cells.copy()
-        return orig_panel_b(ax, cells, holdout_year=holdout_year)
+        return orig_panel_b(ax, cells, holdout_year=holdout_year, **kw)
 
     monkeypatch.setattr(ev, "_panel_a_raincloud", spy_panel_a)
     monkeypatch.setattr(ev, "_panel_b_kill_shot", spy_panel_b)
@@ -353,7 +368,9 @@ def test_part_main_figure_us_panel_a_uses_tract_level_rho(tmp_path, monkeypatch)
     ev.part_main_figure_us(ctx)
 
     assert captured["a"]["rho"].mean() > 0.9   # tract-level: near-perfect
-    assert captured["b"]["rho"].abs().mean() < 0.3  # building-level: near-zero
+    assert captured["b"]["rho"].mean() > 0.9   # tract-level too, same cells as A
+    pd.testing.assert_frame_equal(captured["a"].reset_index(drop=True),
+                                  captured["b"].reset_index(drop=True))
 
 
 def test_part_main_figure_us_drops_cities_below_min_tracts(tmp_path):
@@ -462,3 +479,81 @@ def test_part_main_figure_us_empty_bld_skips(tmp_path):
     ctx = _FakeCtx(empty, empty, None, out)
     headline = ev.part_main_figure_us(ctx)
     assert headline == {}
+
+
+# ─── Panel C: GB2 cardinal reconstruction ───────────────────────────────────
+
+def _gb2_world(n_tracts=80, years=(2016, 2017), seed=11, noise=0.3):
+    """Cities at very different wealth levels; tract truth is lognormal and the
+    prediction is a noisy within-city signal (no level information)."""
+    rng = np.random.default_rng(seed)
+    level = {"10420": 11.0, "35620": 12.5, "41860": 12.0, "99999": 11.5}
+    wl, tr = [], []
+    for cbsa, mu in level.items():
+        z = rng.normal(0, 1, n_tracts)
+        for yr in years:
+            for i in range(n_tracts):
+                geoid = f"{cbsa}{i:06d}"
+                wl.append({"GEOID": geoid, "cbsa": cbsa, "year": yr,
+                           "usd": float(np.exp(mu + 0.6 * z[i]))})
+                tr.append({"GEOID": geoid, "cbsa": cbsa, "year": yr, "label": z[i],
+                           "pred": z[i] + rng.normal(0, noise)})
+    return pd.DataFrame(wl), pd.DataFrame(tr)
+
+
+def test_gb2_mapped_tracts_preserves_within_city_order_and_beats_city_only():
+    wl, tr = _gb2_world()
+    params = ev._fit_city_gb2(wl, set(wl["cbsa"]))
+    f = ev.gb2_mapped_tracts(tr, wl, params)
+    assert len(f) == len(tr)
+    for _, g in f.groupby(["cbsa", "year"]):
+        assert g["city_usd"].nunique() == 1                        # constant benchmark
+        assert np.array_equal(g["pred"].rank().values, g["pred_usd"].rank().values)
+    s = ev.cardinal_fit_stats(f)
+    assert s["between_share"] > 0.5                                # level gaps dominate here
+    assert s["city_r2"] > 0.4                                      # survey alone is strong...
+    assert s["r2"] > s["city_r2"] and s["rho"] > s["city_rho"]     # ...the model adds to it
+
+
+def test_gb2_mapped_tracts_perfect_ranks_recover_dollars():
+    wl, tr = _gb2_world(noise=0.0)
+    f = ev.gb2_mapped_tracts(tr, wl, ev._fit_city_gb2(wl, set(wl["cbsa"])))
+    assert ev.cardinal_fit_stats(f)["r2"] > 0.95
+
+
+def test_gb2_mapped_tracts_uses_nearest_fitted_vintage_and_drops_unfitted():
+    wl, tr = _gb2_world(years=(2016,))
+    params = ev._fit_city_gb2(wl, {"10420", "35620"})
+    tr = pd.concat([tr, tr.assign(year=2018)])                     # no 2018 survey -> use 2016
+    f = ev.gb2_mapped_tracts(tr, wl, params)
+    assert set(f["cbsa"]) == {"10420", "35620"}
+    assert set(f["acs_year"]) == {2016} and set(f["year"]) == {2016, 2018}
+
+
+def test_part_main_figure_us_panel_c_gb2_mode(tmp_path, monkeypatch):
+    out = tmp_path / "evaluation"
+    (out / "figures").mkdir(parents=True)
+    (out / "tables").mkdir(parents=True)
+    wl, tr = _gb2_world(n_tracts=40, years=(2016, 2017))
+    cbsas = {"10420": "small", "35620": "mega", "41860": "large", "99999": "medium"}
+    cbsa_meta = pd.DataFrame({"cbsa_code": list(cbsas), "bracket": list(cbsas.values())})
+    bld = tr.assign(type="test", building_id=tr["GEOID"] + "_b")
+    ctx = _FakeCtx(bld, tr, cbsa_meta, out)
+    ctx.processed_dir, ctx.indicator = tmp_path, "W2_r5"
+    monkeypatch.setattr(ev, "_load_wealth_dollars_long", lambda *a, **k: wl)
+    head = ev.part_main_figure_us(ctx)
+    assert head["main_figure/panel_c_mode"] == "gb2"
+    assert head["main_figure/panel_c_r2"] > head["main_figure/panel_c_city_r2"]
+    assert head["main_figure/panel_c_n"] == len(tr)
+    assert (out / "figures" / "US_main_performance_figure.pdf").exists()
+
+
+def test_part_main_figure_us_panel_c_falls_back_without_panel_dollars(tmp_path):
+    out = tmp_path / "evaluation"
+    (out / "figures").mkdir(parents=True)
+    (out / "tables").mkdir(parents=True)
+    _, tr = _gb2_world(n_tracts=30, years=(2016,))
+    cbsas = {"10420": "small", "35620": "mega", "41860": "large", "99999": "medium"}
+    cbsa_meta = pd.DataFrame({"cbsa_code": list(cbsas), "bracket": list(cbsas.values())})
+    ctx = _FakeCtx(tr.assign(type="test", building_id=tr["GEOID"]), tr, cbsa_meta, out)
+    assert ev.part_main_figure_us(ctx)["main_figure/panel_c_mode"] == "latent"

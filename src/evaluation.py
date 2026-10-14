@@ -44,6 +44,7 @@ from __future__ import annotations
 
 import argparse
 import faulthandler
+import json
 import re
 import textwrap
 import warnings
@@ -87,6 +88,7 @@ from src.utils.metrics import (
 )
 from src.data import indicators
 from src.data import cbsa_brackets
+from src.data import level_labels
 # Module level (part_d also imports it locally) so `CONTROL_THRESHOLD` can be
 # part_d's default argument rather than a sentinel.
 from src import csa_event_study as ces
@@ -300,8 +302,23 @@ def _available_years(results_dir: Path) -> list[int]:
 # a run name on purpose: a run-name check silently does nothing the moment a
 # directory is renamed or copied, while the sentinel is the actual evidence of the
 # defect and disappears by itself once a pass is regenerated with the guard
-# active. Set `NODATA_PREDICTION_VALUE = None` to disable.
+# active.
+#
+# The sentinel is a property of the model, not a constant. On run_20260722 the
+# L2 baseline (run_20260722_l2_lr1e-04) scores black crops 0.3659668 (3,587
+# buildings) and the adjacent 0.3657227 (379), and it has no excess at
+# 0.68359375. Hard-coding the ordinal value therefore missed every L2 black crop
+# and dropped 183 ordinary L2 buildings. The loaders now detect each run's values
+# with `_detect_nodata_values`: a value is a sentinel when its building count
+# spikes far above its neighbouring distinct values. Measured on both runs, real
+# sentinels reach z = 17-274 and ordinary values stay at z <= 6.
+# NODATA_PREDICTION_VALUE is the ordinal model's sentinel. It is used only by
+# direct `_drop_nodata_predictions` calls that pass no values. Set it to None to
+# disable the filter everywhere, including detection in the loaders.
 NODATA_PREDICTION_VALUE: float | None = 0.68359375
+NODATA_SPIKE_Z: float = 10.0          # Poisson z of a value's count vs. its neighbours
+NODATA_SPIKE_MIN_COUNT: int = 50      # ignore spikes on a handful of buildings
+_NODATA_NEIGHBOURS: int = 10          # distinct values on each side used as baseline
 
 # Dropping the black buildings is necessary but not sufficient. The guard drops
 # the crop, which drops the building, which EMPTIES the tract-year, which drops
@@ -314,17 +331,49 @@ NODATA_PREDICTION_VALUE: float | None = 0.68359375
 NODATA_TRACT_YEAR_SHARE: float = 0.5
 
 
-def _drop_nodata_predictions(df: pd.DataFrame, source: Path | None = None) -> pd.DataFrame:
+def _detect_nodata_values(pred: pd.Series) -> list[float]:
+    """The run's black-crop prediction values, found as spikes in its histogram.
+
+    The model maps every all-zero crop to the same output (or a couple of
+    adjacent bf16 values), so black crops pile up on one value. That value then
+    holds far more buildings than its neighbours on the prediction grid. Each
+    distinct value's count is compared with the median count of the
+    ``_NODATA_NEIGHBOURS`` distinct values on either side, as a Poisson z-score.
+    Values with z >= ``NODATA_SPIKE_Z`` and at least ``NODATA_SPIKE_MIN_COUNT``
+    buildings are returned. A smooth mode, such as the ordinal run's busiest value
+    at -1.25, has busy neighbours too and stays near z = 0. Returns [] for a clean
+    run.
+    """
+    pred = pd.Series(pred).dropna()
+    counts = pred.value_counts().sort_index()
+    window = 2 * _NODATA_NEIGHBOURS + 1
+    if len(counts) < window:
+        return []
+    c = counts.to_numpy(float)
+    baseline = (pd.Series(c).rolling(window, center=True, min_periods=_NODATA_NEIGHBOURS + 1)
+                .median().to_numpy())
+    z = (c - baseline) / np.sqrt(np.maximum(baseline, 1.0))
+    spike = (z >= NODATA_SPIKE_Z) & (c >= NODATA_SPIKE_MIN_COUNT)
+    return [float(v) for v in counts.index[spike]]
+
+
+def _drop_nodata_predictions(df: pd.DataFrame, source: Path | None = None,
+                             values: list[float] | None = None) -> pd.DataFrame:
     """Remove nodata-hole predictions from an already-loaded prediction frame.
 
-    Expects the canonical columns (``GEOID``, ``year``, ``pred``). Returns the
-    frame unchanged when the sentinel is absent, which is the normal case for any
-    pass written with the guard active — so this costs one comparison and says
-    nothing on a clean run.
+    Expects the canonical columns (``GEOID``, ``year``, ``pred``). ``values`` are
+    the run's black-crop predictions, usually from `_detect_nodata_values`. When
+    it is None, ``[NODATA_PREDICTION_VALUE]`` is used instead. An empty list, or
+    NODATA_PREDICTION_VALUE = None, leaves the frame unchanged. A run with no
+    black crops is also returned unchanged, without any message.
     """
     if NODATA_PREDICTION_VALUE is None or df.empty:
         return df
-    black = df["pred"].round(6) == round(float(NODATA_PREDICTION_VALUE), 6)
+    if values is None:
+        values = [NODATA_PREDICTION_VALUE]
+    if not len(values):
+        return df
+    black = df["pred"].round(6).isin({round(float(v), 6) for v in values})
     n_black = int(black.sum())
     if not n_black:
         return df
@@ -339,8 +388,9 @@ def _drop_nodata_predictions(df: pd.DataFrame, source: Path | None = None) -> pd
 
     kept = df[~black & ~dead]
     where = f" in {source}" if source is not None else ""
+    shown = ", ".join(f"{float(v):.7g}" for v in values)
     print(f"    ⚠️ nodata-hole filter{where}: dropped {n_black:,} buildings at the "
-          f"black-crop value {NODATA_PREDICTION_VALUE}"
+          f"black-crop value(s) {shown}"
           + (f", plus the {n_remnant:,} surviving buildings of "
              f"{n_dead_cells:,} tract-years that were ≥{NODATA_TRACT_YEAR_SHARE:.0%} "
              f"nodata" if n_dead_cells else "")
@@ -348,6 +398,53 @@ def _drop_nodata_predictions(df: pd.DataFrame, source: Path | None = None) -> pd
             f"the CyclicCacheManager zero-pixel guard; regenerating them makes this "
             f"filter a no-op.")
     return kept.reset_index(drop=True)
+
+
+def _tract_means_from_buildings(tract: pd.DataFrame, bld: pd.DataFrame,
+                                years) -> pd.DataFrame:
+    """Re-derive tract-year predictions from the nodata-filtered building frame.
+
+    ``predictions_by_tract_<year>.parquet`` is a plain per-tract mean of the
+    building CSV, written before `_drop_nodata_predictions` existed, so it still
+    averages black crops in. Measured on run_20260722: the NAIP-edge tracts of
+    partially imaged multi-state CBSAs (Cincinnati 2016 Ohio border tracts, 4-9
+    buildings, 25-62% black) moved test-city Spearmans such as Portland 2017 from
+    0.66 to 0.50.
+
+    Expects canonical columns on both frames (``GEOID``, ``year``, ``pred``; the
+    tract frame may carry ``predicted_value_std``). ``bld`` must already have been
+    through `_drop_nodata_predictions`. Each tract-year's ``pred`` (and std) is
+    replaced by the mean over its surviving buildings. Tract-years with no surviving
+    building, i.e. a tract-year the filter removed whole, are dropped. Labels and
+    other tract columns are kept as they are. ``years`` lists the years whose
+    building CSV was loaded. Tract rows from any other year are left untouched,
+    because there is nothing to rebuild them from. Coverage comes from ``years``,
+    not from the years left in ``bld``, so a year the filter emptied completely is
+    still treated as covered and its tract rows are dropped. On a clean pass the
+    recomputed means equal the parquet's, so the function changes nothing.
+    """
+    if tract.empty:
+        return tract
+    clean = (bld.groupby(["GEOID", "year"])["pred"]
+             .agg(clean_pred="mean", clean_std="std").reset_index())
+    covered = tract["year"].isin({int(y) for y in years})
+    merged = tract.merge(clean, on=["GEOID", "year"], how="left")
+
+    emptied = covered.values & merged["clean_pred"].isna().values
+    changed = (covered.values & ~emptied
+               & ~np.isclose(merged["pred"].values.astype(float),
+                             merged["clean_pred"].values.astype(float), atol=1e-9))
+    upd = covered.values & ~emptied
+    merged.loc[upd, "pred"] = merged.loc[upd, "clean_pred"]
+    if "predicted_value_std" in merged.columns:
+        merged.loc[upd, "predicted_value_std"] = merged.loc[upd, "clean_std"]
+    out = merged.loc[~emptied].drop(columns=["clean_pred", "clean_std"])
+
+    if changed.any() or emptied.any():
+        print(f"    ⚠️ nodata-hole filter (tract level): re-averaged {int(changed.sum()):,} "
+              f"tract-year(s) over their non-black buildings and dropped "
+              f"{int(emptied.sum()):,} with none left (of {len(tract):,}).")
+    return out.reset_index(drop=True)
 
 
 def _load_building_preds_us(results_dir: Path, years: list[int] | None = None) -> pd.DataFrame:
@@ -384,7 +481,11 @@ def _load_building_preds_us(results_dir: Path, years: list[int] | None = None) -
     if "type" not in df.columns:
         df["type"] = "unassigned"
     df["type"] = df["type"].astype(str)
-    df = _drop_nodata_predictions(df, source=results_dir)
+    # Detect this run's own sentinel(s) across all its years: the black-crop value
+    # depends on the model (the ordinal and L2 runs differ).
+    if NODATA_PREDICTION_VALUE is not None:
+        df = _drop_nodata_predictions(df, source=results_dir,
+                                      values=_detect_nodata_values(df["pred"]))
     return df.reset_index(drop=True)
 
 
@@ -2520,14 +2621,15 @@ def _csa_building_preds(results_dir: Path, years: list[int]) -> pd.DataFrame:
     return out
 
 
-def _tex_pct(frac: float) -> str:
+def _tex_pct(frac: float, digits: int = 0) -> str:
     """Format a fraction as a LaTeX-safe percentage, e.g. 0.05 -> '5\\%'.
 
     paper.mplstyle sets text.usetex, where a bare '%' opens a comment and
     silently swallows the rest of the string — so "5% of baseline area" renders
     as "5". Every percentage that reaches a figure must go through here.
+    ``digits`` keeps fractions like 0.995 from rounding to a misleading '100%'.
     """
-    return rf"{frac:.0%}".replace("%", r"\%")
+    return rf"{frac:.{digits}%}".replace("%", r"\%")
 
 
 def _tex_escape(s: str) -> str:
@@ -3568,6 +3670,9 @@ class _USContext:
             tract = tract.drop(columns=["GEOID"]).rename(
                 columns={"GEOID_str": "GEOID", "predicted_value": "pred", "Rel_Score": "label"}
             )
+            # The parquet predates the nodata filter; rebuild its means from the
+            # filtered buildings so tract-level parts see the same clean sample.
+            tract = _tract_means_from_buildings(tract, bld, self.years)
             tract = _attach_cbsa(tract, panel)
         self.tract = tract
         self._drop_small_cbsas()
@@ -4137,30 +4242,16 @@ def _panel_a_raincloud(ax: plt.Axes, cells: pd.DataFrame, bracket_of: dict) -> N
     _panel_title(ax, "A")
 
 
-def _synthetic_cardinal_baseline(years: np.ndarray, ordinal: np.ndarray,
-                                 seed: int = 0) -> np.ndarray:
-    """Illustrative decaying curve standing in for a not-yet-trained cardinal
-    (L2-regression) baseline. NOT measured data — deterministic placeholder
-    only, to be replaced once a real baseline model's per-year Spearman is
-    available. Starts near the ordinal curve's first year and decays with
-    distance from it, approximating the label drift a level-regression model
-    suffers as the city-wide income distribution moves away from its training
-    years.
-    """
-    years = np.asarray(years, dtype=float)
-    rng = np.random.default_rng(seed)
-    span = max(years.max() - years.min(), 1.0)
-    decay = ((years - years.min()) / span) ** 1.5
-    start = float(ordinal[0]) if len(ordinal) else 0.82
-    curve = start - 0.45 * decay
-    curve = curve + rng.normal(0, 0.015, size=len(years))
-    return np.clip(curve, 0.05, 0.95)
+_PANEL_B_N_BOOT = 1000
 
 
-def _panel_b_kill_shot(ax: plt.Axes, cells: pd.DataFrame,
-                       holdout_year: int | None = None) -> None:
-    """Year-by-year Spearman: ordinal model (real, tract-weighted across test
-    cities) vs a cardinal-baseline placeholder (illustrative — see caller).
+def _cell_weights(cells: pd.DataFrame) -> pd.Series:
+    """Tract counts (the effective sample size of a cell), else building counts."""
+    return cells["n_tracts"] if "n_tracts" in cells.columns else cells["n"]
+
+
+def _yearly_weighted_rho(cells: pd.DataFrame) -> pd.DataFrame:
+    """[year, rho]: tract-weighted mean of the per-(CBSA, year) Spearmans.
 
     Weighted by ``n_tracts``, not the building count ``n``, to match
     ``metrics.weighted_within_spearman`` and the per-bracket tables. Labels are
@@ -4169,27 +4260,69 @@ def _panel_b_kill_shot(ax: plt.Axes, cells: pd.DataFrame,
     per tract (e.g. one predicted at full universe rather than the ~100/tract
     cap) dominate this curve without contributing more evidence.
     """
-    year_rows = []
+    rows = [(int(yr), float(np.average(g["rho"], weights=_cell_weights(g))))
+            for yr, g in cells.groupby("year")]
+    return pd.DataFrame(sorted(rows), columns=["year", "rho"])
+
+
+def _yearly_rho_band(cells: pd.DataFrame, n_boot: int = _PANEL_B_N_BOOT,
+                     seed: int = 0, alpha: float = 0.05) -> pd.DataFrame:
+    """[year, lo, hi]: percentile CI of each year's weighted rho, resampling
+    the year's cells — one cell per test city, so this resamples whole cities
+    (the honest unit: a city's tracts share its flight and label vintage).
+    Years with fewer than 2 cities get NaN bounds."""
+    rng = np.random.default_rng(seed)
+    rows = []
     for yr, g in cells.groupby("year"):
-        w = g["n_tracts"] if "n_tracts" in g.columns else g["n"]
-        year_rows.append((int(yr), float(np.average(g["rho"], weights=w))))
-    if not year_rows:
+        rho = g["rho"].to_numpy(dtype=float)
+        w = _cell_weights(g).to_numpy(dtype=float)
+        if len(rho) < 2:
+            rows.append((int(yr), np.nan, np.nan))
+            continue
+        take = rng.integers(0, len(rho), size=(n_boot, len(rho)))
+        stats = (rho[take] * w[take]).sum(axis=1) / w[take].sum(axis=1)
+        lo, hi = np.percentile(stats, [100 * alpha / 2, 100 * (1 - alpha / 2)])
+        rows.append((int(yr), float(lo), float(hi)))
+    return pd.DataFrame(sorted(rows), columns=["year", "lo", "hi"])
+
+
+def _plot_yearly_curve(ax: plt.Axes, cells: pd.DataFrame, *, color: str, marker: str,
+                       label: str, bands: bool, zorder: int) -> pd.DataFrame:
+    """One Panel B line (+ optional city-bootstrap band); returns its [year, rho]."""
+    curve = _yearly_weighted_rho(cells)
+    if bands:
+        band = _yearly_rho_band(cells)
+        ax.fill_between(band["year"], band["lo"], band["hi"], color=color,
+                        alpha=0.15, linewidth=0, zorder=zorder - 1)
+    ax.plot(curve["year"], curve["rho"], marker + "-", color=color, linewidth=2.0,
+            markersize=5, label=label, zorder=zorder)
+    return curve
+
+
+def _panel_b_kill_shot(ax: plt.Axes, cells: pd.DataFrame,
+                       holdout_year: int | None = None,
+                       baseline_cells: pd.DataFrame | None = None,
+                       bands: bool = False) -> None:
+    """Year-by-year within-city Spearman (tract-weighted across test cities)
+    for the ordinal model and, when ``baseline_cells`` is given, the measured
+    cardinal L2 baseline (src/run_L2_model.py) on the same cells. ``bands``
+    adds 95% city-bootstrap bands to every line."""
+    if not len(cells):
         ax.text(0.5, 0.5, "no temporal data", ha="center", va="center", transform=ax.transAxes)
         return
-    year_rows.sort()
-    years = np.array([r[0] for r in year_rows])
-    ordinal = np.array([r[1] for r in year_rows])
+
+    curve = _plot_yearly_curve(ax, cells, color=_ORDINAL_COLOR, marker="o",
+                               label="Ordinal model (this paper)", bands=bands, zorder=3)
+    years = set(curve["year"])
+    if baseline_cells is not None and len(baseline_cells):
+        base = _plot_yearly_curve(ax, baseline_cells, color=_BASELINE_COLOR, marker="s",
+                                  label="Cardinal L2 baseline", bands=bands, zorder=2)
+        years |= set(base["year"])
+    years = sorted(years)
 
     if holdout_year is not None and holdout_year in years:
         ax.axvspan(holdout_year - 0.5, holdout_year + 0.5, color="0.88", zorder=0,
                     label="Temporal holdout year")
-
-    ax.plot(years, ordinal, "o-", color=_ORDINAL_COLOR, linewidth=2.0, markersize=5,
-            label="Ordinal model (this paper)", zorder=3)
-
-    baseline = _synthetic_cardinal_baseline(years, ordinal)
-    ax.plot(years, baseline, "s--", color=_BASELINE_COLOR, linewidth=1.6, markersize=4,
-            alpha=0.85, label="Cardinal (L2) baseline*", zorder=2)
 
     ax.set_xlabel("Year")
     ax.set_ylabel(r"Mean Spearman $\rho$ (test cities)")
@@ -4268,11 +4401,244 @@ def _panel_c_binned_scatter(ax: plt.Axes, tract_df: pd.DataFrame, year: int | No
     if n_out:
         frac_out = n_out / len(x)
         outlier_note = (
-            rf"Panel C axes are clipped to the central {_tex_pct(central_frac)} of "
+            rf"Panel C axes are clipped to the central {_tex_pct(central_frac, 1)} of "
             rf"{n_label} by label and by prediction; {n_out:,} of {len(x):,} {n_label} "
             rf"({_tex_pct(frac_out)}) fall outside this range and are not shown."
         )
     return sc, rho, outlier_note
+
+
+def gb2_mapped_tracts(tract_df: pd.DataFrame, wealth_long: pd.DataFrame,
+                      params_by_city: dict) -> pd.DataFrame:
+    """Cardinal reconstruction of each predicted tract-year.
+
+    Within each (cbsa, year) of ``tract_df`` the predicted score's Hazen
+    position (rank among that city-year's predicted tracts) is pushed through
+    the GB2 fitted to the city's ACS tract distribution in the nearest
+    available vintage — the paper's survey-anchored mapping, available for any
+    surveyed city. Returns one row per tract-year with ``true_usd`` (the ACS
+    tract value, constant dollars), ``pred_usd`` (GB2-mapped prediction) and
+    ``city_usd`` (the city-year GB2 median: a city-only benchmark that knows
+    the survey distribution but nothing about the tract). Rows without an ACS
+    value or a GB2 fit are dropped.
+    """
+    t = tract_df[["GEOID", "cbsa", "year", "pred"]].dropna().copy()
+    t["cbsa"] = t["cbsa"].astype(str)
+    t["GEOID"] = t["GEOID"].astype(str)
+    fitted = {c: sorted(ys) for c, ys in params_by_city.items()}
+    t["acs_year"] = [
+        min(fitted[c], key=lambda a: abs(a - int(y))) if c in fitted else -1
+        for c, y in zip(t["cbsa"], t["year"])
+    ]
+    t = t[t["acs_year"] > 0]
+    truth = wealth_long[["GEOID", "year", "usd"]].rename(columns={"year": "acs_year"})
+    truth = truth.assign(GEOID=truth["GEOID"].astype(str)).drop_duplicates(["GEOID", "acs_year"])
+    t = t.merge(truth, on=["GEOID", "acs_year"], how="inner").rename(columns={"usd": "true_usd"})
+    t = t[np.isfinite(t["true_usd"]) & (t["true_usd"] > 0)].reset_index(drop=True)
+    if t.empty:
+        return t.assign(pred_usd=[], city_usd=[])
+    t["prob"] = _hazen_within(t, "pred")
+    t["pred_usd"] = _gb2_dollars(t, "prob", params_by_city, year_col="acs_year")
+    t["prob_city"] = 0.5
+    t["city_usd"] = _gb2_dollars(t, "prob_city", params_by_city, year_col="acs_year")
+    t = t[np.isfinite(t["pred_usd"]) & np.isfinite(t["city_usd"])]
+    return t.drop(columns=["prob", "prob_city"]).reset_index(drop=True)
+
+
+def _log_r2(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+    """1 - SSE/SST on log dollars, with the prediction used as-is (no refit)."""
+    lt, lp = np.log(y_true), np.log(y_pred)
+    sst = np.sum((lt - lt.mean()) ** 2)
+    return float(1 - np.sum((lt - lp) ** 2) / sst) if sst > 0 else float("nan")
+
+
+def cardinal_fit_stats(frame: pd.DataFrame) -> dict:
+    """Pooled Spearman and log-dollar R^2 of the GB2-mapped prediction and of
+    the city-only benchmark, plus the between-city-year share of the variance
+    in log ACS wealth (how much the benchmark can capture at most)."""
+    lt = np.log(frame["true_usd"].to_numpy(float))
+    cell_mean = pd.Series(lt).groupby([frame["cbsa"].to_numpy(), frame["year"].to_numpy()]).transform("mean")
+    total = np.var(lt)
+    return {
+        "n": int(len(frame)),
+        "rho": float(spearmanr(frame["pred_usd"], frame["true_usd"]).statistic),
+        "r2": _log_r2(frame["true_usd"].to_numpy(float), frame["pred_usd"].to_numpy(float)),
+        "city_rho": float(spearmanr(frame["city_usd"], frame["true_usd"]).statistic),
+        "city_r2": _log_r2(frame["true_usd"].to_numpy(float), frame["city_usd"].to_numpy(float)),
+        "between_share": float(np.var(cell_mean.to_numpy()) / total) if total > 0 else float("nan"),
+    }
+
+
+def _panel_c_gb2_scatter(ax: plt.Axes, frame: pd.DataFrame, stats: dict,
+                         n_bins: int = 10,
+                         central_frac: float = _PANEL_C_CENTRAL_FRAC) -> int:
+    """Log-log scatter of GB2-mapped predicted vs ACS tract wealth, pooled
+    across cities, with a decile (of ACS wealth) conditional-mean line, the
+    45-degree line, and the model / city-only statistics. Both axes share the
+    range covering the central ``central_frac`` of the pooled log values (a
+    few near-zero-wealth tracts would otherwise squeeze the bulk into a
+    corner); every point still enters the statistics. Returns the number of
+    off-canvas points."""
+    x = frame["true_usd"].to_numpy(float)
+    y = frame["pred_usd"].to_numpy(float)
+    ax.scatter(x, y, s=1, alpha=0.3, color="steelblue", linewidths=0, zorder=1)
+    lx, ly = np.log(x), np.log(y)
+    edges = np.percentile(lx, np.linspace(0, 100, n_bins + 1))
+    bins = np.clip(np.digitize(lx, edges[1:-1]), 0, n_bins - 1)
+    bx = [np.exp(lx[bins == b].mean()) for b in range(n_bins) if (bins == b).any()]
+    by = [np.exp(ly[bins == b].mean()) for b in range(n_bins) if (bins == b).any()]
+    ax.plot(bx, by, "o-", color="firebrick", markeredgecolor="white", linewidth=1.8,
+            markersize=5, zorder=3, label=f"{n_bins}-bin conditional mean")
+    ax.set_xscale("log")
+    ax.set_yscale("log")
+    llo, lhi = _central_limits(np.concatenate([lx, ly]), central_frac)
+    lo, hi = np.exp(llo), np.exp(lhi)
+    ax.plot([lo, hi], [lo, hi], color="0.5", linestyle=":", linewidth=1.0, zorder=2)
+    ax.set_xlim(lo, hi)
+    ax.set_ylim(lo, hi)
+    n_out = int(np.sum((x < lo) | (x > hi) | (y < lo) | (y > hi)))
+    ax.text(0.04, 0.96,
+            rf"$\rho$ = {stats['rho']:.2f}, $R^2$ = {stats['r2']:.2f}" + "\n"
+            + rf"city-only: $\rho$ = {stats['city_rho']:.2f}, $R^2$ = {stats['city_r2']:.2f}"
+            + "\n" + rf"$n$ = {stats['n']:,} tract-years",
+            transform=ax.transAxes, fontsize=6.5, va="top")
+    ax.legend(fontsize=6, loc="lower right", frameon=True, facecolor="white",
+              edgecolor="none", framealpha=0.8)
+    ax.set_xlabel(r"ACS tract wealth (2023 \$)")
+    ax.set_ylabel(r"Predicted wealth (GB2, 2023 \$)")
+    _panel_title(ax, "C")
+    return n_out
+
+
+def _panel_c_gb2_frame(ctx, tract_test: pd.DataFrame, year: int | None) -> pd.DataFrame | None:
+    """GB2-mapped frame for Panel C, or None when the panel dollars / GB2 fits
+    are unavailable (the caller then falls back to the latent-score panel)."""
+    processed_dir = getattr(ctx, "processed_dir", None)
+    indicator = getattr(ctx, "indicator", None)
+    if processed_dir is None or indicator is None:
+        return None
+    t = tract_test if year is None else tract_test[tract_test["year"] == year]
+    try:
+        acs_years = sorted({min(_ACS_PANEL_YEARS, key=lambda a: abs(a - int(y)))
+                            for y in t["year"].unique()})
+        wealth_long = _residential_wealth(
+            _load_wealth_dollars_long(Path(processed_dir), indicator, acs_years))
+        params = _fit_city_gb2(wealth_long, set(t["cbsa"].astype(str)))
+        frame = gb2_mapped_tracts(t, wealth_long, params)
+    except (OSError, KeyError, ValueError) as exc:
+        print(f"  ⚠️ GB2 Panel C unavailable ({type(exc).__name__}: {exc}); "
+              "falling back to the latent-score panel")
+        return None
+    if len(frame) < 30:
+        print("  ⚠️ too few GB2-mapped tract-years; falling back to the latent-score panel")
+        return None
+    return frame
+
+
+# ─── non-residential tracts ───────────────────────────────────────────────────
+# Two kinds of tract are excluded from the evaluation figures. Neither is a
+# residential neighbourhood whose wealth the imagery could be expected to rank.
+#  * Census special-land-use tracts, tract code 9800-9899: prisons, airports,
+#    military bases, large parks, campuses. Their ACS figures describe an
+#    institutional population. 17197980100 (Will County IL, per-capita income
+#    $3.5k) has ACS wealth of $184.
+#  * Tract-years whose ACS wealth is below NEAR_ZERO_WEALTH_USD (2023 $). On
+#    run_20260722's test sample the tail below $10k is $184, $603, $789, $3.9k
+#    and $7.2k, then a gap to $12k, which is East St. Louis, a real neighbourhood.
+#    These five values are ACS artifacts or institutional tracts (e.g. OKC
+#    40109108321: $603 in 2021, $47.7k in 2023, per-capita income $27k). The
+#    floor is absolute rather than relative to the city median on purpose: a
+#    relative cut at 5% of the median would also remove the poorest real tracts.
+# Measured on Panel C: 14 tract-years (0.1%) carried 13% of the log-dollar SSE.
+SPECIAL_LAND_USE_TRACT_PREFIX: str = "98"
+NEAR_ZERO_WEALTH_USD: float = 10_000.0
+
+
+def _is_special_land_use(geoid: pd.Series) -> np.ndarray:
+    """True for Census special-land-use tracts (tract code 98xx)."""
+    tract_code = pd.Series(geoid).astype(str).str.zfill(11).str[5:]
+    return tract_code.str.startswith(SPECIAL_LAND_USE_TRACT_PREFIX).to_numpy()
+
+
+def _residential_wealth(wealth_long: pd.DataFrame) -> pd.DataFrame:
+    """``wealth_long`` without special-land-use tracts or near-zero-wealth
+    tract-years. Use it for the GB2 fits, so the fitted city distribution
+    describes residential tracts and has no artificial lower tail. Rows with a
+    missing value are kept, because the GB2 fit drops them itself."""
+    usd = wealth_long["usd"].to_numpy(float)
+    drop = _is_special_land_use(wealth_long["GEOID"]) | (usd < NEAR_ZERO_WEALTH_USD)
+    return wealth_long[~drop].reset_index(drop=True)
+
+
+def _nonresidential_tract_years(tract_df: pd.DataFrame,
+                                wealth_long: pd.DataFrame | None) -> dict:
+    """Flag the tract-years of ``tract_df`` to exclude.
+
+    Returns ``{'mask', 'special', 'near_zero', 'wealth_rule'}``. ``mask`` is
+    aligned with ``tract_df``'s rows. ``special`` and ``near_zero`` count flagged
+    tract-years per rule (a tract-year can match both). Each prediction year is
+    compared with the nearest ACS vintage in ``wealth_long``, the vintage
+    Panel C maps it to. With no ``wealth_long``, only the 98xx rule runs
+    (``wealth_rule`` False).
+    """
+    special = _is_special_land_use(tract_df["GEOID"])
+    near_zero = np.zeros(len(tract_df), dtype=bool)
+    wealth_rule = wealth_long is not None and len(wealth_long) > 0
+    if wealth_rule:
+        acs_years = sorted(int(y) for y in wealth_long["year"].unique())
+        acs_of = {int(y): min(acs_years, key=lambda a: abs(a - int(y)))
+                  for y in tract_df["year"].unique()}
+        usd = wealth_long.drop_duplicates(["GEOID", "year"]).set_index(["GEOID", "year"])["usd"]
+        keys = pd.MultiIndex.from_arrays(
+            [tract_df["GEOID"].astype(str).to_numpy(),
+             tract_df["year"].map(lambda y: acs_of[int(y)]).to_numpy()])
+        near_zero = (usd.reindex(keys).to_numpy(float) < NEAR_ZERO_WEALTH_USD)
+    return {"mask": special | near_zero, "special": int(special.sum()),
+            "near_zero": int(near_zero.sum()), "wealth_rule": wealth_rule}
+
+
+def _exclusion_wealth(ctx) -> pd.DataFrame | None:
+    """Wealth dollars for the near-zero rule, loaded once per context. None when
+    the context has no processed panel (e.g. synthetic contexts in tests)."""
+    cached = getattr(ctx, "_exclusion_wealth_cache", False)
+    if cached is not False:
+        return cached
+    processed_dir = getattr(ctx, "processed_dir", None)
+    indicator = getattr(ctx, "indicator", None)
+    wealth = None
+    if processed_dir is not None and indicator is not None:
+        try:
+            wealth = _load_wealth_dollars_long(Path(processed_dir), indicator, _ACS_PANEL_YEARS)
+        except (OSError, KeyError, ValueError) as exc:
+            print(f"  ⚠️ wealth panel unavailable ({type(exc).__name__}: {exc}); "
+                  "near-zero-wealth exclusion skipped (98xx exclusion still applies)")
+    try:
+        ctx._exclusion_wealth_cache = wealth
+    except AttributeError:
+        pass
+    return wealth
+
+
+def _drop_nonresidential(ctx, tract: pd.DataFrame, bld: pd.DataFrame,
+                         what: str) -> tuple[pd.DataFrame, pd.DataFrame, dict]:
+    """Remove non-residential tract-years from the tract and building frames.
+    Returns both frames and the exclusion counts. Frames without a ``GEOID``
+    column (some synthetic test contexts) pass through unchanged."""
+    if "GEOID" not in tract.columns or tract.empty:
+        return tract, bld, {"n": 0, "special": 0, "near_zero": 0, "wealth_rule": False}
+    flags = _nonresidential_tract_years(tract, _exclusion_wealth(ctx))
+    excl = {k: v for k, v in flags.items() if k != "mask"}
+    excl["n"] = int(flags["mask"].sum())
+    if not excl["n"]:
+        return tract, bld, excl
+    dead = pd.MultiIndex.from_frame(tract.loc[flags["mask"], ["GEOID", "year"]])
+    tract = tract[~flags["mask"]]
+    if "GEOID" in bld.columns:
+        bld = bld[~pd.MultiIndex.from_frame(bld[["GEOID", "year"]]).isin(dead)]
+    print(f"  {what}: excluding {excl['n']} non-residential tract-year(s) "
+          f"({excl['special']} special-land-use 98xx, {excl['near_zero']} with ACS "
+          f"wealth < ${NEAR_ZERO_WEALTH_USD:,.0f})")
+    return tract, bld, excl
 
 
 def _figure_test_sample(ctx: _USContext, what: str = "figure",
@@ -4280,10 +4646,12 @@ def _figure_test_sample(ctx: _USContext, what: str = "figure",
     """The test-city sample shared by the main figure and the growth figure.
 
     Test-split CBSAs (from building-level ``type == 'test'``), restricted to
-    (CBSA, year) cells with at least ``min_tracts`` predicted tracts. Returns
-    ``{'test_bld', 'tract_test', 'cells_tract'}`` or None (with a printed
-    reason) when nothing survives. One function so both figures provably see
-    the same cells.
+    (CBSA, year) cells with at least ``min_tracts`` predicted tracts.
+    Non-residential tract-years (special-land-use 98xx tracts and near-zero ACS
+    wealth, see `_nonresidential_tract_years`) are removed before the cells are
+    counted. Returns ``{'test_bld', 'tract_test', 'cells_tract', 'excluded'}``,
+    or None (with a printed reason) when nothing survives. One function so every
+    figure provably sees the same cells.
     """
     if ctx.bld.empty or not len(ctx.tract):
         print(f"  missing building or tract predictions; skipping {what}")
@@ -4296,6 +4664,8 @@ def _figure_test_sample(ctx: _USContext, what: str = "figure",
 
     test_cbsas = set(test_bld_all["cbsa"].unique())
     tract_test_all = ctx.tract[ctx.tract["cbsa"].isin(test_cbsas)]
+    tract_test_all, test_bld_all, excluded = _drop_nonresidential(
+        ctx, tract_test_all, test_bld_all, what)
 
     # Tract-level cells for Panel A — one rho per (CBSA, year) from tract-mean
     # pred vs. tract label, rather than the building-level correlation (which
@@ -4329,7 +4699,8 @@ def _figure_test_sample(ctx: _USContext, what: str = "figure",
     tract_test = tract_test_all[
         pd.MultiIndex.from_frame(tract_test_all[["cbsa", "year"]]).isin(eligible_pairs)
     ].reset_index(drop=True)
-    return {"test_bld": test_bld, "tract_test": tract_test, "cells_tract": cells_tract}
+    return {"test_bld": test_bld, "tract_test": tract_test, "cells_tract": cells_tract,
+            "excluded": excluded}
 
 
 def part_main_figure_us(ctx: _USContext, year: int | None = None,
@@ -4339,22 +4710,30 @@ def part_main_figure_us(ctx: _USContext, year: int | None = None,
     A. Raincloud of within-city **tract-level** Spearman by population bracket
        (all test City-Year cells) — one rho per (CBSA, year) computed on
        tract-mean pred vs. tract label, not the building-level correlation.
-    B. Year-by-year Spearman stability: the ordinal model (real, size-weighted
-       across test cities, building-level cells) vs a cardinal-baseline
-       placeholder. The baseline line is a deterministic synthetic decay
-       curve, NOT measured data — no L2-regression baseline model has been
-       trained yet. Swap ``_synthetic_cardinal_baseline`` for real per-year
-       results once one exists.
-    C. Pooled scatter (marker size 1) of predicted score vs ACS label, with a
-       decile conditional-mean overlay. Pools every eligible test year by
-       default (``year=None``); pass ``year=`` for a single cross-section
-       instead. Pooling means each tract contributes once per year, so those
-       points are not independent draws (a persistently rich tract shows up
-       as several correlated points) — see ``_panel_c_binned_scatter``. Axes
-       show the full range of the data (no outlier trimming).
+    B. Year-by-year within-city **tract-level** Spearman (same cells as
+       Panel A, tract-weighted across test cities) for the ordinal model and,
+       when one is linked (ctx.baseline), the measured cardinal L2 baseline on
+       the tract-years both models predicted, with city-bootstrap bands.
+       Tract level because the ACS label only exists per tract: against a
+       tract label, within-tract spread of building predictions acts as noise
+       (~45% of the variance on run_20260722), so building-level rho is
+       attenuated (~0.58 vs ~0.78) without measuring anything about ranking.
+    C. Cardinal reconstruction of the US tract wealth distribution: within
+       each city-year, predicted tract ranks are mapped through a GB2 fitted
+       to that city-year's ACS tract distribution (as for any surveyed city)
+       and plotted against the ACS tract dollars, pooled across cities, so
+       both local relative wealth and the per-city level enter. The panel
+       reports a city-only benchmark (every tract at its city-year GB2
+       median) — the part of the fit the survey supplies on its own — and
+       the between-city share of the variance. Pools every eligible test
+       year by default (``year=None``; each tract then appears once per year,
+       so points are not independent draws); ``year=`` gives one
+       cross-section. Without panel dollars (ctx.processed_dir/indicator, or
+       the feather) it falls back to latent score vs z-label.
 
-    Reads only ctx.bld / ctx.tract / ctx.cbsa_meta — self-contained, so it can
-    run standalone via ``--parts main_figure``.
+    Reads ctx.bld / ctx.tract / ctx.cbsa_meta, plus the panel's dollar
+    columns for Panel C — self-contained, so it can run standalone via
+    ``--parts main_figure``.
     """
     print("\n=== Main performance figure (US) ===")
     out = ctx.out
@@ -4382,6 +4761,17 @@ def part_main_figure_us(ctx: _USContext, year: int | None = None,
         print("  no usable within-city cells; skipping main figure")
         return {}
 
+    # Panel B (tract-level, like Panel A): with a linked L2 baseline, both
+    # curves are drawn on the tract-years both models predicted (see
+    # _paired_test_samples), with city-bootstrap bands; without one, the
+    # ordinal curve alone on Panel A's cells.
+    base_ctx = getattr(ctx, "baseline", None)
+    paired = _paired_test_samples(ctx, base_ctx) if base_ctx is not None else None
+    if paired is not None:
+        panel_b_cells, panel_b_baseline = paired["cells_tract_ord"], paired["cells_tract_l2"]
+    else:
+        panel_b_cells, panel_b_baseline = cells_tract, None
+
     # constrained_layout (not tight_layout) — it is colorbar-aware, so the
     # extra Axes fig.colorbar() attaches to ax_c doesn't throw off the row
     # spacing between the panel row and the caption row below it.
@@ -4399,19 +4789,39 @@ def part_main_figure_us(ctx: _USContext, year: int | None = None,
     ax_cap.axis("off")
 
     _panel_a_raincloud(ax_a, cells_tract, bracket_of)
-    _panel_b_kill_shot(ax_b, cells_bld, holdout_year=holdout_year)
-    # year=None (the default) pools every eligible test year into Panel C;
-    # pass an explicit year to fall back to a single cross-section.
-    _sc, panel_c_rho, outlier_note = _panel_c_binned_scatter(ax_c, tract_test, year)
+    _panel_b_kill_shot(ax_b, panel_b_cells, holdout_year=holdout_year,
+                       baseline_cells=panel_b_baseline, bands=paired is not None)
+    # Panel C: cardinal reconstruction — predicted within-city ranks mapped
+    # through each city-year's ACS GB2, against ACS tract dollars, pooled
+    # across the US (local relative wealth + per-city level), with a
+    # city-only benchmark. Falls back to latent score vs z-label when the
+    # panel dollars are unavailable. year=None pools every eligible test year.
+    gb2_frame = _panel_c_gb2_frame(ctx, tract_test, year)
+    panel_c_stats, outlier_note = None, None
+    if gb2_frame is not None:
+        panel_c_stats = cardinal_fit_stats(gb2_frame)
+        n_off = _panel_c_gb2_scatter(ax_c, gb2_frame, panel_c_stats)
+        if n_off:
+            outlier_note = (
+                rf"Panel C axes cover the central {_tex_pct(_PANEL_C_CENTRAL_FRAC, 1)} of log "
+                rf"wealth; {n_off:,} of {len(gb2_frame):,} tract-years "
+                rf"({_tex_pct(n_off / len(gb2_frame))}) fall outside and are not shown "
+                r"but enter $\rho$ and $R^2$."
+            )
+        panel_c_rho = panel_c_stats["rho"]
+        pc_x, pc_y, pc_src = "true_usd", "pred_usd", gb2_frame
+    else:
+        _sc, panel_c_rho, outlier_note = _panel_c_binned_scatter(ax_c, tract_test, year)
+        pc_x, pc_y, pc_src = "label", "pred", tract_test
 
-    # Per-year pooled Spearman (cities pooled, one year at a time) alongside
-    # the panel's own rho — lets you check how much of a pooled-year rho is
-    # inflated by tract persistence vs. genuine within-year ranking. Computed
+    # Per-year pooled Spearman (cities pooled, one year at a time) of whatever
+    # Panel C plots, alongside the panel's own rho — shows how much of a
+    # pooled rho is carried by tract persistence across years. Computed
     # regardless of whether Panel C itself is pooled or single-year.
     panel_c_rho_by_year: dict[int, float] = {}
-    for yr, g in tract_test.groupby("year"):
-        xx = g["label"].values.astype(float)
-        yy = g["pred"].values.astype(float)
+    for yr, g in pc_src.groupby("year"):
+        xx = g[pc_x].values.astype(float)
+        yy = g[pc_y].values.astype(float)
         finite = np.isfinite(xx) & np.isfinite(yy)
         xx, yy = xx[finite], yy[finite]
         if len(xx) >= 10 and np.ptp(xx) > 0 and np.ptp(yy) > 0:
@@ -4426,20 +4836,47 @@ def part_main_figure_us(ctx: _USContext, year: int | None = None,
         rf"year {year}, all test cities" if year is not None
         else "all test years and cities"
     )
+    panel_b_desc = (
+        r"(B) Tract-level within-city Spearman $\rho$ by year for the ordinal model and "
+        r"a cardinal L2 baseline (same backbone, data and batches; pointwise MSE on "
+        r"pooled log real wealth), on the test tract-years both models predicted; bands "
+        r"are 95\% city-bootstrap intervals. "
+        if paired is not None else
+        r"(B) Tract-level within-city Spearman $\rho$ by year for the ordinal model. "
+    )
+    if panel_c_stats is not None:
+        panel_c_desc = (
+            rf"(C) Predicted vs.~ACS tract wealth (2023 \$, log scale), pooled across "
+            rf"{panel_c_pool_desc}: within each city-year, predicted tract ranks are mapped "
+            r"to dollars through a GB2 fitted to that city-year's ACS tract distribution. "
+            rf"A city-only benchmark (every tract at its city-year GB2 median) reaches "
+            rf"$\rho$ = {panel_c_stats['city_rho']:.2f}, $R^2$ = {panel_c_stats['city_r2']:.2f}; "
+            rf"between-city-year differences are {_tex_pct(panel_c_stats['between_share'])} "
+            r"of the variance in log tract wealth."
+        )
+    else:
+        panel_c_desc = (
+            rf"(C) Predicted score vs.~ACS label, pooled across {panel_c_pool_desc} "
+            r"\textemdash\ clean separation of poorest and richest deciles, "
+            r"out-of-sample."
+        )
     caption_body = (
         rf"(A) Tract-level Spearman $\rho$ by city-size bracket \textemdash\ uniform "
         r"performance from mega to small metros. "
-        r"(B) Spearman $\rho$ by year \textemdash\ the ordinal model stays flat "
-        r"2010--2024 while a cardinal L2 baseline* decays. "
-        rf"(C) Predicted score vs.~ACS label, pooled across {panel_c_pool_desc} "
-        r"\textemdash\ clean separation of poorest and richest deciles, "
-        r"out-of-sample."
+        + panel_b_desc + panel_c_desc
     )
     caption_note = (
-        r"*Illustrative placeholder for Panel B's baseline \textemdash\ not yet trained. "
         rf"City-year cells with fewer than {_MIN_FIGURE_TRACTS} predicted tracts are "
         r"excluded from all three panels."
     )
+    excl = sample.get("excluded") or {}
+    if excl.get("n"):
+        rule = (rf" and tract-years with ACS wealth below \${NEAR_ZERO_WEALTH_USD:,.0f}"
+                if excl.get("wealth_rule") else "")
+        caption_note += (
+            rf"  Special-land-use tracts (Census tract codes 98xx){rule} are not "
+            rf"residential and are excluded ({excl['n']:,} tract-years)."
+        )
     if outlier_note:
         caption_note += "  " + outlier_note
     caption = "\n".join(textwrap.wrap(caption_body, width=130)) + "\n" + "\n".join(
@@ -4469,6 +4906,9 @@ def part_main_figure_us(ctx: _USContext, year: int | None = None,
         "main_figure/n_test_cities": n_cities,
         "main_figure/n_cells_tract": int(len(cells_tract)),
         "main_figure/n_cells_bld": int(len(cells_bld)),
+        "main_figure/n_excluded_nonresidential": int(excl.get("n", 0)),
+        "main_figure/n_excluded_special_land_use": int(excl.get("special", 0)),
+        "main_figure/n_excluded_near_zero_wealth": int(excl.get("near_zero", 0)),
     }
     if year is not None:
         headline["main_figure/panel_c_year"] = int(year)
@@ -4477,9 +4917,493 @@ def part_main_figure_us(ctx: _USContext, year: int | None = None,
         headline["main_figure/panel_c_n_tract_years"] = int(len(tract_test))
     if panel_c_rho is not None:
         headline["main_figure/panel_c_rho"] = panel_c_rho
+    headline["main_figure/panel_c_mode"] = "gb2" if panel_c_stats is not None else "latent"
+    if panel_c_stats is not None:
+        for k in ("r2", "city_rho", "city_r2", "between_share", "n"):
+            headline[f"main_figure/panel_c_{k}"] = panel_c_stats[k]
+        print(f"  panel C (GB2 dollars): rho={panel_c_stats['rho']:.3f} R2={panel_c_stats['r2']:.3f} | "
+              f"city-only rho={panel_c_stats['city_rho']:.3f} R2={panel_c_stats['city_r2']:.3f} | "
+              f"between share={panel_c_stats['between_share']:.3f}")
     for yr, r in panel_c_rho_by_year.items():
         headline[f"main_figure/panel_c_rho_year_{yr}"] = r
+    if paired is not None:
+        headline["main_figure/l2_baseline"] = str(base_ctx.results_dir.name)
+        for name, cells in (("ordinal", panel_b_cells), ("l2", panel_b_baseline)):
+            for _, r in _yearly_weighted_rho(cells).iterrows():
+                headline[f"main_figure/panel_b_{name}_rho_year_{int(r['year'])}"] = float(r["rho"])
     return headline
+
+
+# ─── Cardinal L2 baseline comparison (US) ─────────────────────────────────────
+# The baseline (B1) is trained by src/run_L2_model.py: same backbone, data and
+# batches as the ordinal model, pointwise MSE on the pooled log real-dollar
+# wealth level (src/data/level_labels.py). Its prediction CSVs carry the same
+# Rel_Score (z-score) labels as the ordinal run, and within-city Spearman is
+# invariant to the per-city offset that separates the two targets, so every
+# comparison below is like-for-like. Both models are scored on the SAME
+# (building/tract, year) rows: anything one model predicted and the other did
+# not (fetch failures, different full-universe bypasses) is dropped first.
+
+L2_POINTER_FILENAME = "l2_baseline.json"
+WANDB_HISTORY_FILENAME = "wandb_history.csv"
+_L2_N_BOOT = 1000
+
+
+def resolve_l2_baseline_dir(results_dir: Path, baseline_savename: str | None = None) -> Path | None:
+    """Results dir of the L2 baseline paired with ``results_dir``, or None.
+
+    An explicit ``baseline_savename`` wins; otherwise the pointer
+    ``<results_dir>/l2_baseline.json`` written by run_L2_model.py is used. The
+    baseline must have prediction CSVs, else None (with a printed reason).
+    """
+    results_dir = Path(results_dir)
+    if not baseline_savename:
+        pointer = results_dir / L2_POINTER_FILENAME
+        if not pointer.exists():
+            return None
+        try:
+            baseline_savename = json.loads(pointer.read_text()).get("savename")
+        except (OSError, ValueError) as exc:
+            print(f"  ⚠️ unreadable {pointer} ({exc}); no L2 baseline")
+            return None
+        if not baseline_savename:
+            return None
+    base_dir = results_dir.parent / str(baseline_savename)
+    if not base_dir.exists() or not _available_years(base_dir):
+        print(f"  ⚠️ L2 baseline '{baseline_savename}' has no prediction CSVs under {base_dir}")
+        return None
+    return base_dir
+
+
+def _align_rows(a: pd.DataFrame, b: pd.DataFrame, keys: list[str]) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Restrict ``a`` and ``b`` to the rows whose ``keys`` appear in both."""
+    ka = pd.MultiIndex.from_frame(a[keys].astype(str))
+    kb = pd.MultiIndex.from_frame(b[keys].astype(str))
+    return (a[ka.isin(kb)].reset_index(drop=True),
+            b[kb.isin(ka)].reset_index(drop=True))
+
+
+def _paired_cells(cells_a: pd.DataFrame, cells_b: pd.DataFrame) -> pd.DataFrame:
+    """[cbsa, year, n_tracts, rho_ord, rho_l2] for cells present in both."""
+    m = cells_a.merge(cells_b, on=["cbsa", "year"], suffixes=("_ord", "_l2"))
+    m["n_tracts"] = m["n_tracts_ord"]
+    return m[["cbsa", "year", "n_tracts", "rho_ord", "rho_l2"]]
+
+
+def _paired_test_samples(ctx: _USContext, base_ctx: _USContext) -> dict | None:
+    """Both models' test samples restricted to the rows both predicted.
+
+    Each side first goes through ``_figure_test_sample`` (test split, tract
+    floor), then buildings are matched on (building_id, year) and tracts on
+    (GEOID, year), and the within-city cells are recomputed on the matched
+    rows. A test-city mismatch between the two runs means their splits differ
+    — it is reported, and only the shared cities are compared.
+    """
+    s_ord = _figure_test_sample(ctx, what="L2 comparison (ordinal)")
+    s_l2 = _figure_test_sample(base_ctx, what="L2 comparison (baseline)")
+    if s_ord is None or s_l2 is None:
+        return None
+    c_ord = set(s_ord["test_bld"]["cbsa"].astype(str))
+    c_l2 = set(s_l2["test_bld"]["cbsa"].astype(str))
+    if c_ord != c_l2:
+        print(f"  ⚠️ test cities differ between runs ({len(c_ord - c_l2)} only ordinal, "
+              f"{len(c_l2 - c_ord)} only L2) — were they trained on different "
+              f"cbsa_splits? Comparing the {len(c_ord & c_l2)} shared cities only.")
+    bld_ord, bld_l2 = _align_rows(s_ord["test_bld"], s_l2["test_bld"], ["building_id", "year"])
+    tr_ord, tr_l2 = _align_rows(s_ord["tract_test"], s_l2["tract_test"], ["GEOID", "year"])
+    if bld_ord.empty or tr_ord.empty:
+        print("  no rows predicted by both models; skipping the L2 comparison")
+        return None
+    return {
+        "bld_ord": bld_ord, "bld_l2": bld_l2, "tract_ord": tr_ord, "tract_l2": tr_l2,
+        "cells_bld_ord": within_city_cells(bld_ord), "cells_bld_l2": within_city_cells(bld_l2),
+        "cells_tract_ord": within_city_cells(tr_ord), "cells_tract_l2": within_city_cells(tr_l2),
+    }
+
+
+def _city_rho_diff(paired: pd.DataFrame) -> pd.DataFrame:
+    """[cbsa, n_tracts, rho_ord, rho_l2, diff] — tract-weighted over each city's years."""
+    rows = []
+    for cbsa, g in paired.groupby("cbsa"):
+        w = g["n_tracts"].to_numpy(dtype=float)
+        ro = float(np.average(g["rho_ord"], weights=w))
+        rl = float(np.average(g["rho_l2"], weights=w))
+        rows.append({"cbsa": str(cbsa), "n_tracts": float(w.sum()),
+                     "rho_ord": ro, "rho_l2": rl, "diff": ro - rl})
+    return pd.DataFrame(rows, columns=["cbsa", "n_tracts", "rho_ord", "rho_l2", "diff"])
+
+
+def _weighted_diff_ci(city: pd.DataFrame, n_boot: int = _L2_N_BOOT, seed: int = 0,
+                      alpha: float = 0.05) -> tuple[float, float]:
+    """Percentile CI of the tract-weighted mean city ``diff``, resampling cities."""
+    d = city["diff"].to_numpy(dtype=float)
+    w = city["n_tracts"].to_numpy(dtype=float)
+    if len(d) < 2:
+        return float("nan"), float("nan")
+    take = np.random.default_rng(seed).integers(0, len(d), size=(n_boot, len(d)))
+    stats = (d[take] * w[take]).sum(axis=1) / w[take].sum(axis=1)
+    lo, hi = np.percentile(stats, [100 * alpha / 2, 100 * (1 - alpha / 2)])
+    return float(lo), float(hi)
+
+
+def l2_bracket_table(paired: pd.DataFrame, bracket_of: dict) -> pd.DataFrame:
+    """Per bracket (+ 'all'): tract-weighted rho of each model, their
+    difference, and a city-bootstrap 95% CI of the difference."""
+    city = _city_rho_diff(paired)
+    city["bracket"] = city["cbsa"].map(bracket_of)
+    groups = [(b, city[city["bracket"] == b]) for b in _BRACKET_ORDER
+              if (city["bracket"] == b).any()]
+    groups.append(("all", city))
+    rows = []
+    for name, g in groups:
+        w = g["n_tracts"].to_numpy(dtype=float)
+        lo, hi = _weighted_diff_ci(g)
+        rows.append({"bracket": name, "n_cities": int(len(g)), "tracts": int(w.sum()),
+                     "rho_ordinal": float(np.average(g["rho_ord"], weights=w)),
+                     "rho_l2": float(np.average(g["rho_l2"], weights=w)),
+                     "diff": float(np.average(g["diff"], weights=w)),
+                     "diff_ci_lo": lo, "diff_ci_hi": hi})
+    return pd.DataFrame(rows)
+
+
+def city_level_distance(wealth_long: pd.DataFrame, years, mu: float, sd: float) -> pd.DataFrame:
+    """[cbsa, mean_log_real, dist_sd]: each city's mean log real wealth over
+    ``years`` (tract-years, unweighted), as a signed distance from the L2
+    baseline's pooled train mean in train-SD units — i.e. the city's mean
+    label under the baseline's target. ``wealth_long``: [GEOID, cbsa, year, usd]
+    in constant dollars (``_load_wealth_dollars_long``)."""
+    w = wealth_long[wealth_long["year"].isin([int(y) for y in years])]
+    w = w[np.isfinite(w["usd"]) & (w["usd"] > 0)]
+    city = (np.log(w["usd"])).groupby(w["cbsa"].astype(str)).mean()
+    out = city.rename("mean_log_real").reset_index().rename(columns={"index": "cbsa"})
+    out.columns = ["cbsa", "mean_log_real"]
+    out["dist_sd"] = (out["mean_log_real"] - mu) / sd
+    return out
+
+
+def _ols_slope(x: np.ndarray, y: np.ndarray) -> float:
+    if len(x) < 3 or np.ptp(x) == 0:
+        return float("nan")
+    return float(np.polyfit(x, y, 1)[0])
+
+
+def distance_slope(city: pd.DataFrame, n_boot: int = _L2_N_BOOT, seed: int = 0) -> dict:
+    """OLS slope of the city Δρ (ordinal − L2) on |distance| (SD units), a
+    city-bootstrap 95% CI, and the Spearman of the two. Positive slope = the
+    baseline loses more ground the farther a city's wealth level sits from
+    the pooled training level — the cross-city corruption hypothesis."""
+    x = np.abs(city["dist_sd"].to_numpy(dtype=float))
+    y = city["diff"].to_numpy(dtype=float)
+    ok = np.isfinite(x) & np.isfinite(y)
+    x, y = x[ok], y[ok]
+    out = {"n_cities": int(len(x)), "slope": _ols_slope(x, y),
+           "slope_ci_lo": float("nan"), "slope_ci_hi": float("nan"),
+           "spearman": float(spearmanr(x, y).statistic) if len(x) >= 3 else float("nan")}
+    if len(x) >= 3:
+        rng = np.random.default_rng(seed)
+        stats = [s for s in (_ols_slope(x[i], y[i]) for i in
+                             rng.integers(0, len(x), size=(n_boot, len(x))))
+                 if np.isfinite(s)]
+        if stats:
+            out["slope_ci_lo"], out["slope_ci_hi"] = (float(v) for v in np.percentile(stats, [2.5, 97.5]))
+    return out
+
+
+def _city_short_name(title) -> str | None:
+    """First principal city + first state of a CBSA title:
+    'Dallas-Fort Worth-Arlington, TX' -> 'Dallas, TX';
+    'Chicago-Naperville-Elgin, IL-IN' -> 'Chicago, IL'."""
+    if not isinstance(title, str) or not title:
+        return None
+    place, _, states = title.partition(",")
+    return f"{place.split('-')[0].strip()}, {states.strip().split('-')[0]}" if states else place.split("-")[0].strip()
+
+
+def _city_names(cbsa_meta: pd.DataFrame | None) -> dict:
+    """cbsa_code (str) -> short city name, from cbsa_splits' cbsa_title."""
+    if cbsa_meta is None or "cbsa_title" not in cbsa_meta.columns:
+        return {}
+    return {str(c): _city_short_name(t) for c, t in zip(cbsa_meta["cbsa_code"], cbsa_meta["cbsa_title"])}
+
+
+def _ols_band(x: np.ndarray, y: np.ndarray, xs: np.ndarray, n_boot: int = _L2_N_BOOT,
+              seed: int = 0, alpha: float = 0.05) -> tuple[np.ndarray, np.ndarray]:
+    """Pointwise percentile band of the OLS line over ``xs``, resampling cities."""
+    rng = np.random.default_rng(seed)
+    fits = []
+    for idx in rng.integers(0, len(x), size=(n_boot, len(x))):
+        if np.ptp(x[idx]) > 0:
+            b1, b0 = np.polyfit(x[idx], y[idx], 1)
+            fits.append(b0 + b1 * xs)
+    fits = np.asarray(fits)
+    return (np.percentile(fits, 100 * alpha / 2, axis=0),
+            np.percentile(fits, 100 * (1 - alpha / 2), axis=0))
+
+
+def _panel_l2_paired_raincloud(ax: plt.Axes, paired: pd.DataFrame, bracket_of: dict,
+                               letter: str | None = "A") -> None:
+    """Per-bracket clouds of tract-level cell rho, ordinal next to L2."""
+    p = paired.copy()
+    p["bracket"] = p["cbsa"].astype(str).map(bracket_of)
+    groups, brackets = [], []
+    for b in _BRACKET_ORDER:
+        g = p[p["bracket"] == b]
+        if len(g):
+            brackets.append(_BRACKET_LABELS[b])
+            groups.append(("Ord.", g["rho_ord"].to_numpy(), _ORDINAL_COLOR))
+            groups.append(("L2", g["rho_l2"].to_numpy(), _BASELINE_COLOR))
+    if not groups:
+        ax.text(0.5, 0.5, "no bracket data", ha="center", va="center", transform=ax.transAxes)
+        return
+    _raincloud(ax, groups)
+    ax.tick_params(axis="x", labelsize=6)
+    # Bracket name centred under each (Ord., L2) pair of clouds
+    for k, name in enumerate(brackets):
+        ax.text(2 * k + 0.5, -0.11, name, transform=ax.get_xaxis_transform(),
+                ha="center", va="top", fontsize=7)
+    ax.set_ylabel(r"Within-city Spearman $\rho$")
+    ax.set_xlabel("City-size bracket", labelpad=14)
+    if letter:
+        _panel_title(ax, letter)
+
+
+def _l2_cities_to_label(city: pd.DataFrame, bracket_of: dict, n_top: int = 5) -> list[str]:
+    """CBSAs worth naming on the distance plot: the largest gaps, every city
+    where L2 wins, and the mega city (the pooled training level's anchor)."""
+    ok = city.dropna(subset=["dist_sd", "diff"])
+    picks = list(ok.nlargest(n_top, "diff")["cbsa"]) + list(ok.loc[ok["diff"] < 0, "cbsa"])
+    picks += [c for c in ok["cbsa"] if bracket_of.get(c) == "mega"]
+    return list(dict.fromkeys(picks))
+
+
+def _panel_l2_distance(ax: plt.Axes, city: pd.DataFrame, bracket_of: dict, fit: dict,
+                       letter: str | None = "B", names: dict | None = None,
+                       mean_gap: float | None = None, band: bool = False) -> None:
+    """City Δρ (ordinal − L2) against |distance from the pooled train level|.
+
+    ``names`` labels the notable cities (see _l2_cities_to_label);
+    ``mean_gap`` draws the tract-weighted mean gap; ``band`` adds a 95%
+    city-bootstrap band around the OLS line.
+    """
+    x = np.abs(city["dist_sd"].to_numpy(dtype=float))
+    y = city["diff"].to_numpy(dtype=float)
+    big = names is not None
+    colors = [_BRACKET_COLORS.get(bracket_of.get(c), "0.5") for c in city["cbsa"]]
+    ax.scatter(x, y, s=30 if big else 14, c=colors, alpha=0.85,
+               edgecolors="white" if big else "none", linewidths=0.5 if big else 0, zorder=3)
+    ax.axhline(0, color="0.6", linestyle=":", linewidth=1.0, zorder=0)
+    if mean_gap is not None:
+        ax.axhline(mean_gap, color="0.45", linestyle="--", linewidth=0.9, zorder=0)
+        ax.text(0.99, mean_gap, f" mean gap {mean_gap:+.3f}", transform=ax.get_yaxis_transform(),
+                ha="right", va="bottom", fontsize=6.5, color="0.35")
+    if np.isfinite(fit.get("slope", np.nan)):
+        ok = np.isfinite(x) & np.isfinite(y)
+        b1, b0 = np.polyfit(x[ok], y[ok], 1)
+        xs = np.linspace(np.nanmin(x), np.nanmax(x), 50)
+        if band:
+            lo, hi = _ols_band(x[ok], y[ok], xs)
+            ax.fill_between(xs, lo, hi, color="0.25", alpha=0.12, linewidth=0, zorder=1)
+        ax.plot(xs, b0 + b1 * xs, color="0.25", linewidth=1.4, zorder=2)
+        ax.text(0.02 if big else 0.04, 0.97,
+                rf"OLS slope = {fit['slope']:.3f} [{fit['slope_ci_lo']:.3f}, {fit['slope_ci_hi']:.3f}]"
+                + "\n" + rf"Spearman $\rho_S$ = {fit['spearman']:.2f}, $n$ = {fit['n_cities']} cities",
+                transform=ax.transAxes, fontsize=7.5 if big else 6.5, va="top")
+    if big:
+        x_flip = np.nanmin(x) + 0.85 * (np.nanmax(x) - np.nanmin(x))
+        for c in _l2_cities_to_label(city, bracket_of):
+            r = city.loc[city["cbsa"] == c].iloc[0]
+            px = abs(r["dist_sd"])
+            right_edge = px > x_flip   # label to the left so it stays on canvas
+            ax.annotate(names.get(c) or c, (px, r["diff"]),
+                        xytext=(-4 if right_edge else 4, 3), textcoords="offset points",
+                        ha="right" if right_edge else "left", fontsize=6.5, color="0.2")
+    handles = [mpatches.Patch(color=_BRACKET_COLORS[b], label=_BRACKET_LABELS[b])
+               for b in _BRACKET_ORDER if b in set(bracket_of.get(c) for c in city["cbsa"])]
+    if handles:
+        ax.legend(handles=handles, fontsize=7 if big else 6, loc="lower right", frameon=True,
+                  facecolor="white", edgecolor="none", framealpha=0.8, title="City size",
+                  title_fontsize=7 if big else 6)
+    ax.set_xlabel(r"$|$city wealth level $-$ pooled training level$|$ (training SD)")
+    ax.set_ylabel(r"Within-city $\Delta\rho$ (ordinal $-$ L2)")
+    if letter:
+        _panel_title(ax, letter)
+
+
+def part_l2_comparison_us(ctx: _USContext) -> dict:
+    """Ordinal vs cardinal L2 baseline on the shared test sample.
+
+    Writes two standalone figures — ``figures/US_L2_city_gap_vs_distance.pdf``
+    (full width: each test city's Δρ vs its distance from the pooled training
+    wealth level, OLS line with a city-bootstrap band, notable cities named)
+    and ``figures/US_L2_bracket_raincloud.pdf`` (appendix: paired per-bracket
+    rainclouds of tract-level cell rho); the year-by-year curves are the main
+    figure's Panel B — plus the tables ``US_L2_paired_cells.csv``,
+    ``US_L2_by_bracket.csv``, ``US_L2_city_distance.csv``. Skips (returns {})
+    when no baseline is linked.
+    """
+    print("\n=== L2 baseline comparison (US) ===")
+    base_ctx = getattr(ctx, "baseline", None)
+    if base_ctx is None:
+        print("  no L2 baseline linked (run src/run_L2_model.py, or pass "
+              "--l2-baseline); skipping")
+        return {}
+    bracket_of = _bracket_of(ctx.cbsa_meta)
+    sample = _paired_test_samples(ctx, base_ctx)
+    if sample is None:
+        return {}
+    paired_tract = _paired_cells(sample["cells_tract_ord"], sample["cells_tract_l2"])
+    paired_bld = _paired_cells(sample["cells_bld_ord"], sample["cells_bld_l2"])
+    if not len(paired_tract):
+        print("  no paired city-year cells; skipping")
+        return {}
+
+    out = ctx.out
+    paired_tract.to_csv(out / "tables" / "US_L2_paired_cells.csv", index=False)
+    by_bracket = l2_bracket_table(paired_tract, bracket_of)
+    by_bracket.to_csv(out / "tables" / "US_L2_by_bracket.csv", index=False)
+
+    # City distance from the baseline's pooled train level, in its own units.
+    city = _city_rho_diff(paired_tract)
+    fit = {}
+    try:
+        stats = json.loads((base_ctx.results_dir / "level_label_stats.json").read_text())
+        acs_years = sorted({min(_ACS_PANEL_YEARS, key=lambda a: abs(a - int(y)))
+                            for y in paired_tract["year"].unique()})
+        dist = city_level_distance(
+            _load_wealth_dollars_long(ctx.processed_dir, ctx.indicator, acs_years),
+            acs_years, stats["mu"], stats["sd"])
+        city = city.merge(dist, on="cbsa", how="left")
+        fit = distance_slope(city)
+    except (OSError, ValueError, KeyError) as exc:
+        print(f"  ⚠️ city-distance panel unavailable ({type(exc).__name__}: {exc})")
+        city["dist_sd"] = np.nan
+    city.to_csv(out / "tables" / "US_L2_city_distance.csv", index=False)
+
+    # Two standalone figures (the year-by-year curves are the main figure's
+    # Panel B): the city-gap scatter, full width — the paper figure — and the
+    # per-bracket rainclouds, single column, for the appendix.
+    if fit:
+        all_row = by_bracket.loc[by_bracket["bracket"] == "all"]
+        fig, ax = plt.subplots(figsize=(FIG_SIZE_TWO_COL[0], FIG_SIZE_TWO_COL[0] * 0.52),
+                               constrained_layout=True)
+        _panel_l2_distance(ax, city, bracket_of, fit, letter=None,
+                           names=_city_names(ctx.cbsa_meta),
+                           mean_gap=float(all_row["diff"].iloc[0]) if len(all_row) else None,
+                           band=True)
+        for spine in ("top", "right"):
+            ax.spines[spine].set_visible(False)
+        _savefig(fig, out / "figures" / "US_L2_city_gap_vs_distance.pdf")
+
+    fig, ax = plt.subplots(figsize=(FIG_SIZE_ONE_COL[0], FIG_SIZE_ONE_COL[0] * 0.75),
+                           constrained_layout=True)
+    _panel_l2_paired_raincloud(ax, paired_tract, bracket_of, letter=None)
+    for spine in ("top", "right"):
+        ax.spines[spine].set_visible(False)
+    _savefig(fig, out / "figures" / "US_L2_bracket_raincloud.pdf")
+
+    for _, r in by_bracket.iterrows():
+        print(f"  {r['bracket']:7s} cities={r['n_cities']:3d}  ordinal={r['rho_ordinal']:.3f}  "
+              f"L2={r['rho_l2']:.3f}  diff={r['diff']:+.3f} "
+              f"[{r['diff_ci_lo']:+.3f}, {r['diff_ci_hi']:+.3f}]")
+    if fit:
+        print(f"  Δρ on |distance|: slope={fit['slope']:+.4f} "
+              f"[{fit['slope_ci_lo']:+.4f}, {fit['slope_ci_hi']:+.4f}], "
+              f"Spearman={fit['spearman']:+.3f}, n={fit['n_cities']}")
+
+    headline = {"l2/baseline": str(base_ctx.results_dir.name),
+                "l2/n_paired_cells": int(len(paired_tract)),
+                "l2/n_paired_cells_bld": int(len(paired_bld))}
+    for _, r in by_bracket.iterrows():
+        for k in ("rho_ordinal", "rho_l2", "diff", "diff_ci_lo", "diff_ci_hi"):
+            headline[f"l2/{r['bracket']}/{k}"] = float(r[k])
+    for k, v in fit.items():
+        headline[f"l2/distance_{k}"] = v
+    return headline
+
+
+def load_selection_history(results_dir: Path) -> pd.DataFrame | None:
+    """[epoch, score] from ``<results_dir>/wandb_history.csv`` (exported by
+    run_L2_model.py --export-history), or None when absent/unusable."""
+    path = Path(results_dir) / WANDB_HISTORY_FILENAME
+    if not path.exists():
+        return None
+    h = pd.read_csv(path)
+    if "epoch" not in h.columns or "selection/score" not in h.columns:
+        print(f"  ⚠️ {path} lacks 'epoch' / 'selection/score' columns")
+        return None
+    h = h[["epoch", "selection/score"]].rename(columns={"selection/score": "score"})
+    h = h.dropna().astype({"epoch": int})
+    # A resumed run can log an epoch twice; keep the last value logged for it.
+    return h.drop_duplicates("epoch", keep="last").sort_values("epoch").reset_index(drop=True)
+
+
+def matched_budget_table(ordinal: pd.DataFrame, baseline: pd.DataFrame) -> pd.DataFrame:
+    """Best validation selection score of each model at the baseline's budget
+    (its last epoch) and, for the ordinal model, over its whole run."""
+    budget = int(baseline["epoch"].max())
+    rows = []
+    for model, h, scope in (("ordinal", ordinal[ordinal["epoch"] <= budget], f"<= epoch {budget}"),
+                            ("ordinal", ordinal, f"full run ({int(ordinal['epoch'].max())} epochs)"),
+                            ("l2", baseline, f"<= epoch {budget}")):
+        if h.empty:
+            continue
+        best = h.loc[h["score"].idxmax()]
+        rows.append({"model": model, "budget": scope, "best_epoch": int(best["epoch"]),
+                     "best_selection_score": float(best["score"])})
+    return pd.DataFrame(rows)
+
+
+def part_l2_training_curves_us(ctx: _USContext) -> dict:
+    """Validation selection score vs epoch: the ordinal run, the L2 baseline
+    and (when the pointer lists them) its learning-rate screen runs, plus the
+    matched-budget table ``US_L2_matched_budget.csv``. Needs each run's
+    ``wandb_history.csv`` (python src/run_L2_model.py --export-history)."""
+    print("\n=== L2 training curves (US) ===")
+    base_ctx = getattr(ctx, "baseline", None)
+    if base_ctx is None:
+        print("  no L2 baseline linked; skipping")
+        return {}
+    h_ord = load_selection_history(ctx.results_dir)
+    h_l2 = load_selection_history(base_ctx.results_dir)
+    if h_ord is None or h_l2 is None:
+        print("  missing wandb_history.csv for the ordinal and/or L2 run — export with "
+              "`python src/run_L2_model.py --export-history`; skipping")
+        return {}
+
+    screens = {}
+    try:
+        pointer = json.loads((ctx.results_dir / L2_POINTER_FILENAME).read_text())
+        for lr, name in (pointer.get("screen") or {}).items():
+            h = load_selection_history(ctx.results_dir.parent / name)
+            if h is not None:
+                screens[lr] = h
+    except (OSError, ValueError):
+        pass
+
+    fig, ax = plt.subplots(figsize=FIG_SIZE_ONE_COL)
+    for lr, h in sorted(screens.items()):
+        ax.plot(h["epoch"], h["score"], color=_BASELINE_COLOR, alpha=0.35, linewidth=0.8)
+    ax.plot(h_ord["epoch"], h_ord["score"], color=_ORDINAL_COLOR, linewidth=1.2,
+            label="Ordinal model")
+    ax.plot(h_l2["epoch"], h_l2["score"], color=_BASELINE_COLOR, linewidth=1.2,
+            label="Cardinal L2 baseline" + (" (thin: LR screen)" if screens else ""))
+    for h, color in ((h_ord, _ORDINAL_COLOR), (h_l2, _BASELINE_COLOR)):
+        best = h.loc[h["score"].idxmax()]
+        ax.plot([best["epoch"]], [best["score"]], "*", color=color, markersize=8)
+    ax.axvline(int(h_l2["epoch"].max()), color="0.6", linestyle=":", linewidth=1.0)
+    ax.set_xlabel("Epoch")
+    ax.set_ylabel("Validation selection score")
+    ax.legend(fontsize=6, loc="lower right", frameon=True, facecolor="white",
+              edgecolor="none", framealpha=0.8)
+    for spine in ("top", "right"):
+        ax.spines[spine].set_visible(False)
+    _savefig(fig, ctx.out / "figures" / "US_L2_training_curves.pdf")
+
+    table = matched_budget_table(h_ord, h_l2)
+    table.to_csv(ctx.out / "tables" / "US_L2_matched_budget.csv", index=False)
+    print(table.to_string(index=False))
+    return {f"l2_budget/{r['model']}/{r['budget']}": r["best_selection_score"]
+            for _, r in table.iterrows()}
 
 
 # ─── Long-difference growth figure (US) ───────────────────────────────────────
@@ -4612,30 +5536,12 @@ def _demean_within(values: pd.Series, groups: pd.Series) -> pd.Series:
     return values - values.groupby(groups).transform("mean")
 
 
-# BLS CPI-U, U.S. city average, all items (series CUUR0000SA0), annual
-# averages. ACS 5-year dollar estimates are in the nominal dollars of the
-# vintage's final year; deflating to one base year keeps ~25% inflation
-# between 2016 and 2023 from masquerading as wealth growth proportional to
-# each tract's level (which any levels-only model would "predict").
-_CPI_U_ANNUAL = {
-    2010: 218.056, 2011: 224.939, 2012: 229.594, 2013: 232.957, 2014: 236.736,
-    2015: 237.017, 2016: 240.007, 2017: 245.120, 2018: 251.107, 2019: 255.657,
-    2020: 258.811, 2021: 270.970, 2022: 292.655, 2023: 304.702,
-}
-_GROWTH_DOLLAR_BASE_YEAR = 2023
-
-
-def _deflate(values, year: int, base: int = _GROWTH_DOLLAR_BASE_YEAR):
-    """Nominal ``year`` dollars -> constant ``base``-year dollars (CPI-U)."""
-    return values * (_CPI_U_ANNUAL[base] / _CPI_U_ANNUAL[int(year)])
-
-
-def _wealth_dollar_column(indicator: str, year: int) -> str:
-    """Panel column holding the dollar variable behind ``indicator``'s label
-    (the label is the per-CBSA z-score of its log): W-family tokens -> the
-    wealth index (e.g. 'W2_i_r5pct_2016'), 'inc' -> per-capita income."""
-    var = indicators.token_to_var(indicator)
-    return f"{var}_{year}" if var else f"per_capita_income_usd_{year}"
+# CPI-U deflation and the dollar-column map live in src/data/level_labels.py,
+# shared with the L2 baseline's level target (one table, never two).
+_CPI_U_ANNUAL = level_labels.CPI_U_ANNUAL
+_GROWTH_DOLLAR_BASE_YEAR = level_labels.DOLLAR_BASE_YEAR
+_deflate = level_labels.deflate
+_wealth_dollar_column = level_labels.wealth_dollar_column
 
 
 def _load_wealth_dollars_long(processed_dir: Path, indicator: str, years) -> pd.DataFrame:
@@ -5052,6 +5958,8 @@ def part_growth_figure_us(ctx: _USContext, target_gap: int = _GROWTH_TARGET_GAP,
         except Exception as exc:
             print(f"  wealth panel unavailable ({exc}); skipping growth figure")
             return {}
+    # Same residential universe as the sample: no 98xx / near-zero-wealth tails.
+    wealth_long = _residential_wealth(wealth_long)
     print(f"  fitting GB2 per test city-year ({tract['cbsa'].nunique()} cities)...")
     params = _fit_city_gb2(wealth_long, tract["cbsa"].unique())
     fit_err = _gb2_fit_error(
@@ -5984,13 +6892,14 @@ _US_PARTS = {
     "cross": part_a_us, "temporal": part_b_us, "dollars": part_c_us,
     "main_figure": part_main_figure_us, "growth": part_growth_figure_us,
     "khachiyan": part_khachiyan_pc_us,
+    "l2": part_l2_comparison_us, "l2_training": part_l2_training_curves_us,
 }
-# main_figure's Panel B carries a synthetic (non-measured) cardinal-baseline
-# line, clearly marked with an asterisk in the figure and caption. It is in the
-# 'both' default set (that figure is a deliverable) but NOT in the us-only
-# default, so an automated US run never emits it by accident.
+# The paper-figure parts (main figure, growth, L2 comparison) are in the 'both'
+# default set but not the us-only default. The l2 parts skip themselves when
+# no baseline is linked (l2_baseline.json pointer or --l2-baseline).
 _DEFAULT_US_PARTS = ("cross", "temporal", "dollars")
-_ALL_US_PARTS = ("cross", "temporal", "dollars", "main_figure", "growth", "khachiyan")
+_ALL_US_PARTS = ("cross", "temporal", "dollars", "main_figure", "growth", "khachiyan",
+                 "l2", "l2_training")
 
 _NYC_PARTS = ("A", "B", "C", "D", "E", "F")
 _DEFAULT_NYC_PARTS = ("A", "B", "C")
@@ -6083,8 +6992,14 @@ def run_evaluation(
     nyc_subdir: str | None = NYC_SUBDIR,
     csa_screen: float | None = None,
     csa_anticipation=CSA_ANTICIPATION_ARMS,
+    l2_baseline: str | None = None,
 ) -> dict:
     """Post-hoc evaluation callable from main.py or the CLI.
+
+    ``l2_baseline`` names the cardinal L2 baseline run (results/<name>) to
+    compare against; when None, ``<results_dir>/l2_baseline.json`` (written by
+    run_L2_model.py) is used if present. The baseline feeds the main figure's
+    Panel B and the 'l2' / 'l2_training' parts.
 
     Modes
     -----
@@ -6134,6 +7049,12 @@ def run_evaluation(
             ran_any = True
             ctx = _USContext(results_dir, processed_dir, out_dir, indicator)
             summary["years"] = ctx.years
+            ctx.baseline = None
+            base_dir = resolve_l2_baseline_dir(results_dir, l2_baseline)
+            if base_dir is not None:
+                print(f"L2 baseline: {base_dir}")
+                ctx.baseline = _USContext(base_dir, processed_dir, out_dir, indicator)
+                summary["l2_baseline"] = base_dir.name
             for key in us_parts:
                 fn = _US_PARTS[key]
                 try:
@@ -6321,6 +7242,12 @@ def main() -> None:
              "of years in every city — 2 in NYC, 2-3 in Tampa — so read the arms "
              "against each city's cadence."
     )
+    parser.add_argument(
+        "--l2-baseline", default=None, metavar="SAVENAME",
+        help="Cardinal L2 baseline run (results/<SAVENAME>) for the main "
+             "figure's Panel B and the 'l2' / 'l2_training' parts. Default: the "
+             "l2_baseline.json pointer that run_L2_model.py writes into --savename."
+    )
     args = parser.parse_args()
 
     run_evaluation(
@@ -6334,6 +7261,7 @@ def main() -> None:
         csa_screen=args.csa_screen,
         csa_anticipation=(CSA_ANTICIPATION_ARMS if args.csa_anticipation is None
                           else tuple(args.csa_anticipation)),
+        l2_baseline=args.l2_baseline,
     )
 
 

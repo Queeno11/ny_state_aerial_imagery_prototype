@@ -1,6 +1,7 @@
 ##############      Configuración      ##############
 from tqdm import tqdm
 from ast import Return
+import json
 import os
 import math
 import pickle
@@ -27,6 +28,7 @@ import pandas as pd
 import src.geo_utils as geo_utils
 from src.data import indicators
 from src.data import cbsa_brackets
+from src.data import level_labels
 from src.data import us_split
 from src.data.pair_table import LazyPairTable, FLAT_COLUMNS, weighted_qcut
 from src.data.process_acs import BASE_YEAR as ACS_BASE_YEAR, PANEL_YEARS as ACS_PANEL_YEARS
@@ -151,7 +153,7 @@ def load_satellite_datasets(years,stretch=False, engine="zarr"):
 def generate_datasets(savename, sat_data, years, small_sample=False, tau_meters=100,
                       indicator=None, footprints_source="ms_us", states=None,
                       naip_coverage_csv=None, val_years_per_city=1,
-                      val_stability_buildings_per_cbsa=25):
+                      val_stability_buildings_per_cbsa=25, label_target="rel_score"):
 
     indicator = indicator if indicator is not None else indicators.DEFAULT_INDICATOR
     all_years_datasets, all_years_extents, df = open_datasets(
@@ -166,7 +168,85 @@ def generate_datasets(savename, sat_data, years, small_sample=False, tau_meters=
         val_stability_buildings_per_cbsa=val_stability_buildings_per_cbsa,
     )
 
+    # Applied AFTER the split: the level target's scale is fitted on the final
+    # train-city list, never on val/test cities.
+    df_train, df_vals_dict, df_test = apply_label_target(
+        df_train, df_vals_dict, df_test, label_target, indicator, years, savename,
+    )
+
     return all_years_datasets, all_years_extents, df_train, df_vals_dict, df_test, df_dead_zone
+
+
+def acs_panel_path():
+    """The US tract panel feather written by process_acs.py."""
+    return (PROCESSED_DATA_DIR
+            / f"us_metros_panel_{ACS_PANEL_YEARS[0]}_{ACS_PANEL_YEARS[-1]}.feather")
+
+
+def level_label_stats_path(savename):
+    """Where apply_label_target records the fitted level-label scale."""
+    return RESULTS_DIR / savename / "level_label_stats.json"
+
+
+def load_level_label_stats(savename):
+    """The {mu, sd, ...} written by apply_label_target for ``savename``."""
+    path = level_label_stats_path(savename)
+    if not path.exists():
+        raise FileNotFoundError(f"{path} not found — label_target='log_level' must go "
+                                f"through generate_datasets, which fits and writes it.")
+    return json.loads(path.read_text())
+
+
+def apply_label_target(df_train, df_vals_dict, df_test, label_target, indicator,
+                       panel_years, savename, city_split=None, wealth_long=None):
+    """Swap the training label for the L2 baseline's level target.
+
+    ``"rel_score"`` (the ordinal model) returns the inputs untouched.
+    ``"log_level"`` replaces ``Rel_Score`` on every split with the standardized
+    log real-dollar level (src/data/level_labels.py), fitted on train CBSAs
+    only, and writes the fitted constants to
+    ``RESULTS_DIR/<savename>/level_label_stats.json`` so the scale is on record.
+    Only the lazy ms_us path is supported: the legacy flat (doitt_nyc / small
+    sample) frames carry no train-city structure to fit the scale on.
+
+    ``city_split`` / ``wealth_long`` default to cbsa_splits.feather and the
+    panel's dollar columns; tests inject synthetic frames.
+    """
+    if label_target not in level_labels.LABEL_TARGETS:
+        raise ValueError(f"label_target must be one of {level_labels.LABEL_TARGETS}, "
+                         f"got {label_target!r}")
+    if label_target == "rel_score":
+        return df_train, df_vals_dict, df_test
+    if not isinstance(df_train, LazyPairTable):
+        raise NotImplementedError(
+            "label_target='log_level' is implemented for the lazy ms_us path only "
+            "(footprints_source='ms_us', small_sample=False).")
+
+    city_split = cbsa_brackets.load_city_split() if city_split is None else city_split
+    train_cbsas = city_split.loc[city_split["split"] == "train", "cbsa_code"]
+    holdout_map = cbsa_brackets.holdout_year_map(city_split)
+    if wealth_long is None:
+        acs_years = sorted({get_closest_acs_year(int(y)) for y in panel_years})
+        wealth_long = level_labels.read_panel_log_real_wealth(
+            acs_panel_path(), PANEL_GEOID_COL, indicator, acs_years)
+
+    new_labels, stats = level_labels.standardized_level_labels(
+        df_train.labels, wealth_long, get_closest_acs_year, train_cbsas, holdout_map)
+    stats.update({"indicator": indicator, "label_target": label_target})
+    print(f"📏 Level labels (log real {stats['base_year']} $): mu={stats['mu']:.4f}, "
+          f"sd={stats['sd']:.4f} from {stats['n_rows']:,} train tract-years in "
+          f"{stats['n_cbsas']} CBSAs; {stats['n_nan']:,} / {stats['n_labels']:,} "
+          f"tract-years without a positive dollar value -> NaN")
+
+    out = level_label_stats_path(savename)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps(stats, indent=2))
+
+    df_train = df_train.with_labels(new_labels)
+    df_test = df_test.with_labels(new_labels)
+    df_vals_dict = {name: level_labels.relabel_flat(df, new_labels)
+                    for name, df in df_vals_dict.items()}
+    return df_train, df_vals_dict, df_test
     
 # def load_landsat_datasets(stretch=False):
 #     """Load satellite datasets and get their extents"""
@@ -226,11 +306,7 @@ PANEL_GEOID_COL = f"geoid_{ACS_BASE_YEAR}"
 
 def process_acs_panel():
     print("Loading and processing ACS panel data...")
-    panel_path = (
-        PROCESSED_DATA_DIR
-        / f"us_metros_panel_{ACS_PANEL_YEARS[0]}_{ACS_PANEL_YEARS[-1]}.feather"
-    )
-    panel_tract_gdf = gpd.read_feather(panel_path).to_crs(geo_utils.METRIC_CRS)
+    panel_tract_gdf = gpd.read_feather(acs_panel_path()).to_crs(geo_utils.METRIC_CRS)
     return panel_tract_gdf
 
 

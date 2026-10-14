@@ -222,6 +222,17 @@ class LazyPairTable:
             unavailable=self.unavailable,
         )
 
+    def with_labels(self, labels):
+        """Same table (building order, holdouts, unavailable mask) over a new
+        (tract, year) label frame — e.g. the L2 baseline's level labels
+        (src/data/level_labels.py). Holdout / unavailable NaN-ing still applies
+        at materialization, on top of the new labels."""
+        return LazyPairTable(
+            self.buildings, labels, self.years, self.tau_meters,
+            holdout_map=self.holdout_map, split_type=self.split_type,
+            unavailable=self.unavailable,
+        )
+
     # ------------------------------------------------------------------ #
     # Materialization                                                     #
     # ------------------------------------------------------------------ #
