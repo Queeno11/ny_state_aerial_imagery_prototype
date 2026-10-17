@@ -1,0 +1,74 @@
+This is BibTeX, Version 0.99e
+Capacity: max_strings=200000, hash_size=200000, hash_prime=170003
+The top-level auxiliary file: ordinal_index.aux
+Reallocating 'name_of_file' (item size: 1) to 8 items.
+The style file: apalike.bst
+Reallocating 'name_of_file' (item size: 1) to 11 items.
+Database file #1: references.bib
+Warning--I didn't find a database entry for "khachiyan2022"
+Warning--I didn't find a database entry for "han1987"
+Warning--I didn't find a database entry for "abrevaya2000"
+Warning--I didn't find a database entry for "xie2016transfer"
+Warning--I didn't find a database entry for "ayush2020generating"
+Warning--I didn't find a database entry for "suel2021multimodal"
+Warning--I didn't find a database entry for "huang2021using"
+Warning--I didn't find a database entry for "karasov2025predicting"
+Warning--I didn't find a database entry for "fan2023urban"
+Warning--I didn't find a database entry for "gebru2017using"
+Warning--I didn't find a database entry for "rolf2021generalizable"
+Warning--I didn't find a database entry for "zheng2026satellite"
+Warning--I didn't find a database entry for "chi2022micro"
+Warning--I didn't find a database entry for "law2019take"
+Warning--I didn't find a database entry for "sherman2026global"
+Warning--I didn't find a database entry for "sherman1993"
+Warning--I didn't find a database entry for "cavanagh1998"
+Warning--I didn't find a database entry for "lin2017"
+Warning--I didn't find a database entry for "wang2024deep"
+Warning--I didn't find a database entry for "fan2020rank"
+Warning--I didn't find a database entry for "farrell2021deep"
+Warning--I didn't find a database entry for "schmidthieber2020"
+Warning--I didn't find a database entry for "neyman1948"
+Warning--I didn't find a database entry for "lindsay1988"
+Warning--I didn't find a database entry for "newey1994"
+You've used 5 entries,
+            1935 wiz_defined-function locations,
+            530 strings with 5176 characters,
+and the built_in function-call counts, 2435 in all, are:
+= -- 220
+> -- 150
+< -- 1
++ -- 54
+- -- 54
+* -- 236
+:= -- 436
+add.period$ -- 15
+call.type$ -- 5
+change.case$ -- 52
+chr.to.int$ -- 5
+cite$ -- 5
+duplicate$ -- 74
+empty$ -- 148
+format.name$ -- 61
+if$ -- 456
+int.to.chr$ -- 1
+int.to.str$ -- 0
+missing$ -- 5
+newline$ -- 28
+num.names$ -- 15
+pop$ -- 48
+preamble$ -- 1
+purify$ -- 52
+quote$ -- 0
+skip$ -- 50
+stack$ -- 0
+substring$ -- 146
+swap$ -- 5
+text.length$ -- 0
+text.prefix$ -- 0
+top$ -- 0
+type$ -- 30
+warning$ -- 0
+while$ -- 16
+width$ -- 0
+write$ -- 66
+(There were 25 warnings)

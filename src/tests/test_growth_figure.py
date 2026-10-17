@@ -538,6 +538,9 @@ def test_part_f_end_to_end_with_stubbed_geometry(tmp_path, monkeypatch):
         {"GEOID_str": gids}), None))
     monkeypatch.setattr(ev, "_csa_city_outcomes", lambda *a, **k: pd.DataFrame(rows))
     monkeypatch.setattr(ev, "_load_tract_long", lambda r, y=None: pd.DataFrame(labs))
+    monkeypatch.setattr(ev, "_load_wealth_dollars_long",
+                        lambda *a, **k: pd.DataFrame({"GEOID": gids, "cbsa": "35620", "year": 2016,
+                                                      "usd": 5e5}))
     monkeypatch.setattr(ev, "_csa_split_of",
                         lambda p: {g: ("heldout" if i % 2 else "train") for i, g in enumerate(gids)})
 
@@ -565,6 +568,31 @@ def test_acs_window_years_match_5yr_survey_window():
     assert ev._acs_window_years(2018, NYC_YEARS) == [2014, 2016, 2018]
     assert ev._acs_window_years(2023, NYC_YEARS) == [2020, 2022]
     assert ev._acs_window_years(2013, [2011, 2013, 2015]) == [2011, 2013]
+
+
+def test_acs_window_years_extend_after_adds_next_flight_only():
+    assert ev._acs_window_years(2013, NYC_YEARS, extend_after=2) == [2010, 2012, 2014]
+    assert ev._acs_window_years(2023, NYC_YEARS, extend_after=2) == [2020, 2022, 2024]
+    assert ev._acs_window_years(2023, NYC_YEARS, extend_after=0) == [2020, 2022]
+
+
+def test_acs_window_pairs_extended_window_keeps_endpoint_labels_and_single_flight():
+    # Pre flights 2010/2012/2014 = 0, 0, 3 -> window mean 1; post 2020/2022/2024 = 2, 2, 5 -> 3.
+    vals = {2010: 0.0, 2012: 0.0, 2014: 3.0, 2020: 2.0, 2022: 2.0, 2024: 5.0}
+    rows = [{"GEOID": g, "year": y, "pred": v + k} for k, g in enumerate("abc")
+            for y, v in vals.items()]
+    labels = pd.DataFrame({"GEOID": list("abc") * 2, "year": [2013] * 3 + [2023] * 3,
+                           "label": [0.0, 1.0, 2.0, 1.0, 2.0, 3.0]})
+    p = ev._acs_window_pairs(pd.DataFrame(rows), labels, 2013, 2023, NYC_YEARS,
+                             extend_after=2).set_index("GEOID")
+    assert p.attrs["window_pre"] == [2010, 2012, 2014]
+    assert p.attrs["window_post"] == [2020, 2022, 2024]
+    assert list(p["n_pre"]) == [3, 3, 3] and list(p["n_post"]) == [3, 3, 3]
+    np.testing.assert_allclose(p["pred_pre"], [1.0, 2.0, 3.0])
+    np.testing.assert_allclose(p["pred_post"], [3.0, 4.0, 5.0])
+    assert list(p["d_label"]) == [1.0, 1.0, 1.0]
+    np.testing.assert_allclose(p["pred_single_pre"], [0.0, 1.0, 2.0])   # 2012, not 2014
+    np.testing.assert_allclose(p["pred_single_post"], [2.0, 3.0, 4.0])  # 2022, not 2024
 
 
 def test_window_average_and_counts():
@@ -803,6 +831,8 @@ def test_part_f_khachiyan_end_to_end(tmp_path, monkeypatch):
     tl = tract.rename(columns={"GEOID": "GEOID_str", "pred": "predicted_value"})
     tl["GEOID"] = tl["GEOID_str"].astype("int64")   # the real loader carries both
     monkeypatch.setattr(ev, "_load_tract_long", lambda r, y=None: tl)
+    monkeypatch.setattr(ev, "_csa_building_preds",
+                        lambda r, y=None: tl[["GEOID_str", "year", "predicted_value"]].copy())
     monkeypatch.setattr(ev, "_load_wealth_dollars_long", lambda *a, **k: inc.assign(cbsa="35620"))
     split = {g: ("heldout" if i % 2 else "train") for i, g in enumerate(sorted(tl.GEOID_str.unique()))}
     t = ev.part_f_khachiyan(tmp_path / "r", tmp_path, out, years=[2016, 2018, 2020, 2022],
@@ -828,3 +858,150 @@ def test_cross_fitted_calibration_never_uses_scored_rows():
     fm = pd.Series(np.r_[np.ones(100, bool), np.zeros(50, bool)])
     cal3 = ev._cross_fitted_calibration(a, p, g, fit_mask=fm)
     assert cal3.notna().all()
+
+
+# ─── Part F construction scatter (four nested groups, W2 GB2 Δlog) ──────────
+
+def test_cohort_window_counts_nested_and_windowed():
+    coh = {0.01: pd.DataFrame({"cohort_year": [0, 0, 2014, 2016, 2020, 2022, 2012]}),
+           0.05: pd.DataFrame({"cohort_year": [0, 2016, 2022]}),
+           0.10: pd.DataFrame({"cohort_year": [0, 2022]})}
+    c = ev._cohort_window_counts(coh, {"10y": (2013, 2023), "5y": (2018, 2023)}).set_index("window")
+    assert c.loc["10y", "stable"] == 2
+    assert (c.loc["10y", "built >=1%"], c.loc["10y", "built >=5%"], c.loc["10y", "built >=10%"]) == (4, 2, 1)
+    assert (c.loc["5y", "built >=1%"], c.loc["5y", "built >=5%"]) == (2, 1)
+
+
+def test_part_f_construction_scatter_end_to_end(tmp_path, monkeypatch):
+    from src import csa_event_study as ces
+    out = tmp_path / "evaluation"
+    (out / "tables").mkdir(parents=True)
+    (out / "figures").mkdir(parents=True)
+    proc = tmp_path / "processed"
+    proc.mkdir()
+    (proc / ces.CSA_CITIES["nyc"].footprints_filename).write_bytes(b"")
+    rng = np.random.default_rng(5)
+    gids = [f"36061{i:06d}" for i in range(200)]
+    # 60 tracts built in 2016 (inside the 2013->2023 window), 10 built before it, rest stable.
+    cohort = {g: (2016 if i < 60 else (2012 if i < 70 else 0)) for i, g in enumerate(gids)}
+    jump = {g: (rng.uniform(0.2, 1.0) if cohort[g] == 2016 else 0.0) for g in gids}
+    level = {g: rng.normal() for g in gids}
+    rows = [{"GEOID_str": g, "year": y,
+             "pred_all": level[g] + (jump[g] if y >= 2016 else 0) + rng.normal(0, 0.01)}
+            for y in NYC_YEARS for g in gids]
+    lab = pd.DataFrame([{"GEOID": g, "year": y, "label": level[g] + (jump[g] if y == 2023 else 0)}
+                        for y in (2013, 2023) for g in gids])
+    wl = pd.DataFrame([{"GEOID": g, "cbsa": "35620", "year": y,
+                        "usd": float(4e5 * np.exp(0.5 * (level[g] + (jump[g] if y == 2023 else 0))))}
+                       for y in (2013, 2023) for g in gids])
+    # One stable tract with near-zero ACS wealth in 2013: must be excluded.
+    wl.loc[(wl.GEOID == gids[-1]) & (wl.year == 2013), "usd"] = 100.0
+    monkeypatch.setattr(ev, "_csa_city_geometry", lambda p, s: (None, pd.DataFrame({"GEOID_str": gids}), None))
+    monkeypatch.setattr(ev, "_csa_city_outcomes", lambda *a, **k: pd.DataFrame(rows))
+    monkeypatch.setattr(ev, "_load_panel_scores", lambda *a, **k: lab)
+    monkeypatch.setattr(ev, "_csa_split_of",
+                        lambda p: {g: ("heldout" if i % 2 else "train") for i, g in enumerate(gids)})
+
+    class _Coh:
+        cohorts = pd.DataFrame({"GEOID_str": gids, "cohort_year": [cohort[g] for g in gids]})
+    monkeypatch.setattr(ces, "build_tract_cohorts", lambda *a, **k: _Coh())
+    t = ev.part_f_construction_scatter(tmp_path / "res", proc, out, years=NYC_YEARS, n_boot=10,
+                                       wealth_long=wl).set_index("group")
+    assert list(t.index) == ["stable", "change 1%", "change 5%", "change 10%"]
+    # 200 tracts - 60 built - 10 pre-window = 130 stable, minus the near-zero-wealth one.
+    assert t.loc["stable", "n"] == 129 and t.loc["change 5%", "n"] == 60
+    assert t.loc["change 5%", "shift_pred_vs_stable"] > 0.05
+    assert t.loc["change 5%", "r2_ols"] > 0.8
+    assert (out / "figures" / "F_construction_scatter.pdf").exists()
+    pairs = pd.read_csv(out / "tables" / "F_construction_pairs.csv")
+    assert int(pairs["in_change_5pct"].sum()) == t.loc["change 5%", "n"]
+    assert int(pairs["in_stable"].sum()) == t.loc["stable", "n"]
+    counts = pd.read_csv(out / "tables" / "F_construction_counts.csv")
+    assert set(counts["window"]) == {"2013->2023", "2018->2023 (5y)"}
+    ext = ev.part_f_construction_scatter(tmp_path / "res", proc, out, years=NYC_YEARS, n_boot=10,
+                                         wealth_long=wl, extend_after=2).set_index("group")
+    assert (out / "figures" / "F_construction_scatter_3flights.pdf").exists()
+    ext_pairs = pd.read_csv(out / "tables" / "F_construction_pairs_3flights.csv")
+    assert (ext_pairs["n_pre"] == 3).all() and (ext_pairs["n_post"] == 3).all()
+    assert ext.loc["stable", "n"] == 129 and ext.loc["change 5%", "r2_ols"] > 0.8
+
+
+# ─── volume weights ─────────────────────────────────────────────────────────
+
+def test_volume_weights_align_by_building_id():
+    per_building = pd.DataFrame({"GEOID_str": ["A", "A", "B"], "area": [100.0, 50.0, 10.0]},
+                                index=pd.Index([11, 12, 13], name="DOITT_ID"))
+    heights = pd.DataFrame({"DOITT_ID": [12, 11, 99], "height_roof": [20.0, 10.0, 5.0],
+                            "height_imputed": [False, True, False]})
+    v = ev._volume_weights(per_building, heights)
+    assert v[11] == pytest.approx(1000.0) and v[12] == pytest.approx(1000.0)
+    assert np.isnan(v[13])                     # no height -> NaN, filled downstream
+
+
+def test_part_f_construction_scatter_volume_weighting(tmp_path, monkeypatch):
+    from src import csa_event_study as ces
+    out = tmp_path / "evaluation"
+    (out / "tables").mkdir(parents=True)
+    (out / "figures").mkdir(parents=True)
+    proc = tmp_path / "processed"
+    proc.mkdir()
+    (proc / ces.CSA_CITIES["nyc"].footprints_filename).write_bytes(b"")
+    rng = np.random.default_rng(9)
+    gids = [f"36061{i:06d}" for i in range(120)]
+    cohort = {g: (2016 if i < 40 else 0) for i, g in enumerate(gids)}
+    # Two buildings per tract: a tall one that tracks the tract's change and a
+    # small one that is pure noise. Volume weighting should favour the tall one.
+    bld, per = [], []
+    level = {g: rng.normal() for g in gids}
+    jump = {g: (rng.uniform(0.2, 1.0) if cohort[g] == 2016 else 0.0) for g in gids}
+    for k, g in enumerate(gids):
+        tall, small = 2 * k + 1, 2 * k + 2
+        per += [(tall, g, 100.0), (small, g, 100.0)]
+        for y in NYC_YEARS:
+            bld.append({"GEOID": g, "GEOID_str": g, "year": y, "building_id": tall,
+                        "predicted_value": level[g] + (jump[g] if y >= 2016 else 0)})
+            bld.append({"GEOID": g, "GEOID_str": g, "year": y, "building_id": small,
+                        "predicted_value": rng.normal(0, 3)})
+    per_building = pd.DataFrame([{"GEOID_str": g, "area": a} for _, g, a in per],
+                                index=pd.Index([i for i, _, _ in per], name="DOITT_ID"))
+    heights = pd.DataFrame({"DOITT_ID": [i for i, _, _ in per],
+                            "height_roof": [500.0 if i % 2 else 5.0 for i, _, _ in per],
+                            "height_imputed": False})
+    heights.loc[3, "height_roof"] = np.nan   # a gap must not break anything
+    lab = pd.DataFrame([{"GEOID": g, "year": y, "label": level[g] + (jump[g] if y == 2023 else 0)}
+                        for y in (2013, 2023) for g in gids])
+    wl = pd.DataFrame([{"GEOID": g, "cbsa": "35620", "year": y,
+                        "usd": float(4e5 * np.exp(0.5 * (level[g] + (jump[g] if y == 2023 else 0))))}
+                       for y in (2013, 2023) for g in gids])
+    ev._CSA_OUTCOME_CACHE.clear()
+    monkeypatch.setattr(ev, "_csa_city_geometry",
+                        lambda p, s: (per_building, pd.DataFrame({"GEOID_str": gids}), None))
+    monkeypatch.setattr(ev, "_csa_city_preds", lambda *a, **k: pd.DataFrame())
+    monkeypatch.setattr(ev, "_csa_building_preds", lambda *a, **k: pd.DataFrame(bld))
+    monkeypatch.setattr(ev, "_load_panel_scores", lambda *a, **k: lab)
+    monkeypatch.setattr(ev, "_csa_split_of",
+                        lambda p: {g: ("heldout" if i % 2 else "train") for i, g in enumerate(gids)})
+
+    class _Coh:
+        cohorts = pd.DataFrame({"GEOID_str": gids, "cohort_year": [cohort[g] for g in gids]})
+    monkeypatch.setattr(ces, "build_tract_cohorts", lambda *a, **k: _Coh())
+    eq = ev.part_f_construction_scatter(tmp_path / "res", proc, out, years=NYC_YEARS, n_boot=5,
+                                        wealth_long=wl).set_index("group")
+    vol = ev.part_f_construction_scatter(tmp_path / "res", proc, out, years=NYC_YEARS, n_boot=5,
+                                         wealth_long=wl, weighting="volume",
+                                         heights=heights).set_index("group")
+    assert (out / "figures" / "F_construction_scatter_volume.pdf").exists()
+    assert (out / "tables" / "F_construction_scatter.csv").exists()
+    assert vol.loc["change 5%", "r2_ols"] > eq.loc["change 5%", "r2_ols"] + 0.2
+    with pytest.raises(ValueError):
+        ev.part_f_construction_scatter(tmp_path / "res", proc, out, years=NYC_YEARS,
+                                       wealth_long=wl, weighting="people")
+
+
+def test_full_range_limits_cover_every_point():
+    v = np.array([[-2.5, 0.1], [0.3, 4.0], [np.nan, 1.0]])
+    lo, hi = ev._full_range_limits(v)
+    assert lo < -2.5 and hi > 4.0
+    assert ev._full_range_limits(np.array([np.nan])) == (-1.0, 1.0)
+    lo, hi = ev._full_range_limits(np.array([0.5, 0.5]))
+    assert lo < 0.5 < hi

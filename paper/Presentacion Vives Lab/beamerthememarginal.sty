@@ -1,0 +1,484 @@
+% ============================================================
+%  beamerthememarginal.sty  --  "Marginal" Beamer theme
+%  Monospaced, minimal, a little colour. For economists.
+%
+%  Fonts: iA Writer Quattro by iA Inc. (OFL 1.1, based on IBM
+%  Plex) and IBM Plex Mono by IBM (OFL 1.1).
+%  Layout ideas (window boxes with hard shadows, block progress
+%  bar, [nn/NN] page counter) adapted from the "Terminal" theme
+%  by Sheikh Azizul Hakim (CC BY 4.0). Palette adapted from the
+%  light/dark themes of the pi coding agent (MIT).
+%
+%  Compile with XeLaTeX or LuaLaTeX (twice, for the frame count).
+%  Options:  dark            pi-style dark palette
+%            nosectionpages  no section divider slides
+%            noprogressbar   footer without the block bar
+%            nouppercase     frame titles in sentence case
+%            imageframes     frame + shadow on every \includegraphics
+%                            (default: plain images, as in LaTeX)
+%            systemfont      use IBM Plex Mono installed on the
+%                            system instead of ./fonts/
+% ============================================================
+\NeedsTeXFormat{LaTeX2e}
+\ProvidesPackage{beamerthememarginal}[2026/10/13 Marginal beamer theme]
+
+\RequirePackage{iftex}
+\RequirePackage{xcolor}
+\RequirePackage{tikz}
+\RequirePackage{tcolorbox}
+\tcbuselibrary{skins}
+\RequirePackage{booktabs}
+\RequirePackage{colortbl}
+
+% ---------- options -----------------------------------------
+\newif\ifmg@dark          \mg@darkfalse
+\newif\ifmg@sectionpages  \mg@sectionpagestrue
+\newif\ifmg@progressbar   \mg@progressbartrue
+\newif\ifmg@uppercase     \mg@uppercasetrue
+\newif\ifmg@systemfont    \mg@systemfontfalse
+\newif\ifmg@imageframes   \mg@imageframesfalse
+\DeclareOptionBeamer{dark}{\mg@darktrue}
+\DeclareOptionBeamer{nosectionpages}{\mg@sectionpagesfalse}
+\DeclareOptionBeamer{noprogressbar}{\mg@progressbarfalse}
+\DeclareOptionBeamer{nouppercase}{\mg@uppercasefalse}
+\DeclareOptionBeamer{systemfont}{\mg@systemfonttrue}
+\DeclareOptionBeamer{imageframes}{\mg@imageframestrue}
+\DeclareOptionBeamer{noimageframes}{\mg@imageframesfalse}
+\ProcessOptionsBeamer
+
+% ---------- palette (from pi's light / dark themes) ---------
+\ifmg@dark
+  \definecolor{mgBg}{HTML}{21252C}
+  \definecolor{mgCard}{HTML}{282C34}
+  \definecolor{mgText}{HTML}{DEE0E1}
+  \definecolor{mgMuted}{HTML}{9DA5A9}
+  \definecolor{mgDim}{HTML}{768186}
+  \definecolor{mgRule}{HTML}{4A5157}
+  \definecolor{mgShadow}{HTML}{0F1114}
+  \definecolor{mgViolet}{HTML}{A798D7}
+  \definecolor{mgBlue}{HTML}{69ADD0}
+  \definecolor{mgGreen}{HTML}{68B78D}
+  \definecolor{mgRed}{HTML}{EA7F81}
+  \definecolor{mgYellow}{HTML}{CD9A22}
+  \definecolor{mgBlueBg}{HTML}{213B49}
+  \definecolor{mgGreenBg}{HTML}{254131}
+  \definecolor{mgRedBg}{HTML}{5B282A}
+  \definecolor{mgVioletBg}{HTML}{3A3055}
+  \definecolor{mgInfoBg}{HTML}{4E2F1B}
+  \colorlet{mgOnAccent}{mgBg}
+  \colorlet{mgDotGrey}{mgDim}
+\else
+  \definecolor{mgBg}{HTML}{EFEEEE}
+  \definecolor{mgCard}{HTML}{F7F6F6}
+  \definecolor{mgText}{HTML}{3B3F41}
+  \definecolor{mgMuted}{HTML}{677176}
+  \definecolor{mgDim}{HTML}{9AA2A7}
+  \definecolor{mgRule}{HTML}{C9CDD0}
+  \definecolor{mgShadow}{HTML}{3B3F41}
+  \definecolor{mgViolet}{HTML}{7459B4}
+  \definecolor{mgBlue}{HTML}{2F7899}
+  \definecolor{mgGreen}{HTML}{337E58}
+  \definecolor{mgRed}{HTML}{C8253D}
+  \definecolor{mgYellow}{HTML}{8F6802}
+  \definecolor{mgBlueBg}{HTML}{DFE7EC}
+  \definecolor{mgGreenBg}{HTML}{DEE9E1}
+  \definecolor{mgRedBg}{HTML}{EEE2E1}
+  \definecolor{mgVioletBg}{HTML}{E6E4EE}
+  \definecolor{mgInfoBg}{HTML}{EDE3DD}
+  \colorlet{mgOnAccent}{white}
+  \colorlet{mgDotGrey}{mgShadow}
+\fi
+% the one accent; change it in your preamble with \colorlet{mgAccent}{mgBlue}
+\colorlet{mgAccent}{mgViolet}
+
+% ---------- fonts --------------------------------------------
+% Body text: iA Writer Quattro -- IBM Plex Mono redrawn with
+%   proportional widths, so it reads like normal text but keeps
+%   the terminal look (credit: iA Inc., based on IBM Plex; OFL 1.1).
+% Labels (titles, box bars, footer, numbers): IBM Plex Mono.
+% Math: standard LaTeX (Computer Modern), untouched.
+\usefonttheme{professionalfonts}
+\usefonttheme[onlymath]{serif}
+\ifPDFTeX
+  \PackageWarning{beamerthememarginal}{Compile with XeLaTeX or LuaLaTeX for the theme fonts}
+  \RequirePackage[T1]{fontenc}
+  \RequirePackage[scale=0.95]{plex-mono}
+  \RequirePackage{plex-sans}
+  \renewcommand*\familydefault{\sfdefault}
+\else
+  \PassOptionsToPackage{no-math}{fontspec}
+  \RequirePackage{fontspec}
+  \ifmg@systemfont
+    \setmainfont{iA Writer Quattro S}
+    \setsansfont{iA Writer Quattro S}
+    \setmonofont{IBM Plex Mono}[LetterSpace=1.0, WordSpace=1.05,
+      FontFace={sb}{n}{IBM Plex Mono SemiBold}, FontFace={mb}{n}{IBM Plex Mono Medium}]
+  \else
+    \defaultfontfeatures{Path=./fonts/, Extension=.ttf,
+      UprightFont=*-Regular, ItalicFont=*-Italic,
+      BoldFont=*-Bold, BoldItalicFont=*-BoldItalic}
+    \setmainfont{iAWriterQuattroS}
+    \setsansfont{iAWriterQuattroS}
+    \defaultfontfeatures{Path=./fonts/, Extension=.otf,
+      LetterSpace=1.0, WordSpace=1.05,
+      UprightFont=*-Regular, ItalicFont=*-Italic,
+      BoldFont=*-Bold, BoldItalicFont=*-BoldItalic,
+      FontFace={sb}{n}{*-SemiBold}, FontFace={mb}{n}{*-Medium},
+      FontFace={l}{n}{*-Light}}
+    \setmonofont{IBMPlexMono}
+  \fi
+  \defaultfontfeatures{}
+\fi
+\linespread{1.18}
+\newcommand\mgsemibold{\ttfamily\fontseries{sb}\selectfont}
+\newcommand\mgheavy{\bfseries}
+\newcommand\mglight{\ttfamily\fontseries{l}\selectfont}
+\newcommand\mgmono{\ttfamily}
+
+\setbeamerfont{normal text}{size=\normalsize}
+\setbeamerfont{frametitle}{size=\large,series=\bfseries,family=\ttfamily}
+\setbeamerfont{title}{size=\LARGE,series=\bfseries,family=\ttfamily}
+\setbeamerfont{subtitle}{size=\normalsize,series=\mdseries}
+\setbeamerfont{footline}{size=\scriptsize,family=\ttfamily}
+\setbeamerfont{block title}{size=\small,series=\bfseries,family=\ttfamily}
+\setbeamerfont{itemize/enumerate subbody}{size=\normalsize}
+\setbeamerfont{itemize/enumerate subsubbody}{size=\small}
+\setbeamerfont{caption}{size=\footnotesize}
+\setbeamerfont{footnote}{size=\scriptsize}
+
+% ---------- beamer colours -----------------------------------
+\setbeamercolor{normal text}{fg=mgText,bg=mgBg}
+\setbeamercolor{background canvas}{bg=mgBg}
+\setbeamercolor{structure}{fg=mgText}
+\setbeamercolor{alerted text}{fg=mgAccent}
+\setbeamercolor{example text}{fg=mgGreen}
+\setbeamercolor{frametitle}{fg=mgText}
+\setbeamercolor{title}{fg=mgText}
+\setbeamercolor{subtitle}{fg=mgMuted}
+\setbeamercolor{footline}{fg=mgMuted}
+\setbeamercolor{itemize item}{fg=mgAccent}
+\setbeamercolor{itemize subitem}{fg=mgDim}
+\setbeamercolor{itemize subsubitem}{fg=mgDim}
+\setbeamercolor{enumerate item}{fg=mgAccent}
+\setbeamercolor{enumerate subitem}{fg=mgDim}
+\setbeamercolor{caption name}{fg=mgMuted}
+\setbeamercolor{footnote mark}{fg=mgAccent}
+\setbeamercolor{bibliography entry author}{fg=mgText}
+\setbeamercolor{bibliography entry note}{fg=mgMuted}
+\setbeamercolor{bibliography entry location}{fg=mgMuted}
+\setbeamercolor{button}{fg=mgAccent,bg=mgVioletBg}
+
+\setbeamertemplate{navigation symbols}{}
+\setbeamertemplate{caption}[default]
+\setbeamertemplate{bibliography item}{\textcolor{mgAccent}{[\theenumiv]}}
+\setbeamersize{text margin left=9mm,text margin right=9mm}
+\setlength{\parskip}{3pt}
+
+% booktabs rules in muted ink
+\AtBeginDocument{%
+  \arrayrulecolor{mgDim}%
+  \setlength{\heavyrulewidth}{0.8pt}\setlength{\lightrulewidth}{0.4pt}}
+
+% ---------- user-facing knobs --------------------------------
+\def\mg@footprefix{}
+\newcommand\marginalfoot[1]{\def\mg@footprefix{#1}}   % footer left label
+\def\mg@window{}
+\newcommand\marginalwindow[1]{\def\mg@window{#1}}     % title-window label
+\def\mg@titlenote{}
+\newcommand\marginalnote[1]{\def\mg@titlenote{#1}}    % JEL codes etc.
+\def\mg@cells{24}
+\newcommand\marginalcells[1]{\def\mg@cells{#1}}       % progress bar width
+
+\newcommand\mg@twodigits[1]{\ifnum#1<10 0\fi\number#1}
+
+% ---------- progress bar ([###.....] in coloured cells) -------
+\newcommand\mg@progressbar{%
+  \begin{tikzpicture}[baseline=-0.6ex]
+    \pgfmathtruncatemacro\mg@total{max(\inserttotalframenumber,1)}%
+    \pgfmathtruncatemacro\mg@filled{round(\mg@cells*min(\insertframenumber,\mg@total)/\mg@total)}%
+    \foreach \i in {1,...,\mg@cells}{%
+      \ifnum\i>\mg@filled\relax
+        \fill[mgRule] ({(\i-1)*1.35mm},-0.75mm) rectangle ++(0.95mm,1.5mm);
+      \else
+        \fill[mgAccent] ({(\i-1)*1.35mm},-0.75mm) rectangle ++(0.95mm,1.5mm);
+      \fi}
+  \end{tikzpicture}}
+
+% ---------- footline -----------------------------------------
+\setbeamertemplate{footline}{%
+  \leavevmode\usebeamerfont{footline}\usebeamercolor[fg]{footline}%
+  \hbox to \paperwidth{%
+    \hskip9mm%
+    \ifx\mg@footprefix\@empty\else{\color{mgAccent}\mg@footprefix}\hskip1.2ex{\color{mgDim}/}\hskip1.2ex\fi
+    \insertshorttitle\hfill
+    \ifmg@progressbar\mg@progressbar\hskip3ex\fi
+    {\color{mgDim}[}\,{\color{mgText}\mg@twodigits{\insertframenumber}}{\color{mgDim}/\mg@twodigits{\inserttotalframenumber}}\,{\color{mgDim}]}%
+    \hskip9mm}%
+  \vskip5mm}
+
+% ---------- frame title --------------------------------------
+\newcommand\mg@titlecase[1]{\ifmg@uppercase\MakeUppercase{#1}\else#1\fi}
+\setbeamertemplate{frametitle}{%
+  \vskip5mm
+  \hbox to \textwidth{%
+    \usebeamerfont{frametitle}\usebeamercolor[fg]{frametitle}%
+    \strut\mg@titlecase{\insertframetitle}\hfill}%
+  \ifx\insertframesubtitle\@empty\else
+    \vskip1pt\hbox{\usebeamerfont{subtitle}\color{mgMuted}\insertframesubtitle}%
+  \fi
+  \vskip2pt
+  \hbox{{\color{mgAccent}\rule{14mm}{1.2pt}}{\color{mgRule}\rule{\dimexpr\textwidth-14mm\relax}{0.4pt}}}%
+  \vskip1mm}
+
+% ---------- lists ---------------------------------------------
+\setbeamertemplate{itemize item}{%
+  \raisebox{0.18ex}{\tikz\fill[mgAccent] (0,0) rectangle (0.55ex,0.55ex);}}
+\setbeamertemplate{itemize subitem}{\textcolor{mgDim}{--}}
+\setbeamertemplate{itemize subsubitem}{\textcolor{mgDim}{\textperiodcentered}}
+\setbeamertemplate{enumerate item}{\ttfamily\textcolor{mgDim}{[}\textcolor{mgAccent}{\insertenumlabel}\textcolor{mgDim}{]}}
+\setbeamertemplate{enumerate subitem}{\textcolor{mgDim}{\insertsubenumlabel.}}
+\setlength{\leftmargini}{1.6em}
+\setlength{\leftmarginii}{1.4em}
+
+% ---------- boxes ----------------------------------------------
+% common look: sharp corners, 0.6pt frame, hard (unblurred) shadow
+\tcbset{
+  mgbase/.style={enhanced, sharp corners, boxrule=0.6pt,
+    left=2.2mm, right=2.2mm, top=1.6mm, bottom=1.6mm,
+    colback=mgCard, colframe=mgText, coltext=mgText,
+    fonttitle=\usebeamerfont{block title},
+    toptitle=0.6mm, bottomtitle=0.6mm, lefttitle=2.2mm,
+    shadow={1.1mm}{-1.1mm}{0mm}{fill=mgShadow},
+    before upper=\raggedright, before skip=4pt, after skip=8pt},
+  mgtone/.style 2 args={colbacktitle=#2, coltitle=#1,
+    title filled, colframe=mgText}}
+
+% window with a title bar; optional arg = tone (blue|green|red|violet|plain)
+\newenvironment{tbox}[2][blue]{%
+  \begin{tcolorbox}[mgbase, mgtone={mgText}{\mg@tonebg{#1}},
+    title={\mg@dots{#1}\hskip1.4ex#2}]}{\end{tcolorbox}}
+% plain panel, no title bar
+\newenvironment{pbox}[1][plain]{%
+  \begin{tcolorbox}[mgbase, colback=\mg@panelbg{#1}]}{\end{tcolorbox}}
+% accent banner: filled with the accent colour
+\newenvironment{ibox}{%
+  \begin{tcolorbox}[mgbase, colback=mgAccent, coltext=mgOnAccent,
+    fontupper=\bfseries, colframe=mgText]}{\end{tcolorbox}}
+% semantic shortcuts for papers
+\newenvironment{resultbox}[1][Result]{\begin{tbox}[green]{#1}}{\end{tbox}}
+\newenvironment{caveatbox}[1][Caveat]{\begin{tbox}[red]{#1}}{\end{tbox}}
+\newenvironment{notebox}[1][Note]{\begin{tbox}[violet]{#1}}{\end{tbox}}
+
+\def\mg@tonebg#1{\csname mg@bg@#1\endcsname}
+\def\mg@bg@blue{mgBlueBg}\def\mg@bg@green{mgGreenBg}
+\def\mg@bg@red{mgRedBg}\def\mg@bg@violet{mgVioletBg}
+\def\mg@bg@plain{mgCard}\def\mg@bg@info{mgInfoBg}
+\def\mg@panelbg#1{\csname mg@pb@#1\endcsname}
+\def\mg@pb@plain{mgCard}\def\mg@pb@blue{mgBlueBg}\def\mg@pb@green{mgGreenBg}
+\def\mg@pb@red{mgRedBg}\def\mg@pb@violet{mgVioletBg}\def\mg@pb@info{mgInfoBg}
+\def\mg@tonefg#1{\csname mg@fg@#1\endcsname}
+\def\mg@fg@blue{mgBlue}\def\mg@fg@green{mgGreen}\def\mg@fg@red{mgRed}
+\def\mg@fg@violet{mgViolet}\def\mg@fg@plain{mgDim}\def\mg@fg@info{mgYellow}
+\newcommand\mg@greydot{\tikz[baseline=-0.55ex]\fill[mgDotGrey] (0,-0.32em) rectangle (0.64em,0.32em);}
+% the little coloured square in each title bar
+\newcommand\mg@dots[1]{\tikz[baseline=-0.55ex]\fill[\mg@tonefg{#1}] (0,-0.32em) rectangle (0.64em,0.32em);}
+
+% restyle beamer's own blocks
+\setbeamertemplate{block begin}{%
+  \par\vskip2pt\begin{tcolorbox}[mgbase, mgtone={mgText}{mgBlueBg},
+    title={\mg@dots{blue}\hskip1.4ex\insertblocktitle}]}
+\setbeamertemplate{block end}{\end{tcolorbox}}
+\setbeamertemplate{block alerted begin}{%
+  \par\vskip2pt\begin{tcolorbox}[mgbase, mgtone={mgText}{mgRedBg},
+    title={\mg@dots{red}\hskip1.4ex\insertblocktitle}]}
+\setbeamertemplate{block alerted end}{\end{tcolorbox}}
+\setbeamertemplate{block example begin}{%
+  \par\vskip2pt\begin{tcolorbox}[mgbase, mgtone={mgText}{mgGreenBg},
+    title={\mg@dots{green}\hskip1.4ex\insertblocktitle}]}
+\setbeamertemplate{block example end}{\end{tcolorbox}}
+% theorem-like environments use the blocks above
+
+% ---------- inline helpers -------------------------------------
+\newcommand\inv[1]{{\setlength{\fboxsep}{1.5pt}\colorbox{mgAccent}{\textcolor{mgOnAccent}{\strut#1}}}}
+\newcommand\hl[1]{{\setlength{\fboxsep}{1.5pt}\colorbox{mgInfoBg}{\strut#1}}}
+\newcommand\pos[1]{\textcolor{mgGreen}{#1}}   % positive / significant
+\newcommand\negv[1]{\textcolor{mgRed}{#1}}    % negative
+\newcommand\muted[1]{\textcolor{mgMuted}{#1}}
+\newcommand\chip[1]{{\setlength{\fboxsep}{1.2pt}\fcolorbox{mgDim}{mgCard}{\scriptsize\strut\,#1\,}}}
+\newcommand\src[1]{\par\vfill\hfill{\tiny\color{mgMuted}\textcolor{mgDim}{Source:}\ #1}\par}
+
+% ---------- \thanks ----------------------------------------------
+% Use \thanks{...} inside \title{} or \author{} as in an article.
+% Marks are set as *, †, ‡, ... in the accent colour; the notes are
+% printed at the foot of the title window. Use \thanks[1]{...} to
+% force a numeric mark instead of a symbol.
+\newcounter{mgthanks}
+\def\mg@thankslist{}
+\newcommand\mg@thanksmark{%
+  \ifcase\value{mgthanks}\or *\or \textdagger\or \textdaggerdbl\or \textsection\or
+    \textparagraph\or **\or \textdagger\textdagger\or \textdaggerdbl\textdaggerdbl
+  \else\arabic{mgthanks}\fi}
+\newcommand\mg@dothanks[2][]{%
+  \stepcounter{mgthanks}%
+  \edef\mg@curmark{\if\relax\detokenize{#1}\relax\mg@thanksmark\else#1\fi}%
+  \textsuperscript{\textcolor{mgAccent}{\mdseries\mg@curmark}}%
+  \protected@xdef\mg@thankslist{\mg@thankslist
+    \protect\mg@thanksline{\mg@curmark}{\unexpanded{#2}}}}
+\newcommand\mg@thanksline[2]{%
+  \hangindent1.6em\hangafter1\noindent
+  \makebox[1.6em][l]{\textcolor{mgAccent}{#1}}#2\par}
+\newcommand\mg@resetthanks{%
+  \setcounter{mgthanks}{0}\gdef\mg@thankslist{}%
+  \def\thanks{\NoCaseChange\mg@dothanks}}
+
+% ---------- title page -----------------------------------------
+\setbeamertemplate{title page}{%
+  \mg@resetthanks
+  \vfill
+  \begin{tcolorbox}[mgbase, width=0.84\textwidth, center,
+      left=6mm, right=6mm, top=5mm, bottom=5mm,
+      mgtone={mgMuted}{mgVioletBg},
+      fonttitle=\usebeamerfont{footline}\mdseries,
+      title={\mg@greydot\hskip0.6ex\mg@greydot\hskip0.6ex\mg@greydot%
+        \ifx\mg@window\@empty\else\hskip1.6ex\mg@window\fi}]
+    {\usebeamerfont{title}\usebeamercolor[fg]{title}\linespread{1.15}\selectfont\MakeUppercase{\inserttitle}\par}
+    \ifx\insertsubtitle\@empty\else
+      \vskip2mm{\usebeamerfont{subtitle}\color{mgMuted}\insertsubtitle\par}
+    \fi
+    \vskip4mm
+    {\color{mgAccent}\rule{14mm}{1.2pt}}{\color{mgRule}\rule{\dimexpr\linewidth-14mm}{0.4pt}}\par
+    \vskip3mm
+    {\small\insertauthor
+     \ifx\insertinstitute\@empty\else\hskip1ex{\color{mgDim}//}\hskip1ex\insertinstitute\fi
+     \ifx\insertdate\@empty\else\hskip1ex{\color{mgDim}//}\hskip1ex{\color{mgMuted}\insertdate}\fi\par}
+    \ifx\mg@titlenote\@empty\else
+      \vskip2mm{\scriptsize\ttfamily\color{mgMuted}\mg@titlenote\par}
+    \fi
+    \ifx\mg@thankslist\@empty\else
+      \vskip3mm{\color{mgRule}\rule{\linewidth}{0.4pt}}\par\vskip1.5mm
+      {\scriptsize\color{mgMuted}\linespread{1.2}\selectfont\mg@thankslist}%
+    \fi
+  \end{tcolorbox}
+  \global\let\@thanks\@empty
+  \vfill}
+
+% ---------- section pages --------------------------------------
+\newcommand\mg@sectionframe{%
+  \begingroup
+  \setbeamertemplate{footline}{}%
+  \begin{frame}[plain,noframenumbering]
+    \vfill
+    \hskip0.06\textwidth\begin{minipage}{0.86\textwidth}
+      {\ttfamily\fontsize{54}{54}\selectfont\mgheavy\color{mgAccent}\mg@twodigits{\thesection}\par}
+      \vskip3mm
+      {\ttfamily\Large\bfseries\mg@titlecase{\insertsectionhead}\par}
+      \vskip4mm
+      {\color{mgAccent}\rule{14mm}{1.2pt}}{\color{mgRule}\rule{\dimexpr\linewidth-14mm}{0.4pt}}\par
+      \vskip2mm
+      {\ttfamily\scriptsize\color{mgMuted}\insertshorttitle\par}
+    \end{minipage}
+    \vfill
+  \end{frame}
+  \endgroup}
+\ifmg@sectionpages
+  \AtBeginSection{\ifnum\thesection>0\mg@sectionframe\fi}
+\fi
+
+% ---------- closing / big-statement slide ----------------------
+% \marginalscreen{small label}{BIG TEXT}{bottom line}
+\newcommand\marginalscreen[3]{%
+  \begingroup\setbeamertemplate{footline}{}%
+  \begin{frame}[plain,noframenumbering]
+    \vfill\centering
+    {\ttfamily\scriptsize\color{mgMuted}#1\par}\vskip3mm
+    {\ttfamily\fontsize{40}{44}\selectfont\mgheavy\color{mgText}#2\par}\vskip5mm
+    {\color{mgAccent}\rule{14mm}{1.2pt}}\par\vskip4mm
+    {\small\color{mgMuted}#3\par}
+    \vfill
+  \end{frame}\endgroup}
+
+% siunitx numbers in the text font
+\AtBeginDocument{\@ifpackageloaded{siunitx}{\sisetup{mode=text}}{}}
+
+% ---------- figures and framed images ---------------------------
+% figurewindow: a figure drawn as an old-computer window -- title bar
+% with three grey squares and the figure title, frame, hard shadow,
+% no padding around the content. Centred; it shrinks to the content.
+%   \begin{figurewindow}{Event study: teen employment}
+%     \includegraphics[width=0.6\textwidth]{event.pdf}
+%   \end{figurewindow}
+%   Optional argument: [at left] or [at right] instead of centred,
+%   or any extra tcolorbox keys. Starred form figurewindow* adds a
+%   little padding inside the window -- nicer for plots and diagrams.
+% Plain LaTeX still works as usual: figure + \includegraphics are left
+% unstyled. Other helpers:
+%   \framedgraphics[...]{fig.png}  frame + shadow, no title bar
+%   \rawgraphics[...]{fig.png}     never framed (also with imageframes)
+% The imageframes option frames every \includegraphics automatically.
+\tcbset{
+  mgimage/.style={enhanced, sharp corners, nobeforeafter,
+    boxrule=0.6pt, boxsep=0pt, left=0pt, right=0pt, top=0pt, bottom=0pt,
+    colback=mgCard, colframe=mgText,
+    shadow={1.1mm}{-1.1mm}{0mm}{fill=mgShadow}, tcbox raise base},
+  at left/.style={enlarge left by=0pt, enlarge right by=\linewidth-(\kvtcb@width)},
+  at right/.style={enlarge right by=0pt, enlarge left by=\linewidth-(\kvtcb@width)}}
+\newcommand\mg@windowdots{\mg@greydot\hskip0.6ex\mg@greydot\hskip0.6ex\mg@greydot}
+\newsavebox\mg@figbox
+\newlength\mg@figwd
+\newcommand\mg@figbegin[1]{%
+  \par\def\mg@figpad{#1}%
+  \begin{lrbox}{\mg@figbox}%
+  \let\includegraphics\rawgraphics
+  \ignorespaces}
+\newcommand\mg@figend[2]{%
+  \unskip\end{lrbox}%
+  \sbox\mg@figbox{\hskip\mg@figpad
+    \vbox{\vskip\mg@figpad\hbox{\usebox\mg@figbox}\vskip\mg@figpad}\hskip\mg@figpad}%
+  \global\mg@figwd=\dimexpr\wd\mg@figbox+1.2pt\relax
+  \begin{tcolorbox}[mgbase, center,
+      width=\mg@figwd,
+      boxsep=0pt, left=0pt, right=0pt, top=0pt, bottom=0pt,
+      colback=mgCard, colbacktitle=mgVioletBg, coltitle=mgMuted, title filled,
+      fonttitle=\usebeamerfont{footline}\mdseries,
+      toptitle=0.9mm, bottomtitle=0.9mm, lefttitle=2mm, righttitle=2mm,
+      title={\setbox0\hbox{\mg@windowdots\hskip1.6ex}\hangindent\wd0\hangafter1\noindent\box0 #2},
+      #1]
+    \noindent\usebox\mg@figbox
+  \end{tcolorbox}}
+\NewDocumentEnvironment{figurewindow}{O{} m}{\mg@figbegin{0pt}}{\mg@figend{#1}{#2}}
+\NewDocumentEnvironment{figurewindow*}{O{} m}{\mg@figbegin{2.5mm}}{\mg@figend{#1}{#2}}
+\NewDocumentCommand\framedgraphics{s O{} m}{%
+  \tcbox[mgimage]{\IfBooleanTF{#1}{\rawgraphics*[#2]{#3}}{\rawgraphics[#2]{#3}}}}
+\NewDocumentCommand\mg@framedincludegraphics{s O{} m}{%
+  \IfBooleanTF{#1}{\framedgraphics*[#2]{#3}}{\framedgraphics[#2]{#3}}}
+\AtBeginDocument{%
+  \NewCommandCopy\rawgraphics\includegraphics
+  \ifmg@imageframes
+    \RenewCommandCopy\includegraphics\mg@framedincludegraphics
+    % keep beamer's own logo / title graphic unframed
+    \pretocmd\logo{\let\includegraphics\rawgraphics}{}{}%
+    \pretocmd\titlegraphic{\let\includegraphics\rawgraphics}{}{}%
+  \fi}
+
+% ---------- pgfplots defaults (if loaded) ----------------------
+\AtBeginDocument{%
+  \@ifpackageloaded{pgfplots}{%
+    \pgfplotsset{
+      every axis/.append style={
+        axis line style={mgDim, line width=0.5pt},
+        tick style={mgDim}, major tick length=2pt,
+        tick label style={font=\scriptsize, text=mgMuted},
+        label style={font=\footnotesize, text=mgText},
+        grid style={mgRule, line width=0.3pt},
+        legend style={font=\scriptsize, draw=mgText, fill=mgCard,
+          text=mgText, line width=0.5pt},
+        legend cell align=left},
+      cycle list={
+        {mgAccent, line width=1.1pt, mark=*, mark size=1.5pt},
+        {mgBlue, line width=1.1pt, mark=square*, mark size=1.4pt},
+        {mgGreen, line width=1.1pt, densely dashed, mark=triangle*, mark size=1.7pt},
+        {mgRed, line width=1.1pt, densely dotted, mark=diamond*, mark size=1.7pt},
+        {mgDim, line width=1.1pt, mark=o, mark size=1.5pt}}}%
+  }{}}
+
+\endinput

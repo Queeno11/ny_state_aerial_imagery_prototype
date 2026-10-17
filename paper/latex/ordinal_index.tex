@@ -1,0 +1,1014 @@
+\documentclass[11pt]{article}
+\usepackage[margin=1.1in]{geometry}
+\usepackage{amsmath, amssymb, amsfonts, amsthm}
+\usepackage{booktabs}
+\usepackage{tabularx}
+\usepackage{natbib}
+\usepackage{hyperref}
+\hypersetup{colorlinks=true, linkcolor=black, citecolor=black, urlcolor=blue}
+\usepackage{soul}
+\newtheorem{assumption}{Assumption}
+\newtheorem{theorem}{Theorem}
+\newtheorem{corollary}{Corollary}
+\newtheorem{lemma}{Lemma}
+\newtheorem{proposition}{Proposition}
+\newtheorem{condition}{Condition}
+\newtheorem{definition}{Definition}
+\theoremstyle{remark}
+\newtheorem{remark}{Remark}
+
+\newcommand{\E}{\mathbb{E}}
+\newcommand{\Qc}{Q_{\mathrm{cross}}}
+\newcommand{\Qs}{Q_{\mathrm{stable}}}
+\newcommand{\Qt}{Q}
+\newcommand{\Qch}{\hat{Q}_{\mathrm{cross}}}
+\newcommand{\Qsh}{\hat{Q}_{\mathrm{stable}}}
+\newcommand{\Qth}{\hat{Q}}
+\newcommand{\sign}{\operatorname{sign}}
+\newcommand{\Cc}{\mathcal{C}}
+\newcommand{\Ss}{\mathcal{S}}
+
+\title{\textbf{Learning a Common Index from Outcomes Measured on Non-Comparable Scales}\\[0.3em]
+\large Technical note}
+\date{}
+
+\begin{document}
+\maketitle
+\vspace{-2em}
+
+\begin{abstract}
+\noindent Outcomes recorded across groups often have incomparable scales. A fixed income affords different housing across cities, exams vary in difficulty, and credit ratings depend on the rating system. We show that such labels can nevertheless identify a common latent index when covariates determine a shared index and each group observes it through an unknown monotone rescaling. Within-group rankings reveal relative latent values, while repeated observations of units with nearly unchanged covariates constrain changes in the index. We combine these restrictions in an objective with a pairwise logistic ranking loss within groups and a scale-free stability penalty. The objective is invariant to the unknown group-specific label scales. Under logistic residuals, near-minimizers recover the index up to scale and a group-specific additive constant, with squared error bounded by the penalty weight times the squared index drift at an unchanged unit. When groups are sampled as independent clusters, a fitted neural network converges to this target up to the approximation error of its function class. We illustrate the method by learning a neighborhood wealth index from local imagery and tract incomes across U.S. cities.
+\end{abstract}
+
+\section*{Introduction}
+
+\hl{Nota para JAUME: esta intro sufre un problema de identidad respecto al abstract. El abstract está seteando un problema en general, en la intro escribí todo como mi paper de imágenes. Según para donde apuntemos, voy a reescribir una o la otra!}
+
+Aerial imagery now covers most of the United States at building-level resolution and annual frequency, while the American Community Survey reports five-year averages for census tracts with margins of error that are wide for small areas. A model that reads wealth from imagery could close that gap. It would help target programs at a geography the survey cannot support, sharpen small-area estimates by combining the two signals, and measure change between survey rounds. It would also make impact evaluation possible where no survey covers the affected places or years: after a rezoning, a transit extension or a subsidized housing program, the units of interest are blocks, and the relevant window is shorter than a survey cycle.
+
+Despite the importance of this task, there is a foundamental problem with remote wealth estimation that has remained unresolved. Remote detection models scale on detection tasks because, for example, a building is a building in Dallas and in Lagos, so every labeled image is one more example of a single relationship. Wealth labels lack that property. Surveys report wealth in dollars, and the same visual bundle carries different dollar values in two cities or in two years, because each local wealth distribution is shifted, stretched and reshaped by forces unrelated to the built environment. Pooling dollar labels across places and periods therefore mixes incompatible relationships, and a new city can add an inconsistent
+example rather than another instance of the same one. To illustrate this, \citet{khachiyan2022} report $R^{2}\approx 0.90$
+for income levels pooled over 2000 and 2010 and $R^{2}\approx 0.40$ for the 2000--2010 change, highlighting the difficulty the models face to detect changes from the images.
+
+This note shows that dollar labels nevertheless identify a common index of relative wealth, provided an estimator that uses only the comparisons the labels support. There are two instances where we get information about the latent common index. Within a city and year, the labels order tracts
+as their latent wealth positions do, whatever the local map to dollars. Across years the labels cannot be compared, but a location whose imagery barely changes has an expected position that barely moves---a restriction that uses no label at all. We build a criterion from these two restrictions: a pairwise ranking term within each city-year, and a penalty on how much the scores of structurally unchanged locations move, divided by the dispersion of the scores so that it cannot be satisfied by shrinking them.
+
+Two results follow. The identification theorem shows that, when the residual difference within a city-year is logistic, any score that nearly minimizes the
+criterion reproduces the index up to scale and a constant per city-year, with squared error of the same order. The estimation theorem treats cities as independent clusters of arbitrarily dependent tracts and shows that a fitted neural network converges to that target up to the approximation error of its class. The main theoretical limitation is that cities need not to be tied: cities could end up being represented into disjoints segments of the latent space. The temporal penalty ties the constants of a city's years together, but nothing in the criterion ties cities to one another, so comparisons of levels across cities rest on the fitted representation and have to be checked in the data. \hl{NOTA PARA JAUME: Es lógico que la representación sobre un soporte común, si es factible, tiene que ser más "barata" para las estimaciones en muestra finita que una representación disjunta. Lo que no me queda claro es si esto es un teorema que dependa de la signal to noise en la muestra, o si es algo que queda para ver empíricamente o con un monte carlo...} 
+
+\paragraph{The model.} Units $i$ are census tracts, $c$ indexes cities and $t$ years; the pair
+$(c,t)$ is a \emph{cell}. Two objects are observed: $W_{ict}$, the tract's wealth as the survey reports
+it,\footnote{The label is tract per-capita income from the ACS five-year estimates. Following the
+companion paper, we read it as a noisy measure of wealth in the
+permanent-income sense---the expected present value of future earnings plus accumulated assets---which
+is what the latent position below orders; survey sampling error and the gap between current and
+permanent income enter the residual $\varepsilon$.} and $X_{ict}$, what the model sees of the tract: an
+aerial image tile of $250\times250$ meters drawn at random from the tract, and a set of covariates. A third variable, the latent wealth index
+$R_{ict}$, is latent. The model is
+\begin{equation}\label{eq:model}
+    W_{ict} = \Psi_{ct}\!\left(R_{ict}\right),
+    \qquad
+    R_{ict} = f(X_{ict}) + \varepsilon_{ict}.
+\end{equation}
+where $\varepsilon_{ict}$ is the gap between that latent index and the one its tile predicts. Because the tile is a random local view of the tract, $f(x)$ is the expected latent wealth of a tract of which $x$ is such a view.
+
+Each piece plays a different role. The \emph{index function} $f$ maps a bundle of features into a latent wealth position and is the same in every cell; it is the object we estimate. The transformation $\Psi_{ct}$ converts positions into dollars and is specific to the cell: it sends each position to the dollars at the same quantile of the local distribution, so it carries that distribution's level, spread and shape. It has to be cell-specific because the map from position to dollars moves along both dimensions of the panel. Over time, inflation and rising living costs shift it up, and changes in local inequality stretch and reshape it, so no single deflator puts two years on one scale. Across cities, the same visual bundle corresponds to different dollar amounts because wage and price levels differ. The model assigns all of this variation to $\Psi_{ct}$ and none to $f$: the same features mean the same latent position in every city and year, while the dollars attached to that position are left unrestricted and never estimated. In position form, \eqref{eq:model} is the generalized regression model of \citet{han1987} with two changes: $f$ is nonparametric, estimated by a neural network, and the transformation is cell-specific, as in \citet{abrevaya2000}.
+
+\paragraph{What pooling dollars estimates.} A model naively fitted to map images to
+dollars is forced to map similar images of different cities to two different numbers, so the fitted function becomes a mixture.
+
+\begin{proposition}[Pooled levels estimate a mixture]\label{prop:mixture}
+Suppose \eqref{eq:model} holds, $\E|W| < \infty$, and $W$ is regressed on $X$ pooling all cells
+without conditioning on $(c,t)$. Then
+\begin{equation}\label{eq:mixture}
+    \E\!\left[W \mid X=x\right]
+    \;=\; \sum_{c,t} \Pr\!\left(c,t \mid X=x\right)\,
+    \E\!\left[\Psi_{ct}(R) \mid X=x,\, c,\, t\right].
+\end{equation}
+\end{proposition}
+
+The weights in \eqref{eq:mixture} reflect which cities and years happen to be in the training sample, not anything about the economy, and they can scramble the ranking. Take New York and Dallas, and three kinds of buildings that rank the same way in both cities: luxury residential towers at the top, single-family houses in the middle, public housing towers at the bottom. The same position in the local wealth distribution pays more nominal dollars in New York. Luxury towers and houses exist in both cities, so the pooled model learns for each an average of New York and Dallas incomes, and for houses that average leans toward Dallas, where most houses are. Public housing towers show up only in New York, so the model learns New York incomes for them and nothing else. If the dollar gap between the two cities is large enough, public housing ends up predicted richer than houses, although it is poorer in each city. The model has not learned that public housing signals wealth; it has learned that public housing signals New York. While this might not end up happening exactly as described in the pooled estimate, nothing in the model prevents this kind of unwanted behavior.
+
+\paragraph{What the labels can still support.} One reading of the evidence is that the map from features to wealth is inherently local, so every city and year needs its own model. We read it differently: the locality is in the dollar labels, not in the ordering. In the leftmost part of the wealth distribution, choice is limited to the cheaper buildings, which are older, in less maintained areas, and farther away from the economic center; to the right of the distribution, wealth buys amenities that look much the same everywhere---space, light, quiet, greenery, quality of construction, height, centrality. A tower with high-quality finishes in the core of a metropolis belongs near the top of its own city's distribution wherever that metropolis is. What travels across cities is the position of a feature bundle; what does not travel is the number of dollars attached to it.\footnote{This is why the index is latent rather than a percentile rank. A percentile index would require the best towers to sit at the same percentile in every city, which fails: in one city they may house the richest 0.1 percent, in another the richest 0.5 percent, because the two cities have different numbers of such towers. The latent index instead gives each bundle a level on a common scale. A city's percentiles then depend on how many of its tracts sit at each level, so the same tower can fall at different percentiles in different cities while keeping the same index.}
+
+\paragraph{Related work.} Proposition~\ref{prop:mixture} suggests why existing designs sidestep a free
+$\Psi_{ct}$ rather than confront it, and they do so in one of four ways. Some fit a single cell, where
+$\Psi_{ct}$ is a constant that never has to be estimated: \citet{xie2016transfer} and
+\citet{ayush2020generating} use one Ugandan survey round, \citet{suel2021multimodal} one year of
+London, \citet{huang2021using} a single post-treatment cross-section of a Kenyan experiment. Others fit
+one model per cell, so each fit absorbs its own transformation: \citet{jean2016combining} within
+country, \citet{karasov2025predicting} separately for Amsterdam, New York and Sydney,
+\citet{fan2023urban} separately by metropolitan area. A third group pools cells and assumes a common
+transformation, which is the setting of Proposition~\ref{prop:mixture}: \citet{gebru2017using} across
+200 cities, \citet{rolf2021generalizable} across the continental United States, \citet{khachiyan2022}
+across places and two census years, and \citet{abbate2025longitudinal} by copying one year's labels
+onto every year, which holds $\Psi_{ct}$ fixed by construction. A fourth avoids a monetary target
+altogether and treats an asset index as the position itself \citep{yeh2020using, zheng2026satellite}, or reports
+an explicitly within-country relative index \citep{chi2022micro}. Two designs correct the
+transformation parametrically: \citet{law2019take} add the sale year to a hedonic price model, and \citet{sherman2026global} convert to purchasing-power parity and re-anchor predictions to known country
+means. Both absorb a shift in the level of $\Psi$, neither a change in its shape. Nothing in this list
+pools cells while leaving $\Psi_{ct}$ free, which is what a panel of cities requires. There are two
+ways to face it: let the fit differ by cell, which works in sample but says nothing about a cell
+without labels, or restrict how the index depends on features. We take the second route, because the
+goal is prediction in cities without labels. \hl{NOTE FOR JAUME: I think here I need to work this a bit more (with the finite sample result). Its not that you cannot estimate an pooled model---all the papers that use whole country does that. The issue is you force the model to learn which city is which, which is detrimental to out-sample prediction, and fairly equivalente to adding fixed effects, and also possible has worse small sample properties (you are forcing to learn one representation per city vs a single representation). I'll have to think about it in more detail}
+
+This is not the first rank-based estimator for a transformation model with repeated observations, nor
+the first to put a flexible index inside a rank criterion. Three strands each have one of the
+ingredients. The first eliminates an unknown monotone transformation by pairwise rankings but keeps a
+finite-dimensional index \citep{han1987, sherman1993, cavanagh1998}; here the index function is
+unrestricted and it is its ordering that is identified. The second uses repeated or clustered
+observations for transformation models with group-specific or random effects: \citet{abrevaya2000}
+allows the transformation to differ across groups and \citet{lin2017} handle clustered data through
+symmetry of a random effect. In both the object recovered is a finite-dimensional parameter, and
+repeated observations remove a nuisance term rather than restrict the index function itself, which is
+what the stability restriction does here. The third is flexible or high-dimensional rank estimation.
+\citet{wang2024deep} is the closest prior work: they estimate a nonparametric transformation model with
+a deep network inside a maximum rank correlation objective, but their transformation is a single
+population-level function and their design is cross-sectional, which is precisely where the two
+extensions here sit. \citet{fan2020rank} study rank estimation as the dimension grows, which is not the
+regime here: the architecture is fixed, so what is needed is a law of large numbers over cities rather
+than increasing-dimension rank theory.
+
+The problem is not specific to imagery or to wealth. It arises wherever labels are comparable within
+groups but not across them and some units appear in more than one group: preference and reward data
+with annotator-specific scales, test scores across forms and graders, credit risk across vintages,
+severity graded from medical images across sites and scanners, and hedonic quality across markets whose
+price levels differ.
+
+\paragraph{Roadmap.} Section~\ref{sec:target} states the four assumptions under which one function of
+features serves every city and derives the two restrictions the data make available;
+Section~\ref{sec:crit} builds the criterion from them and shows what its minimizers recover;
+Section~\ref{sec:scale} turns to the estimator and its convergence as cities accumulate;
+Section~\ref{sec:valid} proposes checks of whether the fitted index holds still where nothing changed,
+moves where something did, and puts all cities on one scale; and Section~\ref{sec:disc} collects what is
+left open. All proofs are in Appendix~\ref{app:proofs}.
+
+
+%======================================================================
+\section{What the data reveal about the latent variable}\label{sec:target}
+%======================================================================
+
+The labels are in dollars and the map from positions to dollars is unknown and specific to each cell,
+so it is not obvious what the data say about the latent position at all. This section states the
+assumptions of the model and derives what the labels reveal about $R$. Proposition~\ref{prop:implications}
+shows two things: within a cell, the labels order tracts exactly as their latent positions do; and at a
+location that did not change, the expected position its tile predicts barely moves across years, a
+restriction that uses no label. The section closes by defining the estimand.
+
+The index function acts on the image through a representation. Let
+$H_{ict} = \phi(X_{ict}) \in \mathbb{R}^{K}$ be the vector produced before the final scalar layer, with
+each coordinate standardized, and write
+\begin{equation}\label{eq:rep}
+    f \;=\; g \circ \phi .
+\end{equation}
+The representation is not an object of estimation: for any invertible $A$ the pair
+$(g\circ A^{-1}, A\circ\phi)$ generates the same $f$, so only $f$ is identified. The factorization is a
+device for stating a regularity restriction on $f$, and a very intuitive interpretation of what the deep-learning models will learn: a set of embeddings or features $H_{ict}$ that end in a linear model $g$. 
+
+The information comes from two kinds of comparisons. Within a cell, the unknown $\Psi_{ct}$ changes dollar values but preserves their ordering, so comparing two tracts reveals which has the higher $R$ without estimating $\Psi_{ct}$. Across years, a structurally unchanged location offers a different restriction: under the assumptions below, its tiles should predict nearly the same expected $R$, even though their dollar labels cannot be compared.
+
+Let $\Cc$ be the set of cross-sectional pairs $(i,j)$ of distinct tracts in a common cell, with tiles $X_i$ and $X_j$ and label comparison $y_{ij}:=\mathbf{1}\{W_j>W_i\}$; cell subscripts are dropped. We draw these pairs under the \emph{tract-uniform measure}: a tract uniformly from the pooled set of tracts across cells, its partner uniformly from its cell-mates, and a tile uniformly within each.\footnote{Census tracts are drawn to hold roughly equal populations, so weighting by tract is approximately weighting by population; a city-uniform measure would weight small metropolitan areas by their share of the map rather than their share of the population, and a tile-uniform one would weight places by land area. The weighting does not touch the estimand, which is identified cell by cell; it matters only for the approximation error of Section~\ref{sec:scale}, which is defined relative to it.}
+
+Let $\Ss$ be the set of stable pairs $(x,x')$: tiles of the same location in two years $t\ne t'$ of a city, recorded as structurally unchanged using imagery and footprint records. The images need not be identical. A stable pair follows a location rather than a tract, whose boundaries may change between censuses. Stable pairs are weighted equally, and neither pair set is selected using the labels.
+
+For a random variable $Y$ defined on pairs, write $\|Y\|:=(\E[Y^2])^{1/2}$, taking the expectation over $\Cc$ under the tract-uniform measure or over $\Ss$, as appropriate; for vectors, $\|\cdot\|$ is the Euclidean norm. Write $\Lambda(z):=1/(1+\exp(-z))$. Four assumptions formalize the two comparisons.
+
+\begin{assumption}[Monotonicity]\label{as:mono}
+$\Psi_{ct}$ is strictly increasing for every $(c,t)$.
+\end{assumption}
+\vspace{-0.5em}
+\begin{assumption}[Logistic residual differences]\label{as:meaninv}
+$\E|\varepsilon_{ict}| < \infty$ and $\E[\varepsilon_{ict} \mid X_{ict}, c,t] = 0$, and for any two
+distinct tracts $i,j$ of a cell $(c,t)$, conditionally on the cell, $\varepsilon_{ict}-\varepsilon_{jct}$
+is independent of $(X_{ict}, X_{jct})$ and logistic with scale $1/\rho$, where $\rho>0$ is the same in
+every cell:
+\[
+    \Pr\big(\varepsilon_{ict}-\varepsilon_{jct} < u \,\big|\, X_{ict}, X_{jct}, c, t\big) = \Lambda(\rho u).
+\]
+\end{assumption}
+\vspace{-0.5em}
+\begin{assumption}[Regularity of the index function]\label{as:lip}
+There exists a factorization $f = g \circ \phi$ as in \eqref{eq:rep}, with the coordinates of
+$H = \phi(X)$ standardized, such that $g$ is $L$-Lipschitz on the support of $H$,
+$|g(h)-g(h')| \le L\|h-h'\|$, and every stable pair $(x,x')\in\Ss$ satisfies
+$\|\phi(x')-\phi(x)\| \le \delta$. The index is not constant within cells: $f(X_j) \ne f(X_i)$ with
+positive probability over $(i,j)\in\Cc$.
+\end{assumption}
+\vspace{-0.5em}
+\begin{assumption}[Spatio-temporal invariance]\label{as:transport}
+$f$ does not depend on $c$ or $t$.
+\end{assumption}
+
+Assumption~\ref{as:mono} says that within a city and year the label
+ranks tracts as their positions do. Given the quantile characterization of $\Psi_{ct}$ in the
+introduction, it is closer to a normalization than to an economic claim, and the content of the model
+sits in the three that follow.
+
+Assumption~\ref{as:meaninv} has two parts. The first is the independence assumption of
+\citet{han1987}, stated for differences within a cell: the features shift the latent variable without
+changing the distribution of the residual difference. It allows the residuals of a pair to be
+correlated and restricts residuals within a cell
+only---correlation across a tract's years matters for inference, not identification---and it excludes
+residual spread that varies with the features. That exclusion is demanding here.\footnote{Because the tile is a
+random view of its tract, the residual includes what a single tile fails to reveal about the tract, and
+the assumption requires that shortfall not to depend on what the tile looks like; tiles typical of
+heterogeneous tracts, where one view is a poor guide, are where it is most likely to fail.} The second part is the logistic shape with a common scale. The restrictive part is the common scale: $\rho$ is the dispersion of the index relative to that
+of the residual difference, and it is the same in every city and year. \hl{For JAUME: I think i need to make this depend on ct, but lets first discuss the general paper's sturcture then how to improve this...}
+
+Assumption~\ref{as:lip} is existential: it asks that \emph{some} standardized factorization of the true
+index function be smooth, with structurally unchanged locations close in it, so the standardization is
+part of the chosen factorization rather than a loose end. Its last sentence asks only that the features
+carry some information about position within a cell, which the normalization of the estimand needs; how
+much they carry is an empirical matter. Neither $L$ nor $\delta$ is an observable number. $\delta$ is
+set implicitly by the rule that defines a stable pair---no recorded footprint change, or an image-change
+score below a threshold---so tightening the rule should lower it, and $L$ is a property of the chosen
+factorization, bounded for a scalar head by the norm of its weights on the standardized representation.
+Neither is estimated. They enter the bounds below mainly through their product, as the price of a
+restriction the design chooses; $L$ also bounds the range of the index through the diameter of the
+support of $H$. Their product bounds how far the true index moves at an unchanged location.
+
+Assumption~\ref{as:transport} is the substantive one, and the name says what it asks: the map from
+features to position is the same across space and across time, so that a backyard with a pool ranks
+above one without in Manhattan and in Dallas alike. It is what allows a model trained on some cities to
+be applied to another, and it is the formal version of the argument in the introduction. Because $f$
+is the expected position of a tract given one random view of it, the assumption also covers how tiles
+relate to their tracts: large, heterogeneous suburban tracts and small, dense urban ones must link a
+tile to its tract's position in the same way.
+
+\begin{proposition}[What the labels reveal about the latent variable]\label{prop:implications}
+Let Assumptions~\ref{as:mono}--\ref{as:transport} hold.
+\begin{itemize}
+\item[\textbf{(i)}] \emph{Cross-sectional ordering.} For two distinct tracts $i,j$ of a cell $(c,t)$,
+\[
+    W_{jct} > W_{ict} \iff R_{jct} > R_{ict}.
+\]
+\item[\textbf{(ii)}] \emph{Temporal stability.} For every stable pair $(x,x')\in\Ss$ from the same tract tile $i$, observed in years $t$ and $t'$ of city $c$,
+\[
+    \Bigl|\, \E[R_{ict}\mid X_{ict}=x,c,t] - \E[R_{ict'}\mid X_{ict'}=x',c,t'] \,\Bigr| \;\le\; L\delta ,
+\]
+\end{itemize}
+\end{proposition}
+
+Part (i) is the logic of the maximum rank correlation estimator of \citet{han1987}, here with a
+nonparametric index function and a cell-specific transformation: within a cell the labels carry the
+ordering of the latent positions, and nothing else. Part (ii) needs no label, which is what makes it
+usable: the labels attached to one location in two years belong to two cells and cannot be compared,
+but the expected position its tile predicts moves by at most $L\delta$.
+
+One having made clear what is inferable about $R$, we can properly define the estimand for this paper:
+
+\begin{definition}[Estimand]\label{def:estimand}
+The estimand is the index function $f$, normalized so that $\tfrac12\,\|f(X_j)-f(X_i)\|^{2} = 1$.
+\end{definition}
+
+By Assumptions~\ref{as:meaninv} and~\ref{as:transport}, $f(x) = \E[R_{ict}\mid X_{ict}=x, c, t]$ in
+every cell: the expected position of a tract of which $x$ is a random tile, a population object rather
+than a realization of the unobserved $R$. It is a function of a tile and can be evaluated at any tile,
+but what it measures at a tile is the tract position typical of tiles like it, not the wealth of the
+buildings in it. It is determined at most up to location and scale: adding a constant to $f$ and $R$,
+or multiplying $f$, $R$ and $\varepsilon$ by the same positive number and dividing $\rho$ by it, leaves
+every assumption and every observable unchanged. Location plays no role below, since every statement
+concerns differences. The normalization fixes the scale, which Assumption~\ref{as:lip} makes positive:
+$\tfrac12\|f(X_j)-f(X_i)\|^{2}$ is the within-cell dispersion of the index averaged across cells with
+tract weights---not each cell's own, so it says nothing about how dispersed one city is relative to
+another. The index is then read in within-cell standard deviations, the unit Section~\ref{sec:valid}
+reports in and the unit in which the Lipschitz constant of Assumption~\ref{as:lip} is stated. The
+criterion of Section~\ref{sec:crit} is invariant to this choice, so it is a convention for reading $f$
+and not a restriction the estimator imposes.
+
+%======================================================================
+\section{The criterion}\label{sec:crit}
+%======================================================================
+
+This section turns the two restrictions of Proposition~\ref{prop:implications} into a criterion and
+shows that its minimizers recover the estimand. It starts from what the labels imply for observable
+comparisons, a pairwise logit, and Definition~\ref{def:crit} builds the criterion from its log
+likelihood and from the temporal restriction. Proposition~\ref{prop:criterion} shows that the criterion
+uses the two restrictions and nothing else. Theorem~\ref{thm:approx} is the identification result:
+$\rho f$ nearly minimizes the criterion, and any score that nearly minimizes it is close to $\rho f$,
+up to a constant per cell.
+
+For a pair $(i,j)\in\Cc$ in cell $(c,t)$, Proposition~\ref{prop:implications}(i) gives $y_{ij}=1$
+exactly when $R_{jct} > R_{ict}$, that is, when $\varepsilon_{ict}-\varepsilon_{jct} < f(X_j) - f(X_i)$,
+and Assumption~\ref{as:meaninv} gives the probability of that event:
+\begin{equation}\label{eq:logit}
+    \Pr\big(y_{ij} = 1 \,\big|\, X_i, X_j, c, t\big) \;=\; \Lambda\big(\rho f(X_j) - \rho f(X_i)\big).
+\end{equation}
+Within a cell, the labels follow a pairwise logit in the difference of the index, with $\rho f$ in the
+role of the index. Its log likelihood is the ranking term of the criterion.
+
+\begin{definition}[Criterion]\label{def:crit}
+For a score function $s$, which maps tiles into a real number, the \emph{criterion} is
+\begin{equation}\label{eq:loss}
+    \Qt(s) \;:=\; \Qc(s) \;+\; \lambda_{s}\,\frac{\Qs(s)}{V(s)},
+    \qquad \lambda_{s} > 0,
+\end{equation}
+where
+\begin{align*}
+    \Qc(s) &:= \E_{(i,j)\in\Cc}\big[\ell(s;X_i,X_j,y_{ij})\big],\\
+    \Qs(s) &:= \E_{(x,x')\in\Ss}\big[(s(x')-s(x))^{2}\big],\\
+    V(s) &:= \tfrac12\,\E_{(i,j)\in\Cc}\big[(s(X_j)-s(X_i))^{2}\big],
+\end{align*}
+the ratio is read as $+\infty$ when $V(s)=0$, pairs whose labels tie are dropped, and
+\[
+    \ell(s; X_i, X_j, y_{ij}) \;:=\; -y_{ij}\log\Lambda\big(s(X_j)-s(X_i)\big)
+    - (1-y_{ij})\log\big(1-\Lambda(s(X_j)-s(X_i))\big)
+\]
+is the pairwise ranking loss.
+\end{definition}
+
+The three terms use different data: $\Qc$ uses cross-sectional pairs and their labels, $\Qs$ uses stable
+pairs and no labels, and $V$ uses cross-sectional pairs and no labels. $V$ is the within-cell dispersion
+of the scores, so $V(f)=1$ is the normalization of Definition~\ref{def:estimand}, and the penalty is a
+ratio of two $L^{2}$ norms of score differences, $2\|s(x')-s(x)\|^{2}/\|s(X_j)-s(X_i)\|^{2}$. The ranking
+term is the cross-entropy of a binary logit for $y_{ij}$ with the score difference as its single
+regressor---equivalently, with the $\pm1$ coding $Y=2y_{ij}-1$, the margin form
+$\E[\log(1+\exp(-Y(s(X_j)-s(X_i))))]$ of \citet{burges2005learning}, and a smooth version of the rank
+criterion of \citet{han1987}. By \eqref{eq:logit} that logit is correctly specified.
+
+\begin{proposition}[Properties of the criterion]\label{prop:criterion}
+Let Assumption~\ref{as:mono} hold.
+\begin{itemize}
+\item[\textbf{(i)}] \emph{Where the ranking term is minimized.} Under Assumptions~\ref{as:meaninv}
+and~\ref{as:transport}, $\Qc(s) \ge \Qc(\rho f)$ for every bounded measurable $s$.
+\item[\textbf{(ii)}] \emph{What the stability term costs the index function.} Under
+Assumptions~\ref{as:lip} and~\ref{as:transport}, $\Qs(f) \le L^{2}\delta^{2}$, so the penalty at $f$ is
+at most $L^{2}\delta^{2}/V(f)$.
+\item[\textbf{(iii)}] \emph{Invariance to the label.} Write $\Qt(s;\ell)$ for the criterion under labels
+$\ell$. For every $s$ and every collection of strictly increasing $T_{ct}$,
+\[
+    \Qt\!\left(s; \{T_{ct}(W_{ict})\}\right)
+    = \Qt\!\left(s; \{W_{ict}\}\right)
+    = \Qt\!\left(s; \{R_{ict}\}\right),
+\]
+and the same holds for the sample criterion. Within a cell the labels carry nothing beyond their
+orderings.
+\item[\textbf{(iv)}] \emph{The penalty is scale-free.} For every $a>0$, $\Qs(as) = a^{2}\Qs(s)$ and
+$V(as) = a^{2}V(s)$, so $\Qs(as)/V(as) = \Qs(s)/V(s)$.
+\end{itemize}
+\end{proposition}
+
+The four parts are the reason the criterion has the shape it has. Part (iii) is why the ranking term
+reads only signs. A criterion in levels absorbs each cell's aggregate movement, because that movement
+lives in $\Psi_{ct}$; this one cannot see $\Psi_{ct}$ at all, so dollars, logs, within-cell percentiles
+and within-cell $z$-scores give the same objective and the same minimizers. The requirement that pairs
+be chosen without reference to the labels is not decoration: a rule that selected pairs by label
+magnitudes would leave each pair's supervision unchanged while making the sample itself depend on
+$\Psi_{ct}$.\footnote{Survey sampling error displaces the position the label implies, so it belongs to
+$\varepsilon$ rather than to pair selection. Unfiltered pairs are therefore licensed: noisy labels lower
+$\rho$ and cost precision, not consistency.}
+
+Part (ii) is why the temporal term is a quadratic in score differences and carries no label. The two
+dollar values attached to an unchanged location differ whenever $\Psi_{ct}\ne\Psi_{ct'}$ even though its
+index does not, so stability has to be imposed on the model's own scores; and the restriction it
+implements is one-sided, since the index may move by up to $L\delta$, which a quadratic charges at most
+$L^{2}\delta^{2}$.
+
+Part (iv) is why that quadratic is divided by $V(s)$. A raw $\Qs(s)$ falls by $a^{2}$ when the score is
+rescaled by $a<1$, so an optimizer could improve it mechanically by shrinking every score instead of by
+learning a more stable function. Both $\Qs$ and $V$ scale by $a^{2}$, so their ratio does not: stability
+cannot be bought by shrinking, the term measures the share of within-cell score variance that is
+temporal noise, and $\lambda_{s}$ is dimensionless and means the same thing across fits. The penalty
+constrains the fitted scores, not the representation: it can be satisfied by a score that ignores the
+features that move between acquisitions, so it says nothing directly about $\delta$, which belongs to
+the true factorization of Assumption~\ref{as:lip}.
+
+Part (i) is where the logistic form of Assumption~\ref{as:meaninv} enters: by \eqref{eq:logit} the
+ranking term is a correctly specified log likelihood, minimized at the true index difference pair by
+pair.
+
+\subsection{Identification}\label{sec:approx}
+
+\begin{theorem}[Identification]\label{thm:approx}
+Let Assumptions~\ref{as:mono}--\ref{as:transport} hold, and let $H$ have bounded support.
+\begin{itemize}
+\item[\textbf{(i)}] \emph{The criterion.} For every bounded measurable $s$ with $V(s)>0$,
+\[
+    \Qt(\rho f) \;\le\; \Qt(s) + \lambda_{s}L^{2}\delta^{2}.
+\]
+Consequently every $s$ with $\Qt(s) \le \Qt(\rho f)$, in particular every minimizer of $\Qt$, satisfies
+$\Qc(s) - \Qc(\rho f) \le \lambda_{s}L^{2}\delta^{2}$.
+\item[\textbf{(ii)}] \emph{The score.} For every bounded score $s$, if $B$ bounds the within-cell
+differences of both $s$ and $\rho f$, then
+\[
+    \big\|(s-\rho f)(X_j)-(s-\rho f)(X_i)\big\|^{2} \;\le\; \frac{2}{\Lambda'(B)}\,\big[\Qc(s) - \Qc(\rho f)\big].
+\]
+In particular every minimizer $s^{*}$ of $\Qt$ satisfies
+\[
+    \big\|(s^{*}-\rho f)(X_j)-(s^{*}-\rho f)(X_i)\big\|^{2} \;\le\; \frac{2\lambda_{s}L^{2}\delta^{2}}{\Lambda'(B)}.
+\]
+\end{itemize}
+\end{theorem}
+
+Part (i) is a statement about criterion values: $\rho f$ sits above the minimum of the criterion by at
+most $\lambda_{s}L^{2}\delta^{2}$, the price of the stability term and the product of two things the
+design controls, the weight $\lambda_{s}$ and the representation distance $\delta$ that the selection
+rule for stable pairs allows. Part (ii) turns criterion values into distances between functions. Given
+a pair, the expected ranking loss is a strictly convex function of the score difference, minimized at
+the true difference $\rho f(X_j)-\rho f(X_i)$ by \eqref{eq:logit}, with curvature $\Lambda'$. A
+second-order expansion around the minimum shows that a score whose differences miss the true ones pays
+at least $\tfrac12\Lambda'(B)$ times the squared miss; averaging over pairs gives (ii). Together the two
+parts are the identification result. Three consequences are immediate.
+
+First, the distance in (ii) is the mean squared error in within-cell differences, which is blind to
+constants within a cell, so the recovery is up to a constant per cell; with a gap of zero, $s$ equals
+$\rho f$ plus a constant in each cell. Second, the scale is recovered: $\sqrt{V(s)} =
+\|s(X_j)-s(X_i)\|/\sqrt2$ and $\|\rho f(X_j)-\rho f(X_i)\| = \sqrt2\rho$, so the triangle inequality
+gives $|\sqrt{V(s)}-\rho| \le \|(s-\rho f)(X_j)-(s-\rho f)(X_i)\|/\sqrt2$, and $\sqrt{V(s)}$ plays the
+role a fitted inverse temperature would. Third, the constant is poor: $\Lambda'(B) =
+\Lambda(B)(1-\Lambda(B))$ is the curvature of the logit at the largest score difference, $1/4$ at $B=0$
+and roughly $\exp(-B)$ for large $B$, so the bound is a qualitative statement about recovery rather
+than a usable error band. Appendix~\ref{app:misrank} gives a companion bound in the units the exercise
+cares about: a minimizer misranks a within-cell pair at most $\sqrt{2\lambda_{s}}\,L\delta$ more often
+than $f$ does.
+
+\begin{remark}[Constants across the years of a city]\label{rem:kappa}
+The ranking term compares tracts only within a cell, so Theorem~\ref{thm:approx}(ii) leaves a constant
+in every cell. The stability term compares one location across the years of its city, so it charges
+differences between those constants. For a score $s = \rho f + k$ with $k$ constant within every cell,
+$\Qc(s) = \Qc(\rho f)$ and $V(s) = \rho^{2}$, so $\Qt(s) \le \Qt(\rho f)$ requires
+$\|s(x')-s(x)\| \le \|\rho f(x')-\rho f(x)\| \le \rho L\delta$, and the triangle inequality gives
+$\|k(x')-k(x)\| \le 2\rho L\delta$: over stable pairs, the constants of the two years differ by at most
+$2\rho L\delta$ in root mean square. This ties together only years that are linked, directly or through
+other years, by stable pairs.
+\end{remark}
+
+\paragraph{What the results do not say.} Nothing above determines the constants across cities. A score
+that reproduces within-cell differences city by city while shifting whole cities relative to one
+another---in the extreme, sending each to its own band of the index---comes as close to the minimum as
+$\rho f$ does, and the penalty, a ratio of within-cell and within-location dispersions, is indifferent
+to where a city sits. Pinning the city constants would require comparing tracts across cities, which the
+survey does not license unless their tiles are close in a representation fixed before training, and the
+criterion makes no such comparison. What separates the two scores is that the score is one function of
+the image through a shared representation: to hold cities apart, that representation would have to
+encode which city an image came from. The constants matter less than they might. Within-city rankings
+ignore them, and an event study with city-by-year effects differences them out. What requires them to vanish is a comparison of levels across cities.
+Whether the fitted representation delivers it is a question about the estimate, and
+Section~\ref{sec:valid} checks it directly.
+
+%======================================================================
+\section{Estimation and convergence}\label{sec:scale}
+%======================================================================
+
+This section moves from the population to the sample. The estimator minimizes a sample version of
+\eqref{eq:loss} over $\theta$, the parameters of a network score $s_\theta$ that contains both the image
+backbone and the scalar head; the class of such networks need not contain $\rho f$, and observations
+depend on one another within cities. Section~\ref{sec:sample} defines the sample criterion and the
+estimator and states the sampling scheme, in which cities are independent clusters of arbitrarily
+dependent tracts. Section~\ref{sec:conv} first shows that the sample criterion converges uniformly
+(Lemma~\ref{lem:ulln}), except near scores with no within-cell spread, then that the estimator stays
+away from those scores (Lemma~\ref{lem:coinflip}), and combines both with Theorem~\ref{thm:approx} into
+Theorem~\ref{thm:consist}: the fitted score converges to a neighborhood of $\rho f$ whose size is set
+by the approximation error of the class and by the regularization price.
+Section~\ref{sec:convdisc} discusses what that delivers and what it does not.
+
+\subsection{The sample criterion and the estimator}\label{sec:sample}
+
+Every term of the criterion averages over pairs drawn inside one city, so the sample criterion is
+written in terms of city totals. For city $c$, $\Cc_c$ is the set of its cross-sectional pairs, ordered,
+in cells with at least two tracts, and $\Ss_c$ the set of its stable pairs.
+
+\begin{definition}[Sample criterion]\label{def:sample}
+For a sample of $C$ cities, the \emph{sample criterion} is
+\begin{equation}\label{eq:sampleloss}
+    \Qth_C(\theta) \;:=\; \Qch(\theta) + \lambda_{s}\frac{\Qsh(\theta)}{\hat{V}(\theta)},
+    \qquad
+    \Qch = \frac{\sum_{c} q_c}{\sum_{c} n_c},
+    \quad
+    \Qsh = \frac{\sum_{c} d_c}{\sum_{c} m_c},
+    \quad
+    \hat{V} = \frac{\sum_{c} v_c}{\sum_{c} n_c},
+\end{equation}
+with sums over $c=1,\dots,C$ and the ratio read as $+\infty$ when $\hat V(\theta) = 0$, where the city
+totals are
+\[
+    q_c(\theta) = \sum_{(i,j)\in\Cc_c} \frac{\bar\ell_{ij}(\theta)}{n_{ij}-1},
+    \qquad
+    v_c(\theta) = \sum_{(i,j)\in\Cc_c} \frac{\bar v_{ij}(\theta)}{n_{ij}-1},
+    \qquad
+    d_c(\theta) = \sum_{(x,x')\in\Ss_c} \big(s_\theta(x') - s_\theta(x)\big)^{2},
+\]
+and $\bar\ell_{ij}$ and $\bar v_{ij}$ average the pairwise terms over the tiles of tracts $i$ and $j$,
+\begin{align*}
+    \bar\ell_{ij}(\theta) &= \frac{1}{|\mathcal{T}_{i}||\mathcal{T}_{j}|}
+        \sum_{x_i\in\mathcal{T}_{i}}\sum_{x_j\in\mathcal{T}_{j}} \ell(s_\theta; x_i, x_j, y_{ij}),\\
+    \bar v_{ij}(\theta) &= \frac{1}{|\mathcal{T}_{i}||\mathcal{T}_{j}|}
+        \sum_{x_i\in\mathcal{T}_{i}}\sum_{x_j\in\mathcal{T}_{j}} \tfrac12\big(s_\theta(x_j) - s_\theta(x_i)\big)^{2}.
+\end{align*}
+Here $\mathcal{T}_{i}$ is the set of tiles of tract $i$ in its year, $n_{ij}$ the number of tracts in the
+cell of $i$ and $j$, $n_c$ the number of tract-year observations of city $c$ in cells with at least two
+tracts, and $m_c = |\Ss_c|$. Pairs whose labels tie are left out of $q_c$.
+\end{definition}
+
+\begin{definition}[Estimator]\label{def:estimator}
+The \emph{estimator} is any $\hat{\theta}_C$ in the parameter set $\Theta$ of the network with
+$\Qth_C(\hat{\theta}_C) \le \inf_{\Theta}\Qth_C + \eta_C$, where $\eta_C \ge 0$ is the optimization
+error. The fitted score is $\hat{s}_C := s_{\hat{\theta}_C}$.
+\end{definition}
+
+Each tract contributes the average over its cell-mates and over the tiles of both tracts. That is the
+tract-uniform measure with the draw of tiles averaged out exactly rather than sampled: using every tile
+of a tract leaves the population criterion unchanged and gives a sample criterion with less variance
+than one tile per tract would. The dispersion $v_c$ is formed within each cell and then summed, never by
+pooling scores across cells, which would put between-cell differences in levels into the normalization.
+
+In practice the sample criterion is minimized by stochastic gradient descent. As is standard for
+estimators defined through deep networks \citep{farrell2021deep, schmidthieber2020}, we do not analyze
+the optimization: whatever separates the output of training from the minimum of the sample criterion,
+including a local minimum, is the optimization error $\eta_C$.\footnote{Batches are drawn from a single
+cell, so every pair of tiles from distinct tracts in a batch is a licensed comparison; pairs of tiles
+from the same tract share a label and are left out, and stable pairs are appended to the batch. The
+ratio in the penalty is formed over a group of $K$ batches, with numerator and denominator evaluated at
+the same parameters and the denominator differentiated through; a rolling variance carried over from
+earlier parameters would not rescale with the numerator and would reinstate the shrinkage the ratio is
+there to remove. Because the penalty is a ratio of averages, a minibatch estimate of it is biased, by
+an amount of order $1/(KB)$ with $B$ the number of pairs in a batch; that discrepancy is part of
+$\eta_C$. The sample criterion can be evaluated at the fitted parameters in one pass over the data and
+reported next to the training objective.}
+
+\paragraph{Sampling.} The number of tracts in a city is fixed by geography, so within a city the sample
+can grow at most to the size of the city. What can grow is the number of cities, and under
+Assumption~\ref{as:transport} each additional city adds observations about the same index function
+rather than a new unknown. The independent unit is the city, not the cell: a stable pair joins two
+years of one city, so a city's cells are dependent by construction of the criterion.
+
+\begin{assumption}[Clustered sampling]\label{as:cluster}
+Let $Z_c$ collect what the criterion uses from city $c$ in all $T$ years: the tiles and covariates of
+its tracts, their cell memberships, the within-cell orderings of their labels, and the pair sets $\Cc_c$
+and $\Ss_c$. The $Z_c$, $c=1,\dots,C$, are independent and identically distributed; within a city,
+tracts, years and pairs may depend on one another arbitrarily. City sizes and stable-pair counts are
+bounded, $n_c \le \bar{n} < \infty$ and $m_c \le \bar{m} < \infty$, with $\E[n_c]>0$ and $\E[m_c]>0$,
+and asymptotics are taken as $C \to \infty$ with $T$ fixed.
+\end{assumption}
+
+The sampling unit is the tract, and tracts are sampled in clusters. Within a city nothing is assumed
+about how tracts depend on one another, and there are several reasons not to assume anything: they
+share one transformation $\Psi_{ct}$ and one housing and labor market, neighbors share amenities,
+construction vintages and spatially correlated residual positions, ACS tract estimates share survey
+weighting at higher geographies, and the same locations enter in every year, with interiors, finishes
+and tenure the imagery does not see and that persist across acquisitions. The criterion adds dependence
+of its own, since every cross-sectional pair and every stable pair joins observations of one city.
+Across cities we assume independence and identical distribution: each city is a draw of its full data
+from a common superpopulation of metropolitan areas. Independence makes the city the unit of the law of
+large numbers. Identical distribution makes the population criterion a fixed object, the same whichever
+cities are drawn, so that its minimizer is a well-defined target rather than one that moves with the
+composition of the sample. Cities differ in size, climate, vintage and the shape of their wealth
+distributions, but that heterogeneity lies within the superpopulation rather than across it, as
+heterogeneous units in a cross-section are draws from one distribution.
+
+Under Assumption~\ref{as:cluster} the city totals $(q_c, d_c, v_c, n_c, m_c)$ are iid, and the
+population counterpart of each ratio in \eqref{eq:sampleloss} is the ratio of expectations,
+\begin{equation}\label{eq:popratio}
+    \Qc(\theta) = \frac{\E[q_c(\theta)]}{\E[n_c]},
+    \qquad
+    \Qs(\theta) = \frac{\E[d_c(\theta)]}{\E[m_c]},
+    \qquad
+    V(\theta) = \frac{\E[v_c(\theta)]}{\E[n_c]},
+\end{equation}
+which are the terms of Definition~\ref{def:crit} for $s = s_\theta$, with the tract-uniform measure
+taken over the superpopulation; under Assumptions~\ref{as:mono} and~\ref{as:meaninv} labels tie with
+probability zero, so leaving tied pairs out of $q_c$ does not change the population ratio. Write
+$\Qt(\theta)$ for the population criterion at $s_\theta$. Because $Z_c$ contains the labels only through
+their within-cell orderings, Assumption~\ref{as:cluster} is not violated by movements in $\Psi_{ct}$
+that are common across cities, such as national growth in the level of wealth.
+
+\begin{assumption}[Regularity]\label{as:regular}
+The trainable parameter $\theta$ ranges over a compact set $\Theta \subset \mathbb{R}^{p}$. For every
+tile $x$, $\theta \mapsto s_\theta(x)$ is continuous, and scores are bounded,
+$\sup_{\theta\in\Theta,\,x}|s_\theta(x)| \le \bar{S} < \infty$. The class beats a coin flip:
+$\inf_{\Theta}\Qt < \log 2$.
+\end{assumption}
+
+Bounded scores hold for a network with bounded weights acting on bounded pixel values, and continuity
+in $\theta$ covers piecewise-linear activations, so no differentiability is required. The value
+$\log 2$ is the ranking loss of a score that gives both tracts of every pair the same value, which
+predicts every comparison with probability one half. The last condition asks that some network in the
+class do better than that, penalty included. It holds whenever the approximation error of the class
+($a_\Theta$, defined in Section~\ref{sec:conv}) plus $\lambda_{s}L^{2}\delta^{2}$ is smaller than
+$\log 2 - \Qc(\rho f)$, the predictive signal of the index: the penalty and the limits of the class must
+not use up what the index predicts. A fitted criterion clearly below $\log 2 \approx 0.69$ is direct
+evidence for it. For $v>0$ write $\Theta_v := \{\theta\in\Theta : V(\theta) \ge v\}$ for the
+parameters whose scores have within-cell spread at least $v$.
+
+\subsection{Convergence}\label{sec:conv}
+
+Two lemmas prepare the result. The city means converge uniformly (Lemma~\ref{lem:ulln}), but the full
+criterion does so only away from scores with no within-cell spread, where the ratio in the penalty
+approaches zero over zero. Scores with little within-cell spread cannot beat a coin flip
+(Lemma~\ref{lem:coinflip}), so the estimator stays away from them. Theorem~\ref{thm:consist} combines
+the two with Theorem~\ref{thm:approx}.
+
+\begin{lemma}[Uniform convergence of city means]\label{lem:ulln}
+Under Assumptions~\ref{as:cluster} and~\ref{as:regular}, $\Qc$, $\Qs$ and $V$ are continuous on
+$\Theta$,
+\[
+    \sup_{\theta\in\Theta}\bigl|\Qch(\theta) - \Qc(\theta)\bigr| \to_p 0,
+    \qquad
+    \sup_{\theta\in\Theta}\bigl|\hat{V}(\theta) - V(\theta)\bigr| \to_p 0,
+\]
+and for every $v>0$, $\sup_{\theta\in\Theta_v}\bigl|\Qth_C(\theta) - \Qt(\theta)\bigr| \to_p 0$.
+\end{lemma}
+
+\begin{lemma}[Scores with little within-cell spread cannot beat a coin flip]\label{lem:coinflip}
+Let Assumptions~\ref{as:mono} and~\ref{as:meaninv} hold. For every bounded measurable $s$,
+\[
+    \Qc(s) \;\ge\; \log 2 - \tfrac12\sqrt{2V(s)} .
+\]
+\end{lemma}
+
+Write
+\[
+    a_\Theta := \inf_{\Theta}\Qt - \inf_{s}\Qt(s) \;\ge\; 0
+\]
+for the approximation error of the class, where the second infimum is over all bounded measurable scores
+with $V(s)>0$: how far the best network in $\Theta$ falls short of the best score of any kind.
+
+\begin{theorem}[Convergence of the fitted score]\label{thm:consist}
+Let Assumptions~\ref{as:mono}--\ref{as:regular} hold, let $H$ have bounded support with diameter $D$,
+and let $\eta_C \to_p 0$. With $B := \max\{2\bar{S},\, \rho L D\}$, for every $\epsilon>0$,
+\[
+    \Pr\!\left( \big\|(\hat s_C - \rho f)(X_j)-(\hat s_C - \rho f)(X_i)\big\|^{2} \;\le\;
+    \frac{2\,(a_\Theta + \lambda_s L^2\delta^2)}{\Lambda'(B)} + \epsilon \right) \to 1 .
+\]
+\end{theorem}
+
+The proof has three steps. By Lemma~\ref{lem:coinflip}, the estimator lies among scores with
+within-cell spread bounded away from zero, with probability tending to one. There, by
+Lemma~\ref{lem:ulln}, the criterion at the estimate converges to its value at the best approximations
+in the class, $\inf_\Theta\Qt$: the usual conclusion of extremum estimation, with the pseudo-true
+parameters forming a set rather than a point because network weights are not identified. Finally,
+Theorem~\ref{thm:approx} says what that value implies for the score. The theorem is the sample
+counterpart of Theorem~\ref{thm:approx}(ii): as cities accumulate, the fitted score is as close to
+$\rho f$ as the approximation error of the class and the regularization price allow, up to a constant
+per cell, with distance measured by the error in within-cell differences.
+
+Two consequences are worth stating. First, the index itself is read in the units of $f$ by dividing
+the score by its fitted dispersion, $\hat f_C := \hat s_C/\sqrt{\hat V(\hat\theta_C)}$; the theorem
+then holds for $\|(\hat f_C - f)(X_j)-(\hat f_C - f)(X_i)\|^{2}$ with the factor $2$ replaced by
+$8/\rho^{2}$ (Appendix~\ref{app:proofs}). Second, the same argument combined with
+Proposition~\ref{prop:misrank} in Appendix~\ref{app:misrank} gives
+$\Pr\big(M(\hat s_C) - M^{*} \le \sqrt{2(a_\Theta + \lambda_s L^2\delta^2)} + \epsilon\big) \to 1$.
+
+\subsection{What convergence delivers}\label{sec:convdisc}
+
+\paragraph{Approximation error.} Theorem~\ref{thm:consist} leaves two terms that more cities do not
+remove. $\lambda_s L^2\delta^2$ is the regularization price of Theorem~\ref{thm:approx}, set by the
+design. $a_\Theta$, the approximation error of the class, is measured under the tract-uniform measure.
+It is a property of the architecture, not of the sample: a larger class that contains the current one
+cannot increase it, which is the sense in which larger models reduce it. We do not claim it vanishes.
+
+\paragraph{Prediction in new cities.} The guarantee of Theorem~\ref{thm:consist} is about the population
+of Assumption~\ref{as:cluster}. It is an average over draws of cities, weighted by tracts, so it covers
+a new city drawn from the same superpopulation on average, not every such city. A city outside that
+population---Mexico City for a model trained on large US metropolitan areas---can fail in two distinct
+ways. Transport can fail: the map from features to position differs, as when rooftop water tanks or
+walled compounds signal something else there. Or transport can hold while the city lies off the support
+of the training data: $a_\Theta$ is measured under the training distribution and says nothing about the
+approximation error where the new city's mass sits, and Assumption~\ref{as:lip} helps only for bundles
+close in the representation to bundles seen in training. Both failures are partly checkable. Distances in
+$H$ from the new city's tiles to the training tiles measure the second, and a within-city rank
+correlation against whatever labels exist there tests the first directly.
+
+\paragraph{There are no incidental parameters.} A panel with a cell-specific nuisance function and a
+growing number of cells is where one expects the problem of \citet{neyman1948}. It does not arise here,
+and the reason is the construction rather than an assumption: $\Psi_{ct}$ is never estimated. It enters
+the criterion only through the signs of within-cell label differences, which it leaves unchanged by
+Proposition~\ref{prop:criterion}(iii), so it drops out as a fixed effect drops out of a conditional
+likelihood. In that language \eqref{eq:loss} is a composite pairwise likelihood \citep{lindsay1988}, and
+a growing number of cities adds data, not unknowns.
+
+\paragraph{The effective sample size.} The sampling scheme fixes the unit in which information
+accrues. City totals are iid and bounded, so
+averages over cities converge at $C^{-1/2}$ whatever the dependence within a city: strong dependence
+among a city's tracts and years changes the constant, not the rate, and in the extreme where a city's
+observations are perfectly correlated a city carries one observation's worth of information however
+many tracts it holds. The effective sample size for this design is the number of cities. No rate is
+claimed for the estimator itself.
+
+\paragraph{Inference.} Inference is not covered here. Network weights are not identified, so the
+curvature of the criterion in $\theta$ is in general singular---for instance along the rescalings a
+piecewise-linear activation allows---and the usual sandwich formula is unavailable;
+statements about uncertainty would have to be made at the level of the fitted function or of functionals
+of it. Whatever form they take, the city is the unit of independence. Clustering at the city nests the
+dependence within a tract: much of what its tiles miss---interiors, finishes, tenure---persists across
+acquisitions, so a tract's residuals are correlated over time and its years are not independent
+observations.
+
+%======================================================================
+\section{Validation}\label{sec:valid}
+%======================================================================
+
+Theorems~\ref{thm:approx} and~\ref{thm:consist} leave four questions to the data. The bounds depend on
+$L\delta$, which is not observed; the fitted index may hold still where nothing changed without moving
+where something did; the criterion does not force all cities onto one scale; and nothing in the theory
+licenses reading the index below the tract. This section proposes one check for each: stability on
+held-out stable pairs, an event study of construction, three tests of a common scale across cities, and
+a comparison with block-group estimates.
+
+\paragraph{Stability.} By Proposition~\ref{prop:implications}(ii) a structurally unchanged location
+should hold its position. The check measures the within-location standard deviation of the fitted
+index and its rank autocorrelation across years, on locations, years and cities outside the stability
+pairs, since the stability term trains on exactly this property. It measures how much the fitted index
+moves at unchanged locations: a diagnostic of the fit, not an estimate of $L\delta$, which concerns the
+true index.
+
+\paragraph{Responsiveness.} Responsiveness requires a direction. Assumption~\ref{as:lip} bounds how far
+the index moves and says nothing about which way; the condition below says which changes
+raise it.
+
+\begin{condition}[Directional relevance]\label{cond:direct}
+For the class $\mathcal{D}^{+}$ of structural improvements used in validation,
+$h' \in \mathcal{D}^{+}(h) \implies g(h') > g(h)$ for the true $g$.
+\end{condition}
+
+The condition is stated for the true index function, not the estimate, which keeps the exercise a test:
+assumed of $\hat{g}$, a positive effect would be what the assumption requires. It also disciplines the
+null, since without it a flat response could mean either an unresponsive model or construction that does
+not raise relative position.
+
+The test runs through three links: recorded construction implies $\Delta H \in \mathcal{D}^{+}$, which
+is the maintained interpretation of the treatment; Condition~\ref{cond:direct} turns that into
+$\Delta g > 0$; and an event study would ask whether the fitted scores inherit the increase. Following
+\citet{callaway2021difference}, let $S_k$ be the first year tract $k$ crosses the construction threshold
+and $\bar{R}_{kt}(s)$ the potential mean score of its tiles in year $t$ if first treated in year
+$s$, with $s=\infty$ for never treated. The target is
+\[
+    ATT(s,t) \;=\; \E\!\left[\bar{R}_{kt}(s) - \bar{R}_{kt}(\infty) \,\middle|\, S_k = s\right],
+\]
+a displacement in the index, measured in within-cell standard deviations of the score.
+Comparisons would be made with city-by-year effects, so the cell constants of
+Theorem~\ref{thm:approx}(ii) difference out.
+
+The first link is the weakest: the treatment is new footprint area relative to the pre-existing stock,
+which does not separate luxury from subsidized development, and construction of the second kind may fall
+outside $\mathcal{D}^{+}$, diluting the measured response toward zero. The two exercises bracket the
+representation. A model over-regularized toward stability passes the first and fails the second; a model
+that tracks acquisition noise does the reverse.
+
+\paragraph{One scale or several.} By Theorem~\ref{thm:consist}, the fitted index may differ from $f$
+by a constant per cell. By Remark~\ref{rem:kappa} the stability term ties those constants together
+across the years of a city that are linked by stable pairs, and nothing in the criterion rules out a
+different constant for each city. A first step is to report, for every city, whether its years are
+linked by stable pairs, directly or through other years. Three checks would then ask whether the city
+constants are equal. The first fits a classifier for the city on the representation and compares its accuracy to the base rate, since
+a score that holds cities apart has to carry that information. The second matches like tiles across
+cities on building footprint, structure type and building age, and regresses the difference in their
+scores on city indicators; the city effects should be near zero, a joint test of equal city constants and
+Assumption~\ref{as:transport}. The third refits the model leaving one city out at a time: a held-out
+city's constant is set only by the representation, so the dispersion of held-out constants measures
+directly how far the fitted scale is common. None of these tests the identifying assumptions of
+Section~\ref{sec:target}; they ask whether the estimate uses one scale or several.
+
+\paragraph{Below the tract.} The index is learned from tract labels, so nothing above licenses reading
+variation in $\hat f$ within a tract as variation in wealth. The American Community Survey also
+publishes five-year estimates for block groups, with wider margins of error. Averaging the fitted
+index over the tiles of each block group and comparing the within-tract ranking of block groups with
+their survey ranking would test directly whether the index carries information below the tract. Because the
+comparison is within a tract, it is invariant to $\Psi_{ct}$ and to the constants of
+Theorem~\ref{thm:approx}(ii).
+
+%======================================================================
+\section{Discussion}\label{sec:disc}
+%======================================================================
+
+This section collects what the results leave open. Five questions stand out. The first is a rate, and with it a sieve version in which the class grows
+with the number of cities and $\lambda_{s}$ shrinks, so that the approximation and regularization terms
+vanish; for the within-cell target the second costs nothing. The second is the city constants. The
+criterion compares tracts only within a cell and locations only across the years of a city, and the
+index function is tied across cities by Assumption~\ref{as:transport} and by bundles that appear in more
+than one city, which the criterion does not use; a statement that makes that tie formal is the natural next result, and
+Section~\ref{sec:valid} checks it empirically in the meantime. The third is heterogeneity in the scale
+of the residual difference across cells, $\rho_{ct}$, which Assumption~\ref{as:meaninv} rules out along with other shapes of the residual difference. The
+fourth is finite-sample behavior, which the asymptotics in the number of cities do not speak to: Monte
+Carlo evidence should ask how the estimator performs with few cities, and whether city-specific cues in
+the images---which let a network hold cities apart---degrade within-city rankings in held-out cities or
+only shift their levels. The fifth is a genuinely sub-tract index. A model in which the positions of
+tiles aggregate into the position of their tract, with the tract scored by the mean of its tiles'
+scores, would identify one, at the price of an aggregation assumption and of an ill-posed inversion from
+tract means to tiles.
+
+\paragraph{Questions for Jaume.}
+\begin{enumerate}
+\item Is this a small econometrics paper on its own, with a little more on other applications and a
+Monte Carlo, or an appendix to the companion paper?
+\item Should the contribution center on the city constants: when the criterion puts all cities on one
+scale, and what support across cities that requires?
+\item Is a cell-specific scale $\rho_{ct}$ worth the extra estimation it needs?
+\item Is the sieve version---a class that grows with the number of cities, with $\lambda_{s}$ shrinking---
+worth the approximation-rate assumption it would require?
+\item What evidence would make the method convincing?
+\end{enumerate}
+
+
+\bibliographystyle{apalike}
+\bibliography{metrics_bib}
+
+\appendix
+
+%======================================================================
+\section{Proofs}\label{app:proofs}
+%======================================================================
+
+Throughout, for a pair $(i,j)\in\Cc$ write $p_{ij} := \Pr(y_{ij}=1\mid X_i,X_j)$. Since
+$\Lambda(t) = \exp(t)/(1+\exp(t))$, $\log\Lambda(t) = t - \log(1+\exp(t))$ and
+$\log(1-\Lambda(t)) = -\log(1+\exp(t))$, so the pairwise loss is
+$\ell(s;X_i,X_j,y_{ij}) = \log\big(1+\exp(s(X_j)-s(X_i))\big) - y_{ij}\big(s(X_j)-s(X_i)\big)$, and the
+expected loss of the pair given its tiles is $g_{ij}\big(s(X_j)-s(X_i)\big)$, with
+\[
+    g_{ij}(t) := \log\big(1+\exp(t)\big) - p_{ij}\,t,
+    \qquad
+    g_{ij}'(t) = \Lambda(t) - p_{ij},
+    \qquad
+    g_{ij}''(t) = \Lambda'(t) > 0 .
+\]
+This uses only the definition of the loss. Under Assumptions~\ref{as:mono}--\ref{as:transport},
+\eqref{eq:logit} gives $p_{ij} = \Lambda\big(\rho f(X_j)-\rho f(X_i)\big)$, so $g_{ij}'$ vanishes at the
+true difference $\rho f(X_j)-\rho f(X_i)$.
+
+\paragraph{Proof of Proposition~\ref{prop:mixture}.} Iterated expectations over $(c,t)$.
+
+\paragraph{Proof of Proposition~\ref{prop:implications}.} (i) Both labels are images of the same
+strictly increasing $\Psi_{ct}$.
+
+(ii) By Assumption~\ref{as:meaninv} the residual has mean zero given the tile within a cell, so
+$\E[R\mid X, c,t] = f(X)$ in every cell, and by Assumption~\ref{as:transport} it is the same $f$ in
+both years. The difference is therefore $g(\phi(x)) - g(\phi(x'))$, which is at most
+$L\|\phi(x)-\phi(x')\| \le L\delta$ in absolute value by Assumption~\ref{as:lip}. \qed
+
+\paragraph{Proof of Proposition~\ref{prop:criterion}.} (i) $g_{ij}$ is strictly convex and its
+derivative vanishes at $\rho f(X_j)-\rho f(X_i)$, so the score $\rho f$ minimizes the expected loss of
+every pair simultaneously, and hence its average $\Qc$.
+
+(ii) By Assumption~\ref{as:transport} the same $f = g\circ\phi$ applies in both years of a stable pair,
+so $\Qs(f) = \|g(\phi(x')) - g(\phi(x))\|^{2} \le L^{2}\delta^{2}$, since $g$ is $L$-Lipschitz and
+stable pairs are $\delta$-close under Assumption~\ref{as:lip}.
+
+(iii) $\Qc$ depends on the labels only through $y_{ij}$, the indicator of which tract of the pair is
+ranked higher within the cell. Because $T_{ct}$ is strictly increasing and common to the cell,
+relabeling leaves that indicator unchanged, and it equals the indicator for the corresponding
+difference in $R$ by Proposition~\ref{prop:implications}(i). The pair sets do not depend on the labels,
+and $\Qs$ and $V$ are functions of the scores alone; the argument is unchanged for sample averages. For
+the last sentence, fix a cell and let $r_1,\dots,r_n$ have the same ordering and ties as
+$W_{1ct},\dots,W_{nct}$. The distinct values of the two collections induce the same ordered partition of
+tracts, so the map sending the $k$th distinct value of $\{r_i\}$ to the $k$th of $\{W_{ict}\}$ is
+strictly increasing; linear interpolation, extended by any strictly increasing function outside the
+range, gives a strictly increasing $\Psi$ with $\Psi(r_i)=W_{ict}$ for every $i$. Every
+order-preserving assignment of magnitudes is therefore consistent with the labels.
+
+(iv) Both $\Qs$ and $V$ are squared $L^{2}$ norms of score differences, homogeneous of degree two. \qed
+
+\paragraph{Proof of Theorem~\ref{thm:approx}.} (i) By Proposition~\ref{prop:criterion}(i),
+$\Qc(\rho f) \le \Qc(s)$. By parts (ii) and (iv) the penalty at $\rho f$ equals
+$\Qs(f)/V(f) \le L^{2}\delta^{2}$, since $V(f) = 1$, and the penalty at $s$ is nonnegative. Chaining
+the three,
+\[
+    \Qt(\rho f) \;\le\; \Qc(\rho f) + \lambda_{s}L^{2}\delta^{2}
+    \;\le\; \Qc(s) + \lambda_{s}L^{2}\delta^{2}
+    \;\le\; \Qt(s) + \lambda_{s}L^{2}\delta^{2}.
+\]
+For the consequence, $\Qc(s) \le \Qt(s) \le \Qt(\rho f) \le \Qc(\rho f) + \lambda_{s}L^{2}\delta^{2}$.
+
+(ii) Fix a pair $(i,j)\in\Cc$. Since $g_{ij}'$ vanishes at $\rho f(X_j)-\rho f(X_i)$ and
+$g_{ij}'' = \Lambda'$, a second-order Taylor expansion around that point gives, for some $\xi$ between
+$s(X_j)-s(X_i)$ and $\rho f(X_j)-\rho f(X_i)$,
+\[
+    g_{ij}\big(s(X_j)-s(X_i)\big) - g_{ij}\big(\rho f(X_j)-\rho f(X_i)\big)
+    = \tfrac12\,\Lambda'(\xi)\,\Big[(s-\rho f)(X_j) - (s-\rho f)(X_i)\Big]^{2}.
+\]
+$\Lambda'$ decreases in $|t|$ and both differences are at most $B$ in absolute value, so
+$\Lambda'(\xi) \ge \Lambda'(B)$. Taking expectations over pairs, the left side averages to
+$\Qc(s)-\Qc(\rho f)$ and the squared bracket to $\|(s-\rho f)(X_j)-(s-\rho f)(X_i)\|^{2}$, which gives the
+inequality. The last claim follows from (i). \qed
+
+\paragraph{Proof of Lemma~\ref{lem:ulln}.} Let $a_c(\theta) = (q_c(\theta), d_c(\theta), v_c(\theta))$
+and $b_c = (n_c, m_c)$. These are the same measurable functions of $Z_c$ for every city, so by
+Assumption~\ref{as:cluster} the pairs $(a_c(\cdot), b_c)$ are iid across cities. Each coordinate of
+$a_c$ is a finite sum of continuous functions of scores---the logistic loss and a square---so
+$a_c(\theta)$ is continuous in $\theta$ by Assumption~\ref{as:regular}. Every score difference is at
+most $2\bar{S}$ in absolute value, so $\ell \le \log(1+\exp(2\bar{S}))$, and since each tract's weights
+on its cell-mates sum to at most one,
+\[
+    \sup_{\theta\in\Theta}\|a_c(\theta)\|
+    \;\le\; n_c\log\big(1+\exp(2\bar{S})\big) + 2\bar{S}^{2}n_c + 4\bar{S}^{2}m_c,
+\]
+which is bounded because $n_c \le \bar{n}$ and $m_c \le \bar{m}$. These are the conditions of
+\citet[Lemma 2.4]{newey1994}---iid data, a compact parameter set, continuity in $\theta$ and a
+dominating function with finite mean---so $\E[a_c(\theta)]$ is continuous on $\Theta$ and
+$C^{-1}\sum_c a_c(\theta)$ converges to it uniformly in probability. By the weak law of large numbers
+$C^{-1}\sum_c b_c \to_p \E[b_c]$, whose coordinates are positive. The denominators of $\Qch$ and
+$\hat V$ do not depend on $\theta$, which gives the first two statements and the continuity of $\Qc$,
+$\Qs$ and $V$.
+
+For the full criterion fix $v>0$. On $\Theta_v$, $V \ge v$, so with probability tending to one
+$\hat{V} \ge v/2$ on $\Theta_v$, and $C^{-1}\sum_c n_c$ and $C^{-1}\sum_c m_c$ exceed half their
+expectations. On that event the denominators of $\Qth_C$ and $\Qt$ are bounded away from zero, so
+$\Qth_C$ is a Lipschitz function of the five city means, and uniform convergence carries over to
+$\Qth_C$ on $\Theta_v$. \qed
+
+\paragraph{Proof of Lemma~\ref{lem:coinflip}.} Fix a pair $(i,j)\in\Cc$. $g_{ij}$ is convex, with
+$g_{ij}(0) = \log 2$ and $g_{ij}'(0) = \tfrac12 - p_{ij} \in [-\tfrac12,\tfrac12]$, so it lies above its
+tangent at zero: $g_{ij}(t) \ge \log 2 + (\tfrac12-p_{ij})\,t \ge \log 2 - \tfrac12|t|$. Under
+Assumptions~\ref{as:mono} and~\ref{as:meaninv} labels tie with probability zero, so the pairs that
+enter $\Qc$ and $V$ carry the same measure. Taking expectations and applying Jensen's inequality,
+$\Qc(s) \ge \log 2 - \tfrac12\E|s(X_j)-s(X_i)| \ge \log 2 - \tfrac12\|s(X_j)-s(X_i)\|
+= \log 2 - \tfrac12\sqrt{2V(s)}$. \qed
+
+\paragraph{Proof of Theorem~\ref{thm:consist}.} Let $\eta := (\log 2 - \inf_\Theta\Qt)/2$, which is
+positive by Assumption~\ref{as:regular}, let $v := \eta^{2}/2$, and let
+$A_C := \sup_{\Theta_v}|\Qth_C - \Qt|$, which converges to zero in probability by Lemma~\ref{lem:ulln}.
+
+\emph{Step 1: the estimator lies in $\Theta_v$.} By Lemma~\ref{lem:coinflip}, and because the penalty is
+nonnegative, every $\theta$ with $V(\theta) < v$ has $\Qt(\theta) \ge \Qc(\theta) \ge \log 2 - \eta/2$.
+Take $\theta^{\dagger}$ with $\Qt(\theta^{\dagger}) \le \log 2 - 3\eta/2$; it exists because
+$\inf_\Theta\Qt = \log 2 - 2\eta$, and it lies in $\Theta_v$. Then
+\[
+    \Qth_C(\hat\theta_C) \le \Qth_C(\theta^{\dagger}) + \eta_C
+    \le \log 2 - \tfrac32\eta + A_C + \eta_C .
+\]
+If $V(\hat\theta_C) < v$, then, since the sample penalty is also nonnegative,
+$\Qth_C(\hat\theta_C) \ge \Qch(\hat\theta_C) \ge \log 2 - \tfrac12\eta - \sup_\Theta|\Qch - \Qc|$. The
+two displays together require $\eta \le A_C + \eta_C + \sup_\Theta|\Qch - \Qc|$, whose probability
+tends to zero by Lemma~\ref{lem:ulln}. Hence $\Pr(\hat\theta_C\in\Theta_v) \to 1$.
+
+\emph{Step 2: the criterion at the estimate converges to its pseudo-true value.} On the event
+$\hat\theta_C\in\Theta_v$, for every $\theta \in \Theta_v$,
+\[
+    \Qt(\hat\theta_C) \le \Qth_C(\hat\theta_C) + A_C \le \Qth_C(\theta) + \eta_C + A_C
+    \le \Qt(\theta) + \eta_C + 2A_C .
+\]
+By Step 1 the infimum of $\Qt$ over $\Theta_v$ equals the infimum over $\Theta$, so
+$\Qt(\hat\theta_C) \le \inf_\Theta\Qt + \eta_C + 2A_C$.
+
+\emph{Step 3: from the criterion to the score.} On the same event,
+\begin{align*}
+    \Qc(\hat{s}_C) \;\le\; \Qt(\hat{\theta}_C) \;&\le\; \inf_\Theta\Qt + \eta_C + 2A_C
+    \;\le\; \Qt(\rho f) + a_\Theta + \eta_C + 2A_C \\
+    &\le\; \Qc(\rho f) + \lambda_s L^2\delta^2 + a_\Theta + \eta_C + 2A_C .
+\end{align*}
+The first inequality holds because the penalty is nonnegative, the second is Step 2, the third uses the
+definition of $a_\Theta$ and $\inf_s\Qt(s) \le \Qt(\rho f)$, and the last inequality holds because the penalty at $\rho f$ is at most
+$L^{2}\delta^{2}$ by Proposition~\ref{prop:criterion}(ii) and (iv) and $V(f)=1$. The within-cell
+differences of $\hat s_C$ are at most $2\bar S$ by Assumption~\ref{as:regular}, and those of $\rho f$ at
+most $\rho LD$ by Assumption~\ref{as:lip}, so Theorem~\ref{thm:approx}(ii) gives
+\[
+    \big\|(\hat s_C - \rho f)(X_j)-(\hat s_C - \rho f)(X_i)\big\|^{2} \;\le\;
+    \frac{2}{\Lambda'(B)}\big(a_\Theta + \lambda_s L^2\delta^2 + \eta_C + 2A_C\big).
+\]
+Since $\eta_C + 2A_C \to_p 0$, the statement follows. \qed
+
+\paragraph{The fitted index in the units of $f$.} Write $\sigma = \sqrt{V(\hat\theta_C)}$ and
+$\hat\sigma = \sqrt{\hat V(\hat\theta_C)}$, and abbreviate
+$e := \|(\hat s_C-\rho f)(X_j)-(\hat s_C-\rho f)(X_i)\|$. Since $\|\hat s_C(X_j)-\hat s_C(X_i)\| =
+\sqrt2\sigma$ and $\|\rho f(X_j)-\rho f(X_i)\| = \sqrt2\rho$, the triangle inequality gives
+$|\sigma-\rho| \le e/\sqrt2$, and therefore
+\[
+    \big\|(\hat s_C/\sigma - f)(X_j)-(\hat s_C/\sigma - f)(X_i)\big\|
+    \;\le\; \sqrt2\sigma\,\Big|\tfrac1\sigma-\tfrac1\rho\Big| + \tfrac{e}{\rho}
+    \;\le\; \tfrac{2e}{\rho}.
+\]
+Replacing $\sigma$ by $\hat\sigma$ changes the left side by $\sqrt2|\sigma-\hat\sigma|/\hat\sigma$, which
+converges to zero in probability because $\sigma^{2} \ge v$ on the event of Step 1 and
+$\sup_\Theta|\hat V - V| \to_p 0$. Squaring and combining with Theorem~\ref{thm:consist} gives the
+statement with the factor $8/\rho^{2}$.
+
+%======================================================================
+\section{Misranking}\label{app:misrank}
+%======================================================================
+
+Write $M(s)$ for the probability that a score $s$ orders a cross-sectional pair differently from its
+labels, with ties in $s$ counted as half, and $M^{*}$ for its value at $f$.
+
+\begin{proposition}[Excess misranking]\label{prop:misrank}
+Let Assumptions~\ref{as:mono}--\ref{as:transport} hold. For every bounded score $s$,
+\[
+    M(s) - M^{*} \;\le\; \sqrt{2\,\big[\Qc(s) - \Qc(\rho f)\big]} .
+\]
+In particular every minimizer of $\Qt$ misranks a within-cell pair at most
+$\sqrt{2\lambda_{s}}\,L\delta$ more often than $f$ does.
+\end{proposition}
+
+\begin{proof}
+Fix a pair $(i,j)\in\Cc$. Since $p_{ij} > 1/2$ exactly when $f(X_j) > f(X_i)$, given the pair $f$
+disagrees with the label with probability $\min\{p_{ij},1-p_{ij}\}$, and $s$ disagrees with probability
+larger by $|2p_{ij}-1|$ when it orders the pair the other way from $f$, by $\tfrac12|2p_{ij}-1|$ when it
+ties, and by zero otherwise. Write $w \in \{0,\tfrac12,1\}$ for these three cases, so that
+$M(s) - M^{*} = \E\big[|2p_{ij}-1|\,w\big]$.
+
+When $w>0$, zero lies between $s(X_j)-s(X_i)$, inclusive, and $\rho f(X_j)-\rho f(X_i)$, so convexity of
+$g_{ij}$ gives $g_{ij}\big(s(X_j)-s(X_i)\big) \ge g_{ij}(0) = \log 2$. At its minimum $g_{ij}$ equals the
+binary entropy $-p_{ij}\log p_{ij}-(1-p_{ij})\log(1-p_{ij})$, so the excess loss of the pair is at least
+$\log 2 + p_{ij}\log p_{ij} + (1-p_{ij})\log(1-p_{ij})$. This is at least $\tfrac12(2p_{ij}-1)^{2}$: the
+difference between the two vanishes with its derivative at $p_{ij}=\tfrac12$, and its second derivative
+is $1/(p_{ij}(1-p_{ij})) - 4 \ge 0$. Hence, on $\{w>0\}$,
+\[
+    (2p_{ij}-1)^{2} \;\le\; 2\Big[g_{ij}\big(s(X_j)-s(X_i)\big) - g_{ij}\big(\rho f(X_j)-\rho f(X_i)\big)\Big],
+\]
+and the bracket is nonnegative everywhere. Since $w \le \mathbf{1}\{w>0\}$, Cauchy--Schwarz gives
+\[
+    M(s) - M^{*} \;\le\; \Big(\E\big[(2p_{ij}-1)^{2}\,\mathbf{1}\{w>0\}\big]\Big)^{1/2}
+    \;\le\; \Big(2\,\big[\Qc(s)-\Qc(\rho f)\big]\Big)^{1/2}.
+\]
+The last claim follows from Theorem~\ref{thm:approx}(i).
+\end{proof}
+
+\end{document}

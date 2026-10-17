@@ -1,0 +1,188 @@
+{
+  "seed": 72101,
+  "function_seed": 983,
+  "models": [
+    "linear",
+    "nn"
+  ],
+  "truths": [
+    "linear"
+  ],
+  "n": [
+    32
+  ],
+  "city_grid": [
+    4
+  ],
+  "reps": 1,
+  "cities": 4,
+  "views": 2,
+  "noise_sd": 0.7,
+  "bayes_target": 0.2,
+  "acquisition_strength": 1.0,
+  "group_strength": 1.0,
+  "validation_fraction": 0.25,
+  "pair_mode": "all",
+  "pairs_per_label": 8,
+  "test_per_city": 128,
+  "test_pairs": 3000,
+  "hidden": [
+    32,
+    16
+  ],
+  "weight_bound": 10.0,
+  "rff": 16,
+  "epochs": 50,
+  "restarts": 1,
+  "lbfgs_steps": 30,
+  "audit_steps": 15,
+  "lr": 0.01,
+  "tau": 0.1,
+  "ridge_grid": [
+    0.0
+  ],
+  "lambda_grid": [
+    0.0,
+    0.3
+  ],
+  "lambda_t": 0.3,
+  "lambda_c": 0.3,
+  "dtype": "float64",
+  "device": "cpu",
+  "threads": 1,
+  "grad_tol": 1e-05,
+  "audit_tol": 1e-05,
+  "false_jump": 1.0,
+  "experiment1": {
+    "psi_shapes": [
+      "tanh"
+    ],
+    "cases": [
+      [
+        "common",
+        0.0
+      ],
+      [
+        "multiplier",
+        1.0
+      ],
+      [
+        "location_scale",
+        1.0
+      ],
+      [
+        "shape",
+        1.0
+      ]
+    ],
+    "composition_grid": [
+      0.0,
+      0.7
+    ],
+    "losses": [
+      "common_logit",
+      "heterogeneous_logit",
+      "ordinal_smooth"
+    ],
+    "methods": [
+      "rank_common",
+      "rank_heterogeneous",
+      "rank_ordinal",
+      "raw_levels",
+      "log_cell_fe",
+      "within_zscore",
+      "within_percentile",
+      "oracle_latent",
+      "oracle_inverse"
+    ]
+  },
+  "experiment2": {
+    "losses": [
+      "common_logit",
+      "heterogeneous_logit",
+      "ordinal_smooth"
+    ],
+    "arms": [
+      "none"
+    ],
+    "cases": [
+      [
+        "gumbel",
+        0.0
+      ],
+      [
+        "student",
+        3.0
+      ],
+      [
+        "cell_scale",
+        0.7
+      ],
+      [
+        "feature_scale",
+        0.7
+      ],
+      [
+        "median_violation",
+        0.7
+      ]
+    ]
+  },
+  "experiment3": {
+    "losses": [
+      "common_logit",
+      "heterogeneous_logit",
+      "ordinal_smooth"
+    ],
+    "arms": [
+      "none",
+      "temporal",
+      "cross_city",
+      "both"
+    ],
+    "nuisance_cases": [
+      [
+        1.0,
+        1.0
+      ],
+      [
+        0.0,
+        1.0
+      ],
+      [
+        1.0,
+        0.0
+      ]
+    ]
+  },
+  "experiment4": {
+    "losses": [
+      "common_logit",
+      "heterogeneous_logit",
+      "ordinal_smooth"
+    ],
+    "arms": [
+      "temporal",
+      "cross_city",
+      "both"
+    ],
+    "cases": [
+      [
+        "exact",
+        0.0
+      ],
+      [
+        "drift",
+        0.15
+      ],
+      [
+        "random_false",
+        0.2
+      ],
+      [
+        "systematic_false",
+        0.2
+      ]
+    ]
+  }
+}

@@ -1,0 +1,34 @@
+\begin{thebibliography}{}
+
+\bibitem[Abbate et~al., 2026]{abbate2025longitudinal}
+Abbate, N.~F., Gasparini, L., Ronchetti, F., and Quiroga, F.~M. (2026).
+\newblock Deep learning with satellite images enables high-resolution income
+  estimation: {A} case study of {Buenos Aires}.
+\newblock {\em PLOS ONE}, 21(1):e0338110.
+
+\bibitem[Burges et~al., 2005]{burges2005learning}
+Burges, C., Shaked, T., Renshaw, E., Lazier, A., Deeds, M., Hamilton, N., and
+  Hullender, G. (2005).
+\newblock Learning to rank using gradient descent.
+\newblock In {\em Proceedings of the 22nd international conference on Machine
+  learning (ICML)}.
+
+\bibitem[Callaway and Sant'Anna, 2021]{callaway2021difference}
+Callaway, B. and Sant'Anna, P.~H. (2021).
+\newblock Difference-in-differences with multiple time periods.
+\newblock {\em Journal of Econometrics}, 225(2):200--230.
+
+\bibitem[Jean et~al., 2016]{jean2016combining}
+Jean, N., Burke, M., Xie, M., Davis, W.~M., Lobell, D.~B., and Ermon, S.
+  (2016).
+\newblock Combining satellite imagery and machine learning to predict poverty.
+\newblock {\em Science}, 353(6301):790--794.
+
+\bibitem[Yeh et~al., 2020]{yeh2020using}
+Yeh, C., Perez, A., Driscoll, A., Azzari, G., Tang, Z., Lobell, D., Ermon, S.,
+  and Burke, M. (2020).
+\newblock Using publicly available satellite imagery and deep learning to
+  understand economic well-being in africa.
+\newblock {\em Nature Communications}, 11(1):2583.
+
+\end{thebibliography}

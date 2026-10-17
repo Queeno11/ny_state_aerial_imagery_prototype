@@ -110,6 +110,16 @@ def test_distance_slope_detects_rising_gap():
     assert fit["spearman"] == pytest.approx(1.0)
 
 
+def test_signed_distance_slope_separates_poor_from_rich():
+    # Gap grows only on the poor side: |d| sees a weak rise, signed d a clear fall.
+    city = pd.DataFrame({"cbsa": list("abcdef"), "dist_sd": [-2, -1, 0, 1, 2, 3],
+                         "diff": [0.3, 0.2, 0.1, 0.1, 0.1, 0.1]})
+    signed = ev.distance_slope(city, n_boot=300, signed=True)
+    assert signed["slope"] < 0 and signed["spearman"] < 0
+    unsigned = ev.distance_slope(city, n_boot=300)
+    assert unsigned["slope"] != pytest.approx(signed["slope"])
+
+
 def test_matched_budget_table_and_history_loader(tmp_path):
     pd.DataFrame({"epoch": [1, 2, 3, 3, 4], "selection/score": [0.1, 0.5, 0.2, 0.3, 0.9]}).to_csv(
         tmp_path / "wandb_history.csv", index=False)
@@ -154,6 +164,7 @@ def test_part_l2_comparison_end_to_end(tmp_path, monkeypatch):
     head = ev.part_l2_comparison_us(ctx)
     out = ctx.out
     assert (out / "figures" / "US_L2_city_gap_vs_distance.pdf").exists()
+    assert (out / "figures" / "US_L2_city_gap_vs_signed_distance.pdf").exists()
     assert (out / "figures" / "US_L2_bracket_raincloud.pdf").exists()
     assert not (out / "figures" / "US_L2_comparison_figure.pdf").exists()
     for t in ("US_L2_paired_cells.csv", "US_L2_by_bracket.csv", "US_L2_city_distance.csv"):
@@ -161,6 +172,7 @@ def test_part_l2_comparison_end_to_end(tmp_path, monkeypatch):
     assert head["l2/all/diff"] > 0                      # baseline noisier everywhere
     assert head["l2/small/diff"] > head["l2/mega/diff"]
     assert head["l2/distance_slope"] > 0                # gap grows with level distance
+    assert head["l2/signed_distance_slope"] < 0         # fake cities: all poorer than train
     assert head["l2/n_paired_cells"] == 4 * 3
 
 

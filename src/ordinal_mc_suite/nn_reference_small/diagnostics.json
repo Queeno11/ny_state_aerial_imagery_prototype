@@ -1,0 +1,7 @@
+{
+  "selected_fits": 20,
+  "candidate_fits": 480,
+  "audit_unstable": 0,
+  "first_order_not_small": 20,
+  "note": "Diagnostics are not global optimality certificates. CI uses independent repetitions, not pairs; fewer than 20 repetitions is exploratory."
+}

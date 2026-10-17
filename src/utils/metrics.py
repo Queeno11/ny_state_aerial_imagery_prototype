@@ -141,8 +141,8 @@ def selection_score(val_set_metrics, mode="within_50_50", temporal_set="val_temp
     return score, components
 
 
-def rank_autocorrelation(val_df, min_common=5):
-    """Cross-year rank stability of STABLE buildings, per city, n-weighted.
+def rank_autocorrelation_by_city(val_df, min_common=5):
+    """Per-city cross-year rank stability of STABLE buildings.
 
     For each city, picks the year pair with the most stable buildings observed
     in both years (ties -> widest span, mirroring the paper's 2016<->2024 pair)
@@ -152,10 +152,12 @@ def rank_autocorrelation(val_df, min_common=5):
     does not affect them. The label autocorrelation is the genuine-reshuffling
     benchmark: the pred-minus-label gap is model-induced instability.
 
-    Returns {} when no city has >= min_common common stable buildings.
+    Returns a DataFrame with columns cbsa, t1, t2, n, rho_p, rho_l (empty when
+    no city has >= min_common common stable buildings).
     """
     from scipy.stats import spearmanr
 
+    cols = ["cbsa", "t1", "t2", "n", "rho_p", "rho_l"]
     stable = val_df[val_df["change"] == 0]
     per_city = []
     for cbsa, g in stable.groupby("cbsa"):
@@ -179,13 +181,23 @@ def rank_autocorrelation(val_df, min_common=5):
         rho_l, _ = spearmanr(ll[t1], ll[t2])
         if np.isnan(rho_p) or np.isnan(rho_l):
             continue
-        per_city.append({"n": len(pp), "rho_p": float(rho_p), "rho_l": float(rho_l)})
-    if not per_city:
+        per_city.append({"cbsa": cbsa, "t1": t1, "t2": t2, "n": len(pp),
+                         "rho_p": float(rho_p), "rho_l": float(rho_l)})
+    return pd.DataFrame(per_city, columns=cols)
+
+
+def rank_autocorrelation(val_df, min_common=5):
+    """n-weighted average of rank_autocorrelation_by_city over cities.
+
+    Returns {} when no city has >= min_common common stable buildings.
+    """
+    per_city = rank_autocorrelation_by_city(val_df, min_common)
+    if per_city.empty:
         return {}
-    ns = np.array([c["n"] for c in per_city], dtype=float)
+    ns = per_city["n"].to_numpy(dtype=float)
     return {
-        "rank_autocorr_pred": float(np.average([c["rho_p"] for c in per_city], weights=ns)),
-        "rank_autocorr_label": float(np.average([c["rho_l"] for c in per_city], weights=ns)),
+        "rank_autocorr_pred": float(np.average(per_city["rho_p"], weights=ns)),
+        "rank_autocorr_label": float(np.average(per_city["rho_l"], weights=ns)),
         "rank_autocorr_n": int(ns.sum()),
     }
 

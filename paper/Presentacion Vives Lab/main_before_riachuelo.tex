@@ -1,0 +1,1501 @@
+%% =====================================================================
+%%  Reading Wealth from Above — research agenda talk
+%%  Vives-i-Bastida Lab, Fall 2026  ·  ~40 min (36 core + 4 for questions)
+%%  Theme: Marginal (beamerthememarginal.sty, fonts in ./fonts)
+%%  Compile: xelatex main.tex   (twice, for the frame count)
+%%  Speaker notes: change "hide notes" to "show notes on second screen=right"
+%% =====================================================================
+\documentclass[10pt,aspectratio=169]{beamer}
+\usetheme{marginal}
+
+\usepackage{amsmath,amssymb,mathtools}
+\usepackage{tabularx,array,multirow,makecell}
+\usepackage{graphicx}
+\usetikzlibrary{arrows.meta,positioning,calc,shadows}
+\usepackage{url}
+\usepackage{pgfpages}
+\IfFileExists{appendixnumberbeamer.sty}{\usepackage{appendixnumberbeamer}}{}
+\setbeameroption{hide notes}
+% \setbeameroption{show notes on second screen=right}
+
+% Skull for the inference slide (falls back to text if fontawesome5 is absent)
+\IfFileExists{fontawesome5.sty}%
+  {\usepackage{fontawesome5}\newcommand{\skull}{\faSkull}}%
+  {\newcommand{\skull}{\texttt{[x\_x]}}}
+
+\marginalfoot{Vives Lab}
+\marginalwindow{abbate // research agenda}
+\marginalnote{Work in progress · comments welcome}
+
+%% ---------------------------------------------------------------------
+%%  FIGURE PATHS — edit here only.  Missing files render as placeholder
+%%  panels showing their path, so the deck always compiles.
+%%  This file lives in  <project>/docs/Presentacion Vives Lab/ , so the
+%%  project's results folder is two levels up.
+%% ---------------------------------------------------------------------
+\newcommand{\figdir}{figures}                                   % figures from the old deck
+\newcommand{\resdir}{../../results/run_20260722}                % US run
+\newcommand{\nycres}{../../results/run_20260722/nyc_zarr_check/evaluation}
+\newcommand{\mcdir}{figures/mc}                                 % Monte Carlo figures
+\newcommand{\nycyears}{figures/nyc_years}                       % copies of E:/Datasets/Imagenes Satelitales/New York City/nyc_YYYY.png
+\newcommand{\puzzledir}{figures/puzzle}                         % 6 puzzle tiles + footprint versions
+
+%% ---------------------------------------------------------------------
+%%  Macros
+%% ---------------------------------------------------------------------
+\newcommand{\E}{\mathbb{E}}
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\Sset}{\mathcal{S}}
+\newcommand{\Cset}{\mathcal{C}}
+\newcommand{\one}{\mathbf{1}}
+\newcommand{\Qc}{Q_{\mathrm{cross}}}
+\newcommand{\cit}[1]{{\scriptsize\color{mgMuted}[#1]}}
+\newcommand{\todo}[1]{\ifmmode\text{\ttfamily\color{mgRed}[#1]}\else{\ttfamily\color{mgRed}[#1]}\fi}
+
+% status bar in the theme's progress-bar style: 10 cells, #1 filled
+\newcommand{\status}[2]{%
+  \tikz[baseline=-0.6ex]{\foreach \i in {1,...,10}{%
+    \ifnum\i>#1\relax\fill[mgRule]({(\i-1)*1.35mm},-0.75mm) rectangle ++(0.95mm,1.5mm);
+    \else\fill[mgAccent]({(\i-1)*1.35mm},-0.75mm) rectangle ++(0.95mm,1.5mm);\fi}}%
+  \hskip1ex{\scriptsize\ttfamily\color{mgMuted}#2}}
+
+% TikZ styles matching the theme's windows (sharp, 0.6pt ink, hard shadow)
+\tikzset{
+  mgnode/.style={draw=mgText, line width=0.6pt, fill=mgCard, text=mgText,
+    general shadow={fill=mgShadow, shadow xshift=0.9mm, shadow yshift=-0.9mm}},
+  mgarrow/.style={-{Stealth[length=2.3mm]}, line width=0.9pt, mgAccent},
+  mgcap/.style={font=\scriptsize, text=mgMuted, align=center}}
+
+% TikZ overlay helper: [visible on=<2->] draws the element transparent before slide 2,
+% so hidden parts keep their place in the layout.
+\tikzset{
+  invisible/.style={opacity=0},
+  visible on/.style={alt={#1{}{invisible}}},
+  alt/.code args={<#1>#2#3}{\alt<#1>{\pgfkeysalso{#2}}{\pgfkeysalso{#3}}}}
+
+% \resultsladder{k}: the results roadmap with rungs 1..k shown; later rungs are drawn
+% invisible so every repeat has the same layout.
+\newcommand{\resultsladder}[1]{%
+  \ifnum1>#1\tikzset{r1/.style={opacity=0}}\else\tikzset{r1/.style={}}\fi
+  \ifnum2>#1\tikzset{r2/.style={opacity=0}}\else\tikzset{r2/.style={}}\fi
+  \ifnum3>#1\tikzset{r3/.style={opacity=0}}\else\tikzset{r3/.style={}}\fi
+  \ifnum4>#1\tikzset{r4/.style={opacity=0}}\else\tikzset{r4/.style={}}\fi
+  \begin{tikzpicture}[
+    rung/.style={mgnode,minimum width=9.0cm,minimum height=0.95cm,align=left,font=\small,anchor=west,text width=8.6cm},
+    lab/.style={font=\small\ttfamily\bfseries,anchor=east}]
+    \node[rung,r1] (s1) at (0,0)     {Rank tracts within cities never seen};
+    \node[rung,r2] (s2) at (0.6,-1.2)  {Hold still where nothing changed};
+    \node[rung,r3] (s3) at (1.2,-2.4)  {Move where construction happened};
+    \node[rung,r4,fill=mgRedBg] (s4) at (1.8,-3.6){Predict tract-level economic \emph{change}};
+    \node[lab,r1,text=mgGreen] at (-0.25,0) {works};
+    \node[lab,r2,text=mgYellow] at (0.35,-1.2) {mostly works};
+    \node[lab,r3,text=mgYellow] at (0.95,-2.4) {works... on average?};
+    \node[lab,r4,text=mgRed] at (1.55,-3.6) {not yet};
+  \end{tikzpicture}}
+\newcommand{\ladderframe}[1]{\begin{frame}[noframenumbering]{Results as a ladder of harder tests}
+\centering
+\vspace{0.4em}
+\resultsladder{#1}
+\vspace{0.6em}
+
+% same (invisible) closing line as the full version, so the layout does not jump
+\invisible{\small Cross-sectional ranking, responsiveness to construction, and accurate economic change are \textbf{three different achievements}.}
+\end{frame}}
+
+% \setuptag{<position>}{<text>}: small side box with design details, drawn as an overlay
+% on top of everything else, so it never moves the slide's layout. Put it last in the
+% frame. <position> is a TikZ position relative to the page, e.g.
+% at={($(current page.north east)+(-0.35cm,-2.2cm)$)}, anchor=north east
+\newcommand{\setuptag}[2]{\begin{tikzpicture}[remember picture,overlay]
+  \node[mgnode, font=\scriptsize, align=left, inner sep=4pt, #1] {#2};
+\end{tikzpicture}}
+
+% \fig{path}{width}{height}: include if present, placeholder panel otherwise
+% \ffig{path}{width}{height}: same, framed with the theme's hard shadow
+\makeatletter
+\newcommand{\fig@missing}[3]{{\setlength{\fboxsep}{0pt}\fcolorbox{mgDim}{mgCard}{%
+  \parbox[c][#3][c]{#2}{\centering\scriptsize\ttfamily\color{mgMuted}%
+  [ figure ]\\[3pt]\expandafter\url\expandafter{#1}}}}}
+\newcommand{\fig}[3]{%
+  \edef\fig@path{#1}%
+  \IfFileExists{\fig@path}%
+    {\includegraphics[width=#2,height=#3,keepaspectratio]{\fig@path}}%
+    {\fig@missing{\fig@path}{#2}{#3}}}
+\newcommand{\ffig}[3]{%
+  \edef\fig@path{#1}%
+  \IfFileExists{\fig@path}%
+    {\framedgraphics[width=#2,height=#3,keepaspectratio]{\fig@path}}%
+    {\fig@missing{\fig@path}{#2}{#3}}}
+\makeatother
+% puzzle tile: plain image on overlays 1 and 3 (labels), footprint version on overlay 2
+% (tiles + footprints: src/fetch_puzzle_tiles.py --puzzle; labels in figures/puzzle/labels.csv)
+\newlength{\tilesz}\setlength{\tilesz}{0.285\textheight}
+\newcommand{\tile}[1]{\only<1,3>{\ffig{\puzzledir/#1.png}{\tilesz}{\tilesz}}%
+  \only<2>{\ffig{\puzzledir/#1_fp.png}{\tilesz}{\tilesz}}}
+% training label W (W2 wealth index, $ per person) and per-capita income Y, from overlay 3
+\newcommand{\wy}[2]{\uncover<3->{\scriptsize\ttfamily\color{mgAccent}W=\$#1\quad Y=\$#2}}
+
+\title[Reading wealth from above]{Reading Wealth from Above}
+\subtitle{A Building-Level AI Framework for Tracking Spatial Wealth over Time}
+\author{Nicolás F.\ Abbate}
+\institute{NYU}
+\date{Vives-i-Bastida Lab · Fall 2026}
+
+\begin{document}
+
+%% =====================================================================
+\begin{frame}[plain,noframenumbering]
+  \titlepage
+\end{frame}
+
+%% =====================================================================
+%%  INTRO  (~6 min)
+%% =====================================================================
+\section{Motivation and agenda}
+
+\begin{frame}{Local wealth estimates inform real policy decisions}
+\begin{columns}[T]
+\column{0.42\textwidth}
+\footnotesize
+\begin{itemize}
+  \item \textbf{Targeting:} where should scarce resources go?
+  \item \textbf{Assessing targeting:} do programs reach poorer places?
+  \item \textbf{Distributional analysis:} where are the most vulnerable places in a city?
+\end{itemize}
+\column{0.55\textwidth}
+\vspace{-1em}
+\pause
+\begin{tbox}[blue]{Togo · Novissi, 2020–21}
+\footnotesize
+No rural poverty map existed. Two stages:\par\smallskip
+\begin{tabularx}{\linewidth}{@{}l>{\raggedright\arraybackslash}X@{}}
+{\ttfamily\color{mgAccent}1 · places} & Satellite estimates on 2.4\,km cells picked the \textbf{100 poorest cantons}\\[3pt]
+{\ttfamily\color{mgAccent}2 · people} & Phone data ranked \emph{individuals} within them; \textasciitilde 57k beneficiaries\\
+\end{tabularx}
+\end{tbox}
+\vspace{0.2em}
+\end{columns}
+\pause
+{\scriptsize\color{mgMuted}Not a one-off: Nigeria 2021 (poor urban wards, \textasciitilde 1M people); World Bank \emph{Geospatial Poverty Portal}.}
+\begin{ibox}
+Even a single cross section can inform consequential decisions.
+\end{ibox}
+{\hfill\tiny\color{mgMuted}Aiken et al.\ \emph{Nature} 2022; Chi et al.\ \emph{PNAS} 2022; Smythe \& Blumenstock \emph{PNAS} 2022;
+\href{https://www.worldbank.org/en/results/2021/04/13/prioritizing-the-poorest-and-most-vulnerable-in-west-africa-togo-s-novissi-platform-for-social-protection-uses-machine-l}{World Bank: Novissi (2021)};
+\href{https://www.worldbank.org/en/events/2023/09/13/deeper-data-for-development-introducing-the-geospatial-poverty-portal}{Geospatial Poverty Portal (2023)}}
+\note{
+Local wealth estimates matter even with a single point in time: where resources go, whether programs reach poorer places, who lives near services or hazards.
+Togo: keep the two stages distinct. Satellites picked places, phones picked people.
+Imagery does the geographic step; it is not (yet) a household measure.
+Nigeria and the World Bank portal are only there to show this is not a one-off; do not dwell. ~40 seconds.
+}
+\end{frame}
+
+%% ---------------------------------------------------------------------
+% \wealthgrid{1}: every cell at the area mean (63); \wealthgrid{0}: cell-level values.
+% Values are made up for the schematic: poorer toward the waterfront (bottom left).
+\newcommand{\wealthgrid}[1]{%
+  \fill[mgShadow] (0.2,-0.2) rectangle (6.2,5.8);
+  \foreach \row [count=\j from 0] in {{15,20,30,45,55,65},{20,30,40,55,65,70},{35,45,60,65,70,80},
+                                       {55,65,70,80,75,85},{70,80,85,75,80,90},{80,85,75,90,85,80}}{%
+    \foreach \v [count=\i from 0] in \row {%
+      \ifnum#1=1\def\shade{63}\else\edef\shade{\v}\fi
+      \fill[mgAccent!\shade!mgCard] (\i,\j) rectangle ++(1,1);}}
+  \draw[mgCard, line width=0.8pt] (0,0) grid (6,6);
+  \draw[mgText, line width=0.6pt] (0,0) rectangle (6,6);
+  \fill[mgRed, opacity=0.15] (0,0) -- (0,2.7) .. controls (1.2,2.6) and (2.2,1.4) .. (2.8,0) -- cycle;
+  \draw[mgRed, line width=1.1pt, dash pattern=on 3pt off 2pt]
+    (0,0) -- (0,2.7) .. controls (1.2,2.6) and (2.2,1.4) .. (2.8,0) -- cycle;
+  \node[anchor=south west, inner sep=2pt, font=\tiny\bfseries, text=mgRed] at (0,0) {flood zone};}
+\begin{frame}{Spatial detail determines what a wealth map can tell us}
+\begin{columns}[c]
+\column{0.4\textwidth}
+\footnotesize
+\begin{itemize}
+  \item A neighborhood average can hide large differences \emph{within} it
+  \item A flood zone or transit catchment often covers only \textbf{part} of a neighborhood
+  \item Imagery resolves buildings: reliable fine estimates could be aggregated to \textbf{the geography of the question}
+\end{itemize}
+\column{0.57\textwidth}
+\centering
+\begin{tikzpicture}[x=0.4cm, y=0.4cm]
+  \wealthgrid{1}
+  \node[font=\scriptsize\ttfamily, text=mgMuted, anchor=south] at (3,6.1) {area average};
+  \node[mgcap, anchor=north] at (3,-0.35) {zone looks typical};
+  \draw[mgarrow] (6.6,3) -- (7.6,3);
+  \begin{scope}[xshift=8.2*0.4cm]
+    \wealthgrid{0}
+    \node[font=\scriptsize\ttfamily, text=mgMuted, anchor=south] at (3,6.1) {finer estimates};
+    \node[mgcap, anchor=north] at (3,-0.35) {zone is the poorest part};
+  \end{scope}
+  \node[font=\tiny, text=mgMuted, anchor=north] at (7.1,-1.4) {\emph{Illustrative schematic} · stronger color = richer};
+\end{tikzpicture}
+\end{columns}
+\pause
+\begin{ibox}
+First task: reliable wealth rankings across locations, even with few labels.
+\end{ibox}
+\note{
+Walk the figure: the dashed area is a flood zone covering part of a neighborhood.
+Left: assign the neighborhood average to everyone inside it, and the zone looks typical.
+Right: with finer estimates, the zone is the poorest part. That is the difference we care about.
+Same logic for a transit catchment or a program boundary.
+Caveat out loud: detailed pixels do not automatically give equally accurate wealth estimates.
+My current work learns wealth rankings across locations and validates them at the tract level. ~40 seconds.
+}
+\end{frame}
+
+%% ---------------------------------------------------------------------
+\begin{frame}{Historical imagery could extend these maps over time}
+\begin{columns}[T]
+\column{0.48\textwidth}
+\begin{tbox}[blue]{Observe places again}
+\footnotesize
+ACS tracts: 5-year averages, wide error margins. Imagery: every 2--3 years, US-wide (NAIP).
+\end{tbox}
+\column{0.48\textwidth}
+\begin{tbox}[violet]{Look backward}
+\footnotesize
+Archives predate the question: study an old rezoning or flood with images from \textbf{before and after}.
+\end{tbox}
+\end{columns}
+\centering
+\begin{tikzpicture}[x=0.27cm, y=0.85cm]
+  \draw[mgRule, line width=0.8pt, -{Stealth[length=1.6mm]}] (1990,0) -- (2028,0);
+  % imagery row: first orthos, then biennial orthos
+  \foreach \y in {1996,2001.5}{\fill[mgDim] (\y-0.6,-0.11) rectangle ++(1.2,0.22);}
+  \foreach \y in {2004,2006,...,2024}{\fill[mgAccent] (\y-0.6,-0.11) rectangle ++(1.2,0.22);}
+  \node[font=\tiny\ttfamily, text=mgMuted, anchor=south, inner sep=1pt] at (1996,0.17) {1996};
+  \node[font=\tiny\ttfamily, text=mgMuted, anchor=south, inner sep=1pt] at (2001.5,0.17) {2001–02};
+  \draw[mgAccent, line width=0.6pt] (2004,0.5) -- (2024,0.5);
+  \node[font=\tiny\ttfamily, text=mgAccent, anchor=south, inner sep=1pt] at (2014,0.55) {every 2 years, 2004–24};
+  \node[font=\scriptsize, text=mgText, anchor=east] at (1989,0) {NYC aerial imagery};
+  % survey row
+  \draw[mgBlue, line width=3pt] (2009,-0.45) -- (2024,-0.45);
+  \node[font=\scriptsize, text=mgText, anchor=east] at (1989,-0.45) {ACS 5-yr tract data};
+  \node[font=\tiny\ttfamily, text=mgMuted, anchor=east] at (2008,-0.45) {first window 2005–09};
+\end{tikzpicture}
+\pause
+\begin{ibox}
+Next task: establish when differences in predictions measure economic change.
+\end{ibox}
+\note{
+New acquisitions let us revisit places; archives let us look backward.
+The timeline is the point: NYC orthoimagery starts in 1996 and is biennial from 2004, tract-level ACS only from 2005--09.
+So we can ask a question today about an older intervention and still find images from before and after it.
+If asked about survey frequency elsewhere: Malawi / Mozambique, $R^2$ of asset wealth between consecutive censuses $=0.42$ and $-0.71$ (Zheng et al.\ 2026).
+Turning those images into comparable economic measures is the next research problem. Today: the cross-sectional measurement this builds on. ~40 seconds.
+}
+\end{frame}
+
+%% ---------------------------------------------------------------------
+\begin{frame}{The far goal: low-cost impact evaluation anywhere}
+\centering
+\begin{tikzpicture}[
+  box/.style={mgnode,text width=2.45cm,minimum height=1.25cm,align=center,font=\footnotesize}]
+  % one box per click (hidden boxes keep their place), then the paragraph
+  \node[box] (a) {\texttt{(a)} Train a\\``global'' model};
+  \node[mgcap,below=0.35cm of a,text width=2.6cm]{many cities and years,\\non-comparable labels};
+  \begin{scope}[visible on=<2->]
+    \node[box,right=0.5cm of a] (b) {\texttt{(b)} Fine-tune on\\1–2 national surveys};
+    \draw[mgarrow] (a)--(b);
+    \node[mgcap,below=0.35cm of b,text width=2.6cm]{most countries have\\at least one};
+  \end{scope}
+  \begin{scope}[visible on=<3->]
+    \node[box,right=0.5cm of b] (c) {\texttt{(c)} High-res\\\emph{panel} of predictions};
+    \draw[mgarrow] (b)--(c);
+    \node[mgcap,below=0.35cm of c,text width=2.6cm]{stable where nothing\\changed};
+  \end{scope}
+  \begin{scope}[visible on=<4->]
+    \node[box,right=0.5cm of c] (d) {\texttt{(d)} DiD, RDD, \dots\\where no panel exists};
+    \draw[mgarrow] (c)--(d);
+    \node[mgcap,below=0.35cm of d,text width=2.6cm]{prediction error must not\\correlate with treatment};
+  \end{scope}
+\end{tikzpicture}
+\vspace{0.6em}
+
+\uncover<5->{\small\raggedright
+Each arrow is a research problem: \texttt{(a)} is the measurement problem, \texttt{(c)} needs temporal comparability, \texttt{(d)} needs prediction errors that do not distort treatment comparisons. A model can predict \emph{levels} well and still miss \emph{treatment-induced changes}.\par}
+\end{frame}
+
+%% ---------------------------------------------------------------------
+\begin{frame}{An ambitious agenda: four questions}
+\small\renewcommand{\arraystretch}{1.12}
+\begin{tabularx}{\textwidth}{@{}l X l@{}}
+\toprule
+ & {\ttfamily\color{mgMuted}question} & {\ttfamily\color{mgMuted}status}\\
+\midrule
+\texttt{(a)} & \textbf{The measurement problem.} What can be learned from labels on non-comparable scales? Solutions beyond imagery. & \status{3}{\textasciitilde 30\%}\\
+\texttt{(b)} & \textbf{Wealth in the US.} Does it work, and beat existing approaches, in cities never seen? & \status{6}{\textasciitilde 60\%}\\
+\texttt{(c)} & \textbf{Time series.} What additional information identifies economic \emph{change}? & \status{0}{not started}\\
+\texttt{(d)} & \textbf{Applications.} When can predicted outcomes support valid policy evaluation? & \status{0}{not started}\\
+\bottomrule
+\end{tabularx}
+\footnotesize Maybe four papers, maybe one. Today: \texttt{(a)}, \texttt{(b)}, and where they stop.
+\end{frame}
+
+%% ---------------------------------------------------------------------
+\begin{frame}{What I will show today}
+\small A model that ranks neighborhoods by wealth from aerial images, trained only on \emph{rankings within each city and year}, so it never compares dollars across places.
+\par{\footnotesize\textbf{A prediction for every building} (200\,m of sub-meter imagery), validated at tracts; to our knowledge the finest nationwide (cf.\ $\sim$1\,km grids \cit{Rolf et al.\ 2021}; tracts \cit{Hendrix et al.\ 2026}).\par}
+\vspace{0.3em}
+
+\begin{columns}[T]
+\column{0.31\textwidth}
+{\LARGE\ttfamily\bfseries\color{mgAccent} 0.78}\par\smallskip
+\footnotesize Rank correlation between predicted and survey wealth across tracts, in \textbf{36 US cities the model never saw}
+\column{0.33\textwidth}
+{\LARGE\ttfamily\bfseries\color{mgAccent} 35 of 36}\par\smallskip
+\footnotesize test cities where it beats the standard approach (regress the survey value on the image): $0.78$ vs.\ $0.71$, \textbf{+0.07 on average}. Same images, network and stopping rule
+\column{0.31\textwidth}
+{\LARGE\ttfamily\bfseries\color{mgRed} change}\par\smallskip
+\footnotesize It stays still where nothing was built and moves where construction happened, but does \textbf{not yet predict tract-level economic change}
+\end{columns}
+\vspace{0.1em}
+
+{\scriptsize\color{mgMuted} Equal training time (first 200 epochs), validation score: 0.61 vs.\ 0.54. Simulations: the stability restriction is worth 1.5--2.8$\times$ more labeled cities.}
+\note{
+Resolution line: predictions exist for every building (a 200 m NAIP window, 0.6-1 m pixels), but they are only validated against tract averages -- say that plainly. MOSAIKS (Rolf et al. 2021) predicts US income/house prices on ~1 km grid cells from 4 m imagery; Hendrix et al. (2026) predict ACS variables (per-capita income pooled R2 up to 0.43) for all CONUS tracts from 10 m foundation-model embeddings, single year 2022. Neither validates below its label unit either.
+Say it in plain words for people who never saw the project. 0.78 = mean within-city Spearman of tract averages vs ACS, 36 test CBSAs (US_L2_by_bracket.csv, all). L2 = pooled regression on log wealth, same backbone and data.
+Budget: the L2 run early-stopped at epoch 98; the ordinal run had the same early-stopping rule and never triggered it (best epoch 708 of 750). Capped at 200 epochs each, the validation selection score is 0.606 vs 0.535: same gap.
+}
+\end{frame}
+
+%% ---------------------------------------------------------------------
+\begin{frame}{Isn't this done already? Yes and no}
+\begin{columns}[T]
+\column{0.5\textwidth}
+\begin{tbox}[green]{Works well and scales}
+\begin{minipage}[t]{0.58\linewidth}\footnotesize\raggedright
+Footprints, land use, disaster damage: \emph{a building is a building} in Dallas and in Lagos.
+\end{minipage}\hfill
+\begin{minipage}[t]{0.4\linewidth}\vspace{0pt}
+\fig{\figdir/image5.png}{0.48\linewidth}{1.1cm}\hfill\fig{\figdir/image6.jpg}{0.48\linewidth}{1.1cm}
+\end{minipage}
+\end{tbox}
+\begin{tbox}[blue]{Asset indices (DHS)}
+\footnotesize Strong in levels \cit{Jean 2016; Yeh 2020; Chi 2022}. Change improving: decadal $R^2\approx0.69$ / $0.46$ in Malawi / Mozambique \cit{Zheng, Newhouse et al.\ 2026}
+\end{tbox}
+\column{0.48\textwidth}
+\begin{tbox}[blue]{Income / wealth directly}
+\footnotesize Income per capita, 1--2\,km cells, imagery only: $R^2\approx0.33$--$0.39$ in levels, $\approx0.03$--$0.05$ in decadal changes \cit{Khachiyan et al.\ 2022}. One year's labels copied to all years \cit{Abbate et al.\ 2025}.
+\end{tbox}
+\begin{caveatbox}[What is missing]
+\footnotesize A framework for pooling cells whose \textbf{labels are not comparable}: Monetary measures over time and space.
+\end{caveatbox}
+\end{columns}
+\note{
+Khachiyan et al. numbers are per-capita income (online appendix Table 2, test set, no initial conditions); their headline 0.85-0.91 levels / 0.32-0.46 changes are total income and population, which scale with how many people live in a cell. With initial conditions (2000 demographics, employment, county income): 0.61-0.65 levels, ~0.07 changes.
+Do NOT say nobody predicts change: Khachiyan study growth explicitly; Tempov reports decadal change R2 0.69/0.46 for an asset index (also Pettersson et al. 2023).
+Claim instead: explicit framework for cell-specific monotone measurement; monetary target; building scale.
+}
+\end{frame}
+
+%% =====================================================================
+%%  PART 1  (~17 min)
+%% =====================================================================
+\section[Measurement problem]{The measurement problem}
+
+%% ---------------------------------------------------------------------
+\begin{frame}{The puzzle: detection scales, wealth does not}
+\centering
+\vspace{-0.4em}
+\setlength{\tabcolsep}{10pt}\renewcommand{\arraystretch}{0.9}
+\begin{tabular}{r ccc}
+ & {\ttfamily\small rich} & {\ttfamily\small middle} & {\ttfamily\small poor}\\[1pt]
+\raisebox{0.13\textheight}{\ttfamily NYC} & \tile{nyc_rich} & \tile{nyc_mid} & \tile{nyc_poor}\\[-2pt]
+ & \wy{2,368,433}{156,513} & \wy{623,854}{43,268} & \wy{303,761}{24,867}\\[3pt]
+\raisebox{0.13\textheight}{\ttfamily CHI} & \tile{chi_rich} & \tile{chi_mid} & \tile{chi_poor}\\[-2pt]
+ & \wy{2,285,905}{157,163} & \wy{432,680}{28,610} & \wy{162,778}{14,237}\\
+\end{tabular}
+\note{
+Click 1: similar-looking places, row by row. Click 2: footprints (Microsoft US Building Footprints) -- the physical bundles are close across cities. Click 3: same bundle, different dollars -- the label measures something city-and-year specific.
+Tiles: 200 m NAIP windows, NYC 2022 flight, Chicago 2023 flight. Rich: Riverside South vs Lakeshore East. Middle: Queens Village vs Belmont Cragin. Poor: Queensbridge Houses vs Dearborn Homes (CHA).
+W = W2 occupant-wealth index (training label, dollars per person), Y = per-capita income; tract containing the tile centre, ACS 2022 (NYC) / 2023 (Chicago). Within-metro W percentiles: rich 98 vs 99, middle 50 vs 31, poor 12 vs 3.
+
+Evidentiary role: this motivates the possibility that similar physical features carry different dollar labels.
+It does not by itself establish a common ordering across cities -- that is A2.
+}
+\end{frame}
+
+%% ---------------------------------------------------------------------
+% One frame, four overlays (all numbered as this frame). The four PNGs share one
+% layout (1000 px at 100 dpi = 0.72 bp/px); the same trim keeps only the 769x769 px
+% imagery (rows 121-889, cols 129-897): no white margin, year label or border line.
+\newcommand{\nycyear}[1]{\IfFileExists{\nycyears/nyc_#1.png}%
+  {\framedgraphics[height=0.7\textheight, trim=92.88bp 79.20bp 73.44bp 87.12bp, clip]{\nycyears/nyc_#1.png}}%
+  {\fig{\nycyears/nyc_#1.png}{0.7\textheight}{0.7\textheight}}}
+\begin{frame}{A second problem: the same place does not look the same}
+\begin{columns}[c]
+\column{0.36\textwidth}
+{\ttfamily\color{mgMuted}\small NYC orthoimagery}\par\smallskip
+{\Huge\ttfamily\bfseries\color{mgAccent}%
+\only<1>{2010}\only<2>{2016}\only<3>{2020}\only<4>{2024}}\par\medskip
+\small
+\begin{itemize}
+  \item Same blocks, mostly the same buildings
+  \item The \emph{pixels} change: light and shadows, season, sensor, color processing
+\end{itemize}
+\medskip
+\scriptsize Two problems: \hl{measurement variation} (label scale moves across cells) vs.\ \hl{image variation} (pixels move, structures do not)
+\column{0.6\textwidth}
+\centering
+\only<1>{\nycyear{2010}}%
+\only<2>{\nycyear{2016}}%
+\only<3>{\nycyear{2020}}%
+\only<4>{\nycyear{2024}}
+\end{columns}
+\end{frame}
+
+%% ---------------------------------------------------------------------
+\begin{frame}{The model}
+\[
+  \underbrace{W_{ict}}_{\substack{\text{wealth label}\\\text{tract } i,\ \text{city } c,\ \text{year } t}}
+  \;=\;
+  \underbrace{\gamma_{ct}}_{\substack{\text{cell-specific}\\\text{function}}}\!\big(\underbrace{X_{ict}}_{\substack{\text{observables}\\\text{(image tile, covariates)}}}\big)
+  \;+\;
+  \underbrace{u_{ict}}_{\text{error}}
+\]
+\pause
+\begin{itemize}\small
+  \item A \textbf{cell} is a city-year $(c,t)$; $X$ is an image tile, covariates, or both
+  \item $\gamma_{ct}$ must be cell-specific: cost of living, wages, inflation, local inequality all move the map from features to dollars
+\end{itemize}
+\pause
+\begin{tbox}[violet]{Why not just estimate $\gamma_{ct}$?}
+\footnotesize Requires (i) a parametric correction (linear fixed effects, logs, $z$-scores, PPP), or (ii) one function per cell.
+(i) is wrong if the distortion changes \emph{shape}; (ii) says nothing about a cell without labels.
+\muted{Why standardizing ($z$-scores, percentiles) fails: backup.}
+\end{tbox}
+\end{frame}
+
+%% ---------------------------------------------------------------------
+\begin{frame}{Two assumptions: one index, monotone rescaling}
+\[
+  W_{ict} \;=\; \gamma_{ct}(X_{ict}) + u_{ict},
+  \qquad
+  \gamma_{ct} \;=\; \psi_{ct}\circ f
+\]
+{\footnotesize\centering
+$W$: wealth label of tract $i$, city $c$, year $t$ \;·\; $X$: image tile and covariates \;·\; $u$: error\\[2pt]
+$f$: index function, the same everywhere \;·\; $\psi_{ct}$: rescales the index into the dollars of cell $(c,t)$\par}
+\medskip
+\begin{columns}[T]
+\column{0.48\textwidth}
+\begin{uncoverenv}<1->
+\begin{tbox}[blue]{A1 · Monotonicity}
+\footnotesize $\psi_{ct}$ is strictly increasing for every $(c,t)$.\\[1pt]
+\muted{\scriptsize Within a city-year, labels rank tracts as the index does. Given the quantile reading of $\psi_{ct}$, closer to a normalization than an economic claim.}
+\end{tbox}
+\end{uncoverenv}
+\column{0.48\textwidth}
+\begin{uncoverenv}<2->
+\begin{tbox}[blue]{A2 · Spatio-temporal invariance}
+\footnotesize $f$ does not depend on $c$ or $t$.\\[1pt]
+\muted{\scriptsize \textbf{The substantive one.} All cross-cell variation goes to $\psi_{ct}$: a backyard pool ranks above none in Manhattan and in Dallas alike.}
+\end{tbox}
+\end{uncoverenv}
+\end{columns}
+\end{frame}
+
+%% ---------------------------------------------------------------------
+\begin{frame}{The error moves inside: a latent wealth index}
+\setlength{\abovedisplayskip}{3pt}\setlength{\belowdisplayskip}{3pt}
+\footnotesize Under A1, $\psi_{ct}$ is invertible, so the error can be written inside it:
+\vspace{-0.4em}
+\[
+  W_{ict} \;=\; \psi_{ct}\big(f(X_{ict})+\varepsilon_{ict}\big),
+  \qquad
+  R_{ict} \;\coloneqq\; f(X_{ict})+\varepsilon_{ict}.
+\]
+\smallskip
+\begin{minipage}[t]{0.485\textwidth}
+\begin{tbox}[blue]{$f$ · global index function}
+\scriptsize Same in every cell (A2): space, light, greenery, quality, height, centrality.
+\end{tbox}
+\end{minipage}\hfill
+\begin{minipage}[t]{0.485\textwidth}
+\begin{tbox}[blue]{$\psi_{ct}$ · cell-specific rescaling}
+\scriptsize Into the dollars of city $c$, year $t$: level, spread and \emph{shape}. Never estimated.
+\end{tbox}
+\end{minipage}\par
+\smallskip
+\footnotesize $R$ is a \textbf{latent wealth index}: the wealth representation of the image features, regardless of the city; $\psi_{ct}$ rescales that index for a given city and year. Never observed, only $\psi_{ct}(R)$. \textbf{Estimand: $f$}, predictable from $X$ alone, even in cells without labels.
+\pause
+\begin{caveatbox}
+\scriptsize A \emph{reparameterization}: $\varepsilon \coloneqq \psi_{ct}^{-1}(W)-f(X)$ inherits nothing; its properties are separate assumptions (A4).
+\end{caveatbox}
+\note{
+R includes a realization of unobserved factors; the fitted score targets the systematic part f.
+Why the index is latent and not a percentile: the best towers need not sit at the same percentile in every city (different counts of such towers).
+It formalizes the puzzle pictures: dollars differ, but rich > middle > poor in both cities.
+}
+\end{frame}
+
+%% ---------------------------------------------------------------------
+\begin{frame}{What pooling dollars estimates}
+\begin{resultbox}[Proposition 1 · Pooled levels estimate a mixture]
+If $\E[u_{ict}\mid X_{ict},c,t]=0$ and $\E|W|<\infty$, regressing $W$ on $X$ pooling all cells gives
+\[
+  \E[W\mid X=x] \;=\; \sum_{c,t}\Pr(c,t\mid X=x)\;\psi_{ct}\big(f(x)\big).
+\]
+\end{resultbox}
+\pause
+\begin{itemize}
+  \item Weights reflect which cells are in the training sample, not the economy
+  \item They can \textbf{reverse rankings}: houses get Dallas-leaning dollars, public housing towers (NYC only) get NYC dollars $\Rightarrow$ towers predicted richer than houses, though poorer in each city
+  \item The model learned that \emph{public housing signals New York}
+\end{itemize}
+\end{frame}
+
+%% ---------------------------------------------------------------------
+\begin{frame}{A3: Lipschitz continuity of the index function}
+\footnotesize \textbf{Stable pairs} $\Sset$: $(X_{ict},X_{ict'})$, same tract $i$ and city $c$, years $t\neq t'$, chosen \emph{without labels} as unchanged.
+\begin{tbox}[blue]{A3 · Lipschitz continuity of the index function}
+\small $f=g\circ\phi$ with $H=\phi(X)\in\R^K$ standardized, $|g(h)-g(h')|\le L\|h-h'\|$ on the support of $H$, and $\|\phi(X_{ict'})-\phi(X_{ict})\|\le\delta$ for every $(X_{ict},X_{ict'})\in\Sset$. $f$ is not constant within cells.
+\end{tbox}
+\begin{itemize}\footnotesize
+  \item $H$: the embedding before the final scalar layer; $g$: the head. Only the product $L\delta$ matters
+  \item $L$ and $\delta$ are not observed; $\delta$ is set by the rule that defines $\Sset$ (a tighter rule lowers $\delta$ but leaves fewer pairs), so its meaning changes by setup:
+  \begin{itemize}\scriptsize
+    \item aerial imagery: no recorded footprint change between the two dates
+    \item an independent change-detection model that says ``no change''
+    \item other settings: same exam item across forms, same scanner phantom across sites, \dots
+  \end{itemize}
+\end{itemize}
+\note{
+Stable pairs are stated for the same tract and city in two years; the general version (any two cells, including across cities) is in the paper: mention it.
+Likely question: stable structures need not imply stable occupant wealth (sorting, job changes, asset prices).
+Answer: the restriction is on f, the image-based component. Changes in occupant wealth without visible change live in epsilon -- and that is exactly why Delta f is hard (end of talk).
+}
+\end{frame}
+
+%% ---------------------------------------------------------------------
+\begin{frame}{A4: what the errors must do}
+\small For tracts $i\neq j$ of the same cell $(c,t)$, with $f_{ict}\coloneqq f(X_{ict})$,
+\vspace{-0.3em}
+\[
+  p_{ij} \;\coloneqq\; \Pr(W_{jct}>W_{ict}\mid X_{ict},X_{jct})
+  \;=\; \Pr(R_{jct}>R_{ict}\mid\cdot\,)
+  \;=\; \Pr\big(\varepsilon_{ict}-\varepsilon_{jct}< f_{jct}-f_{ict}\mid\cdot\,\big).
+\]
+\begin{tbox}[blue]{A4 · Comparison errors: given $(X_{ict},X_{jct})$, the difference $\varepsilon_{ict}-\varepsilon_{jct}$ \dots}
+\footnotesize
+\begin{tabularx}{\linewidth}{@{}l l X r@{}}
+\texttt{(a)} & median zero & $p_{ij}>\tfrac12 \iff f_{jct}>f_{ict}$ & \muted{noise may depend on $X$}\\
+\texttt{(b)} & heterogeneous logistic & $p_{ij}=\Lambda\big(\rho_{ct}\,[f_{jct}-f_{ict}]\big)$ & \muted{reliability varies by cell}\\
+\texttt{(c)} & homogeneous logistic & $p_{ij}=\Lambda\big(\rho\,[f_{jct}-f_{ict}]\big)$ & \muted{same $\rho$ everywhere}\\
+\end{tabularx}
+\end{tbox}
+\begin{itemize}\footnotesize
+  \item $\Lambda(z)=1/(1+e^{-z})$. Each version picks a loss: \texttt{(a)} a binary right/wrong-order loss, smoothed by a surrogate as is standard practice; \texttt{(b)} RankNet with $\rho_{ct}$; \texttt{(c)} RankNet \cit{Burges et al.\ 2005}
+  \item Done so far: \inv{(c), the strongest assumption}. \texttt{(a)} and \texttt{(b)} are next
+\end{itemize}
+\note{
+(c) excludes feature-dependent dispersion: tiles typical of heterogeneous tracts are where it most likely fails.
+Common rho across cells is the restrictive bit; (b) fixes that. Duchi-Mackey-Jordan 2010: surrogates can be inconsistent for ranking risk -> reason for (a).
+Logistic DIFFERENCES, not logistic levels (if asked).
+}
+\end{frame}
+
+%% ---------------------------------------------------------------------
+\begin{frame}{What the data reveal about the index}
+\begin{columns}[T]
+\column{0.42\textwidth}
+\begin{resultbox}[Prop.\ 2 · A1–A3]
+\footnotesize\textbf{(i) Ordering within a cell.} For $i,j$ in $(c,t)$:\\
+\hfill $W_{jct}>W_{ict}\iff R_{jct}>R_{ict}$\hfill\null\\[3pt]
+\textbf{(ii) Stability across years.} For $(X_{ict},X_{ict'})\in\Sset$:\\
+\hfill $|f(X_{ict'})-f(X_{ict})|\le L\delta$\hfill\null
+\end{resultbox}
+\scriptsize (ii) \textbf{uses no label.}
+
+\medskip
+\footnotesize \alert{Nothing ties cities to each other}: labels work within a cell, stable pairs within a city, so each city's level is free.
+\column{0.56\textwidth}
+\centering
+% One city over three dates. Horizontal position = label W (dollars); fill = index R.
+% Schematic, not estimated. Each date maps a base index position through its own
+% increasing map w_t (inflation, larger at the top), so within a row the colour
+% order still matches the position order (i); stable tracts keep their colour while
+% their dollars drift (ii); two tracts change R and overtake neighbours.
+\begin{tikzpicture}[
+  x=0.62cm, y=0.72cm,
+  font=\scriptsize\ttfamily, text=mgText,
+  declare function={w0(\x)=\x; w1(\x)=0.2+1.03*\x+0.008*\x*\x; w2(\x)=0.4+1.06*\x+0.02*\x*\x;},
+  stable link/.style={draw=mgDim,line width=0.5pt,shorten <=4pt,shorten >=4pt},
+  changed link/.style={draw=mgRed,line width=0.85pt,dash pattern=on 2.5pt off 2pt,
+    shorten <=7pt,shorten >=7pt},
+  obs/.style={circle,minimum size=7.5pt,inner sep=0pt,draw=mgText!70,line width=0.4pt},
+  ring/.style={circle,minimum size=13pt,inner sep=0pt,draw=mgRed,line width=0.6pt,
+    dash pattern=on 2pt off 1.6pt}]
+  \colorlet{rlow}{mgCard}
+  \colorlet{rhigh}{mgBlue!85!black}
+  % axes: dollars to the right, time downwards
+  \draw[-{Stealth[length=3.5pt]},draw=mgMuted,line width=0.5pt] (0.1,0.7) -- (9.6,0.7)
+    node[midway,above=1pt,text=mgText] {label $W$ (dollars)};
+  \draw[-{Stealth[length=3.5pt]},draw=mgMuted,line width=0.5pt] (-1.25,0.45) -- (-1.25,-2.95)
+    node[midway,left=1pt,text=mgMuted,rotate=90,anchor=south] {year};
+  \foreach \yy/\lab in {0/{t},-1.35/{t'},-2.70/{t''}}{\node[anchor=east] at (-0.3,\yy) {$\lab$};}
+  % seven unchanged tracts: base index position / R intensity
+  \foreach \xx/\rr in {0.28/7,1.40/21,2.75/40,3.30/46,3.85/52,5.00/69,6.48/88}{
+    \draw[stable link] ({w0(\xx)},0) -- ({w1(\xx)},-1.35);
+    \draw[stable link] ({w1(\xx)},-1.35) -- ({w2(\xx)},-2.70);
+    \node[obs,fill=rhigh!\rr!rlow] at ({w0(\xx)},0) {};
+    \node[obs,fill=rhigh!\rr!rlow] at ({w1(\xx)},-1.35) {};
+    \node[obs,fill=rhigh!\rr!rlow] at ({w2(\xx)},-2.70) {};
+  }
+  % a tract that improves twice, overtaking three stable tracts
+  \coordinate (a0) at ({w0(1.88)},0); \coordinate (a1) at ({w1(2.36)},-1.35); \coordinate (a2) at ({w2(4.36)},-2.70);
+  \draw[changed link] (a0) -- (a1);
+  \draw[changed link] (a1) -- (a2);
+  \foreach \nn/\rr in {a0/28,a1/34,a2/61}{\node[obs,fill=rhigh!\rr!rlow] at (\nn) {}; \node[ring] at (\nn) {};}
+  % a tract stable at first, then improving past a neighbour
+  \coordinate (b0) at ({w0(5.84)},0); \coordinate (b1) at ({w1(5.84)},-1.35); \coordinate (b2) at ({w2(7.28)},-2.70);
+  \draw[stable link,shorten >=7pt] (b0) -- (b1);
+  \draw[changed link] (b1) -- (b2);
+  \node[obs,fill=rhigh!79!rlow] at (b0) {};
+  \node[obs,fill=rhigh!79!rlow] at (b1) {}; \node[ring] at (b1) {};
+  \node[obs,fill=rhigh!98!rlow] at (b2) {}; \node[ring] at (b2) {};
+  % legend, one row under the plot
+  \begin{scope}[shift={(0.1,-3.65)},font=\tiny\ttfamily]
+    \shade[left color=rlow,right color=rhigh,draw=mgText!70,line width=0.3pt] (0,-0.1) rectangle (1.2,0.1);
+    \node[anchor=west] at (1.25,0) {index $R$};
+    \draw[stable link,shorten <=0pt,shorten >=0pt] (3.3,0) -- (4.0,0);
+    \node[obs,fill=rhigh!48!rlow] at (3.3,0) {}; \node[obs,fill=rhigh!48!rlow] at (4.0,0) {};
+    \node[anchor=west] at (4.2,0) {stable pair};
+    \node[obs,fill=rhigh!30!rlow] at (6.9,0) {}; \node[ring] at (6.9,0) {};
+    \node[anchor=west] at (7.2,0) {changing tract};
+  \end{scope}
+\end{tikzpicture}
+
+\medskip
+\raggedright\footnotesize \alert{Nothing teaches the model about changing tracts}: their scores are learnt from cross-sectional data only (stable pairs only cover what did not change).
+\end{columns}
+\note{
+Nothing teaches the model about change: no label ever compares the same tract over time. Within-cell rankings are cross-sectional, and stable pairs only restrict tracts that did not change. A changed tract's score moves only because its image moved through the f learnt across tracts -- which is why tract-level change (end of talk) is the open problem.
+Proof sketch. (i) the same increasing psi_ct applies to both tracts. (ii) the same f = g o phi in both cells, then Lipschitz with delta-close pairs.
+Nothing ties cities (backup: three checks): within-cell rankings leave a free constant per cell; stable pairs tie one city's years (within 2 rho L delta). It matters only for comparing levels across cities, not for within-city rankings or event studies with city x year effects.
+}
+\end{frame}
+
+%% ---------------------------------------------------------------------
+\begin{frame}{The criterion}
+\begin{notebox}[Definition 2 · Criterion, for a score $s$ mapping tiles to $\R$]
+\vspace{-0.6em}
+\begin{align*}
+  Q(s) &= \E_{\Cset}\big[\ell\big(s_{jct}-s_{ict},\,\one\{W_{jct}>W_{ict}\}\big)\big]
+  \;+\; \lambda_t\,\frac{\E_{\Sset}\big[(s_{ict'}-s_{ict})^2\big]}{\tfrac12\,\E_{\Cset}\big[(s_{jct}-s_{ict})^2\big]}\\
+  &= \Qc(s) \;+\; \lambda_t\,S_t(s)/V(s)
+\end{align*}
+\footnotesize
+$s_{ict}\coloneqq s(X_{ict})$; $\Cset$: pairs $i\neq j$ in the same cell $(c,t)$; $\Sset$: stable pairs, same $i$ and $c$, years $t\neq t'$; $\ell(z,y)=\log(1+e^{z})-yz$.
+\end{notebox}
+\begin{itemize}\footnotesize
+  \item \textbf{Label-invariant:} labels enter only via $\one\{W_{jct}>W_{ict}\}$, so any increasing relabeling within a cell (dollars, logs, $z$-scores, percentiles) gives the same objective. It never sees $\psi_{ct}$
+  \item \textbf{Scale-free penalty:} $S_t(as)/V(as)=S_t(s)/V(s)$; stability cannot be bought by shrinking scores
+\end{itemize}
+\note{
+Stable pairs here: same tract i, same city c, two years. General version (any two cells) in the paper.
+Cross-city stable pairs (a lambda_c term, same form) need neighbours in a representation fixed before training: lambda_c = 0 today. Mention verbally.
+}
+\end{frame}
+
+%% ---------------------------------------------------------------------
+\begin{frame}{Identification under A4(c)}
+\begin{resultbox}[Theorem 1 · A1–A3, A4(c), bounded $H$, $V(f)=1$]
+\textbf{(i) Criterion pseudo-optimization.} For every bounded $s$ with $V(s)>0$:
+\qquad $Q(\rho f) - Q(s) \;\le\; \lambda_t\,(L\delta)^2 .$\\[0.4em]
+\textbf{(ii) Score pseudo-optimization.} For every minimizer $s^*$ of $Q$:
+\[
+  \E_{\Cset}\Big[\Big(\big[s^*_{jct}-s^*_{ict}\big]-\rho\big[f_{jct}-f_{ict}\big]\Big)^2\Big]
+  \;\le\; \frac{2\,\lambda_t\,(L\delta)^2}{\Lambda'(B)},
+\]
+where $B$ bounds the within-cell differences $|s^*_{jct}-s^*_{ict}|$ and $\rho\,|f_{jct}-f_{ict}|$, and $\Lambda'$ is the logistic density.
+\end{resultbox}
+\footnotesize (i) $\rho f$ is within $\lambda_t(L\delta)^2$ of the minimum: the \emph{price of stability}, set by the design. (ii) Recovers $\rho f$ \textbf{up to a constant per cell}, and its scale.
+\note{
+Constant Lambda'(B) ~ exp(-B) is poor: qualitative recovery statement, not a usable band.
+Companion (backup): a minimizer misranks within-cell pairs at most sqrt(2 lambda) L delta more often than f.
+Important: this is a population bound on the distortion from imposing stability; it does NOT show the penalty helps in finite samples. That is what the MC is for.
+}
+\end{frame}
+
+%% ---------------------------------------------------------------------
+\begin{frame}{Estimation: sampling and regularity}
+\small Estimator: $\hat\theta_C$ nearly minimizes the sample criterion over a network class, $\hat Q_C(\hat\theta_C)\le\inf_\Theta\hat Q_C+\eta_C$;\; $\hat s_C\coloneqq s_{\hat\theta_C}$.
+
+\begin{tbox}[blue]{A5 · Clustered sampling}
+\footnotesize $Z_c$: city $c$'s tiles, cell memberships, within-cell label orderings, pair sets. $Z_1,\dots,Z_C$ i.i.d.;
+\textbf{arbitrary dependence within a city}. Bounded sizes $n_c\le\bar n$, $m_c\le\bar m$. Asymptotics: $C\to\infty$, $T$ fixed.
+\end{tbox}
+\begin{tbox}[blue]{A6 · Regularity of the score class}
+\footnotesize $\Theta$ compact; $\theta\mapsto s_\theta(x)$ continuous; $|s_\theta(x)|\le\bar S$; the class \textbf{beats a coin flip}: $\inf_\Theta Q<\log 2$.
+\end{tbox}
+\footnotesize Effective sample size $=$ number of \textbf{cities}. No incidental parameters: $\psi_{ct}$ drops out like a fixed effect in a conditional likelihood.
+\note{
+Why city and not cell: a stable pair joins two years of one city, so a city's cells are dependent by construction.
+iid across cities = draws from a superpopulation of metros; heterogeneity lives within the superpopulation.
+Common national movements in psi (inflation) do not violate A5 since Z_c only contains orderings.
+}
+\end{frame}
+
+%% ---------------------------------------------------------------------
+\begin{frame}{Convergence}
+\begin{resultbox}[Theorem 2 · A1–A6, $\eta_C\to_p0$, $\mathrm{diam}(H)=D$, $B=\max\{2\bar S,\rho LD\}$]
+For every $\epsilon>0$, with $\hat s_{ict}\coloneqq\hat s_C(X_{ict})$,
+\[
+  \Pr\!\left(\E_{\Cset}\Big[\Big(\big[\hat s_{jct}-\hat s_{ict}\big]-\rho\big[f_{jct}-f_{ict}\big]\Big)^2\Big] \;\le\; \frac{2\,(\textcolor{mgAccent}{a_\Theta}+\lambda_t(L\delta)^2)}{\Lambda'(B)}+\epsilon\right)\;\to\;1,
+\]
+\end{resultbox}
+\footnotesize
+\textbf{Reading the band:} Theorem 1(ii) plus $\textcolor{mgAccent}{a_\Theta}\coloneqq\inf_\Theta Q-\inf_s Q(s)$, the approximation error of the class. More cities remove sampling and optimization error, not $a_\Theta$ or the price of stability.
+
+\textbf{Proof:} \texttt{[1]} low within-cell spread cannot beat a coin flip, $\Qc(s)\ge\log2-\tfrac12\sqrt{2V(s)}$, so $V$ stays away from 0; \texttt{[2]} ULLN over i.i.d.\ city totals; \texttt{[3]} plug into Theorem 1(ii).
+
+An \hl{asymptotic error bound}, not exact consistency unless $a_\Theta\to0$, $\delta\to0$. No rate, no inference.
+\end{frame}
+
+%% ---------------------------------------------------------------------
+\begin{frame}{Monte Carlo: learning from external stability}
+\framesubtitle{A controlled test of the mechanism behind the criterion}
+\begin{columns}[T]
+\column{0.54\textwidth}
+\footnotesize\setlength{\abovedisplayskip}{0pt}
+\[
+ X_i=M\begin{pmatrix}H_i\\ A_i\\ Z_c\end{pmatrix},\qquad
+ R_i=f(H_i)+\sigma E_i,\qquad W_i=\psi_{ct}(R_i).
+\]
+\vspace{-0.3em}
+\begin{itemize}\itemsep1pt
+  \item $H_i\in\R^3$: wealth features; $A_i\in\R^2$: acquisition conditions; $Z_c\in\R^2$: city cues.
+  \item Fixed orthogonal $M\in\R^{7\times7}$. The learner sees \textbf{only the mixed features $X_i$}.
+  \item One linear or quadratic $f$, normalized to $V(f)=1$; increasing $\psi_{ct}$.
+  \item $C\in\{8,\dots,64\}$ cities, 2 dates, 16 labels per city-date; 20\% oracle error on \emph{noisy label ranks}.
+\end{itemize}
+\column{0.43\textwidth}
+\begin{tbox}[green]{External information: stable pairs}
+\scriptsize For each fitting unit, generate \textbf{two unlabeled views}: same $H_i$ and $Z_c$, opposite date, independently redrawn $A_i'$.
+\[
+ X_i'=M(H_i,A_i',Z_c)^\top,
+ \qquad f(H_i')=f(H_i).
+\]
+Pair membership is supplied to the learner.
+\end{tbox}
+\end{columns}
+\note{
+The preceding population bound does not establish a finite-sample gain. This simulation asks whether externally supplied stability information improves learning with a fixed label budget.
+These are seven synthetic features, not pixels. M mixes signal and nuisances; the learner cannot discard a named A block. The DGP's f(H) corresponds to the common function of X in the theory, since M is invertible.
+The labeled observations at the two dates are separate draws. Twins are created afterward from fitting units only. They carry no W or R: equality is imposed on f, not on realized noisy R values.
+Labels: 12 fitting and 4 validation per city-date; i.i.d. centered Gumbel errors.
+Acquisition features are U + 0.6 t times the two-vector of ones; each U coordinate is uniform on [-sqrt(3),sqrt(3)]. Opposite-date twins redraw U independently. Exact formulas for f are in backup.
+The two 20-percent quantities must not be confused: noisy label comparisons here; false stability links only in E4.
+}
+\end{frame}
+
+%% ---------------------------------------------------------------------
+\begin{frame}{Monte Carlo: comparisons and evaluation}
+\begin{columns}[T]
+\column{0.55\textwidth}
+\begin{tbox}[blue]{What changes across estimators?}
+\scriptsize
+\textbf{E1: measurement.} Linear truth and scores. Compare log dollars + city-year FE with within-cell ranking.
+\smallskip
+
+\textbf{E3: external information.} Same labels and score class in each comparison:
+\vspace{-0.4em}
+\[
+ \widehat Q_{\mathrm{cross}}(s)
+ +\lambda_t\frac{\widehat S_t(s)}{\widehat V(s)}
+ +\alpha\Omega(s).
+\]
+\vspace{-0.4em}
+No links: $\lambda_t=0$; links: $\lambda_t=0.3$. Linear scores or a ReLU net $7\to8\to4\to1$.
+\smallskip
+
+\textbf{E4: imperfect information.} Corrupt the links; compare fixed and validation-selected $\lambda_t$.
+\end{tbox}
+\column{0.42\textwidth}
+\begin{tbox}[violet]{Common yardstick}
+\footnotesize \textbf{Misranking relative to the true $f$}, for pairs within a city-date in \textbf{previously unseen cities}.
+\end{tbox}
+\begin{itemize}\scriptsize\itemsep2pt
+  \item Same simulated sample across competing arms; independent MC replications.
+  \item Selection uses held-out \emph{observed labels}; never the true $f$.
+  \item NN path-norm weight $\alpha$ tuned separately in each arm; $\alpha=0$ for linear scores.
+  \item Figures: 95\% Monte Carlo intervals across independent replications; compare methods using paired differences.
+\end{itemize}
+\end{columns}
+\note{
+The linked estimator receives more unlabeled views and their pair membership. Its advantage is additional information at the same monetary-label budget, not a claim of identical total data.
+Ranking uses all within-cell fitting pairs and logistic loss. S is mean squared score difference over supplied twins; V is half the weighted mean squared score gap over fitting comparisons. V is differentiated through and the ratio is scale invariant.
+The E1 log regression includes city-year intercepts, discarded for predictions in new cities. Scores are linear in E1; the NN comparison belongs to E3.
+Figures report 95-percent Monte Carlo intervals according to the supplied slide source. E1 uses 30 replications; E3 uses 50 for linear/linear and 30 for NN; E4 uses 30 at C=32. Pair observations within a replication are dependent and are not the units for MC intervals.
+Because the evaluation target is noiseless f, the 20-percent observed-label oracle error is not a floor for these plots. Selection details are in backup.
+}
+\end{frame}
+
+%% ---------------------------------------------------------------------
+\begin{frame}{E1: Parameterization only works for the right model}
+\centering
+\fig{\mcdir/mc_e1_additive.pdf}{\textwidth}{0.50\textheight}
+\begin{resultbox}[The role of specification]
+\footnotesize Log + FE loses accuracy once the additive baseline appears. Ranking is \textbf{unchanged}: both maps preserve every within-cell ordering.
+\end{resultbox}
+\note{
+Same units, covariates and latent index in both panels. Linear truth and scores; 30 matched replications. Panel (b): a_ct = s(.6 + .3 tanh(z_c1) + .1 t) with s = 10, so a_ct lies between 3 and 10 in synthetic label units. b_ct is identical to panel (a). No threshold or extra tanh in R.
+The map's derivative is .6 b exp(.6R) > 0, so it preserves every within-cell ranking. Logs remove multiplicative b as an intercept, but log(a + b exp(.6R)) stays curved in R, and additive fixed effects cannot remove that curvature.
+Log + FE at C=8/16/32/64: 3.6/2.6/1.9/1.3 percent without the baseline, 5.7/3.9/2.7/2.1 percent with it; ranking 3.8/3.0/2.0/1.4 under both maps.
+Full sweep at C=64 (s = 0, 1, 5, 10, 25, 100): 1.34, 1.54, 1.89, 2.07, 2.36, 2.73 percent. The effect grows with the baseline size.
+Log + FE here is the exact least-squares fit; at s=0 it reproduces the trained suite fits exactly. Ranking fits are reused under exact invariance.
+Honest framing: this design was chosen after seeing the mild level+shape result. It is a designed example, not preregistered; confirm with fresh seeds (configs/e1_additive.json with --seed). It shows finite-sample deterioration, not an asymptotic error floor or failure against every alternative estimator.
+}
+\end{frame}
+
+%% ---------------------------------------------------------------------
+\begin{frame}{E3: Even under the true model, stable pairs improve performance}
+\centering
+\fig{\mcdir/mc_e3_links.pdf}{0.94\textwidth}{0.43\textheight}
+\begin{resultbox}[Why the additional information helps]
+\footnotesize Linked scores must agree across acquisition conditions, so the penalty \textbf{restricts the candidate functions} to those that do not fit label noise through $A$.
+\end{resultbox}
+\setuptag{text width=2.15cm, at={($(current page.north east)+(-0.35cm,-2.3cm)$)}, anchor=north east}
+  {Exact links\\ fixed $\lambda_t=0.3$\\ same labels and score class within each panel}
+\note{
+Gains appear with a correctly specified linear score and with a nonlinear truth fitted by a net. The quadratic case remains harder; these plots do not establish a faster convergence rate.
+The two panels are separate experiments, not a head-to-head linear-versus-NN comparison. Left: linear truth/linear score, 50 replications. Right: quadratic truth/NN, 30 replications. The linked mean is lower at every displayed C.
+This is a soft restriction: the parameter class itself is unchanged. The penalty favors its low-stability-loss members. Exact f is compatible with the restriction, whereas functions sensitive to acquisition changes incur a cost. In finite samples the ranking objective can reward accidental nuisance correlations.
+For a linear score, after expressing coefficients in the unmixed coordinates, each link gap is beta_A' (A'-A). The penalty therefore acts directly on nuisance sensitivity. In a net it also discourages interactions involving A.
+The NN's path-norm penalty is tuned separately with and without links. Thus the comparison includes conventional complexity regularization in both arms.
+The supplied original source reports 22--30 percent reductions in linear/linear and 10--23 percent in quadratic/NN, with paired CIs excluding zero for the latter at C>=16. Keep exact inferential assertions tied to the paired estimates. The main slide deliberately shows the supplied curves without treating every replication as an improvement.
+Linear truth fitted by a net has noisier gains; see backup. The original city-equivalence arrows use interpolation across four C values and are not a general sample-complexity result, so they are omitted here.
+}
+\end{frame}
+
+%% ---------------------------------------------------------------------
+% NOTE: the supplied source was cut off after the "Drift" bullet. The rest of this
+% frame (remaining bullets, takeaway, notes) is carried over from the previous E4 slide.
+\begin{frame}{E4: robustness to incorrect stability links}
+\begin{columns}[c]
+\column{0.66\textwidth}
+\centering
+\fig{\mcdir/mc_e4_links.pdf}{\textwidth}{0.66\textheight}
+\column{0.32\textwidth}
+\scriptsize
+\begin{itemize}\itemsep1pt
+  \item \textbf{Drift}: every twin's $H$ moved $\le0.15$
+  \item \textbf{Random}: 20\% unrelated twins
+  \item \textbf{One-sided}: 20\% moved to \emph{higher} $f$
+\end{itemize}
+\begin{resultbox}[What this establishes]
+\scriptsize Fixed $\lambda_t$ still helps (+12--14\%). \alert{Validation-selected $\lambda_t$ hurts}: too few labels to pick it.
+\end{resultbox}
+\end{columns}
+\setuptag{at={($(current page.north west)+(0.9cm,-2.05cm)$)}, anchor=north west}
+  {$C=32$, linear truth and score}
+\note{
+Validation-selected lambda is chosen from {0, .03, .3, 1} by observed validation misranking; it underperforms even with exact links (+16 vs +24 percent). Next: 5-fold CV for lambda.
+Bars: paired reduction in misranking vs no links, 95-percent CI across 30 replications; labels are relative reductions.
+One-sided = construction mislabeled as stable. 8 validation labels per city. 30 replications.
+Drift of 0.15 is a displacement in standardized H-space, not a share of false links. The 20 percent here is a share of false links, unrelated to the 20 percent oracle label error.
+}
+\end{frame}
+
+%% =====================================================================
+%%  PART 2  (~13 min)
+%% =====================================================================
+\section[US application]{Predicting wealth in the US}
+
+%% ---------------------------------------------------------------------
+\begin{frame}{Setting}
+\framesubtitle{Paper (b): zooming in from outer space}
+\begin{columns}[T]
+\column{0.49\textwidth}
+\begin{tbox}[blue]{Images $X$}
+\footnotesize
+\begin{itemize}
+  \item NAIP (USDA), 0.6–1\,m, state cycles of \textasciitilde 2–3 years since \textasciitilde 2010
+  \item $200\times200$\,m tile around a building centroid, resized to $224^2$: constant ground resolution
+  \item Centroids from Microsoft US Building Footprints (\textasciitilde 130M)
+\end{itemize}
+\end{tbox}
+\column{0.49\textwidth}
+\begin{tbox}[blue]{Labels $W$}
+\footnotesize
+\begin{itemize}
+  \item ACS 5-year, tract level, vintages 2011–2023
+  \item All CBSAs $>$500k; tracts on 2023 boundaries
+  \item Tile matched to the ACS year closest to its \emph{actual} flight year
+\end{itemize}
+\end{tbox}
+\end{columns}
+\small Framework used: A4(c), homogeneous logistic differences $\Rightarrow$ RankNet + temporal stability.
+\end{frame}
+
+%% ---------------------------------------------------------------------
+\begin{frame}{$W$: an occupant-wealth index}
+\[
+  W_{it} \;=\;
+  \underbrace{\sum_{a=0}^{H_{i}-1}\frac{y^{L}_{it}}{(1+\rho)^{a}}}_{\substack{\text{human wealth: labor earnings}\\\text{over a tract-specific horizon}}}
+  \;+\;
+  \underbrace{\frac{y^{K}_{it}}{r_k}}_{\substack{\text{capitalized}\\\text{capital income}}}
+  \;+\;
+  \underbrace{(1-\mathrm{LTV}_t)\,\frac{\text{home value}_{it}}{\text{pop}_{it}}}_{\text{net housing equity per capita}}
+\]
+\begin{itemize}\small
+  \item Preferred variant: $\rho=5\%$, $r_k=4.5\%$, year-matched aggregate loan-to-value (alternatives correlation $>.95$)
+  \item Permanent-income reading: what spatial sorting capitalizes into the built environment
+  \item By label invariance, per-CBSA $z$-scores, logs or dollars give \emph{the same} training signal
+\end{itemize}
+\end{frame}
+
+%% ---------------------------------------------------------------------
+\begin{frame}{$X$: what the model sees}
+\centering
+\vspace{0.4em}
+\setlength{\tabcolsep}{8pt}
+\begin{tabular}{ccc}
+\ffig{\figdir/xsees_1.png}{0.27\textwidth}{0.27\textwidth} &
+\ffig{\figdir/xsees_2.png}{0.27\textwidth}{0.27\textwidth} &
+\ffig{\figdir/xsees_3.png}{0.27\textwidth}{0.27\textwidth}\\[4pt]
+\scriptsize\ttfamily dense rowhouses & \scriptsize\ttfamily mid-rise & \scriptsize\ttfamily single-family, pools\\
+\end{tabular}
+
+\vspace{0.8em}
+\small $200\times200$\,m around a building centroid. Training augmentation: $\pm10$\,m jitter, color jitter, 10\% grayscale.
+\end{frame}
+
+%% ---------------------------------------------------------------------
+\begin{frame}{Results as a ladder of harder tests}
+\centering
+\vspace{0.4em}
+\resultsladder{4}
+\vspace{0.6em}
+
+\small Cross-sectional ranking, responsiveness to construction, and accurate economic change are \textbf{three different achievements}.
+\end{frame}
+
+%% ---------------------------------------------------------------------
+\begin{frame}{Model and loss}
+\begin{columns}[T]
+\column{0.44\textwidth}
+\small
+\textbf{Score network}
+\begin{itemize}
+  \item ScaleMAE ViT-L/16 \cit{Reed et al.\ 2023}, LoRA $r=16$ on \texttt{qkv}, \texttt{fc1}, \texttt{fc2}; $>$99\% of weights frozen
+  \item Mean-pooled $h\in\R^{1024}$ $=$ the $H=\phi(X)$ of A3
+  \item Head: $1024\to64$, GELU, LayerNorm, dropout; + distance-to-center; linear $\to\hat s$ $=$ the $g$ of A3
+\end{itemize}
+\column{0.54\textwidth}
+\small
+\textbf{Loss as trained}
+\[
+  \mathcal L=\underbrace{\Qc}_{\text{RankNet, }T=1}
+  +\lambda_s\underbrace{\overline{(\hat s_{k,t}-\hat s_{k,t'})^2}}_{\text{stable twins}}
+  +\underbrace{(\sigma_{cs}-1)^2}_{\text{pins }V\approx1}
+\]
+\begin{itemize}
+  \item $\lambda_s=0.3$ (one shot, untuned); $\rho_{temp}=0.4$ of each batch for temporal twins
+  \item AdamW $10^{-4}$, plateau schedule, effective batch 64
+\end{itemize}
+\end{columns}
+\end{frame}
+
+%% ---------------------------------------------------------------------
+\begin{frame}{Splits: whole cities (except NYC \& CHI), stratified by size}
+\begin{columns}[T]
+\column{0.5\textwidth}
+\footnotesize
+\begin{itemize}
+  \item Each CBSA goes \textbf{wholesale} to train / val / test \cit{as Khachiyan et al.\ 2022}: no spatial leakage
+  \item Size strata (mega 2/1/1, large, medium, small); 50/20/30 by \textbf{tract count}
+  \item Training cities also hold out one flight year: sun, phenology, sensor
+  \item Selection: within-(CBSA, year) Spearman, tract-weighted; half cross-sectional, half temporal
+\end{itemize}
+\column{0.48\textwidth}
+\centering
+\vspace{-2em}
+\begin{figurewindow}{CBSA split}
+\fig{\figdir/image15.png}{0.9\textwidth}{0.27\textheight}
+\end{figurewindow}
+\begin{figurewindow}{NYC / CHI holdouts}
+\fig{\figdir/image17.png}{0.9\textwidth}{0.24\textheight}
+\end{figurewindow}
+\end{columns}
+\end{frame}
+
+%% ---------------------------------------------------------------------
+\ladderframe{1}
+
+%% ---------------------------------------------------------------------
+\begin{frame}{1 · Cross-sectional ranking in held-out cities}
+\centering
+\begin{figurewindow}{Performance 36 held-out cities}
+\fig{\figdir/image18.png}{\textwidth}{0.8\textheight}
+\end{figurewindow}
+\end{frame}
+
+%% ---------------------------------------------------------------------
+\begin{frame}{Ordinal beats $L_2$ almost everywhere}
+\begin{columns}[c]
+\column{0.6\textwidth}
+\centering
+\begin{figurewindow*}{ordinal $-$ $L_2$, within-city Spearman, by test city}
+\fig{\figdir/revised/city_gains.pdf}{\textwidth}{0.55\textheight}
+\end{figurewindow*}
+\column{0.37\textwidth}
+\small
+\begin{itemize}
+  \item Same backbone, same data, same early stopping; only the loss differs
+  \item Gap $>0$ in \inv{35 of 36} test cities; mean gap $0.072$ (CI $0.053$--$0.094$)
+  \item $L_2$ stopped early (epoch 98); ordinal never did. Capped at 200 epochs: validation $0.61$ vs.\ $0.54$
+\end{itemize}
+\end{columns}
+\note{Lead with the broad advantage. Only loser: Baltimore. Gap vs signed wealth distance to training cities: backup (slope CI includes 0, suggestive only). Training curves for both: backup.}
+\end{frame}
+
+%% ---------------------------------------------------------------------
+\begin{frame}[plain]
+\centering
+\vfill
+\begin{figurewindow}{NYC · ACS 2014, tract and building predictions 2016, deciles}
+\fig{\figdir/revised/nyc_map.png}{0.9\textwidth}{0.74\textheight}
+\end{figurewindow}
+{\scriptsize\color{mgMuted}Predictions are \emph{at} building locations; validation is at the tract.}
+\vfill
+\end{frame}
+
+%% ---------------------------------------------------------------------
+\ladderframe{2}
+
+%% ---------------------------------------------------------------------
+\begin{frame}{2 · Stability where nothing changed}
+\centering
+\begin{figurewindow*}{rank autocorrelation of stable buildings, 36 test cities}
+\fig{\figdir/US_autocorr_dumbbell.pdf}{0.9\textwidth}{0.5\textheight}
+\end{figurewindow*}
+\raggedright
+\footnotesize
+\end{frame}
+
+%% ---------------------------------------------------------------------
+\ladderframe{3}
+
+%% ---------------------------------------------------------------------
+\begin{frame}{3 · Responsiveness: what the framework predicts}
+\begin{itemize}\small
+  \item Stable pairs: $\|h-h'\|\le\delta\ \Rightarrow\ |g(h)-g(h')|\le L\delta$
+  \item Construction: $\|h-h'\|$ large, so $|g(h)-g(h')|$ \emph{may} be large. Lipschitz bounds, \textbf{no direction}
+\end{itemize}
+\pause
+\begin{tbox}[blue]{Directional relevance, for the \emph{true} $g$}
+\small For the class $\mathcal D^+$ of structural improvements: $h'\in\mathcal D^+(h)\ \Rightarrow\ g(h')>g(h)$.
+\end{tbox}
+\begin{itemize}\footnotesize
+  \item In words, if a construction is a structural improvement (i.e., the features of the new building improve the old one), the index should rise
+  \item \textbf{Why NYC:} new construction mostly replaces very old stock with high-end towers, plausibly in $\mathcal D^+$. We predict on \textbf{Out-of-sample tracts} and \textbf{Out-of-sensor imagery} (NYC orthoimagery, not NAIP), and use building footprints to define the structural improvement class.
+\end{itemize}
+\pause
+\footnotesize $ATT(g,t)=\E\big[\bar s_{kt}(g)-\bar s_{kt}(\infty)\mid G_k=g\big]$, $\bar s_{kt}$ = tract mean of $\hat s$: a displacement in the fitted \textbf{index}, not the effect of construction on wealth.
+\note{
+Remove the old claim that the score estimates E[W|X].
+Treatment: first year cumulative new footprint area crosses 1/5/10\% of pre-2010 base. Control fixed across thresholds: never crosses 1\%; in-between tracts dropped.
+}
+\end{frame}
+
+
+%% ---------------------------------------------------------------------
+\begin{frame}[plain]
+\centering
+\vfill
+\begin{figurewindow}{NYC Event Study: Callaway-Sant'Anna, 4 years anticipation}
+\fig{\nycres/csa_anticipation2/figures/D_event_study_thresholds_nyc.pdf}{\textwidth}{0.9\textheight}
+\end{figurewindow}
+\vfill
+\end{frame}
+
+
+%% ---------------------------------------------------------------------
+\ladderframe{4}
+
+%% ---------------------------------------------------------------------
+\begin{frame}{4 · The challenge: estimating $\Delta f$}
+\begin{columns}[c]
+\column{0.6\textwidth}
+\centering
+\begin{figurewindow*}{change in prediction vs.\ change in ACS}
+\fig{\nycres/figures/F_construction_scatter.pdf}{\textwidth}{0.56\textheight}
+\end{figurewindow*}
+\column{0.37\textwidth}
+\footnotesize
+\begin{itemize}
+  \item Average shift by construction group: positive
+  \item Held-out tracts: rank correlation 0.10 (stable) to 0.41 (built $\ge$10\%)
+  \item Recognizing construction $\neq$ predicting tract-specific change
+\end{itemize}
+\end{columns}
+\end{frame}
+
+%% ---------------------------------------------------------------------
+\begin{frame}{Why $\Delta f$ is hard: the framework says so}
+\vspace{-1.6em}
+\[
+  \Delta R_{i} \;=\; \underbrace{\Delta f(X_{i})}_{\text{visible}} \;+\; \underbrace{\Delta\varepsilon_{i}}_{\text{invisible}},
+  \qquad
+  \Delta W_{i} \;=\; \psi_{c,t'}(R_{it'})-\psi_{ct}(R_{it})
+\]
+\begin{itemize}\small
+  \item Occupant changes (sorting, earnings, prices) move $R$ through $\varepsilon$, invisibly
+  \item $\psi_{ct}$ itself moves, even where $R$ does not; GB2 adds its own error
+\end{itemize}
+\pause
+\begin{resultbox}[Is it just survey noise? No (NYC, ACS 2014$\to$2023)]
+\scriptsize
+Survey noise (replicate SEs) and prediction noise (split-half flights) measured separately.
+ACS change reliability $\approx$ \textbf{0.61--0.66}, so a perfect predictor could reach $R^2\approx0.6$; we reach $R^2\le0.04$, \textbf{under 6\% of that ceiling}.
+Noise-corrected $r$: 0.06 in stable tracts, 0.2--0.3 where construction happened.
+\end{resultbox}
+\note{
+Source: src/change_reliability.py, paper/latex/Figures/NYC_F_change_reliability.csv (all tracts; held-out similar). Figure in backup.
+Do not claim most tracts satisfy A3 or that Delta f = 0 by design: A3 restricts stable pairs, not tracts.
+Measurement noise is not the binding constraint: the predicted change carries little of the true change, even disattenuated.
+}
+\end{frame}
+
+%% =====================================================================
+%%  CONCLUSIONS  (~3 min)
+%% =====================================================================
+\section{Where this stands}
+
+\begin{frame}{Takeaways}
+\small
+\begin{enumerate}
+  \item \textbf{A framework} for learning one index from labels comparable only within cells: rankings within cells, stability across dates; label-invariant by construction. Identification and an asymptotic error bound under A4(c)
+  \item \textbf{Monte Carlo}: rankings match the correct parametric fix without knowing $\psi$ and halve pooled-$L_2$ error; stable twins are worth \textbf{1.5--2.8$\times$ more labeled cities}, even in a correctly specified model
+  \item \textbf{US application}: within-city Spearman \textbf{0.78} in cities never seen; beats $L_2$ in 35/36 test cities (+0.07)
+  \item \textbf{Behaves as the theory expects} (stable where nothing changed, moves with construction) \textbf{but} tract-level change trajectories are not there yet
+\end{enumerate}
+\end{frame}
+
+%% ---------------------------------------------------------------------
+\begin{frame}{Next steps}
+\begin{columns}[T]
+\column{0.49\textwidth}
+\begin{tbox}[violet]{Theory}
+\footnotesize
+\begin{itemize}
+  \item Remaining results: A4(a) median zero, A4(b) $\rho_{ct}$
+  \item City constants: when does one shared representation put all cities on one scale?
+  \item \emph{Conjecture}: the penalty shrinks the effective class $\Rightarrow$ faster training, smaller $n$ (not shown by the bound)
+  \item Error assumptions that identify \textbf{temporal change}
+\end{itemize}
+\end{tbox}
+\column{0.49\textwidth}
+\begin{tbox}[blue]{Training}
+\footnotesize
+\begin{itemize}
+  \item Tune $\lambda_s$ (so far a single shot)
+  \item Stable pairs without labels; ratio penalty
+  \item Harder augmentation (or a few fine-tuning epochs) for out-of-sensor NYC
+  \item Other error assumptions may also improve fit
+\end{itemize}
+\end{tbox}
+\end{columns}
+\end{frame}
+
+%% ---------------------------------------------------------------------
+\begin{frame}{Where I would like your input}
+\footnotesize
+\begin{enumerate}
+  \item Is \texttt{(a)} a standalone econometrics paper (other applications + Monte Carlo), or an appendix to \texttt{(b)}?
+  \item Should the contribution center on \textbf{cross-city alignment}: what support across cities puts the index on one scale?
+  \item Which restrictions can align cells without imposing false stability?
+  \item Is $\rho_{ct}$ worth the extra estimation? Is a sieve version (class grows with $C$, $\lambda\to0$) worth its approximation-rate assumption?
+  \item Which validation data would separate genuine change from acquisition noise and calibration error?
+  \item \textbf{Inference} {\skull}: four sources (ACS sampling, network estimation with no sandwich, GB2 calibration, downstream design); the \textbf{city} is the unit of independence. City-level resampling, conformal bands, or prediction-powered inference \cit{Angelopoulos et al.\ 2023}? For \texttt{(d)}: prediction error must be uncorrelated with treatment
+\end{enumerate}
+\end{frame}
+
+\marginalscreen{questions?}{THANK YOU}{abbate.nicolas@nyu.edu}
+
+%% =====================================================================
+%%  BACKUP
+%% =====================================================================
+\appendix
+\marginalscreen{appendix}{BACKUP}{proofs · extra Monte Carlo · held-out event studies · design details}
+
+%% ---------------------------------------------------------------------
+\begin{frame}{Backup: standardizing the labels does not fix it}
+\begin{columns}[c]
+\column{0.56\textwidth}
+\centering
+\begin{figurewindow}{z-scores drift as the distribution moves}
+\fig{\figdir/image11.png}{\textwidth}{0.66\textheight}
+\end{figurewindow}
+\column{0.41\textwidth}
+\small
+\begin{itemize}
+  \item Year-level $z$-scores or percentiles: new high-wealth construction shifts the reference distribution
+  \item An unchanged tract slides left mechanically
+  \item Same pixels, different labels across years $\Rightarrow$ corrupted gradients
+  \item Across cities, the same problem in level, spread and shape
+\end{itemize}
+\end{columns}
+\end{frame}
+
+%% ---------------------------------------------------------------------
+\begin{frame}{Examples: held-out cities}
+\centering
+\setlength{\tabcolsep}{3pt}
+\begin{tabular}{ccc}
+\fig{\figdir/image19.png}{0.29\textwidth}{0.3\textheight} &
+\fig{\figdir/image20.png}{0.29\textwidth}{0.3\textheight} &
+\fig{\figdir/image21.png}{0.29\textwidth}{0.3\textheight}\\
+\fig{\figdir/image22.png}{0.29\textwidth}{0.3\textheight} &
+\fig{\figdir/image23.png}{0.29\textwidth}{0.3\textheight} &
+\fig{\figdir/image24.png}{0.29\textwidth}{0.3\textheight}\\
+\end{tabular}
+
+\footnotesize Tract-average prediction vs.\ ACS $z$-score; LOESS in red. $\rho$ from 0.64 (Chattanooga) to 0.83 (Portland, North Port).
+\note{Same as previous beamer. Update to run_20260722 if the numbers changed.}
+\end{frame}
+
+
+%% ---------------------------------------------------------------------
+\begin{frame}{Backup: training curves, ordinal vs.\ $L_2$}
+\centering
+\begin{figurewindow*}{validation metrics over training}
+\fig{\resdir/evaluation/figures/US_L2_training_curves.pdf}{0.85\textwidth}{0.6\textheight}
+\end{figurewindow*}
+\end{frame}
+
+%% ---------------------------------------------------------------------
+\begin{frame}{Backup: held-out city event study, Tampa}
+\centering
+\begin{figurewindow}{Tampa–St.\ Petersburg · NAIP · never seen in training}
+\fig{\figdir/image31.png}{0.95\textwidth}{0.55\textheight}
+\end{figurewindow}
+\footnotesize Each held-out city is judged on its own event-time path: NAIP cadence differs by state, so there is no common calendar grid.
+\end{frame}
+
+%% ---------------------------------------------------------------------
+\begin{frame}{Backup: held-out city event study, Seattle}
+\centering
+\begin{figurewindow}{Seattle (King County) · NAIP · never seen in training}
+\fig{\figdir/image32.png}{0.95\textwidth}{0.55\textheight}
+\end{figurewindow}
+\end{frame}
+
+%% ---------------------------------------------------------------------
+\begin{frame}{Backup: NYC event study, earlier specification}
+\centering
+\begin{figurewindow}{test (top) · train (bottom)}
+\fig{\figdir/image30.png}{0.6\textwidth}{0.64\textheight}
+\end{figurewindow}
+\end{frame}
+
+%% ---------------------------------------------------------------------
+\begin{frame}{Backup: batch composition}
+\centering
+\begin{figurewindow}{hybrid batch}
+\fig{\figdir/image12.png}{0.85\textwidth}{0.64\textheight}
+\end{figurewindow}
+\end{frame}
+
+%% ---------------------------------------------------------------------
+\begin{frame}{Backup: ordinal gain vs.\ distance to training cities}
+\centering
+\begin{figurewindow*}{ordinal $-$ $L_2$ by test city vs.\ signed wealth distance}
+\fig{\resdir/evaluation/figures/US_L2_city_gap_vs_signed_distance.pdf}{0.8\textwidth}{0.6\textheight}
+\end{figurewindow*}
+\footnotesize Slope CI includes 0: suggestive only.
+\end{frame}
+
+%% ---------------------------------------------------------------------
+\begin{frame}{Backup: MC design details}
+\footnotesize
+\begin{columns}[T]
+\column{0.5\textwidth}
+\textbf{Features.} $H_i$: three bounded coordinates (tanh-transformed uniforms), standardized on an independent population draw.
+$A_i=U_i+0.6\,t\,\mathbf 1_2$, $U_i\sim U(-\sqrt3,\sqrt3)^2$, redrawn for each twin.
+$Z_c=\sqrt3\tanh(z_c)$, $z_c\sim N(0,I_2)$, constant within a city.
+
+\medskip
+\textbf{Truths.} With $u=HO$ for a fixed rotation $O$:
+\begin{align*}
+  f_{\text{lin}}&=u_1+0.6u_2-0.4u_3,\\
+  f_{\text{quad}}&=u_1+0.7u_2u_3+0.4(u_3^2-1),
+\end{align*}
+centered and scaled so that $V(f)=1$ within a cell.
+\column{0.46\textwidth}
+\textbf{Selection.} Restarts: lowest training objective. Hyperparameters ($\alpha$ for the net; $\lambda_t$ in E4's selected arm): lowest observed misranking on the 4 held-out labels per city-date. Ties favor more regularization. The true $f$ never enters selection.
+
+\medskip
+\textbf{Optimization.} 1{,}000 Adam epochs, then L-BFGS refinement; three restarts per setting; float64.
+\end{columns}
+\end{frame}
+
+%% ---------------------------------------------------------------------
+\begin{frame}{Backup: MC E1, error change when $\psi_{ct}$ changes}
+\centering
+\fig{\mcdir/mc_e1_invariance.pdf}{0.8\textwidth}{0.55\textheight}
+
+\footnotesize Same simulated units under both maps. Ranking error is exactly unchanged; log + FE loses 0.2--0.5\,pp.
+\end{frame}
+
+%% ---------------------------------------------------------------------
+\begin{frame}{Backup: MC E3 with a neural net, paired gains}
+\footnotesize ReLU net, regularization (path-norm penalty) tuned separately for each arm on validation labels.
+
+\centering
+\only<1>{\fig{\mcdir/mc_e3_nn.pdf}{0.86\textwidth}{0.38\textheight}}%
+\only<2>{\fig{\mcdir/mc_e3_paired.pdf}{0.94\textwidth}{0.38\textheight}}
+
+\begin{resultbox}[Takeaway]
+\footnotesize
+\only<1>{Quadratic $f$: \textbf{10--23\% fewer errors}, CIs exclude 0 for $C\ge16$. Linear $f$: gains of similar size but CIs include 0 (30 reps): the net is noisier.}%
+\only<2>{Paired, replication by replication (\% = share improved): gains beyond what tuned regularization already delivers.}
+\end{resultbox}
+\note{
+Optimization caveat: ReLU objectives are nonsmooth, so no NN fit passes the first-order (gradient) check; 43 of 11,520 candidate fits fail the refinement audit. Mention only if asked.
+}
+\end{frame}
+
+%% ---------------------------------------------------------------------
+\begin{frame}{Backup: MC E1 with city-specific composition}
+\footnotesize Composition $d=0.7$: the distribution of $H$ shifts by city (one $f$ throughout).
+\centering
+\fig{\mcdir/mc_e1_composition.pdf}{0.86\textwidth}{0.6\textheight}
+\end{frame}
+
+%% ---------------------------------------------------------------------
+\begin{frame}{Backup: MC E3, across-date pairs and the linear net}
+\centering
+\fig{\mcdir/mc_e3_backup.pdf}{0.86\textwidth}{0.6\textheight}
+\footnotesize Across-date misranking (different units, two dates of one city) shows the same gain as within-cell.
+\end{frame}
+
+%% ---------------------------------------------------------------------
+\begin{frame}{Backup: MC, nothing aligns cities}
+\centering
+\fig{\mcdir/mc_cross_city.pdf}{0.86\textwidth}{0.44\textheight}
+\footnotesize Cross-city misranking stays at 10--15\% and barely moves with $C$: nothing ties one city's constant to another's (Theorem 1). With the neural net, links even raise it at $C=64$ (6.0\% vs.\ 4.1\%).
+\end{frame}
+
+%% ---------------------------------------------------------------------
+\begin{frame}{Backup: NYC change reliability}
+\centering
+\fig{../latex/Figures/NYC_F_change_reliability.pdf}{0.62\textwidth}{0.64\textheight}
+
+\scriptsize ACS noise from replicate SEs; prediction noise from split-half flights. Dashed: total spread; solid: measurement noise (1 sd).
+\end{frame}
+
+%% ---------------------------------------------------------------------
+\begin{frame}{Backup: proof of Theorem 1}
+\footnotesize
+For a pair $i\neq j$ in cell $(c,t)$, the expected loss given tiles is $g_{ij}(z)=\log(1+e^z)-p_{ij}z$, with $g'_{ij}=\Lambda(z)-p_{ij}$, $g''_{ij}=\Lambda'(z)>0$.
+Under A4(c), $p_{ij}=\Lambda(\rho[f_{jct}-f_{ict}])$, so $g'_{ij}$ vanishes at $\rho[f_{jct}-f_{ict}]$.
+
+\textbf{(i)} $\Qc(\rho f)\le\Qc(s)$ pair by pair. Penalty at $\rho f$: $S_t(f)/V(f)\le (L\delta)^2$ (Lipschitz $+$ $\delta$-close pairs, $V(f)=1$). Penalty at $s\ge0$. Chain:
+\[
+  Q(\rho f)\le\Qc(\rho f)+\lambda (L\delta)^2\le\Qc(s)+\lambda (L\delta)^2\le Q(s)+\lambda (L\delta)^2.
+\]
+\textbf{(ii)} Second-order Taylor around $\rho[f_{jct}-f_{ict}]$:
+\[
+  g_{ij}(s_{jct}-s_{ict})-g_{ij}(\rho[f_{jct}-f_{ict}])=\tfrac12\Lambda'(\xi)\Big(\big[s_{jct}-s_{ict}\big]-\rho\big[f_{jct}-f_{ict}\big]\Big)^2,\qquad \Lambda'(\xi)\ge\Lambda'(B).
+\]
+Average over pairs. For a minimizer, $\Qc(s^*)\le Q(s^*)\le Q(\rho f)\le\Qc(\rho f)+\lambda (L\delta)^2$. \hfill$\square$
+\end{frame}
+
+%% ---------------------------------------------------------------------
+\begin{frame}{Backup: two lemmas and a misranking bound}
+\footnotesize
+\begin{resultbox}[Lemma · coin flip (A1, A4)]
+$\Qc(s)\ge\log2-\tfrac12\sqrt{2V(s)}$.\quad
+{\color{mgMuted}Tangent line at 0, then Jensen.}
+\end{resultbox}
+\begin{resultbox}[Lemma · ULLN over cities (A5, A6)]
+City totals i.i.d., continuous in $\theta$, dominated $\Rightarrow$ uniform convergence (Newey–McFadden L.\,2.4); ratio on $\{V\ge v\}$.
+\end{resultbox}
+\begin{resultbox}[Proposition · excess misranking (A1–A4(c))]
+$M(s)-M^*\le\sqrt{2[\Qc(s)-\Qc(\rho f)]}$; every minimizer misranks a within-cell pair at most $\sqrt{2\lambda}\,L\delta$ more often than $f$.
+\end{resultbox}
+\end{frame}
+
+%% ---------------------------------------------------------------------
+\begin{frame}{Backup: one scale or several? Three checks}
+\footnotesize By Theorem 2 the fitted index differs from $f$ by a constant per cell; stable pairs tie a city's years; nothing ties cities.
+\begin{enumerate}
+  \item \textbf{City classifier} on the representation $H$: accuracy vs.\ base rate. Holding cities apart requires encoding the city
+  \item \textbf{Matched tiles} across cities on footprint, structure type, building age; regress score differences on city indicators. City effects $\approx0$ tests equal constants and A2 jointly
+  \item \textbf{Leave-one-city-out}: a held-out city's constant is set by the representation alone; dispersion of held-out constants measures how common the scale is
+\end{enumerate}
+Also report, per city, whether its years are connected by stable pairs.
+\end{frame}
+
+%% ---------------------------------------------------------------------
+\begin{frame}{Backup: event-study design details}
+\footnotesize
+\begin{itemize}
+  \item Treatment: first year a tract's cumulative new footprint area (built 2010–2024) crosses 1\%, 5\%, 10\% of its pre-2010 base
+  \item \textbf{Control held fixed across thresholds}: tracts that never cross 1\%. Tracts between 1\% and the threshold are dropped
+  \item Why: if never-treated = complement of treated, the control grows with the threshold and estimates confound intensity with the counterfactual (King County: $+0.089\to-0.001$ vs.\ $+0.089\to+0.049$ with the control pinned)
+  \item No re-anchoring at $k=-1$: CS already uses a varying base period, so $ATT(k{=}-1)$ is a genuine placebo
+  \item Held-out cities: city-specific NAIP cadence, so pooling only in event time
+  \item Binding constraint for more cities: maintained, all-class construction dates (Chicago: frozen 2015 layer; Allegheny: $<$2\% commercial parcels dated; Nashville: core counties outside the state system)
+\end{itemize}
+\end{frame}
+
+%% ---------------------------------------------------------------------
+\begin{frame}{Backup: label gate used in the current run}
+\small
+\begin{itemize}
+  \item $Z_{it}$ = within-CBSA $z$-score of $\ln W$; SE via the delta method from MOE/1.645
+  \item $S_i=|Z_{i,2023}-Z_{i,2014}|/\sqrt{\tilde{SE}^2_{2023}+\tilde{SE}^2_{2014}}$; stable if $p\ge0.10$
+  \item Problems relative to the theory: uses labels; depends on $\psi_{ct}$ through the $z$-score of the log; failure to reject $\neq$ physical stability
+  \item Replacement: footprint-change records (where available) or an independent image change detector fixed before training
+\end{itemize}
+\end{frame}
+
+%% ---------------------------------------------------------------------
+\begin{frame}{Backup: related work, transformation models}
+\scriptsize
+\renewcommand{\arraystretch}{1.3}
+\begin{tabular}{@{}p{3.7cm} c c c p{3.9cm}@{}}
+\toprule
+ & {\ttfamily\color{mgMuted}panel} & {\ttfamily\color{mgMuted}nonparam.\ $f$} & {\ttfamily\color{mgMuted}cell $\psi_{ct}$} & \\
+\midrule
+Han (1987); Sherman (1993) & & & & MRC, one $\psi$\\
+Abrevaya (2000); Lin et al.\ (2017) & \checkmark & & \checkmark & finite-dim.\ index\\
+Wang et al.\ (2024) & & \checkmark & & deep net in rank objective\\
+Manifold reg.\ (Belkin 2006); SFA & & \checkmark & & smoothness over unlabeled pairs\\
+IRM (Arjovsky 2019) & \checkmark & \checkmark & & needs a common label scale\\
+\textbf{This project} & \pos{\checkmark} & \pos{\checkmark} & \pos{\checkmark} & \\
+\bottomrule
+\end{tabular}
+\end{frame}
+
+%% ---------------------------------------------------------------------
+\begin{frame}{Backup: references}
+\tiny
+\begin{itemize}
+\item Aiken, Bellue, Karlan, Udry, Blumenstock (2022). Machine learning and phone data can improve targeting of humanitarian aid. \emph{Nature} 603.
+\item Angelopoulos, Bates, Fannjiang, Jordan, Zrnic (2023). Prediction-powered inference. \emph{Science} 382.
+\item Burges et al.\ (2005). Learning to rank using gradient descent. \emph{ICML}.
+\item Callaway, Sant'Anna (2021). Difference-in-differences with multiple time periods. \emph{J.\ Econometrics}.
+\item Chi, Fang, Chatterjee, Blumenstock (2022). Microestimates of wealth for all low- and middle-income countries. \emph{PNAS}.
+\item Han (1987). Non-parametric analysis of a generalized regression model. \emph{J.\ Econometrics}.
+\item Hendrix, Zhang, Heitzig, Bazemore, Rehkopf (2026). Geospatial foundation models capture health-relevant dimensions of place beyond conventional social risk indices. arXiv:2609.11689.
+\item Jean et al.\ (2016). Combining satellite imagery and machine learning to predict poverty. \emph{Science}.
+\item Khachiyan et al.\ (2022). Using neural networks to predict microspatial economic growth. \emph{AER: Insights}.
+\item Pettersson et al.\ (2023). Time series of satellite imagery improve deep learning estimates of neighborhood-level poverty in Africa. \emph{IJCAI}.
+\item Reed et al.\ (2023). Scale-MAE. \emph{ICCV}.
+\item Rolf, Proctor, Carleton, Bolliger, Shankar, Ishihara, Recht, Hsiang (2021). A generalizable and accessible approach to machine learning with global satellite imagery. \emph{Nature Communications} 12.
+\item Smythe, Blumenstock (2022). Geographic micro-targeting of social assistance with high-resolution poverty maps. \emph{PNAS}.
+\item World Bank (2023). Geospatial Poverty Portal; G2Px in Nigeria case study.
+\item Yeh et al.\ (2020). Using publicly available satellite imagery and deep learning to understand economic well-being in Africa. \emph{Nat.\ Commun.}
+\item Zheng, Higuera-Mendieta, Lee, Newhouse, Kilic, Ermon, Burke, et al.\ (2026). A satellite foundation model for improved wealth monitoring. arXiv:2604.23166.
+\end{itemize}
+\end{frame}
+
+\end{document}

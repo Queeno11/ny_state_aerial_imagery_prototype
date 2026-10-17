@@ -2554,7 +2554,8 @@ def _csa_city_geometry(processed_dir: Path, spec):
 
 def _csa_city_outcomes(csa_root: Path, results_dir: Path, processed_dir: Path,
                        spec, city_years: list[int], baseline_year: int,
-                       tracts, construction_year, shared_bld_fn):
+                       tracts, construction_year, shared_bld_fn,
+                       weights: pd.Series | None = None, weight_tag: str = ""):
     """Tract-year outcome means for one city, cached.
 
     Reads the city's dense per-city prediction pass (falling back to the shared
@@ -2565,7 +2566,7 @@ def _csa_city_outcomes(csa_root: Path, results_dir: Path, processed_dir: Path,
     # `processed_dir` belongs in the key even though it is not read here: the
     # outcomes depend on `tracts` and `construction_year`, which come from it.
     key = (str(csa_root), str(results_dir), str(processed_dir), spec.key,
-           tuple(city_years), int(baseline_year))
+           tuple(city_years), int(baseline_year), weight_tag)
     if key in _CSA_OUTCOME_CACHE:
         return _CSA_OUTCOME_CACHE[key]
 
@@ -2581,7 +2582,7 @@ def _csa_city_outcomes(csa_root: Path, results_dir: Path, processed_dir: Path,
         return _CSA_OUTCOME_CACHE[key]
     outcomes = ces.tract_outcomes(
         city_bld, construction_year=construction_year,
-        baseline_year=baseline_year,
+        baseline_year=baseline_year, weights=weights,
     )
     del city_bld
     _csa_release_memory()
@@ -5087,12 +5088,23 @@ def _ols_slope(x: np.ndarray, y: np.ndarray) -> float:
     return float(np.polyfit(x, y, 1)[0])
 
 
-def distance_slope(city: pd.DataFrame, n_boot: int = _L2_N_BOOT, seed: int = 0) -> dict:
+def _distance_x(city: pd.DataFrame, signed: bool = False) -> np.ndarray:
+    """City distance from the pooled train level: |dist_sd|, or dist_sd itself."""
+    x = city["dist_sd"].to_numpy(dtype=float)
+    return x if signed else np.abs(x)
+
+
+def distance_slope(city: pd.DataFrame, n_boot: int = _L2_N_BOOT, seed: int = 0,
+                   signed: bool = False) -> dict:
     """OLS slope of the city Δρ (ordinal − L2) on |distance| (SD units), a
     city-bootstrap 95% CI, and the Spearman of the two. Positive slope = the
     baseline loses more ground the farther a city's wealth level sits from
-    the pooled training level — the cross-city corruption hypothesis."""
-    x = np.abs(city["dist_sd"].to_numpy(dtype=float))
+    the pooled training level — the cross-city corruption hypothesis.
+
+    ``signed=True`` regresses on the signed distance (city level − train
+    level) instead: a negative slope = the gap is larger for poorer cities,
+    a positive one = larger for richer cities (asymmetry, not distance)."""
+    x = _distance_x(city, signed)
     y = city["diff"].to_numpy(dtype=float)
     ok = np.isfinite(x) & np.isfinite(y)
     x, y = x[ok], y[ok]
@@ -5178,20 +5190,27 @@ def _l2_cities_to_label(city: pd.DataFrame, bracket_of: dict, n_top: int = 5) ->
 
 def _panel_l2_distance(ax: plt.Axes, city: pd.DataFrame, bracket_of: dict, fit: dict,
                        letter: str | None = "B", names: dict | None = None,
-                       mean_gap: float | None = None, band: bool = False) -> None:
+                       mean_gap: float | None = None, band: bool = False,
+                       signed: bool = False) -> None:
     """City Δρ (ordinal − L2) against |distance from the pooled train level|.
 
     ``names`` labels the notable cities (see _l2_cities_to_label);
     ``mean_gap`` draws the tract-weighted mean gap; ``band`` adds a 95%
-    city-bootstrap band around the OLS line.
+    city-bootstrap band around the OLS line; ``signed`` plots the signed
+    distance (city − train level; poorer cities left of 0) instead of its
+    modulus — ``fit`` must then come from distance_slope(..., signed=True).
     """
-    x = np.abs(city["dist_sd"].to_numpy(dtype=float))
+    x = _distance_x(city, signed)
     y = city["diff"].to_numpy(dtype=float)
     big = names is not None
     colors = [_BRACKET_COLORS.get(bracket_of.get(c), "0.5") for c in city["cbsa"]]
     ax.scatter(x, y, s=30 if big else 14, c=colors, alpha=0.85,
                edgecolors="white" if big else "none", linewidths=0.5 if big else 0, zorder=3)
     ax.axhline(0, color="0.6", linestyle=":", linewidth=1.0, zorder=0)
+    if signed:
+        ax.axvline(0, color="0.6", linestyle=":", linewidth=1.0, zorder=0)
+        ax.text(0, 0.01, " training level", transform=ax.get_xaxis_transform(),
+                ha="left", va="bottom", fontsize=6.5, color="0.35")
     if mean_gap is not None:
         ax.axhline(mean_gap, color="0.45", linestyle="--", linewidth=0.9, zorder=0)
         ax.text(0.99, mean_gap, f" mean gap {mean_gap:+.3f}", transform=ax.get_yaxis_transform(),
@@ -5204,15 +5223,17 @@ def _panel_l2_distance(ax: plt.Axes, city: pd.DataFrame, bracket_of: dict, fit: 
             lo, hi = _ols_band(x[ok], y[ok], xs)
             ax.fill_between(xs, lo, hi, color="0.25", alpha=0.12, linewidth=0, zorder=1)
         ax.plot(xs, b0 + b1 * xs, color="0.25", linewidth=1.4, zorder=2)
-        ax.text(0.02 if big else 0.04, 0.97,
+        # Signed: the poorest outliers sit top-left, so the stats go top-right.
+        ax.text(0.98 if signed else (0.02 if big else 0.04), 0.97,
                 rf"OLS slope = {fit['slope']:.3f} [{fit['slope_ci_lo']:.3f}, {fit['slope_ci_hi']:.3f}]"
                 + "\n" + rf"Spearman $\rho_S$ = {fit['spearman']:.2f}, $n$ = {fit['n_cities']} cities",
-                transform=ax.transAxes, fontsize=7.5 if big else 6.5, va="top")
+                transform=ax.transAxes, fontsize=7.5 if big else 6.5, va="top",
+                ha="right" if signed else "left")
     if big:
         x_flip = np.nanmin(x) + 0.85 * (np.nanmax(x) - np.nanmin(x))
         for c in _l2_cities_to_label(city, bracket_of):
             r = city.loc[city["cbsa"] == c].iloc[0]
-            px = abs(r["dist_sd"])
+            px = r["dist_sd"] if signed else abs(r["dist_sd"])
             right_edge = px > x_flip   # label to the left so it stays on canvas
             ax.annotate(names.get(c) or c, (px, r["diff"]),
                         xytext=(-4 if right_edge else 4, 3), textcoords="offset points",
@@ -5220,10 +5241,12 @@ def _panel_l2_distance(ax: plt.Axes, city: pd.DataFrame, bracket_of: dict, fit: 
     handles = [mpatches.Patch(color=_BRACKET_COLORS[b], label=_BRACKET_LABELS[b])
                for b in _BRACKET_ORDER if b in set(bracket_of.get(c) for c in city["cbsa"])]
     if handles:
-        ax.legend(handles=handles, fontsize=7 if big else 6, loc="lower right", frameon=True,
+        ax.legend(handles=handles, fontsize=7 if big else 6,
+                  loc="lower left" if signed else "lower right", frameon=True,
                   facecolor="white", edgecolor="none", framealpha=0.8, title="City size",
                   title_fontsize=7 if big else 6)
-    ax.set_xlabel(r"$|$city wealth level $-$ pooled training level$|$ (training SD)")
+    ax.set_xlabel(r"City wealth level $-$ pooled training level (training SD)" if signed else
+                  r"$|$city wealth level $-$ pooled training level$|$ (training SD)")
     ax.set_ylabel(r"Within-city $\Delta\rho$ (ordinal $-$ L2)")
     if letter:
         _panel_title(ax, letter)
@@ -5234,8 +5257,9 @@ def part_l2_comparison_us(ctx: _USContext) -> dict:
 
     Writes two standalone figures — ``figures/US_L2_city_gap_vs_distance.pdf``
     (full width: each test city's Δρ vs its distance from the pooled training
-    wealth level, OLS line with a city-bootstrap band, notable cities named)
-    and ``figures/US_L2_bracket_raincloud.pdf`` (appendix: paired per-bracket
+    wealth level, OLS line with a city-bootstrap band, notable cities named;
+    plus the alternative ``US_L2_city_gap_vs_signed_distance.pdf`` on the
+    signed distance) and ``figures/US_L2_bracket_raincloud.pdf`` (appendix: paired per-bracket
     rainclouds of tract-level cell rho); the year-by-year curves are the main
     figure's Panel B — plus the tables ``US_L2_paired_cells.csv``,
     ``US_L2_by_bracket.csv``, ``US_L2_city_distance.csv``. Skips (returns {})
@@ -5264,7 +5288,7 @@ def part_l2_comparison_us(ctx: _USContext) -> dict:
 
     # City distance from the baseline's pooled train level, in its own units.
     city = _city_rho_diff(paired_tract)
-    fit = {}
+    fit, fit_signed = {}, {}
     try:
         stats = json.loads((base_ctx.results_dir / "level_label_stats.json").read_text())
         acs_years = sorted({min(_ACS_PANEL_YEARS, key=lambda a: abs(a - int(y)))
@@ -5274,6 +5298,7 @@ def part_l2_comparison_us(ctx: _USContext) -> dict:
             acs_years, stats["mu"], stats["sd"])
         city = city.merge(dist, on="cbsa", how="left")
         fit = distance_slope(city)
+        fit_signed = distance_slope(city, signed=True)
     except (OSError, ValueError, KeyError) as exc:
         print(f"  ⚠️ city-distance panel unavailable ({type(exc).__name__}: {exc})")
         city["dist_sd"] = np.nan
@@ -5282,17 +5307,22 @@ def part_l2_comparison_us(ctx: _USContext) -> dict:
     # Two standalone figures (the year-by-year curves are the main figure's
     # Panel B): the city-gap scatter, full width — the paper figure — and the
     # per-bracket rainclouds, single column, for the appendix.
+    # The signed variant (city − train level, poorer cities left of 0) asks
+    # whether the gap is asymmetric — larger for poorer or richer cities —
+    # rather than growing with distance per se.
     if fit:
         all_row = by_bracket.loc[by_bracket["bracket"] == "all"]
-        fig, ax = plt.subplots(figsize=(FIG_SIZE_TWO_COL[0], FIG_SIZE_TWO_COL[0] * 0.52),
-                               constrained_layout=True)
-        _panel_l2_distance(ax, city, bracket_of, fit, letter=None,
-                           names=_city_names(ctx.cbsa_meta),
-                           mean_gap=float(all_row["diff"].iloc[0]) if len(all_row) else None,
-                           band=True)
-        for spine in ("top", "right"):
-            ax.spines[spine].set_visible(False)
-        _savefig(fig, out / "figures" / "US_L2_city_gap_vs_distance.pdf")
+        mean_gap = float(all_row["diff"].iloc[0]) if len(all_row) else None
+        for signed, f, name in ((False, fit, "US_L2_city_gap_vs_distance.pdf"),
+                                (True, fit_signed, "US_L2_city_gap_vs_signed_distance.pdf")):
+            fig, ax = plt.subplots(figsize=(FIG_SIZE_TWO_COL[0], FIG_SIZE_TWO_COL[0] * 0.52),
+                                   constrained_layout=True)
+            _panel_l2_distance(ax, city, bracket_of, f, letter=None,
+                               names=_city_names(ctx.cbsa_meta), mean_gap=mean_gap,
+                               band=True, signed=signed)
+            for spine in ("top", "right"):
+                ax.spines[spine].set_visible(False)
+            _savefig(fig, out / "figures" / name)
 
     fig, ax = plt.subplots(figsize=(FIG_SIZE_ONE_COL[0], FIG_SIZE_ONE_COL[0] * 0.75),
                            constrained_layout=True)
@@ -5309,6 +5339,9 @@ def part_l2_comparison_us(ctx: _USContext) -> dict:
         print(f"  Δρ on |distance|: slope={fit['slope']:+.4f} "
               f"[{fit['slope_ci_lo']:+.4f}, {fit['slope_ci_hi']:+.4f}], "
               f"Spearman={fit['spearman']:+.3f}, n={fit['n_cities']}")
+        print(f"  Δρ on signed distance: slope={fit_signed['slope']:+.4f} "
+              f"[{fit_signed['slope_ci_lo']:+.4f}, {fit_signed['slope_ci_hi']:+.4f}], "
+              f"Spearman={fit_signed['spearman']:+.3f}")
 
     headline = {"l2/baseline": str(base_ctx.results_dir.name),
                 "l2/n_paired_cells": int(len(paired_tract)),
@@ -5318,6 +5351,8 @@ def part_l2_comparison_us(ctx: _USContext) -> dict:
             headline[f"l2/{r['bracket']}/{k}"] = float(r[k])
     for k, v in fit.items():
         headline[f"l2/distance_{k}"] = v
+    for k, v in fit_signed.items():
+        headline[f"l2/signed_distance_{k}"] = v
     return headline
 
 
@@ -6163,6 +6198,23 @@ def _construction_group_row(sub: pd.DataFrame, stable: pd.DataFrame, n_boot: int
     return row
 
 
+def _residential_tract_years(tract: pd.DataFrame, wealth_long: pd.DataFrame | None,
+                             what: str) -> pd.DataFrame:
+    """``tract`` (GEOID, year, ...) without non-residential tract-years — the
+    same rule the US figures apply through ``_drop_nonresidential``:
+    special-land-use 98xx tracts and tract-years whose nearest ACS vintage has
+    wealth below NEAR_ZERO_WEALTH_USD. Prints what it removed."""
+    if tract.empty:
+        return tract
+    flags = _nonresidential_tract_years(tract, wealth_long)
+    n = int(flags["mask"].sum())
+    if n:
+        print(f"  {what}: excluding {n} non-residential tract-year(s) "
+              f"({flags['special']} special-land-use 98xx, {flags['near_zero']} with ACS "
+              f"wealth < ${NEAR_ZERO_WEALTH_USD:,.0f})")
+    return tract[~flags["mask"]].reset_index(drop=True)
+
+
 def part_f(results_dir: Path, processed_dir: Path, out: Path,
            years: list[int] | None = None, target_gap: int = _GROWTH_TARGET_GAP,
            thresholds=None, n_boot: int = _GROWTH_N_BOOT) -> pd.DataFrame | None:
@@ -6199,6 +6251,9 @@ def part_f(results_dir: Path, processed_dir: Path, out: Path,
     tract = tract.rename(columns={"GEOID_str": "GEOID", "pred_all": "pred",
                                   "Rel_Score": "label"}).dropna(subset=["pred", "label"])
     tract["cbsa"] = "35620"
+    tract = _residential_tract_years(
+        tract, _load_wealth_dollars_long(processed_dir, indicators.DEFAULT_INDICATOR,
+                                         _ACS_PANEL_YEARS), "Part F")
     tract["pred_z"] = _zscore_within(tract, "pred")
     pairs = _long_difference_pairs(tract, target_gap, value_cols=("label", "pred", "pred_z"))
     windows = pairs.groupby(["t0", "t1"]).size()
@@ -6248,10 +6303,21 @@ _ACS_WINDOW_SPAN = 5
 _GROUP_COLORS = {"stable": "#0072B2", "change": "#D55E00"}   # Okabe-Ito
 
 
-def _acs_window_years(acs_year: int, imagery_years, span: int = _ACS_WINDOW_SPAN) -> list[int]:
+def _flight_span(flights) -> str:
+    """'2017' for one flight, '2014--2018' (LaTeX en dash) for several."""
+    lo, hi = min(flights), max(flights)
+    return f"{lo}" if lo == hi else f"{lo}--{hi}"
+
+
+def _acs_window_years(acs_year: int, imagery_years, span: int = _ACS_WINDOW_SPAN,
+                      extend_after: int = 0) -> list[int]:
     """Imagery years inside the survey window of the ``acs_year`` 5-year
-    estimate, i.e. in [acs_year - span + 1, acs_year]."""
-    return sorted(int(y) for y in imagery_years if acs_year - span < int(y) <= acs_year)
+    estimate, i.e. in [acs_year - span + 1, acs_year + extend_after].
+    ``extend_after`` > 0 adds flights just after the window (e.g. 2 adds the
+    2014 flight to ACS 2013's 2010/2012) to average out flight-to-flight noise;
+    the label stays the endpoint vintage."""
+    return sorted(int(y) for y in imagery_years
+                  if acs_year - span < int(y) <= acs_year + extend_after)
 
 
 def _window_average(tract: pd.DataFrame, years: list[int], col: str = "pred") -> pd.DataFrame:
@@ -6276,14 +6342,19 @@ def _load_panel_scores(processed_dir: Path, indicator: str, years) -> pd.DataFra
 
 
 def _acs_window_pairs(tract: pd.DataFrame, labels: pd.DataFrame, acs_pre: int, acs_post: int,
-                      imagery_years, span: int = _ACS_WINDOW_SPAN) -> pd.DataFrame:
+                      imagery_years, span: int = _ACS_WINDOW_SPAN,
+                      extend_after: int = 0) -> pd.DataFrame:
     """One row per tract: Δ label between the two ACS vintages and Δ of the
     window-averaged prediction (each window average z-scored across tracts,
     so both sides are in within-sample z units). Tracts need at least one
     flight in each window. Also carries the single-flight Δ (last flight of
-    each window) for comparison."""
-    w_pre = _acs_window_years(acs_pre, imagery_years, span)
-    w_post = _acs_window_years(acs_post, imagery_years, span)
+    each window) for comparison. ``extend_after`` widens the prediction
+    windows only (see ``_acs_window_years``); the single flight stays the last
+    one inside the survey window."""
+    w_pre = _acs_window_years(acs_pre, imagery_years, span, extend_after)
+    w_post = _acs_window_years(acs_post, imagery_years, span, extend_after)
+    s_pre = _acs_window_years(acs_pre, imagery_years, span) or w_pre
+    s_post = _acs_window_years(acs_post, imagery_years, span) or w_post
     if not w_pre or not w_post:
         raise ValueError(f"no imagery year inside an ACS window: {w_pre} / {w_post}")
     a = _window_average(tract, w_pre).rename(columns={"mean": "pred_pre", "n_years": "n_pre"})
@@ -6293,8 +6364,8 @@ def _acs_window_pairs(tract: pd.DataFrame, labels: pd.DataFrame, acs_pre: int, a
     out["label_pre"] = lab[acs_pre].reindex(out["GEOID"]).values
     out["label_post"] = lab[acs_post].reindex(out["GEOID"]).values
     single = tract.pivot(index="GEOID", columns="year", values="pred")
-    out["pred_single_pre"] = single[max(w_pre)].reindex(out["GEOID"]).values
-    out["pred_single_post"] = single[max(w_post)].reindex(out["GEOID"]).values
+    out["pred_single_pre"] = single[max(s_pre)].reindex(out["GEOID"]).values
+    out["pred_single_post"] = single[max(s_post)].reindex(out["GEOID"]).values
     out = out.dropna(subset=["label_pre", "label_post"]).reset_index(drop=True)
     z = lambda s: (s - s.mean()) / s.std()
     out["d_label"] = out["label_post"] - out["label_pre"]
@@ -6544,6 +6615,9 @@ def part_f_acs_window(results_dir: Path, processed_dir: Path, out: Path,
         return None
     tract = outcomes[["GEOID_str", "year", "pred_all"]].rename(
         columns={"GEOID_str": "GEOID", "pred_all": "pred"}).dropna()
+    if wealth_long is None:
+        wealth_long = _load_wealth_dollars_long(processed_dir, indicator, [acs_pre, acs_post])
+    tract = _residential_tract_years(tract, wealth_long, "Part F (ACS window)")
     labels = _load_panel_scores(processed_dir, indicator, [acs_pre, acs_post])
     pairs = _acs_window_pairs(tract, labels, acs_pre, acs_post, city_years)
     w_pre, w_post = pairs.attrs["window_pre"], pairs.attrs["window_post"]
@@ -6551,10 +6625,9 @@ def part_f_acs_window(results_dir: Path, processed_dir: Path, out: Path,
           f"ACS {acs_post} covers {acs_post - _ACS_WINDOW_SPAN + 1}-{acs_post}: flights {w_post}; "
           f"{len(pairs):,} tracts")
 
-    # ── GB2 per vintage on the NYC tract distribution ────────────────────────
-    if wealth_long is None:
-        wealth_long = _load_wealth_dollars_long(processed_dir, indicator, [acs_pre, acs_post])
-    city_w = wealth_long[wealth_long["GEOID"].str[:5].isin(spec.geoid_prefixes)].copy()
+    # ── GB2 per vintage on the NYC residential tract distribution ────────────
+    city_w = _residential_wealth(
+        wealth_long[wealth_long["GEOID"].str[:5].isin(spec.geoid_prefixes)]).copy()
     city_w["cbsa"] = "nyc"
     params = _fit_city_gb2(city_w, ["nyc"]).get("nyc", {})
     if acs_pre not in params or acs_post not in params:
@@ -6636,7 +6709,7 @@ def part_f_acs_window(results_dir: Path, processed_dir: Path, out: Path,
     ax_b.set_ylabel(r"$\Delta$ log predicted wealth per capita")
     _panel_title(ax_b, "B")
     fig.suptitle(rf"NYC, GB2 wealth dollars per ACS vintage; predictions averaged over each "
-                 rf"survey window ({min(w_pre)}--{max(w_pre)} vs {min(w_post)}--{max(w_post)})",
+                 rf"survey window ({_flight_span(w_pre)} vs {_flight_span(w_post)})",
                  fontsize=7.5)
     _savefig(fig, out / "figures" / "F_acs_window_scatter.pdf")
 
@@ -6792,6 +6865,587 @@ def _khachiyan_pc_rows(pairs: pd.DataFrame, label: str, n_boot: int = _GROWTH_N_
     return rows
 
 
+def _load_nyc_heights(processed_dir: Path, heights_path: Path | None = None) -> pd.DataFrame:
+    """[DOITT_ID, height_roof, height_imputed] written by
+    :mod:`src.data.nyc_building_heights` (default
+    ``<processed_dir>/nyc_building_heights.csv``)."""
+    from src.data.nyc_building_heights import HEIGHTS_FILENAME
+    path = Path(heights_path) if heights_path is not None else Path(processed_dir) / HEIGHTS_FILENAME
+    h = pd.read_csv(path)
+    h["DOITT_ID"] = pd.to_numeric(h["DOITT_ID"], errors="coerce").astype("Int64")
+    return h.dropna(subset=["DOITT_ID"])
+
+
+def _volume_weights(per_building: pd.DataFrame, heights: pd.DataFrame) -> pd.Series:
+    """Building volume (footprint area x roof height) indexed by building id.
+
+    ``per_building`` is Part D's footprint table (index = building id, column
+    ``area`` in the area CRS); ``heights`` is the heights CSV. Buildings
+    without a height get NaN, which :func:`ces.tract_outcomes` replaces with
+    its tract-year's median weight — never a crash, never a silent zero.
+    """
+    area = pd.to_numeric(per_building["area"], errors="coerce")
+    area.index = pd.to_numeric(pd.Index(per_building.index), errors="coerce")
+    h = heights.set_index(heights["DOITT_ID"].astype("int64"))["height_roof"]
+    vol = area * h.reindex(area.index).values
+    return vol[~vol.index.duplicated()]
+
+
+def _full_range_limits(values: np.ndarray, pad_frac: float = 0.04) -> tuple[float, float]:
+    """One (lo, hi) covering every finite value plus a small margin, shared by
+    both axes so the 45-degree line stays a true diagonal and no point is
+    off-canvas while still entering the fitted line."""
+    v = np.asarray(values, float)
+    v = v[np.isfinite(v)]
+    if not len(v):
+        return (-1.0, 1.0)
+    lo, hi = float(v.min()), float(v.max())
+    pad = pad_frac * (hi - lo) if hi > lo else 1.0
+    return (lo - pad, hi + pad)
+
+
+def _panel_construction_scatter(ax: plt.Axes, sub: pd.DataFrame, stable: pd.DataFrame,
+                                lims: tuple[float, float], letter: str, title: str,
+                                color: str, x: str = "dlog_label_usd",
+                                y: str = "dlog_pred_usd", is_stable: bool = False) -> dict:
+    """One construction group: actual vs predicted Δlog wealth (GB2), held-out
+    tracts filled and train tracts hollow, 45° line, the group's OLS line, the
+    group's mean (large marker) and — in built panels — the stable group's
+    mean for reference, so the CSA shift and the within-group slope read
+    side by side. Returns the panel's statistics."""
+    ok = np.isfinite(sub[x]) & np.isfinite(sub[y])
+    s = sub[ok]
+    held = s["split_group"] == "heldout"
+    ax.scatter(s.loc[~held, x], s.loc[~held, y], s=9, facecolors="none", edgecolors=color,
+               linewidths=0.5, alpha=0.55, zorder=2, label="train tracts")
+    ax.scatter(s.loc[held, x], s.loc[held, y], s=9, color=color, linewidths=0, alpha=0.75,
+               zorder=3, label="held-out tracts")
+    ax.plot(lims, lims, color="0.45", ls="--", lw=0.9, zorder=1, label=r"45$^\circ$")
+    met = _growth_metrics(s[x].values, s[y].values)
+    met_h = _growth_metrics(s.loc[held, x].values, s.loc[held, y].values)
+    if len(s) >= 3 and np.ptp(s[x]) > 0:
+        b, a = np.polyfit(s[x], s[y], 1)
+        ax.plot(lims, [a + b * lims[0], a + b * lims[1]], color=color, lw=1.6, zorder=4)
+    mx, my = float(s[x].mean()), float(s[y].mean())
+    sx, sy = float(stable[x].mean()), float(stable[y].mean())
+    if not is_stable:
+        ax.scatter([sx], [sy], marker="X", s=70, color=_GROUP_COLORS["stable"],
+                   edgecolors="white", linewidths=0.8, zorder=6, label="stable mean")
+    ax.scatter([mx], [my], marker="X", s=70, color=color, edgecolors="black",
+               linewidths=0.8, zorder=7, label="group mean")
+    ax.axhline(0, color="0.85", lw=0.6, zorder=0)
+    ax.axvline(0, color="0.85", lw=0.6, zorder=0)
+    ax.set_xlim(lims)
+    ax.set_ylim(lims)
+    lines = [rf"$n$ = {met['n']} ({int(held.sum())} held out)",
+             rf"$R^2_{{\mathrm{{oos}}}}$ = {met['r2_oos']:.2f}",
+             rf"$R^2_{{\mathrm{{OLS}}}}$ = {met['r2_ols']:.3f}, $\rho$ = {met['spearman']:.2f}"]
+    if is_stable:
+        lines.append(rf"sd $\Delta$ actual {s[x].std():.2f}, pred {s[y].std():.2f}")
+    else:
+        lines.append(rf"shift vs stable: pred {my - sy:+.2f}")
+        lines.append(rf"shift vs stable: actual {mx - sx:+.2f}")
+    txt = ax.text(0.03, 0.97, "\n".join(lines), transform=ax.transAxes, fontsize=6, va="top",
+                  linespacing=1.45, bbox=dict(facecolor="white", edgecolor="none", alpha=0.85, pad=1.2))
+    txt.set_in_layout(False)   # never let the annotation shrink the axes
+    ax.set_title(title, fontsize=7.5)
+    _panel_title(ax, letter)
+    for spine in ("top", "right"):
+        ax.spines[spine].set_visible(False)
+    return {"n": met["n"], "n_heldout": int(held.sum()), "r2_oos": met["r2_oos"],
+            "r2_ols": met["r2_ols"], "spearman": met["spearman"],
+            "r2_oos_heldout": met_h["r2_oos"], "r2_ols_heldout": met_h["r2_ols"],
+            "spearman_heldout": met_h["spearman"],
+            "mean_dlog_actual": mx, "mean_dlog_pred": my,
+            "shift_pred_vs_stable": my - sy, "shift_actual_vs_stable": mx - sx,
+            "sd_actual": float(s[x].std()), "sd_pred": float(s[y].std())}
+
+
+def _cohort_window_counts(cohorts_by_t: dict, windows: dict[str, tuple[int, int]]) -> pd.DataFrame:
+    """How many tracts first cross each threshold inside each (t0, t1] window,
+    plus the pinned-control (never crossed) count — the observation check
+    before choosing a horizon."""
+    rows = []
+    for name, (t0, t1) in windows.items():
+        row = {"window": name}
+        first = min(cohorts_by_t)
+        row["stable"] = int((cohorts_by_t[first]["cohort_year"] == 0).sum())
+        for t, coh in sorted(cohorts_by_t.items()):
+            yr = coh["cohort_year"]
+            row[f"built >={t:.0%}"] = int(((yr > t0) & (yr <= t1)).sum())
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def _construction_inputs(results_dir: Path, processed_dir: Path, out: Path,
+                         years: list[int] | None, acs_pre: int, acs_post: int, thresholds,
+                         indicator: str, wealth_long: pd.DataFrame | None, weighting: str,
+                         heights: pd.DataFrame | None, heights_path: Path | None,
+                         extend_after: int, what: str,
+                         counts_name: str = "F_construction_counts",
+                         pred_results_dir: Path | None = None,
+                         pred_years: list[int] | None = None,
+                         pred_tag: str = "") -> dict | None:
+    """Shared inputs of the NYC construction-group change figures.
+
+    Loads the per-flight tract predictions (equal or volume weighted), the
+    CSA cohorts at every threshold, the window pairs between ACS ``acs_pre``
+    and ``acs_post`` with the GB2 dollar columns, and the group masks. Writes
+    tables/{counts_name}{suffix}.csv. Returns None (after printing why)
+    when an input is missing; else a dict with ``pairs``, ``tract`` (long,
+    residential tract-years), ``masks``, ``params`` (GB2 by vintage),
+    ``city_years``, ``flight_years``, ``suffix``, ``thresholds``, ``labels``
+    and ``cohorts_by_t`` (threshold -> CSA cohort table, for the tract's
+    first-crossing year).
+
+    ``pred_results_dir`` / ``pred_years`` read the predictions from another
+    pass (e.g. the US NAIP run's ``{year}_predictions.csv``, NYC rows) while
+    the construction cohorts stay on NYC's panel grid, so the groups are the
+    same tracts as the zarr version; ``pred_tag`` is appended to the output
+    suffix. Volume weighting needs NYC footprint ids and is zarr-only.
+    """
+    from src import csa_event_study as ces
+
+    thresholds = tuple(thresholds) if thresholds else ces.DEFAULT_THRESHOLDS
+    spec = ces.CSA_CITIES["nyc"]
+    if not (Path(processed_dir) / spec.footprints_filename).exists():
+        print(f"  {spec.footprints_filename} not found — skipped")
+        return None
+    years = sorted(years) if years else _available_years(results_dir) or list(YEARS)
+    city_years = spec.years(years)
+    flight_years = sorted(pred_years) if pred_years else city_years
+    pred_dir = Path(pred_results_dir) if pred_results_dir is not None else results_dir
+    baseline_year = spec.baseline(CSA_BASELINE_YEAR)
+    per_building, tracts, construction_year = _csa_city_geometry(processed_dir, spec)
+    if pred_results_dir is not None:
+        if weighting != "equal":
+            raise ValueError("volume weights join on NYC footprint ids; use the zarr pass")
+        construction_year = None   # another pass's building ids are not DOITT ids
+        print(f"  predictions from {pred_dir}, flights {flight_years}; "
+              f"cohorts on the NYC grid {city_years}")
+    weights, suffix = None, ""
+    if weighting == "volume":
+        heights = _load_nyc_heights(processed_dir, heights_path) if heights is None else heights
+        weights = _volume_weights(per_building, heights)
+        suffix = "_volume"
+        measured = heights.loc[~heights["height_imputed"].astype(bool), "DOITT_ID"]
+        print(f"  volume weights: {weights.notna().mean():.1%} of footprints weighted; "
+              f"{len(measured) / max(len(heights), 1):.1%} of heights measured, rest 5-NN imputed")
+    elif weighting != "equal":
+        raise ValueError(f"weighting must be 'equal' or 'volume', got {weighting!r}")
+    if extend_after:
+        n_fl = max(len(_acs_window_years(a, flight_years, extend_after=extend_after))
+                   for a in (acs_pre, acs_post))
+        suffix += f"_{n_fl}flights"
+    suffix += pred_tag
+    outcomes = _csa_city_outcomes(
+        pred_dir, pred_dir, processed_dir, spec, flight_years, baseline_year,
+        tracts, construction_year, lambda: _csa_building_preds(pred_dir, flight_years),
+        weights=weights, weight_tag=weighting)
+    if outcomes.empty:
+        print("  no NYC predictions — skipped")
+        return None
+    if "n_weight_filled" in outcomes.columns:
+        print(f"  buildings whose volume weight was filled with the tract median: "
+              f"{int(outcomes['n_weight_filled'].sum()):,} of {int(outcomes['n_all'].sum()):,}")
+    tract = outcomes[["GEOID_str", "year", "pred_all"]].rename(
+        columns={"GEOID_str": "GEOID", "pred_all": "pred"}).dropna()
+
+    cohorts_by_t = {
+        t: ces.build_tract_cohorts(
+            None, tracts, city_years, baseline_year=baseline_year, threshold=t,
+            year_col=spec.year_col, demolition_col=spec.demolition_col,
+            area_epsg=spec.area_epsg, control_threshold=ces.CONTROL_THRESHOLD,
+            per_building=per_building).cohorts
+        for t in sorted({ces.CONTROL_THRESHOLD, *thresholds})}
+    counts = _cohort_window_counts(cohorts_by_t, {
+        f"{acs_pre}->{acs_post}": (acs_pre, acs_post), "2018->2023 (5y)": (2018, 2023)})
+    counts.to_csv(out / "tables" / f"{counts_name}{suffix}.csv", index=False)
+    print("  tracts per group (before matching to predictions/labels):")
+    print("    " + counts.to_string(index=False).replace("\n", "\n    "))
+
+    if wealth_long is None:
+        wealth_long = _load_wealth_dollars_long(processed_dir, indicator, [acs_pre, acs_post])
+    tract = _residential_tract_years(tract, wealth_long, what)
+    labels = _load_panel_scores(processed_dir, indicator, [acs_pre, acs_post])
+    pairs = _acs_window_pairs(tract, labels, acs_pre, acs_post, flight_years,
+                              extend_after=extend_after)
+    city_w = _residential_wealth(
+        wealth_long[wealth_long["GEOID"].str[:5].isin(spec.geoid_prefixes)]).copy()
+    city_w["cbsa"] = "nyc"
+    params = _fit_city_gb2(city_w, ["nyc"]).get("nyc", {})
+    if acs_pre not in params or acs_post not in params:
+        print("  GB2 fit unavailable for a vintage — skipped")
+        return None
+    pairs = _add_window_gb2_dollars(pairs, params, acs_pre, acs_post)
+    pairs["split_group"] = pairs["GEOID"].map(_csa_split_of(processed_dir))
+    masks = _construction_window_groups(pairs, cohorts_by_t)
+    print(f"  windows {pairs.attrs['window_pre']} vs {pairs.attrs['window_post']}; "
+          f"{len(pairs):,} tracts with predictions in both windows")
+    return {"pairs": pairs, "tract": tract, "masks": masks, "params": params,
+            "city_years": city_years, "flight_years": flight_years, "suffix": suffix, "thresholds": thresholds,
+            "labels": labels, "cohorts_by_t": cohorts_by_t}
+
+
+def part_f_construction_scatter(results_dir: Path, processed_dir: Path, out: Path,
+                                years: list[int] | None = None, acs_pre: int = 2013,
+                                acs_post: int = 2023, thresholds=None,
+                                indicator: str = indicators.DEFAULT_INDICATOR,
+                                n_boot: int = _GROWTH_N_BOOT,
+                                wealth_long: pd.DataFrame | None = None,
+                                weighting: str = "equal",
+                                heights: pd.DataFrame | None = None,
+                                heights_path: Path | None = None,
+                                extend_after: int = 0,
+                                pred_results_dir: Path | None = None,
+                                pred_years: list[int] | None = None,
+                                pred_tag: str = "") -> pd.DataFrame | None:
+    """NYC: actual vs predicted change in per-capita wealth (W2, GB2 dollars,
+    Δlog) for the CSA event study's tracts, one panel per construction group.
+
+    Panels: A stable (never crossed CONTROL_THRESHOLD — the CSA's pinned
+    control), then one panel per threshold in ``thresholds`` (nested, as in
+    the CSA: first crossed h inside (acs_pre, acs_post]). Changes are between
+    two ACS 5-year vintages; predictions are averaged over the flights inside
+    each vintage's survey window. ONE GB2 per vintage, fitted to W2 per-capita
+    wealth of the NYC 5-borough tracts, maps the label rank and the predicted
+    rank of every tract (``_add_window_gb2_dollars``, P1/P99-clipped) — never a
+    map per group, which would absorb the construction shift. Writes
+    figures/F_construction_scatter.pdf, tables/F_construction_scatter.csv and
+    tables/F_construction_counts.csv.
+
+    ``weighting="volume"`` makes each tract's prediction the volume-weighted
+    mean of its buildings (footprint area x roof height, from the heights CSV
+    of :mod:`src.data.nyc_building_heights` — pass ``heights`` or
+    ``heights_path``), a proxy for how many people each building holds; the
+    outputs then carry a ``_volume`` suffix.
+
+    ``extend_after`` > 0 also averages the flights up to that many years after
+    each survey window (2 -> 2010/2012/2014 vs 2020/2022/2024 for ACS
+    2013 -> 2023), keeping the labels at the endpoint vintages; the outputs
+    then carry a ``_{n}flights`` suffix.
+    """
+    from src import csa_event_study as ces
+
+    thresholds = tuple(thresholds) if thresholds else ces.DEFAULT_THRESHOLDS
+    print(f"\n=== Part F (construction scatter): NYC, W2 GB2 Δlog, ACS {acs_pre} -> {acs_post} ===")
+    inp = _construction_inputs(results_dir, processed_dir, out, years, acs_pre, acs_post,
+                               thresholds, indicator, wealth_long, weighting, heights,
+                               heights_path, extend_after, "Part F (construction scatter)",
+                               pred_results_dir=pred_results_dir, pred_years=pred_years,
+                               pred_tag=pred_tag)
+    if inp is None:
+        return None
+    pairs, masks, suffix = inp["pairs"], inp["masks"], inp["suffix"]
+
+    groups = [("stable", "Stable (never built $\\geq$1\\%)", masks["stable"])]
+    groups += [(f"change {t:.0%}", f"Built $\\geq${_tex_pct(t)}", masks[f"change {t:.0%}"])
+               for t in thresholds]
+    in_any = pairs["split_group"].notna()
+    use = pairs[in_any]
+    vals = pd.concat([use.loc[m[in_any], ["dlog_label_usd", "dlog_pred_usd"]] for _, _, m in groups])
+    lims = _full_range_limits(vals.values)
+    stable = use[masks["stable"][in_any]]
+
+    colors = [_GROUP_COLORS["stable"], "#E69F00", "#D55E00", "#CC79A7"]
+    ncols = 2 if len(groups) > 2 else len(groups)
+    nrows = int(np.ceil(len(groups) / ncols))
+    fig, axes = plt.subplots(nrows, ncols, figsize=(FIG_SIZE_TWO_COL[0], FIG_SIZE_TWO_COL[0] * 0.48 * nrows),
+                             sharex=True, sharey=True, constrained_layout=True, squeeze=False)
+    axes = axes.ravel()
+    for ax in axes[len(groups):]:
+        ax.axis("off")
+    rows = []
+    for i, ((key, title, mask), ax) in enumerate(zip(groups, axes)):
+        st = _panel_construction_scatter(ax, use[mask[in_any]], stable, lims, "ABCD"[i], title,
+                                         colors[i % len(colors)], is_stable=(key == "stable"))
+        sub = use[mask[in_any]]
+        lo_, hi_ = _cluster_bootstrap_ci(sub["dlog_label_usd"].values, sub["dlog_pred_usd"].values,
+                                         sub["GEOID"].values, _r2_oos, n_boot=n_boot)
+        d_ok = np.isfinite(sub["d_label_usd"]) & np.isfinite(sub["d_pred_usd"])
+        usd = _growth_metrics(sub.loc[d_ok, "d_label_usd"].values, sub.loc[d_ok, "d_pred_usd"].values)
+        rows.append({"group": key, **st, "r2_oos_ci_lo": lo_, "r2_oos_ci_hi": hi_,
+                     "r2_oos_usd": usd["r2_oos"], "r2_ols_usd": usd["r2_ols"]})
+    for i, ax in enumerate(axes[:len(groups)]):
+        if i % ncols == 0:
+            ax.set_ylabel(r"$\Delta$ log predicted wealth p.c. (GB2)", fontsize=7)
+        if i >= len(groups) - ncols:
+            ax.set_xlabel(r"$\Delta$ log ACS wealth p.c. (GB2)", fontsize=7)
+    axes[len(groups) - 1].legend(fontsize=5.5, loc="lower right", frameon=True, facecolor="white",
+                                 edgecolor="none", framealpha=0.85)
+    w_pre, w_post = pairs.attrs["window_pre"], pairs.attrs["window_post"]
+    fig.suptitle(rf"NYC construction groups: W2 wealth per capita, ACS {acs_pre}$\to${acs_post} "
+                 rf"(flights {_flight_span(w_pre)} vs {_flight_span(w_post)}); "
+                 r"one GB2 per ACS release; groups nested as in the CSA"
+                 + ("; tract mean weighted by building volume" if weighting == "volume" else ""),
+                 fontsize=7)
+    _savefig(fig, out / "figures" / f"F_construction_scatter{suffix}.pdf")
+    table = pd.DataFrame(rows)
+    table.to_csv(out / "tables" / f"F_construction_scatter{suffix}.csv", index=False)
+    # One flag per group: the groups overlap (nested thresholds), and a tract can
+    # cross 10% inside the window after crossing 1% before it, so no single
+    # label per tract can represent membership.
+    flags = {f"in_{key.replace(' ', '_').replace('%', 'pct')}": mask for key, _, mask in groups}
+    pairs.assign(**flags).to_csv(out / "tables" / f"F_construction_pairs{suffix}.csv", index=False)
+    for r in table.itertuples(index=False):
+        print(f"  {r.group:10s} n={r.n:4d} (held out {r.n_heldout:3d}) R2_oos={r.r2_oos:+.3f} "
+              f"[{r.r2_oos_ci_lo:+.3f}, {r.r2_oos_ci_hi:+.3f}] R2_ols={r.r2_ols:.4f} rho={r.spearman:+.3f} "
+              f"| held out R2_ols={r.r2_ols_heldout:.4f} rho={r.spearman_heldout:+.3f} "
+              f"| shift pred {r.shift_pred_vs_stable:+.3f} actual {r.shift_actual_vs_stable:+.3f} "
+              f"| sd act/pred {r.sd_actual:.3f}/{r.sd_pred:.3f}")
+    return table
+
+
+# ─── Part F: change reliability (ACS noise vs prediction noise) ───────────────
+# How much of each side of the construction scatter is signal. ACS sampling
+# noise is simulated through the figure's own rank -> GB2 -> clip -> Δlog map
+# from the replicate SEs; prediction noise comes from split-half flights. The
+# statistics live in src/change_reliability.py; this part wires NYC's inputs
+# into them. ACS 2014 is the default start because W-family replicate SEs
+# begin with the 2010-2014 release, so neither endpoint needs a proxy SE.
+
+_RELIABILITY_ACS_PRE = 2014
+
+
+def _rank_gb2_usd(values, params: tuple, winsor: float | None = 0.01) -> np.ndarray:
+    """GB2 dollars of each finite value's Hazen rank among the finite values,
+    P1/P99-clipped — one vintage of ``_add_window_gb2_dollars``."""
+    from scipy.stats import rankdata
+    v = np.asarray(values, float)
+    ok = np.isfinite(v)
+    usd = np.full(len(v), np.nan)
+    if ok.any():
+        usd[ok] = _gb2_quantile((rankdata(v[ok]) - 0.5) / ok.sum(), params)
+    return _winsorize(usd, winsor) if winsor else usd
+
+
+def _rank_gb2_dlog(pre, post, params_pre: tuple, params_post: tuple,
+                   winsor: float | None = 0.01) -> np.ndarray:
+    """Δlog GB2 dollars between two vintages, the figure's change measure.
+    Non-positive dollar ratios give NaN, as in ``_add_window_gb2_dollars``."""
+    a = _rank_gb2_usd(pre, params_pre, winsor)
+    b = _rank_gb2_usd(post, params_post, winsor)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        ratio = b / a
+        return np.where(ratio > 0, np.log(np.where(ratio > 0, ratio, 1.0)), np.nan)
+
+
+def _label_se_pair(geoids: pd.Series, se_long: pd.DataFrame, acs_pre: int,
+                   acs_post: int) -> tuple[np.ndarray, np.ndarray, tuple[int, int]]:
+    """Replicate SE of each tract's label in the two vintages, taking the
+    closest year with an SE when a vintage has none (and saying so)."""
+    se = se_long.set_index(["GEOID", "year"])["se"]
+    have = np.array(sorted(se_long["year"].unique()))
+    if not len(have):
+        raise ValueError("no replicate SE year in the panel")
+    used = tuple(int(have[np.abs(have - y).argmin()]) for y in (acs_pre, acs_post))
+    for y, u in zip((acs_pre, acs_post), used):
+        if u != y:
+            print(f"  ⚠️ no replicate SE for ACS {y}; using ACS {u}'s as a proxy")
+    out = [se.reindex(pd.MultiIndex.from_arrays([geoids.values, np.full(len(geoids), u)])).values
+           for u in used]
+    return np.asarray(out[0], float), np.asarray(out[1], float), used
+
+
+def _reliability_rows(arrays: dict, masks: dict, groups, heldout: pd.Series,
+                      n_boot: int, seed: int) -> pd.DataFrame:
+    """One row per (group, sample) with the decomposition and bootstrap CIs."""
+    from src import change_reliability as cr
+    rows = []
+    for key, _ in groups:
+        for sample, sel in (("all", masks[key].values),
+                            ("heldout", (masks[key] & heldout).values)):
+            args = (arrays["dy"][sel], arrays["dp"][sel], arrays["noise_var_dy"][sel],
+                    arrays["halves"][:, :, sel])
+            rows.append({"group": key, "sample": sample, **cr.reliability_stats(*args),
+                         **cr.bootstrap_reliability(*args, n_boot=n_boot, seed=seed)})
+    return pd.DataFrame(rows)
+
+
+def _noise_ellipse(ax: plt.Axes, cx: float, cy: float, sx: float, sy: float,
+                   color: str, ls: str, label: str | None) -> None:
+    from matplotlib.patches import Ellipse
+    if np.isfinite(sx) and np.isfinite(sy) and sx > 0 and sy > 0:
+        ax.add_patch(Ellipse((cx, cy), 2 * sx, 2 * sy, fill=False, edgecolor=color,
+                             lw=1.3, ls=ls, zorder=4, label=label))
+
+
+def _panel_reliability(ax: plt.Axes, sub: pd.DataFrame, row: dict, lims: tuple,
+                       letter: str, title: str, color: str) -> None:
+    """Δ ACS vs Δ prediction for one group with two 1-sd ellipses at the group
+    mean: total spread (dashed) and the part that is measurement noise (solid:
+    ACS sampling noise across, flight noise up). The gap between them is signal."""
+    lo, hi = lims
+    ax.plot([lo, hi], [lo, hi], color="0.6", ls=":", lw=0.8, zorder=1)
+    ax.scatter(sub["dy"], sub["dp"], s=5, alpha=0.35, color=color, linewidths=0, zorder=2)
+    if row.get("n", 0) >= 5:
+        cx, cy = row["mean_dy"], row["mean_dp"]
+        _noise_ellipse(ax, cx, cy, np.sqrt(row["var_dy"]), np.sqrt(row["var_dp"]),
+                       "0.15", "--", "total spread (1 sd)")
+        _noise_ellipse(ax, cx, cy, row["sd_noise_dy"], row["sd_noise_dp"],
+                       "black", "-", "measurement noise (1 sd)")
+        ci = lambda k: (f" [{row.get(k + '_ci_lo', np.nan):.2f}, {row.get(k + '_ci_hi', np.nan):.2f}]"
+                        if np.isfinite(row.get(k + "_ci_lo", np.nan)) else "")
+        txt = "\n".join([
+            rf"$n$ = {row['n']}",
+            rf"rel(ACS) = {row['rel_y']:.2f}{ci('rel_y')}",
+            rf"rel(pred) = {row['rel_p']:.2f}{ci('rel_p')}",
+            rf"$r$ = {row['r']:.2f}{ci('r')}",
+            rf"$r^*$ = {row['r_disattenuated']:.2f}{ci('r_disattenuated')}",
+            rf"$R^2$/ceiling = {row['r2_share_of_ceiling']:.2f}"])
+        ax.text(0.03, 0.97, txt, transform=ax.transAxes, va="top", ha="left", fontsize=5.5,
+                linespacing=1.4, bbox=dict(facecolor="white", edgecolor="none", alpha=0.85, pad=1.2))
+    ax.axhline(0, color="0.85", lw=0.6, zorder=0)
+    ax.axvline(0, color="0.85", lw=0.6, zorder=0)
+    ax.set_xlim(lo, hi)
+    ax.set_ylim(lo, hi)
+    ax.set_title(title, fontsize=7)
+    ax.text(-0.02, 1.04, letter, transform=ax.transAxes, fontsize=9, fontweight="bold")
+    for spine in ("top", "right"):
+        ax.spines[spine].set_visible(False)
+
+
+def part_f_change_reliability(results_dir: Path, processed_dir: Path, out: Path,
+                              years: list[int] | None = None,
+                              acs_pre: int = _RELIABILITY_ACS_PRE, acs_post: int = 2023,
+                              thresholds=None, indicator: str = indicators.DEFAULT_INDICATOR,
+                              wealth_long: pd.DataFrame | None = None,
+                              se_long: pd.DataFrame | None = None,
+                              weighting: str = "equal", heights: pd.DataFrame | None = None,
+                              heights_path: Path | None = None, extend_after: int = 0,
+                              n_draws: int | None = None, n_boot: int | None = None,
+                              seed: int = 0,
+                                pred_results_dir: Path | None = None,
+                                pred_years: list[int] | None = None,
+                                pred_tag: str = "") -> pd.DataFrame | None:
+    """NYC: how much of the observed ACS change and of the predicted change is
+    signal, per construction group (stable, built >= 1/5/10%).
+
+    Same tracts, groups, flights and rank -> GB2 -> Δlog map as
+    ``part_f_construction_scatter``. ACS noise: ``n_draws`` Monte Carlo
+    perturbations of both vintages' labels by their replicate SEs. Prediction
+    noise: every disjoint split of each window's flights into two halves. See
+    :mod:`src.change_reliability` for the estimands. Writes
+    figures/F_change_reliability{suffix}.pdf, tables/F_change_reliability{suffix}.csv
+    (one row per group x {all, heldout}, with tract-bootstrap CIs) and
+    tables/F_change_reliability_pairs{suffix}.csv (per-tract inputs).
+    """
+    from functools import partial
+    from src import change_reliability as cr
+
+    n_draws = cr.DEFAULT_N_DRAWS if n_draws is None else n_draws
+    n_boot = cr.DEFAULT_N_BOOT if n_boot is None else n_boot
+    print(f"\n=== Part F (change reliability): NYC, W2 GB2 Δlog, ACS {acs_pre} -> {acs_post} ===")
+    inp = _construction_inputs(results_dir, processed_dir, out, years, acs_pre, acs_post,
+                               thresholds, indicator, wealth_long, weighting, heights,
+                               heights_path, extend_after, "Part F (change reliability)",
+                               counts_name="F_change_reliability_counts",
+                               pred_results_dir=pred_results_dir, pred_years=pred_years,
+                               pred_tag=pred_tag)
+    if inp is None:
+        return None
+    pairs, masks, params, suffix = inp["pairs"], inp["masks"], inp["params"], inp["suffix"]
+    pairs = pairs.reset_index(drop=True)
+    to_dlog = partial(_rank_gb2_dlog, params_pre=params[acs_pre], params_post=params[acs_post])
+
+    dy = to_dlog(pairs["label_pre"].values, pairs["label_post"].values)
+    gap = np.nanmax(np.abs(dy - pairs["dlog_label_usd"].values))
+    if not gap < 1e-8:
+        raise RuntimeError(f"rank -> GB2 -> Δlog map disagrees with the figure's by {gap:.2e}")
+
+    if se_long is None:
+        # Every panel year, not just the two vintages: W-family SEs exist only
+        # for 2014 and 2023, and a vintage without one borrows the closest year's.
+        se_long = _load_rel_se_long(processed_dir, indicator, list(_ACS_PANEL_YEARS))
+    se_pre, se_post, se_years = _label_se_pair(pairs["GEOID"], se_long, acs_pre, acs_post)
+    se_pre, n_fill_pre = cr.fill_missing_se(se_pre)
+    se_post, n_fill_post = cr.fill_missing_se(se_post)
+    print(f"  replicate SEs from ACS {se_years[0]} and {se_years[1]}; filled with the median: "
+          f"{n_fill_pre} / {n_fill_post} of {len(pairs):,} tracts")
+    noise_var_dy = cr.simulate_label_noise(pairs["label_pre"].values, pairs["label_post"].values,
+                                           se_pre, se_post, to_dlog, n_draws=n_draws, seed=seed)
+
+    w_pre, w_post = pairs.attrs["window_pre"], pairs.attrs["window_post"]
+    if min(len(w_pre), len(w_post)) >= 2:
+        splits = cr.split_half_assignments(w_pre, w_post)
+        preds_wide = (inp["tract"].pivot_table(index="GEOID", columns="year", values="pred")
+                      .reindex(pairs["GEOID"]))
+        halves = np.array([[a, b] for a, b in cr.split_half_deltas(preds_wide, splits, to_dlog)])
+    else:
+        # One flight in a window: no independent second measurement of Δp, so
+        # prediction reliability (and r*) is not identified; ACS side still is.
+        splits, halves = [], np.empty((0, 2, len(pairs)))
+        print("  ⚠️ a window has a single flight: prediction reliability and r* not identified")
+    print(f"  flights {w_pre} vs {w_post}: {len(splits)} split-half assignments; "
+          f"{n_draws} ACS noise draws")
+
+    arrays = {"dy": dy, "dp": pairs["dlog_pred_usd"].values.astype(float),
+              "noise_var_dy": noise_var_dy, "halves": halves}
+    thresholds = inp["thresholds"]
+    groups = [("stable", "Stable (never built $\\geq$1\\%)")]
+    groups += [(f"change {t:.0%}", f"Built $\\geq${_tex_pct(t)}") for t in thresholds]
+    masks = {k: masks[k].reset_index(drop=True) for k, _ in groups}
+    heldout = (pairs["split_group"] == "heldout").reset_index(drop=True)
+    table = _reliability_rows(arrays, masks, groups, heldout, n_boot, seed)
+    table.to_csv(out / "tables" / f"F_change_reliability{suffix}.csv", index=False)
+
+    tract_out = pairs[["GEOID", "split_group"]].copy()
+    tract_out["dy"], tract_out["dp"] = arrays["dy"], arrays["dp"]
+    tract_out["se_label_pre"], tract_out["se_label_post"] = se_pre, se_post
+    tract_out["noise_var_dy"] = noise_var_dy
+    for k, ((pa, qa), (pb, qb)) in enumerate(splits):
+        tract_out[f"d_half{k}_a"], tract_out[f"d_half{k}_b"] = halves[k, 0], halves[k, 1]
+    for key, _ in groups:
+        tract_out[f"in_{key.replace(' ', '_').replace('%', 'pct')}"] = masks[key].values
+    tract_out.to_csv(out / "tables" / f"F_change_reliability_pairs{suffix}.csv", index=False)
+    pd.DataFrame([{"split": k, "half_a": f"{pa}->{qa}", "half_b": f"{pb}->{qb}"}
+                  for k, ((pa, qa), (pb, qb)) in enumerate(splits)]).to_csv(
+        out / "tables" / f"F_change_reliability_splits{suffix}.csv", index=False)
+
+    plot = tract_out.assign(dy=arrays["dy"], dp=arrays["dp"])
+    sel_any = np.zeros(len(plot), bool)
+    for key, _ in groups:
+        sel_any |= masks[key].values
+    lims = _full_range_limits(plot.loc[sel_any, ["dy", "dp"]].values)
+    colors = [_GROUP_COLORS["stable"], "#E69F00", "#D55E00", "#CC79A7"]
+    ncols = 2 if len(groups) > 2 else len(groups)
+    nrows = int(np.ceil(len(groups) / ncols))
+    fig, axes = plt.subplots(nrows, ncols, figsize=(FIG_SIZE_TWO_COL[0], FIG_SIZE_TWO_COL[0] * 0.48 * nrows),
+                             sharex=True, sharey=True, constrained_layout=True, squeeze=False)
+    axes = axes.ravel()
+    for ax in axes[len(groups):]:
+        ax.axis("off")
+    by = table[table["sample"] == "all"].set_index("group")
+    for i, ((key, title), ax) in enumerate(zip(groups, axes)):
+        _panel_reliability(ax, plot[masks[key].values], by.loc[key].to_dict(), lims,
+                           "ABCD"[i % 4], title, colors[i % len(colors)])
+        if i % ncols == 0:
+            ax.set_ylabel(r"$\Delta$ log predicted wealth p.c. (GB2)", fontsize=7)
+        if i >= len(groups) - ncols:
+            ax.set_xlabel(r"$\Delta$ log ACS wealth p.c. (GB2)", fontsize=7)
+    axes[0].legend(fontsize=5.5, loc="lower right", frameon=True, facecolor="white",
+                   edgecolor="none", framealpha=0.85)
+    fig.suptitle(rf"NYC change reliability: ACS {acs_pre}$\to${acs_post}, flights "
+                 rf"{_flight_span(w_pre)} vs {_flight_span(w_post)}; "
+                 r"ACS noise from replicate SEs, prediction noise from split-half flights; "
+                 r"$r^* = r/\sqrt{\mathrm{rel_{ACS}\,rel_{pred}}}$"
+                 + ("; volume-weighted tract means" if weighting == "volume" else ""),
+                 fontsize=7)
+    _savefig(fig, out / "figures" / f"F_change_reliability{suffix}.pdf")
+
+    for r in table.itertuples(index=False):
+        if r.n < 5:
+            print(f"  {r.group:10s} {r.sample:7s} n={r.n} — too few tracts")
+            continue
+        print(f"  {r.group:10s} {r.sample:7s} n={r.n:4d} rel_ACS={r.rel_y:.2f} "
+              f"[{r.rel_y_ci_lo:.2f}, {r.rel_y_ci_hi:.2f}] rel_pred={r.rel_p:.2f} "
+              f"[{r.rel_p_ci_lo:.2f}, {r.rel_p_ci_hi:.2f}] r={r.r:+.3f} "
+              f"r*={r.r_disattenuated:+.2f} [{r.r_disattenuated_ci_lo:+.2f}, "
+              f"{r.r_disattenuated_ci_hi:+.2f}] R2/ceiling={r.r2_share_of_ceiling:.3f} "
+              f"| signal var ACS {r.signal_var_dy:.4f} pred {r.signal_var_dp:.4f}")
+    return table
+
+
 def part_f_khachiyan(results_dir: Path, processed_dir: Path, out: Path,
                      years: list[int] | None = None, acs_pre: int = 2018,
                      acs_post: int = 2023, split_of: dict | None = None,
@@ -6809,17 +7463,21 @@ def part_f_khachiyan(results_dir: Path, processed_dir: Path, out: Path,
     print(f"\n=== Part F (Khachiyan per-capita benchmark): NYC, ACS {acs_pre}->{acs_post} {tag} ===")
     spec = ces.CSA_CITIES["nyc"]
     years = sorted(years) if years else _available_years(results_dir) or list(YEARS)
-    tl = _load_tract_long(results_dir, years)
-    if tl.empty:
-        print("  no NYC tract predictions — skipped")
+    # Tract means from the building predictions after the nodata (black-crop)
+    # filter — predictions_by_tract_<year>.parquet predates that filter.
+    bld = _csa_building_preds(results_dir, years)
+    if bld.empty:
+        print("  no NYC building predictions — skipped")
         return None
-    # _load_tract_long carries the raw GEOID beside the padded GEOID_str: drop the
-    # raw one first so the rename does not leave two GEOID columns.
-    tract = tl.drop(columns=["GEOID"], errors="ignore").rename(
-        columns={"GEOID_str": "GEOID", "predicted_value": "pred"})[["GEOID", "year", "pred"]].dropna()
+    tract = (bld.groupby(["GEOID_str", "year"])["predicted_value"].mean().reset_index()
+             .rename(columns={"GEOID_str": "GEOID", "predicted_value": "pred"}))
     tract = tract[tract["GEOID"].str[:5].isin(spec.geoid_prefixes)].assign(cbsa="nyc")
+    tract = _residential_tract_years(
+        tract, _load_wealth_dollars_long(processed_dir, indicators.DEFAULT_INDICATOR,
+                                         [acs_pre, acs_post]), "Part F (Khachiyan)")
     inc = _load_wealth_dollars_long(processed_dir, "inc", [acs_pre, acs_post])
-    inc = inc[inc["GEOID"].str[:5].isin(spec.geoid_prefixes)].assign(cbsa="nyc")
+    inc = inc[inc["GEOID"].str[:5].isin(spec.geoid_prefixes)
+              & ~_is_special_land_use(inc["GEOID"])].assign(cbsa="nyc")
     params = _fit_city_gb2(inc, ["nyc"])
     pairs = _window_pc_income_pairs(tract, inc, params, acs_pre, acs_post, years)
     print(f"  windows {pairs.attrs['window_pre']} vs {pairs.attrs['window_post']}; {len(pairs):,} tracts")
@@ -6866,7 +7524,10 @@ def part_khachiyan_pc_us(ctx: _USContext, acs_pre: int = 2018, acs_post: int = 2
     tract["cbsa"] = tract["cbsa"].astype(str)
     if income_long is None:
         income_long = _load_wealth_dollars_long(ctx.processed_dir, "inc", [acs_pre, acs_post])
-    params = _fit_city_gb2(income_long, tract["cbsa"].unique())
+    # Special-land-use tracts out of the fit; the $10k near-zero rule is a
+    # wealth threshold and real low-income tracts sit below it in income.
+    params = _fit_city_gb2(income_long[~_is_special_land_use(income_long["GEOID"])],
+                           tract["cbsa"].unique())
     pairs = _window_pc_income_pairs(tract, income_long, params, acs_pre, acs_post,
                                     sorted(tract["year"].unique()))
     print(f"  windows {pairs.attrs['window_pre']} vs {pairs.attrs['window_post']}; "
@@ -7179,6 +7840,10 @@ def _run_nyc_parts(results_dir, processed_dir, out_dir, parts,
                 part_f(results_dir, processed_dir, out_dir, years=years)
                 part_f_acs_window(results_dir, processed_dir, out_dir, years=years)
                 part_f_khachiyan(results_dir, processed_dir, out_dir, years=years)
+                part_f_construction_scatter(results_dir, processed_dir, out_dir, years=years)
+                part_f_construction_scatter(results_dir, processed_dir, out_dir, years=years,
+                                            extend_after=2)
+                part_f_change_reliability(results_dir, processed_dir, out_dir, years=years)
         except Exception:
             import traceback
             traceback.print_exc()

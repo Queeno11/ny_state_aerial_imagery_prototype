@@ -947,3 +947,36 @@ def test_control_threshold_is_the_smallest_default_threshold():
     part_d's own validation would reject its default."""
     assert ces.CONTROL_THRESHOLD <= min(ces.DEFAULT_THRESHOLDS)
     assert ces.CONTROL_THRESHOLD == min(ces.DEFAULT_THRESHOLDS)
+
+
+# ─── weighted tract outcomes ────────────────────────────────────────────────
+
+def _bld_for_weights():
+    return pd.DataFrame({"GEOID_str": ["A", "A", "A", "B", "B"], "year": 2020,
+                         "building_id": [1, 2, 3, 4, 5],
+                         "predicted_value": [0.0, 1.0, 2.0, 5.0, 7.0]})
+
+
+def test_tract_outcomes_weighted_mean_and_unweighted_default():
+    from src import csa_event_study as ces
+    b = _bld_for_weights()
+    plain = ces.tract_outcomes(b).set_index("GEOID_str")
+    assert plain.loc["A", "pred_all"] == pytest.approx(1.0)
+    w = pd.Series({1: 1.0, 2: 1.0, 3: 2.0, 4: 3.0, 5: 1.0})
+    out = ces.tract_outcomes(b, weights=w).set_index("GEOID_str")
+    assert out.loc["A", "pred_all"] == pytest.approx((0 + 1 + 4) / 4)
+    assert out.loc["B", "pred_all"] == pytest.approx((15 + 7) / 4)
+    assert out["n_weight_filled"].sum() == 0
+
+
+def test_tract_outcomes_weights_never_produce_nan():
+    from src import csa_event_study as ces
+    b = _bld_for_weights()
+    # Building 3's weight missing -> its tract's median valid weight (1.0); tract B
+    # has no valid weight at all -> equal weights.
+    w = pd.Series({1: 1.0, 2: 1.0, 3: np.nan, 4: 0.0, 5: -2.0})
+    out = ces.tract_outcomes(b, weights=w).set_index("GEOID_str")
+    assert np.isfinite(out["pred_all"]).all()
+    assert out.loc["A", "pred_all"] == pytest.approx(1.0)
+    assert out.loc["B", "pred_all"] == pytest.approx(6.0)
+    assert out.loc["A", "n_weight_filled"] == 1 and out.loc["B", "n_weight_filled"] == 2

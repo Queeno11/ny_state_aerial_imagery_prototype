@@ -1,0 +1,305 @@
+{
+  "seed": 72101,
+  "function_seed": 983,
+  "models": [
+    "nn"
+  ],
+  "truths": [
+    "linear",
+    "quadratic",
+    "smooth",
+    "regime"
+  ],
+  "n": [
+    32
+  ],
+  "city_grid": [
+    8,
+    16,
+    32
+  ],
+  "reps": 20,
+  "cities": 4,
+  "views": 2,
+  "noise_sd": 0.7,
+  "bayes_target": 0.2,
+  "acquisition_strength": 1.0,
+  "group_strength": 1.0,
+  "validation_fraction": 0.25,
+  "pair_mode": "all",
+  "pairs_per_label": 8,
+  "test_per_city": 128,
+  "test_pairs": 3000,
+  "hidden": [
+    32,
+    16
+  ],
+  "weight_bound": 10.0,
+  "rff": 16,
+  "epochs": 1000,
+  "restarts": 3,
+  "lbfgs_steps": 300,
+  "audit_steps": 300,
+  "lr": 0.01,
+  "tau": 0.1,
+  "ridge_grid": [
+    0.0,
+    0.001,
+    0.01,
+    0.1
+  ],
+  "lambda_grid": [
+    0.0,
+    0.03,
+    0.3,
+    1.0
+  ],
+  "lambda_t": 0.3,
+  "lambda_c": 0.3,
+  "dtype": "float64",
+  "device": "cpu",
+  "threads": 1,
+  "grad_tol": 1e-05,
+  "audit_tol": 1e-05,
+  "false_jump": 1.0,
+  "experiment1": {
+    "psi_shapes": [
+      "tanh"
+    ],
+    "cases": [
+      [
+        "common",
+        0.0
+      ],
+      [
+        "multiplier",
+        0.25
+      ],
+      [
+        "multiplier",
+        0.5
+      ],
+      [
+        "multiplier",
+        1.0
+      ],
+      [
+        "multiplier",
+        2.0
+      ],
+      [
+        "location_scale",
+        0.25
+      ],
+      [
+        "location_scale",
+        0.5
+      ],
+      [
+        "location_scale",
+        1.0
+      ],
+      [
+        "location_scale",
+        2.0
+      ],
+      [
+        "shape",
+        0.25
+      ],
+      [
+        "shape",
+        0.5
+      ],
+      [
+        "shape",
+        1.0
+      ],
+      [
+        "shape",
+        2.0
+      ]
+    ],
+    "composition_grid": [
+      0.0,
+      0.7
+    ],
+    "losses": [
+      "common_logit",
+      "heterogeneous_logit",
+      "ordinal_smooth"
+    ],
+    "methods": [
+      "rank_common",
+      "rank_heterogeneous",
+      "rank_ordinal",
+      "raw_levels",
+      "log_cell_fe",
+      "within_zscore",
+      "within_percentile",
+      "oracle_latent",
+      "oracle_inverse"
+    ]
+  },
+  "experiment2": {
+    "losses": [
+      "common_logit",
+      "heterogeneous_logit",
+      "ordinal_smooth"
+    ],
+    "arms": [
+      "none"
+    ],
+    "cases": [
+      [
+        "gumbel",
+        0.0
+      ],
+      [
+        "normal",
+        0.0
+      ],
+      [
+        "student",
+        3.0
+      ],
+      [
+        "student",
+        5.0
+      ],
+      [
+        "student",
+        10.0
+      ],
+      [
+        "student",
+        30.0
+      ],
+      [
+        "cell_scale",
+        0.0
+      ],
+      [
+        "cell_scale",
+        0.3
+      ],
+      [
+        "cell_scale",
+        0.7
+      ],
+      [
+        "cell_scale",
+        1.0
+      ],
+      [
+        "feature_scale",
+        0.0
+      ],
+      [
+        "feature_scale",
+        0.3
+      ],
+      [
+        "feature_scale",
+        0.7
+      ],
+      [
+        "feature_scale",
+        1.0
+      ],
+      [
+        "median_violation",
+        0.0
+      ],
+      [
+        "median_violation",
+        0.3
+      ],
+      [
+        "median_violation",
+        0.7
+      ],
+      [
+        "median_violation",
+        1.0
+      ]
+    ]
+  },
+  "experiment3": {
+    "losses": [
+      "common_logit"
+    ],
+    "arms": [
+      "none",
+      "temporal"
+    ],
+    "nuisance_cases": [
+      [
+        1.0,
+        1.0
+      ]
+    ]
+  },
+  "experiment4": {
+    "losses": [
+      "common_logit",
+      "heterogeneous_logit",
+      "ordinal_smooth"
+    ],
+    "arms": [
+      "temporal",
+      "cross_city",
+      "both"
+    ],
+    "cases": [
+      [
+        "exact",
+        0.0
+      ],
+      [
+        "drift",
+        0.05
+      ],
+      [
+        "drift",
+        0.15
+      ],
+      [
+        "drift",
+        0.3
+      ],
+      [
+        "random_false",
+        0.05
+      ],
+      [
+        "random_false",
+        0.1
+      ],
+      [
+        "random_false",
+        0.2
+      ],
+      [
+        "random_false",
+        0.4
+      ],
+      [
+        "systematic_false",
+        0.05
+      ],
+      [
+        "systematic_false",
+        0.1
+      ],
+      [
+        "systematic_false",
+        0.2
+      ],
+      [
+        "systematic_false",
+        0.4
+      ]
+    ]
+  }
+}

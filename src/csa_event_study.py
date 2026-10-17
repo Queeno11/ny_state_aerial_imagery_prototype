@@ -934,12 +934,37 @@ def build_tract_cohorts(
 # Outcomes
 # ═══════════════════════════════════════════════════════════════════════════════
 
+def _weighted_tract_mean(df: pd.DataFrame, pred_col: str, w: pd.Series,
+                         keys=("GEOID_str", "year")) -> pd.DataFrame:
+    """Weighted mean of ``pred_col`` per (tract, year), NaN-proof.
+
+    ``w`` is aligned to ``df``'s rows. A missing, non-finite or non-positive
+    weight takes the median valid weight of its own tract-year; a tract-year
+    with no valid weight at all falls back to equal weights. Returns
+    [keys..., mean, n, n_weight_filled].
+    """
+    d = df[list(keys) + [pred_col]].copy()
+    w = pd.to_numeric(w, errors="coerce").astype(float)
+    valid = np.isfinite(w) & (w > 0)
+    d["_w"] = w.where(valid)
+    med = d.groupby(list(keys))["_w"].transform("median")
+    d["_filled"] = ~valid
+    d["_w"] = d["_w"].fillna(med).fillna(1.0)
+    d["_wp"] = d["_w"] * d[pred_col]
+    g = d.groupby(list(keys))
+    out = g.agg(_sw=("_w", "sum"), _swp=("_wp", "sum"), n=(pred_col, "size"),
+                n_weight_filled=("_filled", "sum")).reset_index()
+    out["mean"] = out["_swp"] / out["_sw"]
+    return out.drop(columns=["_sw", "_swp"])
+
+
 def tract_outcomes(
     bld_preds: pd.DataFrame,
     construction_year: pd.Series | None = None,
     baseline_year: int | None = None,
     pred_col: str = "predicted_value",
     id_col: str = "building_id",
+    weights: pd.Series | None = None,
 ) -> pd.DataFrame:
     """Tract-year outcome means from building-level predictions.
 
@@ -952,6 +977,11 @@ def tract_outcomes(
     all-buildings mean moves partly by construction (a new, high-scoring
     building joins the average); the incumbent mean can only move if the model
     re-reads buildings that did not themselves change.
+
+    ``weights`` (indexed by building id, e.g. volume = footprint area x roof
+    height) turns both means into weighted means via
+    :func:`_weighted_tract_mean`; ``None`` keeps the plain means. The weighted
+    output adds ``n_weight_filled``, the buildings whose weight was missing.
     """
     df = bld_preds.copy()
     if "GEOID_str" not in df.columns:
@@ -960,22 +990,32 @@ def tract_outcomes(
     df[pred_col] = pd.to_numeric(df[pred_col], errors="coerce")
     df = df[np.isfinite(df[pred_col])]
 
-    out = (
-        df.groupby(["GEOID_str", "year"])[pred_col]
-        .agg(pred_all="mean", n_all="size")
-        .reset_index()
-    )
+    if weights is None:
+        out = (
+            df.groupby(["GEOID_str", "year"])[pred_col]
+            .agg(pred_all="mean", n_all="size")
+            .reset_index()
+        )
+    else:
+        w_all = df[id_col].map(weights) if id_col in df.columns else pd.Series(np.nan, index=df.index)
+        out = _weighted_tract_mean(df, pred_col, w_all).rename(
+            columns={"mean": "pred_all", "n": "n_all"})
 
     if construction_year is not None and baseline_year is not None and id_col in df.columns:
         yb = df[id_col].map(construction_year)
         # Unknown year built (NaN / 0 sentinel) is treated as incumbent: these
         # are old buildings with missing records, not post-baseline construction.
         incumbent = ~(yb.notna() & (yb > baseline_year))
-        inc = (
-            df[incumbent].groupby(["GEOID_str", "year"])[pred_col]
-            .agg(pred_incumbent="mean", n_incumbent="size")
-            .reset_index()
-        )
+        if weights is None:
+            inc = (
+                df[incumbent].groupby(["GEOID_str", "year"])[pred_col]
+                .agg(pred_incumbent="mean", n_incumbent="size")
+                .reset_index()
+            )
+        else:
+            inc = _weighted_tract_mean(df[incumbent], pred_col, w_all[incumbent]).rename(
+                columns={"mean": "pred_incumbent", "n": "n_incumbent",
+                         "n_weight_filled": "n_incumbent_weight_filled"})
         out = out.merge(inc, on=["GEOID_str", "year"], how="left")
 
     return out
