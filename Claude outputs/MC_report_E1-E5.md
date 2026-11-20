@@ -11,7 +11,7 @@ Stability restrictions (links between observations known to share the same laten
 - **Dependence (E3).** Spatial and serial dependence in the errors leave the point estimates essentially unchanged.
 - **Misspecification (E4).** When the error depends on an image feature outside the index, unrestricted estimators are inconsistent (index error 0.21–0.33, flat in sample size). The links cut this 2–8× for the same estimator, and the smoothed-MRC version keeps converging under heteroskedasticity.
 - **Predicting change (E5).** With a true baseline survey, learning how much of a tract's baseline residual carries over gives 1.2–2.2× the R² of ΔW of the best naive rule, reaching 71–81% of the oracle. The images recover 87–92% of the change caused by structural change.
-- **Weak point: the second step.** All remaining problems sit in the curve that maps the index back to W (the head), not in the index. It is fragile in heavy upper tails, and one smoothing choice shared by many cities does not scale.
+- **Weak point: the second step.** All remaining problems sit in the curve that maps the index back to W (the head), not in the index. It is fragile in heavy upper tails, and with many cities a pooled R² is dominated by the worst city.
 
 ## Setup
 
@@ -128,7 +128,7 @@ Learning κ gives 1.2–2.2× the R² of the best naive rule and reaches 71–81
 - **Splitting by group matters.** Changing tracts get close to the oracle in the main scenarios. In P_reset, one κ cannot serve stable tracts (true carry-over about 0.71) and changing ones (0): stable tracts fall to 0.15, and image only is best on changing tracts (0.55). A carry-over that depends on a detected-change flag would fix this.
 - **The images detect structural change.** They recover 87–92% of the change caused by the index moving, close to the best achievable with the image curve (92–100%). The remainder is second-step error in the head.
 - **Where ΔW comes from.** On changing tracts at 64×500, structural change explains 7–21% of the variance of observed ΔW (19–38% in the `_x` versions), the city map moving 7–14% (12–27%), residual dynamics 21–40%, and 45–52% is unpredictable even for the oracle. A low overall R² is therefore expected and is not a failure of the images.
-- **The `_x` versions are fragile.** Typical replications are good, but in about 14% of them R² of ΔW is negative, at every size. In those, the index is perfect and the true curve at the estimated index fits as well as ever; the fitted spline head breaks on a few extreme tracts in a convex upper tail. Separately, median structural recovery falls from about 0.85 at 8 cities to 0.70–0.78 at 64, because one smoothing parameter is shared by all 128 city-date curves.
+- **The `_x` versions are fragile.** Typical replications are good, but in about 14% of them R² of ΔW is negative, at every size. In those, the index is perfect and the true curve at the estimated index fits as well as ever; the fitted spline head breaks on a few extreme tracts in a convex upper tail. Pooled structural recovery also falls from about 0.85 at 8 cities to 0.70–0.78 at 64. This is not a scaling failure: the median city recovers about 0.93 at both sizes, but with 64 cities the single worst city carries roughly half of all the error, and a pooled R² follows it.
 
 ## Main conclusions
 
@@ -142,7 +142,7 @@ The restriction is worth making the centre of the paper: it buys precision when 
 
 ## Open issues and next steps
 
-- [ ] **Per-city smoothing for the head.** Choose the spline's flexibility separately for each city; one choice shared by all cells does not scale to many cities (the main issue for a national rollout).
+- [ ] **Report per-cell R² beside pooled R².** With many cities a pooled R² is driven by the worst city, while the median city's structural recovery is about 0.93 at both 8 and 64 cities. Where wealth curves are mild, a fixed cubic head matches the cross-validated one.
 - [ ] **Robustness to heavy tails.** Fit the head on a compressing scale (asinh or log of W) with a retransformation correction, or estimate the map by median regression and carry the residual over inside the map. First check whether the Monte Carlo tail is realistic, since ACS income is top-coded.
 - [ ] **Carry-over by detected change.** Let κ depend on a building-detector change flag, with two thresholds (strictly stable, clearly changed, unsure in between), and simulate a misclassified flag feeding both the links and the head.
 - [ ] **Choice of the smoothing criterion.** Compare the linear W + ΔW criterion now in use with a Cobb–Douglas version and with alternative ΔW groups.
