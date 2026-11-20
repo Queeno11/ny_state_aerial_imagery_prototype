@@ -337,17 +337,26 @@ def validation_error(model, features, design, cfg):
     return misranking(s[j]-s[i],val["w"][j]-val["w"][i])
 
 def test_metrics(model,features,design,cfg):
+    return evaluate_predictions(lambda x: predictions(model,features,x,cfg),design,cfg,
+                                normalized_mse=model.loss in ('common_logit','heterogeneous_logit'))
+
+
+def evaluate_predictions(predict,design,cfg,normalized_mse=True,absolute_scale=False):
+    from .change import evaluate_changes
     result={}
-    train_score=predictions(model,features,design["train"]["x"],cfg)
+    train_score=predict(design["train"]["x"])
     ii,jj=design["pairs"]
     train_sd=np.sqrt(.5*np.sum(design['pair_weights']*(train_score[jj]-train_score[ii])**2))
     for name,(data,pp) in design["tests"].items():
-        s=predictions(model,features,data["x"],cfg)
+        s=predict(data["x"])
         for kind,(i,j) in pp.items():
             result[name+"_"+kind+"_latent"]=misranking(s[j]-s[i],data["f"][j]-data["f"][i])
+            result[name+"_"+kind+"_accuracy"]=1-result[name+"_"+kind+"_latent"]
             if kind=="within":
                 result[name+"_within_observed"]=misranking(s[j]-s[i],data["w"][j]-data["w"][i])
                 result[name+"_oracle_observed"]=misranking(data["f"][j]-data["f"][i],data["w"][j]-data["w"][i])
-                if model.loss in ("common_logit","heterogeneous_logit"):
+                if normalized_mse and train_sd>0:
                     result[name+"_within_difference_mse"]=float(np.mean(((s[j]-s[i])/train_sd-(data["f"][j]-data["f"][i]))**2))
+    result['evaluation_zero_dispersion']=bool(train_sd==0)
+    result.update(evaluate_changes(predict,design,cfg,1. if absolute_scale or train_sd==0 else train_sd))
     return result

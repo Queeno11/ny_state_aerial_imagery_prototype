@@ -1,0 +1,7 @@
+{
+  "original_replications_sha256": "f47c28eafbe3e0d1e130fd8107e8c11ab37a3cd12de121cd2b4649d0506d44a2",
+  "existing_summary_verified": true,
+  "original_estimators_rerun": 0,
+  "matched_ml_fits": 120,
+  "reason": "Same latent data/noise and known inverse transformations; ML fit invariant to additive map"
+}

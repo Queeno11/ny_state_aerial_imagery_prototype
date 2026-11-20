@@ -4,7 +4,7 @@ from pathlib import Path
 import numpy as np
 import torch
 from .config import parse_args, runtime
-from .core import StructuralDGP, Features, prepare, tensor, train_candidate, validation_error, test_metrics, seed_for, InadmissibleScoreError
+from .core import StructuralDGP, Features, prepare, tensor, train_candidate, validation_error, test_metrics, evaluate_predictions, seed_for, InadmissibleScoreError
 from .design import make_design, level_target, PopulationDGP
 from .experiments import jobs
 from .report import export
@@ -57,7 +57,23 @@ def open_database(out,signature,resume):
         conn.execute('INSERT INTO metadata VALUES (?,?)',('signature',canonical(signature))); conn.commit()
     return conn
 
-def fit_job(job,design,cfg):
+def fit_job(job,design,cfg,dgp=None):
+    if job['method']=='ml_correct':
+        from .likelihood import fit_ml
+        if dgp is None:
+            dgp=PopulationDGP(cfg); dgp.configure(job['truth'],job['scenario']['composition'])
+        predict,stats=fit_ml(design,job['truth'],job['scenario'],dgp)
+        base={k:v for k,v in job.items() if k not in ('scenario','weights')}; base.update(job['scenario'])
+        result={**base,**stats,**evaluate_predictions(predict,design,cfg,absolute_scale=True),
+            'reg':0.,'lambda_t':0.,'lambda_c':0.,'restart':0,
+            'validation_misranking':None,'first_order_small':None,
+            'audit_objective_drop':None,'audit_stable':None,
+            'optimizer_status':'ok' if stats['ml_success'] else 'ml_not_converged',
+            'n_fit':design['n_fit'],'n_validation':design['n_val'],
+            'noise_sd_effective':design['noise_sd_effective'],
+            'total_candidate_seconds':stats['ml_seconds'],
+            **design['link_stats']['none']}
+        return result,[]
     # Preprocessing uses fitting labels only, never auxiliary views or validation.
     features=Features(design['train']['x'],job['model'],cfg)
     data=prepare(design,features,cfg); extra={}
@@ -138,19 +154,19 @@ def compute_job(job):
     if key!=state['cache_key']:
         state['design']=make_design(jobcfg,state['dgp'],job['rep'],job['n'],job['truth'],job['scenario'])
         state['cache_key']=key
-    return fit_job(job,state['design'],jobcfg)
+    return fit_job(job,state['design'],jobcfg,state['dgp'])
 
 def main():
     args,d,experiments=parse_args()
     if args.check:
         from .checks import run_checks
         run_checks(); return
-    joblist=list(jobs(d,experiments)); count=sum(len(j['weights'])*len(set(d['ridge_grid']))*d['restarts'] for j in joblist)
+    joblist=list(jobs(d,experiments)); count=sum(1 if j['method']=='ml_correct' else len(j['weights'])*len(set(d['ridge_grid']))*d['restarts'] for j in joblist)
     print(f'Planning {count:,} candidate fits; {len(joblist):,} selected fits. Device={d["device"]}, dtype={d["dtype"]}, workers={d["workers"]}, threads/worker={d["threads"]}.',flush=True)
     if args.plan:
         for e in experiments:
             jj=[j for j in joblist if j['experiment']==e]
-            print(f'  Experiment {e}: {len(jj):,} jobs / {sum(len(j["weights"])*len(set(d["ridge_grid"]))*d["restarts"] for j in jj):,} candidates')
+            print(f'  Experiment {e}: {len(jj):,} jobs / {sum(1 if j["method"]=="ml_correct" else len(j["weights"])*len(set(d["ridge_grid"]))*d["restarts"] for j in jj):,} candidates')
         return
     if d['reps']<20: print('Exploratory run: too few repetitions for reliable Monte Carlo uncertainty.',flush=True)
     runtime(d)
@@ -173,7 +189,8 @@ def main():
                 conn.execute('INSERT INTO jobs VALUES (?,?)',(jid,canonical(result)))
                 conn.executemany('INSERT INTO candidates VALUES (?,?,?)',[(jid,i,canonical(r)) for i,r in enumerate(candidates)])
             completed+=1
-            print(f'[{completed}/{len(joblist)}] E{job["experiment"]} rep={job["rep"]} C={job["cities"]} n={job["n"]} {job["truth"]}/{job["model"]} {job["loss"]} {job["method"]} unseen={result["unseen_within_latent"]:.3f} reg={result["reg"]:g} lambda_t={result["lambda_t"]:g} lambda_c={result["lambda_c"]:g} audit_drop={result["audit_objective_drop"]:.2g}',flush=True)
+            optimization=f'ml_success={result["ml_success"]}' if job['method']=='ml_correct' else f'audit_drop={result["audit_objective_drop"]:.2g}'
+            print(f'[{completed}/{len(joblist)}] E{job["experiment"]} rep={job["rep"]} C={job["cities"]} n={job["n"]} {job["truth"]}/{job["model"]} {job["loss"]} {job["method"]} unseen={result["unseen_within_latent"]:.3f} reg={result["reg"]:g} lambda_t={result["lambda_t"]:g} lambda_c={result["lambda_c"]:g} {optimization}',flush=True)
     except BaseException:
         if results is not None: results.close()
         export(conn,args.out,plots=False); conn.close()

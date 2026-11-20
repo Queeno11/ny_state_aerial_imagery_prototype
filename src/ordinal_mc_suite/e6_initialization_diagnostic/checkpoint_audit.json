@@ -1,0 +1,11 @@
+{
+  "actual_initial_scratch_scorer_and_head_tensors_identical": true,
+  "actual_warm_initial_state_matches_source": true,
+  "initial_checkpoint_eligible_for_all_paths": true,
+  "selected_minimizes_observed_validation_within_patience_prefix": true,
+  "head_monotonicity_initial_selected_fixed_verified": true,
+  "dispersion_matches_original_pairwise_V": true,
+  "scratch_initial_level_scorer_gradient_norm": 10.319708839028804,
+  "scratch_initial_change_scorer_gradient_norm": 28.20921877999046,
+  "audit_is_read_only": true
+}

@@ -1,0 +1,15 @@
+{
+  "passed": true,
+  "new_scorer_fits": 15,
+  "total_new_scorer_fits_including_mask_experiment": 45,
+  "score_freeze_checks": 30,
+  "calibration_head_sets": 30,
+  "all_previous_stage_files_unchanged": true,
+  "shared_calibration_and_test_hashes_match": true,
+  "original_difference_denominator_unchanged": true,
+  "min_fitting_changed_fraction": 0.495625,
+  "max_fitting_changed_fraction": 0.5096875,
+  "max_tangent_gradient": 3.757786220946366e-08,
+  "max_conditional_head_gradient": 4.683753385137379e-16,
+  "elapsed_seconds": 10.005101500079036
+}

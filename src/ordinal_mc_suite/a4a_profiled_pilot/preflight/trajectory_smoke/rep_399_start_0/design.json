@@ -1,0 +1,27 @@
+{
+  "role": "smoke",
+  "seeds": {
+    "contexts": 3587018950,
+    "paired": 1815941733,
+    "split": 4075522096,
+    "fit_aux": 1811017494,
+    "val_aux": 2258094582,
+    "cutoff_contexts": 1799801822,
+    "cutoff": 2457212378,
+    "seen": 3457953764,
+    "unseen_contexts": 607682601,
+    "unseen": 2733391643,
+    "seen_regimes": 286264046,
+    "unseen_regimes": 4124702055
+  },
+  "scorer_seed": 103196105,
+  "fit_tracts": 104,
+  "validation_tracts": 24,
+  "exact_fit_links": 416,
+  "denoms": {
+    "W": 13.04839078166038,
+    "delta_W": 6.292101235468622
+  },
+  "train_tract_ids_sha256": "1f5382de88793c4ee3455338f342bc14f1c34461e8c84cd5c99e1240b1303f8d",
+  "val_tract_ids_sha256": "370bed4d167349d74d5cfad89d8bc1ffffb88d7c784f7ca99ad2362437855fb3"
+}

@@ -1,0 +1,11 @@
+{
+  "selected_fits": 30,
+  "candidate_fits": 0,
+  "audit_unstable": 0,
+  "first_order_not_small": 20,
+  "recovered_selected_fits": 0,
+  "recovered_candidates": 0,
+  "inadmissible_candidates": 0,
+  "ml_not_converged": 0,
+  "note": "Diagnostics are not global optimality certificates. CI uses independent repetitions, not pairs; fewer than 20 repetitions is exploratory."
+}

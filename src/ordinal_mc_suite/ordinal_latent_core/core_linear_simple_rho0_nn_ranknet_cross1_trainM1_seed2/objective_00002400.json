@@ -1,0 +1,47 @@
+{
+  "exposure": {
+    "cross": 1,
+    "cross_count": 3200,
+    "cross_coverage": 0.2,
+    "effective_tract_passes": 28.8,
+    "initialization_seed": 271828,
+    "method": "nn",
+    "rank": "ranknet",
+    "scenario": "linear/simple/rho0",
+    "seed": 2,
+    "selected_tract_records": 460800,
+    "source_fit_cities": 64,
+    "source_fit_n": 250,
+    "stage": "core",
+    "temporal_count": 8064,
+    "temporal_coverage": 0.504,
+    "trained_map": "M1",
+    "updates": 2400,
+    "validation_cross_count": 103,
+    "validation_temporal_count": 256
+  },
+  "train": {
+    "cross_numerator": 0.001314019822010722,
+    "dispersion": 2.062907112516581,
+    "monitored_tract_records": 768,
+    "monitoring_design": "fixed sampled tracts per city; all selected links",
+    "objective": 0.4418728737483396,
+    "pair_loss": 0.4415912480614784,
+    "panel_tract_records": 16000,
+    "temporal_numerator": 0.0006225389529668186,
+    "weighted_cross": 0.00019109243659658383,
+    "weighted_temporal": 9.053325026457993e-05
+  },
+  "validation": {
+    "cross_numerator": 0.0010805804774559682,
+    "dispersion": 2.0343640372115637,
+    "monitored_tract_records": 96,
+    "monitoring_design": "fixed sampled tracts per city; all selected links",
+    "objective": 0.41438984086522723,
+    "pair_loss": 0.4141521834339079,
+    "panel_tract_records": 512,
+    "temporal_numerator": 0.0005310252940510901,
+    "weighted_cross": 0.00015934913186979328,
+    "weighted_temporal": 7.830829944953447e-05
+  }
+}

@@ -1,0 +1,153 @@
+{
+  "scorer_initialization_seed": 1765154216,
+  "fit_seed": 1422665402,
+  "validation_seed": 1157853548,
+  "fitting_endpoints": 13120,
+  "validation_endpoints": 3264,
+  "denominators": {
+    "W": 30.124436698937078,
+    "delta_W": 16.201447520252533
+  },
+  "scratch_scorer_hash": "ae6012432665bcee59ec3fcb7787409867fa3cb9b8c04af26617d8bc9dac957c",
+  "scratch_head_hash": "6d78212f30f03798c0a53a02a3f0aeb87e4c052ce489a3201b8529701c8149b7",
+  "warm_scorer_hash": "7f1ea88d564b50093733ff7db21f2f782859ff706ec7ce272b905616ca04ec72",
+  "warm_head_hash": "806e0b3d60fe8c9605fc3227059e9aa8916c19ad2a12a42165e12e26775f3bfe",
+  "inherited_baseline_updates_executed": 520,
+  "inherited_baseline_selected_update": 320,
+  "inherited_head_updates_executed": 600,
+  "source_config": {
+    "source_config": {
+      "seed": 20261103,
+      "function_seed": 983,
+      "replications": 30,
+      "cities": [
+        32,
+        64
+      ],
+      "cases": [
+        [
+          "linear",
+          "linear"
+        ],
+        [
+          "quadratic",
+          "nn"
+        ]
+      ],
+      "labels_per_city": 512,
+      "validation_fraction": 0.2,
+      "views": 2,
+      "noise_sd": 0.7,
+      "bayes_target": 0.2,
+      "hidden": [
+        32,
+        16
+      ],
+      "weight_bound": 10.0,
+      "acquisition_strength": 1.0,
+      "group_strength": 1.0,
+      "alpha": 0.0,
+      "lambda_t": 0.3,
+      "test_per_city": 128,
+      "test_pairs": 3000,
+      "change_strengths": [
+        0.0,
+        0.15,
+        0.4,
+        0.8
+      ],
+      "changed_share": 0.5,
+      "truth_threshold": 0.05,
+      "false_positive_target": 0.05,
+      "actual_size_edges": [
+        0.05,
+        0.15,
+        0.3,
+        0.6
+      ],
+      "quadrature_nodes": 128,
+      "maps": [
+        "affine",
+        "nonlinear"
+      ],
+      "heads": [
+        "affine",
+        "spline"
+      ],
+      "level_weights": [
+        0.1,
+        1.0,
+        10.0
+      ],
+      "validation_rank_weight": 1.0,
+      "validation_level_weight": 1.0,
+      "kappa_base": 0.6,
+      "kappa_amplitude": 0.2,
+      "kappa_time_shift": 0.5,
+      "restarts": 3,
+      "threads": 1,
+      "workers": 8,
+      "baseline": {
+        "adam_steps": 3000,
+        "lr": 0.01,
+        "check_every": 10,
+        "patience": 20,
+        "lbfgs_steps": 400,
+        "lbfgs_chunk": 10,
+        "lbfgs_patience": 10
+      },
+      "head_training": {
+        "steps": 600,
+        "lr": 0.02,
+        "check_every": 10,
+        "patience": 20,
+        "knots": [
+          0.2,
+          0.5,
+          0.8
+        ],
+        "kappa_G": 0.01,
+        "pool_relative": 10.0
+      },
+      "joint": {
+        "steps": 600,
+        "scorer_lr": 0.001,
+        "head_lr": 0.01,
+        "check_every": 10,
+        "patience": 20
+      },
+      "oracle_R": {
+        "enabled": true,
+        "steps": 600,
+        "lr": 0.001
+      },
+      "min_delta": 1e-05
+    },
+    "diagnostic": {
+      "job": "r001_c32_quadratic_nn",
+      "fit_tracts_per_city": 205,
+      "validation_tracts_per_city": 51,
+      "changed_share": 0.5,
+      "training_change_step": 0.4,
+      "baseline_max_adam": 1000,
+      "baseline_restarts": 1,
+      "baseline_lbfgs": 0,
+      "head_initialization_max_updates": 600,
+      "additional_updates": 200,
+      "scorer_lr": 0.0001,
+      "head_lr": 0.001,
+      "lambda_W": 1.0,
+      "lambda_delta": 1.0,
+      "head_penalty": 0.0,
+      "checkpoints": [
+        0,
+        25,
+        50,
+        100,
+        200
+      ]
+    },
+    "fit_seed": 1422665402,
+    "val_seed": 1157853548
+  }
+}

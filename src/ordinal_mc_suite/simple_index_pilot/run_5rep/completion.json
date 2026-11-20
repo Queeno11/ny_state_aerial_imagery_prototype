@@ -1,0 +1,12 @@
+{
+  "fitted_estimators": 175,
+  "evaluation_replications": [
+    1,
+    2,
+    3,
+    4,
+    5
+  ],
+  "tuning_scorer_fits": 39,
+  "elapsed_seconds": 71.07135590026155
+}

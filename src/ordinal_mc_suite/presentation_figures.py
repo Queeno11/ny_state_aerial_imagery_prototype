@@ -50,7 +50,9 @@ RUNS = {
 # ---------------------------------------------------------------------------
 def load_csv(run_dir: Path, name: str) -> pd.DataFrame:
     """Read one exported CSV of a finished run."""
-    return pd.read_csv(Path(run_dir) / name)
+    original=Path(run_dir)/name
+    augmented=original.with_name(original.stem+'_with_ml'+original.suffix)
+    return pd.read_csv(augmented if augmented.exists() else original)
 
 
 def select(df: pd.DataFrame, **filters) -> pd.DataFrame:
@@ -126,9 +128,29 @@ def draw_curves(ax, curves: list[Curve], xticks=(8, 16, 32, 64)) -> None:
     ax.set_axisbelow(True)
 
 
+def with_ml(curves: list[Curve], rows: pd.DataFrame) -> list[Curve]:
+    """Show the benchmark when reading an upgraded run; retain older figures."""
+    ml=select(rows,method='ml_correct')
+    if not ml.empty:
+        curves.append(curve(ml,'correctly specified ML (oracle nuisance)',YELLOW,linestyle=':'))
+    return curves
+
+
+def finish_legend(fig, ax, ncol=2):
+    """Keep the longer ML legend outside the data panels."""
+    handles,labels=ax.get_legend_handles_labels()
+    width,height=fig.get_size_inches()
+    fig.set_size_inches(width,height+.45)
+    fig.legend(handles,labels,loc='lower center',ncol=ncol,fontsize=7.5,
+               bbox_to_anchor=(.5,0.),frameon=False)
+    fig.tight_layout(rect=(0,.18,1,1))
+
+
 def save(fig, out: Path) -> Path:
     out.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out, bbox_inches="tight")
+    if out.suffix.lower()=='.pdf':
+        fig.savefig(out.with_suffix('.png'),dpi=180,bbox_inches='tight',facecolor='white')
     plt.close(fig)
     return out
 
@@ -155,12 +177,11 @@ def fig_e1(summary: pd.DataFrame, composition: float, metric: str = "unseen_with
         rows = select(summary, metric=metric, psi_stage=stage, composition=composition)
         curves = [curve(select(rows, method=m), lab, col, linestyle=ls)
                   for m, lab, col, ls in E1_METHODS]
-        draw_curves(ax, curves)
+        draw_curves(ax, with_ml(curves,rows))
         ax.set_title(title, loc="left")
         ax.set_xlabel("labeled training cities $C$")
     axes[0].set_ylabel(ylabel)
-    axes[1].legend(loc="upper right")
-    fig.tight_layout()
+    finish_legend(fig,axes[1])
     return fig
 
 
@@ -174,12 +195,11 @@ def fig_links(panels: list[tuple[pd.DataFrame, dict, str]],
         rows = select(summary, **{"metric": metric, **filt})
         curves = [curve(select(rows, method="none"), "no links", MUTED, linestyle="--"),
                   curve(select(rows, method="temporal"), "temporal links", VIOLET)]
-        draw_curves(ax, curves)
+        draw_curves(ax, with_ml(curves,rows))
         ax.set_title(title, loc="left")
         ax.set_xlabel("labeled training cities $C$")
     axes[0][0].set_ylabel(ylabel)
-    axes[0][-1].legend(loc="upper right")
-    fig.tight_layout()
+    finish_legend(fig,axes[0][-1])
     return fig
 
 
@@ -194,14 +214,15 @@ def fig_e4(paired: pd.DataFrame, metric: str = "unseen_within_latent"):
     """E4: paired reduction in misranking vs no links (pp, 95% CI), by link regime."""
     rows = select(paired, metric=metric)
     fig, ax = plt.subplots(figsize=(6.4, 2.8))
-    width = 0.36
-    for k, (method, label, color) in enumerate(E4_METHODS):
+    methods=E4_METHODS+([('ml_correct','correctly specified ML',BLUE)] if 'ml_correct' in set(rows.method) else [])
+    width = .72/len(methods)
+    for k, (method, label, color) in enumerate(methods):
         for i, (case, _) in enumerate(E4_CASES):
             r = select(rows, method=method, link_case=case)
             if len(r) != 1:
                 raise ValueError(f"expected one row for {method}/{case}, got {len(r)}")
             r = r.iloc[0]
-            x = i + (k - 0.5) * width
+            x = i + (k - (len(methods)-1)/2) * width
             m, lo, hi = 100 * r["mean"], 100 * r["ci95_low"], 100 * r["ci95_high"]
             ax.bar(x, m, width * 0.92, color=color, alpha=0.85, label=label if i == 0 else None)
             ax.errorbar(x, m, yerr=[[m - lo], [hi - m]], color=INK, lw=0.9, capsize=2.5)
@@ -214,8 +235,7 @@ def fig_e4(paired: pd.DataFrame, metric: str = "unseen_within_latent"):
     ax.set_ylabel("misranking reduction vs.\nno links (pp)")
     ax.grid(axis="y", color=RULE, lw=0.5)
     ax.set_axisbelow(True)
-    ax.legend(loc="upper right")
-    fig.tight_layout()
+    finish_legend(fig,ax,ncol=3)
     return fig
 
 
@@ -224,12 +244,12 @@ def fig_cross_city(e1: pd.DataFrame, e3_lin: pd.DataFrame):
     fig, axes = plt.subplots(1, 2, figsize=(7.2, 2.7), sharey=True)
     metric = "unseen_cross_city_latent"
     rows = select(e1, metric=metric, psi_stage="shape", composition=0.0)
-    draw_curves(axes[0], [curve(select(rows, method=m), lab, col, linestyle=ls)
-                          for m, lab, col, ls in E1_METHODS])
+    draw_curves(axes[0], with_ml([curve(select(rows, method=m), lab, col, linestyle=ls)
+                          for m, lab, col, ls in E1_METHODS],rows))
     axes[0].set_title("E1 estimators (shape map)", loc="left")
     rows = select(e3_lin, metric=metric)
-    draw_curves(axes[1], [curve(select(rows, method="none"), "no links", MUTED, linestyle="--"),
-                          curve(select(rows, method="temporal"), "temporal links", VIOLET)])
+    draw_curves(axes[1], with_ml([curve(select(rows, method="none"), "no links", MUTED, linestyle="--"),
+                          curve(select(rows, method="temporal"), "temporal links", VIOLET)],rows))
     axes[1].set_title("E3 linear: links within city", loc="left")
     for ax in axes:
         ax.set_xlabel("labeled training cities $C$")
@@ -274,14 +294,14 @@ def fig_e1_additive(summary: pd.DataFrame, scale: float = 10.0,
             raise ValueError(f"no rows for {filt}: was this map run?")
         curves = [curve(select(panel, method=m), lab, col, linestyle=ls)
                   for m, lab, col, ls in E1_ADDITIVE_METHODS if m in set(panel.method)]
+        curves=with_ml(curves,panel)
         draw_curves(ax, curves)
         top = max(top, *(max(c.hi) for c in curves))
         ax.set_title(title, loc="left")
         ax.set_xlabel("labeled training cities $C$")
     axes[0].set_ylim(0, 1.08 * top)  # shared axis: fit the higher panel's bands
     axes[0].set_ylabel("misranked pairs, unseen cities (%)")
-    axes[1].legend(loc="upper right")
-    fig.tight_layout()
+    finish_legend(fig,axes[1])
     return fig
 
 
@@ -313,10 +333,11 @@ def fig_invariance(summary: pd.DataFrame, composition: float = 0.0):
     shift = invariance_shift(summary, composition)
     cities = sorted(shift["cities"].unique())
     fig, ax = plt.subplots(figsize=(6.4, 2.5))
-    width = 0.8 / len(E1_METHODS)
-    for k, (method, label, color, _) in enumerate(E1_METHODS):
+    methods=E1_METHODS+([('ml_correct','correctly specified ML',YELLOW,':')] if 'ml_correct' in set(shift.method) else [])
+    width = 0.8 / len(methods)
+    for k, (method, label, color, _) in enumerate(methods):
         d = select(shift, method=method).set_index("cities").reindex(cities)
-        xs = np.arange(len(cities)) + (k - (len(E1_METHODS) - 1) / 2) * width
+        xs = np.arange(len(cities)) + (k - (len(methods) - 1) / 2) * width
         ax.bar(xs, d["shift_pp"], width * 0.9, color=color, alpha=0.85, label=label)
         if np.allclose(d["shift_pp"], 0, atol=1e-9):
             for x in xs:
@@ -328,8 +349,7 @@ def fig_invariance(summary: pd.DataFrame, composition: float = 0.0):
     ax.set_ylabel("error change when $\\psi_{ct}$\nchanges shape (pp)")
     ax.grid(axis="y", color=RULE, lw=0.5)
     ax.set_axisbelow(True)
-    ax.legend(loc="upper right")
-    fig.tight_layout()
+    finish_legend(fig,ax)
     return fig
 
 
@@ -355,7 +375,7 @@ def fig_doubling(summary: pd.DataFrame, metric: str = "unseen_within_latent",
     none = curve(select(rows, method="none"), "no links", MUTED, linestyle="--")
     linked = curve(select(rows, method="temporal"), "temporal links", VIOLET)
     fig, ax = plt.subplots(figsize=(5.6, 2.9))
-    draw_curves(ax, [none, linked])
+    draw_curves(ax, with_ml([none, linked],rows))
     for c, m in zip(linked.x, linked.mean):
         c_eq = equivalent_cities(none.x, none.mean, m)
         if c_eq is None:
@@ -369,8 +389,7 @@ def fig_doubling(summary: pd.DataFrame, metric: str = "unseen_within_latent",
     ax.set_title(title, loc="left")
     ax.set_xlabel("labeled training cities $C$")
     ax.set_ylabel("misranked pairs, unseen cities (%)")
-    ax.legend(loc="upper right")
-    fig.tight_layout()
+    finish_legend(fig,ax)
     return fig
 
 

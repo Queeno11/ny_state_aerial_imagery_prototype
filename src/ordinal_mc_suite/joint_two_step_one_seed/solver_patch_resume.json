@@ -1,0 +1,31 @@
+{
+  "previous_source_sha256": "0f403b3db4188f300fe87fcd8bcf3d0ffa547115c464116af46d4fe571de57ca",
+  "current_source_sha256": "bbae88d0ba935d7ef4c70f6b2fc44f494fa38a219812d67eaf2c8431f52162e0",
+  "reused_configurations": [
+    "seed1_setting1_ranknet_links0.json",
+    "seed1_setting1_ranknet_links1.json",
+    "seed1_setting1_sigmoid_links0.json",
+    "seed1_setting1_sigmoid_links1.json",
+    "seed1_setting2_ranknet_links0.json",
+    "seed1_setting2_ranknet_links1.json",
+    "seed1_setting2_sigmoid_links0.json",
+    "seed1_setting2_sigmoid_links1.json",
+    "seed1_setting3_ranknet_links0.json",
+    "seed1_setting3_ranknet_links1.json",
+    "seed1_setting3_sigmoid_links0.json",
+    "seed1_setting3_sigmoid_links1.json",
+    "seed1_setting4_ranknet_links0.json",
+    "seed1_setting4_ranknet_links1.json",
+    "seed1_setting4_sigmoid_links0.json",
+    "seed1_setting4_sigmoid_links1.json",
+    "seed1_setting5_ranknet_links0.json",
+    "seed1_setting5_ranknet_links1.json",
+    "seed1_setting5_sigmoid_links0.json",
+    "seed1_setting5_sigmoid_links1.json",
+    "seed1_setting6_ranknet_links0.json",
+    "seed1_setting6_ranknet_links1.json",
+    "seed1_setting6_sigmoid_links0.json",
+    "seed1_setting6_sigmoid_links1.json"
+  ],
+  "reason": "Same objective/constraints; BVLS fallback only when original SLSQP fails"
+}

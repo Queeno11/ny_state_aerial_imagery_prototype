@@ -1,0 +1,86 @@
+{
+  "rep": 101,
+  "fitting_and_validation_seeds": {
+    "cities": 2454330349794379136,
+    "paired": 4623255278271598453,
+    "split": 10049588972676283076,
+    "fit_links": 17147895197996669834,
+    "validation_links": 2586107664024588646,
+    "cutoff_cities": 4345903353748067518,
+    "cutoff": 4060165014198570470,
+    "seen": 7161619817454723394,
+    "unseen_cities": 11836689668300832042,
+    "unseen": 8048824815535590895,
+    "seen_dose": 10620580988340089223,
+    "unseen_dose": 15214066110325421116
+  },
+  "weights": {
+    "A": {
+      "level": 0.024206216757598244,
+      "full": [
+        2.4206216757598242,
+        0.23284880848124456
+      ],
+      "level_change_ratio": 1.0,
+      "grid_winner": "rW10_rD10",
+      "grid_winner_score": 1.2069159522809145,
+      "level_candidate": "rW0.1_rD0",
+      "full_candidate": "rW10_rD10",
+      "l2_delta_candidate": "L2_delta_1",
+      "gradient_reference": 0.0009685869356526699,
+      "gradient_scale_w": 0.24206216757598242,
+      "gradient_scale_d": 0.023284880848124457,
+      "gradient_norms": {
+        "rank": 0.0006848987791126393,
+        "weighted_stability": 0.0006848900015966399,
+        "level": 0.00400139743170991,
+        "change": 0.04159724681308332
+      }
+    },
+    "B": {
+      "level": 0.020129411876543463,
+      "full": [
+        2.0129411876543464,
+        0.306904746781791
+      ],
+      "level_change_ratio": 0.1,
+      "grid_winner": "rW0_rD0",
+      "grid_winner_score": 1.2813306791630348,
+      "level_candidate": "rW0.1_rD0",
+      "full_candidate": "rW10_rD10",
+      "l2_delta_candidate": "L2_delta_0.1",
+      "gradient_reference": 0.0013125626728788821,
+      "gradient_scale_w": 0.20129411876543463,
+      "gradient_scale_d": 0.030690474678179102,
+      "gradient_norms": {
+        "rank": 0.0009281220569277971,
+        "weighted_stability": 0.0009281218765221895,
+        "level": 0.006520621073924142,
+        "change": 0.04276775405536862
+      }
+    },
+    "C": {
+      "level": 0.02534467929171982,
+      "full": [
+        2.534467929171982,
+        0.4288638959333151
+      ],
+      "level_change_ratio": 0.1,
+      "grid_winner": "rW10_rD10",
+      "grid_winner_score": 1.2824896478336663,
+      "level_candidate": "rW0.1_rD0",
+      "full_candidate": "rW10_rD10",
+      "l2_delta_candidate": "L2_delta_0.1",
+      "gradient_reference": 0.0017639756741467181,
+      "gradient_scale_w": 0.2534467929171982,
+      "gradient_scale_d": 0.042886389593331506,
+      "gradient_norms": {
+        "rank": 0.0012473192569129464,
+        "weighted_stability": 0.0012473190651615582,
+        "level": 0.006959944743601527,
+        "change": 0.04113136337363783
+      }
+    }
+  },
+  "evaluated_tests": false
+}

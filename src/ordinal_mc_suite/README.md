@@ -1,3 +1,145 @@
+# Correctly specified ML and matched-tract change recovery (2026-11-02)
+
+## ML appended to the existing saved experiments
+
+ML has now been calculated on the samples of the already completed experiments,
+without rerunning their estimators. The add-on retained all **3,480 existing
+suite fits** and appended **1,301 ML comparison rows** across the 11 saved run
+folders. It also appended 23 ML rows to the three saved rho runs and reused the
+120 matching ML fits for the finished additive-baseline diagnostic.
+
+Original CSVs/checkpoints are unchanged. Augmented exports are named
+`selected_fits_with_ml.csv`, `summary_with_ml.csv`, `paired_replications_with_ml.csv`,
+and `paired_summary_with_ml.csv` beside each run. The chart loader prefers these
+when available. `ml_append_manifest.json` records original-file SHA256 hashes,
+row counts, replay checks and optimizer status. Every added fit converged.
+
+Regenerated PNG/PDF charts and a download ZIP are in `deck_figures_with_ml/`.
+These use the original replication counts and the same 95% Monte Carlo bands.
+
+To reproduce the append-only workflow from this directory:
+
+```bash
+python append_ml_benchmarks.py
+python append_additive_benchmark.py
+python append_rho_benchmarks.py
+python render_saved_ml_charts.py
+```
+
+The suite replay passed 39,366 checks of original sample counts, calibrated
+noise, oracle-label errors and link diagnostics. The rho replay additionally
+checked saved reference draws, nuisance parameters and test truths; cross-build
+float32 arithmetic differences were below 7.05e-8 in latent units.
+
+Every E1–E5 design now includes `ml_correct`. The separate
+`../rho_city_monte_carlo.py` simulation also includes it. Existing saved results
+have not been altered; ML can be appended using the commands above. E5 requires
+new simulations. The older release notes
+below describe the preceding version.
+
+Quick verification and a focused change experiment, from `ordinal_mc_suite`:
+
+```bash
+python run.py --check
+python run.py --config configs/change_recovery.json --experiments 5 --plan
+python run.py --config configs/change_recovery.json --experiments 5 --out change_recovery --workers 4 --threads 1
+```
+
+`--experiments all` includes E5. Existing JSON configurations inherit its defaults.
+For a quick numerical smoke run, use `--reps 1 --epochs 20 --lbfgs-steps 10
+--audit-steps 5 --restarts 1 --models linear --truths linear` in the command above.
+Install the added SciPy dependency with `python -m pip install -r requirements.txt`.
+The updated `bash run_overnight_multicore.sh 4` runs E1, E3, E4 and E5 into fresh
+`benchmarked_*` directories. Set `OUTPUT_PREFIX` to change this prefix. It resumes
+only matching new-version checkpoints. Earlier scientific versions are refused
+on resume; use new output directories to preserve the old results.
+
+### Meaning of the ML benchmark
+
+This is full conditional observation maximum likelihood, rather than a sum of
+overlapping pairwise likelihoods. It estimates an intercept and the coefficients
+of the **correct structural basis** for each truth (linear, quadratic, smooth,
+or regime) using **fitting labels only**. The measurement transformation is
+inverted and the likelihood matches the generated Gumbel, Gaussian, Student,
+mixture, chi-square, cell-scale or feature-scale errors, including the skewed
+feature-dependent design. Parameter-independent measurement Jacobians do not
+affect the estimated coefficients and are omitted from the reported NLL.
+
+It is explicitly an **oracle-nuisance parametric benchmark**: the true structural
+basis, input mixing/rotation, measurement map, error family and noise scales
+are known. Coefficients and the intercept are estimated; true fitting/test `f`
+and stored latent noisy `r` are never fitting targets. Thus this measures the
+attainable performance under these extra assumptions, not an equally informed
+feasible competitor. It also differs from `oracle_latent`, which directly
+regresses on noiseless fitting truths. The same ML benchmark is shown within
+each requested fitted-class/loss comparison panel; the `model`/`loss` columns
+on these rows identify the comparison panel, not the ML model family.
+
+`ml_success`, `ml_message`, `ml_gradient_inf`, `ml_iterations` and
+`ml_coefficients` expose optimization diagnostics. Unsuccessful finite fits are
+retained and counted in `diagnostics.json`; no replication is silently removed.
+Mixture likelihood uses three deterministic label-based starts. Chi-square
+degrees of freedom below 2 are rejected because the moving-boundary likelihood
+is unbounded. Zero-noise designs use the noiseless least-squares limit.
+The independent rho simulation uses its correct cubic basis and centered-Gumbel
+likelihood with known measurement maps/rho, retaining its common evaluation.
+
+Ranking accuracy is now exported as `*_within_accuracy`, `*_across_time_accuracy`
+and `*_cross_city_accuracy` alongside the existing misranking errors.
+All standard suite plots include ML, and the presentation figure builders add
+it when supplied updated summaries (older summaries still work).
+
+### E5: can the estimator recover changes in the same tract?
+
+The earlier `across_time` metric compares **different** tracts at different
+dates. E5 adds independent matched before/after tracts in seen and unseen cities.
+Half are assigned stable structural features; the others receive equally likely
+positive/negative steps along the structural gradient, bounded to feature
+support. Acquisition nuisance is redrawn at each date, including the existing
+date shift. All fits receive exactly the same test panels. Neither test endpoint
+is a fitting tract or an auxiliary training view.
+
+E5 varies feature-change step length (0, .15, .4, .8) and the fraction (0, .2, .5)
+of offered stability links whose endpoints actually change. These changes use
+the same structural step mechanism. Labels, train/validation splits, and test
+panels are paired across contamination levels. It compares no links, temporal
+links, both link types, and correctly specified ML; arms/losses remain configurable.
+The supplied focused config uses 30 replications, 16 cities, 32 labeled tracts
+per city, linear/NN fits and linear/quadratic truths.
+
+Outputs in `selected_fits.csv` and `summary.csv` include:
+
+- `*_change_rmse`, `*_changed_rmse`, `*_stable_rmse`, and signed change bias.
+- `*_change_slope`: regression slope of estimated on actual changes; zero
+  indicates complete attenuation and one indicates the correct scale.
+- Direction accuracy, detection recall/precision, false-positive rate, and
+  AUROC for absolute change. Recall and direction are also split into increases
+  and decreases. A tied predicted direction receives half credit.
+- Realized change prevalence/RMS and the detection threshold.
+
+For ranking/level estimators, score differences use fitting-pair dispersion
+normalization, the suite's existing latent-unit convention. ML has identified
+physical latent units and uses them directly. No test-truth alignment is fitted.
+Consequently magnitude comparisons assume this scale convention; direction and
+AUROC do not require it. Collapsed scores remain visible in the diagnostics.
+
+The detection cutoff is the 95th percentile of absolute predicted changes on a
+**separate, independently generated stable calibration panel**, targeting 5%
+false positives. The test false-positive rate is measured, not imposed.
+By default, a realized absolute true change above .05 latent units counts as
+changed. Zero-change cases have undefined recall/AUROC; fit CSVs leave these
+empty. Summaries omit wholly undefined cells and report `missing_repetitions`
+for partially defined cells. Paired gains are oriented so
+positive means improvement for both error metrics and accuracy/recall/AUROC.
+
+Interpret results jointly: poor clean-link change recovery points toward the
+estimator/representation or optimization; deterioration with contaminated links
+points toward the stability assumption. Good simulated recovery alone cannot
+rule out empirical measurement, registration, sensor, or distribution issues.
+
+Implementation references: [SciPy Gumbel density](https://docs.scipy.org/doc/scipy/reference/generated/scipy.stats.gumbel_r.html)
+and [likelihood optimization](https://docs.scipy.org/doc/scipy/reference/generated/scipy.optimize.minimize.html).
+
 # Zero-dispersion recovery fix
 
 The optimizer may produce a constant ReLU score (V=0), particularly with strong

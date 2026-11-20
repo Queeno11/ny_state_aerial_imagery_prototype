@@ -1,0 +1,36 @@
+{
+  "source": "/mnt/c/Working Papers/NY State Aerial Imagery Prototype/ny_state_aerial_imagery_prototype/src/ordinal_mc_suite/e6_observed_change_diagnostic",
+  "source_hashes_unchanged": {
+    "/mnt/c/Working Papers/NY State Aerial Imagery Prototype/ny_state_aerial_imagery_prototype/src/ordinal_mc_suite/e6_observed_change_diagnostic/checkpoints.pt": "5025d59a150405d7748457b868e4d68b6a1ee75e2c6bcc59ad51d14c1b49b7e9",
+    "/mnt/c/Working Papers/NY State Aerial Imagery Prototype/ny_state_aerial_imagery_prototype/src/ordinal_mc_suite/e6_observed_change_diagnostic/config.json": "16c51886c2784da9b74f34113f50af3b97b4ec06809bae848d899710a3e48447",
+    "/mnt/c/Working Papers/NY State Aerial Imagery Prototype/ny_state_aerial_imagery_prototype/src/ordinal_mc_suite/e6_main_512/manifest.json": "157bd184b0576643975e24299c6b6980c1d8b6227e41a1ab4982e84e31484389"
+  },
+  "denominators": {
+    "W": 30.124436698937078,
+    "delta_W": 16.201447520252533
+  },
+  "head_preparation": {
+    "updates": 1000,
+    "best_step": 10,
+    "validation": 1.1071785398283371,
+    "stop_reason": "budget"
+  },
+  "reference_constraints": {
+    "rank_A": 0.420883854316329,
+    "stability_A": 0.0019176771077221595,
+    "rank_bound": 0.420983854316329,
+    "stability_bound": 0.0019368538787993812
+  },
+  "exact_data_reproduced": true,
+  "F_A_exact_scorer_and_metric_equality": true,
+  "Q_accepted": 22,
+  "Q_rejected": 178,
+  "Q_backtracking_evaluations": 2281,
+  "nominal_scorer_attempts_per_joint_arm": 200,
+  "head_updates_per_branch": 200,
+  "oracle_used_for_training_or_selection": false,
+  "oracle_computed_after_training": true,
+  "optimizer": "Separate Adam scorer/head. Q projects nominal Adam displacement onto linear halfspaces; fallback projected steepest descent if not descending. Actual nonlinear constraint plus cardinal Armijo checks, max 12 evaluations. Rejected proposals roll back parameters AND Adam moments/counter; accepted backtracked proposals retain nominal-gradient Adam moments. Head state advances once per attempt independently.",
+  "integration": "Adaptive deterministic quad_vec over standard Gumbel z in [-12,45], eps 1e-9 and 1e-11; analytic centered error mean and variance; omitted right tail probability < 2.87e-20. No simulation integration.",
+  "labels": "Same independent date-specific centered Gumbel errors and exact original paired data; no extra seeds or searches"
+}

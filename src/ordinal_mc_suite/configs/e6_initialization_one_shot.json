@@ -1,0 +1,23 @@
+{
+  "replication": 1,
+  "cities": 32,
+  "paths": ["ordinal_scratch", "joint_scratch", "extended_warm"],
+  "workers": 3,
+  "threads_per_worker": 1,
+  "updates_per_path": 3000,
+  "scorer_lr": 0.001,
+  "head_lr": 0.001,
+  "lambda_stability": 0.3,
+  "lambda_W": 1.0,
+  "lambda_delta": 1.0,
+  "head_penalty": 0.0,
+  "validation_every": 10,
+  "validation_patience_checks": 20,
+  "validation_min_delta": 0.00001,
+  "trajectory_every": 100,
+  "extra_checkpoints": [0, 25, 50, 200],
+  "validation_joint_weights": {"rank": 1.0, "level": 1.0, "change": 1.0},
+  "fixed_budget_policy": "Freeze the validation-stopped selected checkpoint once patience is reached; continue only for the predeclared fixed-budget trajectory and endpoint. No later checkpoint replaces that selection.",
+  "ordinal_heads": "Same initial head as joint scratch; concurrent level-plus-change updates on detached scores, without feedback into ordinal scorer.",
+  "warm_initialization": "Original paired diagnostic A_0 scorer and calibrated level head; fresh Adam state. No Q checkpoint or oracle-selected state."
+}

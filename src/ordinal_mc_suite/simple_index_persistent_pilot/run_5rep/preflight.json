@@ -1,0 +1,134 @@
+{
+  "noise": {
+    "component_seeds": {
+      "persistent": 926753625739965765,
+      "replacement": 2510791833618535321,
+      "u0": 1347841014907580315,
+      "u1": 15481068423726230049,
+      "features": 17152110988334153033
+    },
+    "independent_diagnostic_pairs": 500000,
+    "normalized_sigma": 1.0,
+    "analytic_stable": {
+      "endpoint_variance": 1.0,
+      "covariance": 0.5,
+      "correlation": 0.5,
+      "delta_variance": 1.0
+    },
+    "analytic_changed": {
+      "endpoint_variance": 1.0,
+      "covariance": 0.0,
+      "correlation": 0.0,
+      "delta_variance": 2.0
+    },
+    "empirical": {
+      "stable": {
+        "var0": 0.9989901808561317,
+        "var1": 1.0028034303881574,
+        "covariance": 0.5014056051757505,
+        "correlation": 0.5009572536236344,
+        "delta_variance": 0.9989824008927872,
+        "correlation_with_feature": 0.0006820947860710054
+      },
+      "changed": {
+        "var0": 0.9989901808561317,
+        "var1": 1.0026719175864895,
+        "covariance": 0.0009684706705547023,
+        "correlation": 0.0009676681289646603,
+        "delta_variance": 1.9997251571015129,
+        "correlation_with_feature": 0.0025558884028535744
+      }
+    }
+  },
+  "conditional_likelihood": {
+    "A": {
+      "directional_error": 1.835655377702139e-10,
+      "zero_correlation_matches_independent": true,
+      "variance_profile": "mean residual transpose R_inverse residual over city endpoints"
+    },
+    "B": {
+      "directional_error": 2.1317766996098442e-10,
+      "zero_correlation_matches_independent": true,
+      "variance_profile": "mean residual transpose R_inverse residual over city endpoints"
+    },
+    "C": {
+      "directional_error": 1.458542314702882e-10,
+      "zero_correlation_matches_independent": true,
+      "variance_profile": "mean residual transpose R_inverse residual over city endpoints"
+    }
+  },
+  "panels": {
+    "fit": {
+      "stable_v_exact": true,
+      "residual_delta_matches_components": true,
+      "stable_delta_has_only_transitory_noise": true,
+      "changed_fraction": 0.505
+    },
+    "validation": {
+      "stable_v_exact": true,
+      "residual_delta_matches_components": true,
+      "stable_delta_has_only_transitory_noise": true,
+      "changed_fraction": 0.48
+    },
+    "heldout_seen_calibration": {
+      "stable_v_exact": true,
+      "residual_delta_matches_components": true,
+      "stable_delta_has_only_transitory_noise": true,
+      "changed_fraction": 0.46964285714285714
+    },
+    "heldout_seen_evaluation": {
+      "stable_v_exact": true,
+      "residual_delta_matches_components": true,
+      "stable_delta_has_only_transitory_noise": true,
+      "changed_fraction": 0.5033730158730159
+    },
+    "heldout_seen_dose_0": {
+      "stable_v_exact": true,
+      "residual_delta_matches_components": true,
+      "stable_delta_has_only_transitory_noise": true,
+      "changed_fraction": 0.0
+    },
+    "heldout_seen_dose_-0.15": {
+      "stable_v_exact": true,
+      "residual_delta_matches_components": true,
+      "stable_delta_has_only_transitory_noise": true,
+      "changed_fraction": 1.0
+    },
+    "heldout_seen_dose_0.15": {
+      "stable_v_exact": true,
+      "residual_delta_matches_components": true,
+      "stable_delta_has_only_transitory_noise": true,
+      "changed_fraction": 1.0
+    },
+    "heldout_unseen_calibration": {
+      "stable_v_exact": true,
+      "residual_delta_matches_components": true,
+      "stable_delta_has_only_transitory_noise": true,
+      "changed_fraction": 0.5053571428571428
+    },
+    "heldout_unseen_evaluation": {
+      "stable_v_exact": true,
+      "residual_delta_matches_components": true,
+      "stable_delta_has_only_transitory_noise": true,
+      "changed_fraction": 0.4994047619047619
+    },
+    "heldout_unseen_dose_0": {
+      "stable_v_exact": true,
+      "residual_delta_matches_components": true,
+      "stable_delta_has_only_transitory_noise": true,
+      "changed_fraction": 0.0
+    },
+    "heldout_unseen_dose_-0.15": {
+      "stable_v_exact": true,
+      "residual_delta_matches_components": true,
+      "stable_delta_has_only_transitory_noise": true,
+      "changed_fraction": 1.0
+    },
+    "heldout_unseen_dose_0.15": {
+      "stable_v_exact": true,
+      "residual_delta_matches_components": true,
+      "stable_delta_has_only_transitory_noise": true,
+      "changed_fraction": 1.0
+    }
+  }
+}

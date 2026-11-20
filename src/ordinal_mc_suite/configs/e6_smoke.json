@@ -1,0 +1,10 @@
+{
+  "replications": 1,
+  "cities": [8],
+  "cases": [["linear", "linear"], ["quadratic", "nn"]],
+  "maps": ["affine", "nonlinear"],
+  "heads": ["affine", "spline"],
+  "level_weights": [0.1, 1.0, 10.0],
+  "workers": 2,
+  "threads": 1
+}

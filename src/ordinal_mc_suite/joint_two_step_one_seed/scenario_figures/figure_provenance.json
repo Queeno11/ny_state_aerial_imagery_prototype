@@ -1,0 +1,49 @@
+{
+  "input_metrics": "C:\\Working Papers\\NY State Aerial Imagery Prototype\\ny_state_aerial_imagery_prototype\\src\\ordinal_mc_suite\\joint_two_step_one_seed\\metrics.csv",
+  "input_sha256": "aae791e87df419e241b8031b0f03f67dd6cdc75451ab7b12bfd292d4766728cd",
+  "seed_ids": [
+    "1"
+  ],
+  "metrics": [
+    "f_mse",
+    "mu_mse",
+    "delta_f_mse",
+    "delta_mu_mse"
+  ],
+  "scenarios": {
+    "M1": [
+      1,
+      4
+    ],
+    "M2": [
+      2,
+      5
+    ],
+    "M3": [
+      3,
+      6,
+      7,
+      8
+    ]
+  },
+  "plotted_records": 832,
+  "means": "Within setting/ranking/link/method over seed IDs; current data have one seed",
+  "axis_limits": {
+    "f_mse": [
+      0.0002831889024216417,
+      1.2004648777316598
+    ],
+    "mu_mse": [
+      0.005434560648559066,
+      2.629128136799747
+    ],
+    "delta_f_mse": [
+      2.7558344548871596e-06,
+      0.04627424251187079
+    ],
+    "delta_mu_mse": [
+      0.0011181557410148998,
+      1.8155540813923692
+    ]
+  }
+}

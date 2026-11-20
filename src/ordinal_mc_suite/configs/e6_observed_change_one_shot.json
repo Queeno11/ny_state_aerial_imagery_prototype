@@ -1,0 +1,18 @@
+{
+  "job": "r001_c32_quadratic_nn",
+  "fit_tracts_per_city": 205,
+  "validation_tracts_per_city": 51,
+  "changed_share": 0.5,
+  "training_change_step": 0.4,
+  "baseline_max_adam": 1000,
+  "baseline_restarts": 1,
+  "baseline_lbfgs": 0,
+  "head_initialization_max_updates": 600,
+  "additional_updates": 200,
+  "scorer_lr": 0.0001,
+  "head_lr": 0.001,
+  "lambda_W": 1.0,
+  "lambda_delta": 1.0,
+  "head_penalty": 0.0,
+  "checkpoints": [0, 25, 50, 100, 200]
+}

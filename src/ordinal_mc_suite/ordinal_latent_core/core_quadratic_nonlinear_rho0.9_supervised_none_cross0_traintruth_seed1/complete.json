@@ -1,0 +1,11 @@
+{
+  "last_checkpoint": 4800,
+  "metric_files": [
+    "metrics_00000400.csv",
+    "metrics_00000600.csv",
+    "metrics_00001200.csv",
+    "metrics_00002400.csv",
+    "metrics_00004800.csv"
+  ],
+  "status": "complete"
+}

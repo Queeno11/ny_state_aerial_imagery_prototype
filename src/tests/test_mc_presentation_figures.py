@@ -167,3 +167,18 @@ def test_build_all_writes_every_figure(tmp_path):
     written = pf.build_all(tmp_path / "out", runs)
     assert len(written) == 10
     assert all(p.exists() and p.stat().st_size > 0 for p in written)
+
+
+def test_load_csv_prefers_ml_append_without_changing_original(tmp_path):
+    pd.DataFrame({'method':['none'],'mean':[.1]}).to_csv(tmp_path/'summary.csv',index=False)
+    original=(tmp_path/'summary.csv').read_bytes()
+    pd.DataFrame({'method':['none','ml_correct'],'mean':[.1,.02]}).to_csv(tmp_path/'summary_with_ml.csv',index=False)
+    assert list(pf.load_csv(tmp_path,'summary.csv').method)==['none','ml_correct']
+    assert (tmp_path/'summary.csv').read_bytes()==original
+
+
+def test_links_show_appended_ml_curve():
+    summary=_e3_summary(('linear',))
+    ml=summary[summary.method=='none'].copy(); ml['method']='ml_correct'
+    fig=pf.fig_links([(pd.concat([summary,ml]),{},'ML comparison')])
+    assert len(fig.axes[0].get_lines())==3

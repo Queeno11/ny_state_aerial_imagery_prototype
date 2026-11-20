@@ -1,0 +1,11 @@
+{
+  "one_replication": true,
+  "three_200_update_scorer_branches": true,
+  "four_200_update_head_branches": true,
+  "all_checkpoint_metrics_present": true,
+  "AB_exact_scorer_metric_equivalence": true,
+  "positive_monotone_heads": true,
+  "finite_latent_metrics": true,
+  "unseen_cell_head_unavailable": true,
+  "source_manifest_unchanged": true
+}

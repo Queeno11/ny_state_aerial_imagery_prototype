@@ -1,0 +1,61 @@
+{
+  "seeds": {
+    "cities": 9296284767202369756,
+    "paired": 15812583204794026873,
+    "split": 17984384595316215347,
+    "fit_links": 10155621602146831710,
+    "validation_links": 5007836134658465668,
+    "cutoff_cities": 16839786236798469611,
+    "cutoff": 6833064843269356264,
+    "seen": 14818541226448696152,
+    "unseen_cities": 14657321846985737067,
+    "unseen": 2456214241722922604,
+    "seen_dose": 736149788016131719,
+    "unseen_dose": 2787470808515005906
+  },
+  "fit_noise_seeds": {
+    "transitory": 12490574733248685974,
+    "persistent": 4059178450995257687,
+    "replacement": 5106249006246601997
+  },
+  "calibration_panels": {
+    "seen": {
+      "panel_seed": 4590843160863949803,
+      "split_seed": 12870407037440699339,
+      "noise_seeds": {
+        "transitory": 18206520836504474788,
+        "persistent": 3719136176571029091,
+        "replacement": 9517698292599989686
+      },
+      "city_effect_seed": null,
+      "calibration_ids_sha256": "d941026e5e78bcc8f171a7f5e1de3daec850e7e7c7b7e38ea97d18e7263a383b",
+      "evaluation_ids_sha256": "3d13dea8a9a92c31ddd48e4b4acb5ea122faad838c17e23574c92e7cd44101ff",
+      "calibration_features_sha256": "4746c541a8289925008e16b9a1181fb9bfbd19e097d3f47fdd6515971c31362d",
+      "evaluation_features_sha256": "57850b55359f9be6e5e43dda776a8b9b78800f82c3ddcb1dae551a3bcd5713b6",
+      "calibration_tracts_per_city": 28,
+      "evaluation_tracts_per_city": 252,
+      "city_count": 20,
+      "calibration_dates_per_tract": 2
+    },
+    "unseen": {
+      "panel_seed": 14324525994746808544,
+      "split_seed": 2800115344338561884,
+      "noise_seeds": {
+        "transitory": 6203520873747994021,
+        "persistent": 12841485411362788688,
+        "replacement": 5918302435142617073
+      },
+      "city_effect_seed": 17358833881672352252,
+      "calibration_ids_sha256": "b1a06a998a450876b55dba00f59f151ce26a142fcf58a3605141a8a1ac33afcd",
+      "evaluation_ids_sha256": "bab401ddb8e19347586de133c320558c3d57689deff00836002778329a5bd582",
+      "calibration_features_sha256": "3e13cf4173ab5847c5e3b3214679c56776aae2a94c3dc56efa6073d999732bef",
+      "evaluation_features_sha256": "c1a501813c5476fe84e85a0dbb87d3105cc8aa957bdf341f4176f3be6cdf3b08",
+      "calibration_tracts_per_city": 28,
+      "evaluation_tracts_per_city": 252,
+      "city_count": 20,
+      "calibration_dates_per_tract": 2
+    }
+  },
+  "fit_features_sha256": "70dc8faf49dd7b80a40397704fce5cb5942cdb6a0832502542d1b1851bbd7a09",
+  "validation_features_sha256": "ba9074aa2ca656355869ef01acdd6711a1f5a725e1b6e546ad6731ff3d166612"
+}

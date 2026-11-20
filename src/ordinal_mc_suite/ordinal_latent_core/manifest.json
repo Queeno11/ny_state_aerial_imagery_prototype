@@ -1,0 +1,48 @@
+{
+  "config": {
+    "batch_cities": 16,
+    "batch_tracts": 12,
+    "checkpoints": [
+      400,
+      600,
+      1200,
+      2400,
+      4800
+    ],
+    "cities": 64,
+    "device": "cuda",
+    "eval_n": 64,
+    "initialization_seed": 271828,
+    "lambda_c": 0.3,
+    "lambda_t": 0.3,
+    "link_fraction": 0.2,
+    "link_limit": null,
+    "links": "both",
+    "lr": 0.001,
+    "methods": [
+      "nn",
+      "basis",
+      "supervised"
+    ],
+    "n": 250,
+    "output": "ordinal_mc_suite/ordinal_latent_core",
+    "rank": "ranknet",
+    "scaling_arm": "wide",
+    "seed": 271828,
+    "seeds": 3,
+    "sigma": 0.8,
+    "smoke": false,
+    "source_test_cities": 8,
+    "stage": "core",
+    "target_cities": 8,
+    "tau": 0.3,
+    "validation_cities": 8,
+    "width": [
+      32,
+      16
+    ]
+  },
+  "device": "cuda",
+  "pilot_sha256": "bbae88d0ba935d7ef4c70f6b2fc44f494fa38a219812d67eaf2c8431f52162e0",
+  "source_sha256": "e4ee76670c604964a0a44aa4cfa3d5363c03dd676ba39048e6272d6327e2efd3"
+}

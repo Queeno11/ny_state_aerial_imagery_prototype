@@ -1,0 +1,51 @@
+{
+  "passed": true,
+  "scorer_fits": 280,
+  "maximum_scorer_fits": 280,
+  "tuning_fits": 39,
+  "replications": [
+    1,
+    2,
+    3,
+    4,
+    5
+  ],
+  "same_structural_inputs_city_parameters_changes_and_splits": true,
+  "same_calibration_test_feature_hashes": true,
+  "original_model_files_unchanged": true,
+  "conditional_head_objectives_mask_checked": true,
+  "shared_calibration_labels": true,
+  "calibration_head_sets": 560,
+  "score_freeze_checks": 560,
+  "max_calibration_gradient": 2.5884056802689363e-14,
+  "max_mask_finite_difference_error": 3.4582394586868404e-10,
+  "independently_namespaced_noise_seeds": 45,
+  "aliases": {
+    "1": {
+      "A": {},
+      "B": {},
+      "C": {}
+    },
+    "2": {
+      "A": {},
+      "B": {},
+      "C": {}
+    },
+    "3": {
+      "A": {},
+      "B": {},
+      "C": {}
+    },
+    "4": {
+      "A": {},
+      "B": {},
+      "C": {}
+    },
+    "5": {
+      "A": {},
+      "B": {},
+      "C": {}
+    }
+  },
+  "elapsed_seconds": 143.1286307000555
+}

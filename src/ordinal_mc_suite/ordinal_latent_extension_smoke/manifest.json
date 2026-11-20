@@ -1,0 +1,64 @@
+{
+  "baseline_manifest": {
+    "config": {
+      "batch_cities": 2,
+      "batch_tracts": 4,
+      "checkpoints": [
+        1,
+        2
+      ],
+      "cities": 4,
+      "device": "cuda",
+      "eval_n": 16,
+      "initialization_seed": 271828,
+      "lambda_c": 0.3,
+      "lambda_t": 0.3,
+      "link_fraction": 0.2,
+      "link_limit": 8,
+      "links": "both",
+      "lr": 0.001,
+      "methods": [
+        "nn",
+        "basis",
+        "supervised"
+      ],
+      "n": 16,
+      "output": "ordinal_mc_suite/ordinal_latent_smoke",
+      "rank": "ranknet",
+      "scaling_arm": "wide",
+      "seed": 271828,
+      "seeds": 1,
+      "sigma": 0.8,
+      "smoke": true,
+      "source_test_cities": 2,
+      "stage": "core",
+      "target_cities": 2,
+      "tau": 0.3,
+      "validation_cities": 2,
+      "width": [
+        32,
+        16
+      ]
+    },
+    "device": "cuda",
+    "pilot_sha256": "bbae88d0ba935d7ef4c70f6b2fc44f494fa38a219812d67eaf2c8431f52162e0",
+    "source_sha256": "e4ee76670c604964a0a44aa4cfa3d5363c03dd676ba39048e6272d6327e2efd3"
+  },
+  "baseline_manifest_sha256": "a03b8aa2b28e9122a741e32de21f3b4bba923f726eac9a01495bb7c57d92e24e",
+  "baseline_path": "/mnt/c/Working Papers/NY State Aerial Imagery Prototype/ny_state_aerial_imagery_prototype/src/ordinal_mc_suite/ordinal_latent_smoke",
+  "continuation_targets": [
+    3,
+    4
+  ],
+  "cross": [
+    1
+  ],
+  "device": "cuda",
+  "extension_source_sha256": "148c2fd773d2cadb19a7d960035b0bf927a46d9262afd0cd8e0f0a2e820ce6ce",
+  "methods": [
+    "nn"
+  ],
+  "ml_iterations": 20,
+  "ml_starts": 2,
+  "smoke": true
+}

@@ -1,0 +1,55 @@
+{
+  "denominators": {
+    "W": 30.124436698937078,
+    "delta_W": 16.201447520252533
+  },
+  "fit_seed": 1422665402,
+  "validation_seed": 1157853548,
+  "fit": {
+    "n_tracts": 6560,
+    "n_assigned_stable": 3296,
+    "error_cross_date_correlation": -0.005522148295588645
+  },
+  "validation": {
+    "n_tracts": 1632,
+    "n_assigned_stable": 800,
+    "error_cross_date_correlation": 0.044433160639842276
+  },
+  "fit_endpoints": 13120,
+  "validation_endpoints": 3264,
+  "stable_auxiliary_links": 26240,
+  "noise_sd_effective": 0.8028980597616118,
+  "errors": "Independent centered Gumbel draws across dates, same E6 scaling; no persistence",
+  "baseline": {
+    "updates": 520,
+    "best_step": 320,
+    "validation": 0.42011134459259564,
+    "stop_reason": "validation_patience",
+    "best_location": [
+      "adam",
+      320
+    ],
+    "lbfgs_steps": 0,
+    "lbfgs_closures": 0
+  },
+  "head_initialization": {
+    "updates": 600,
+    "best_step": 600,
+    "validation": 0.24682904389498922,
+    "stop_reason": "budget"
+  },
+  "source_manifest_unchanged": true,
+  "scorer_AB_equivalence_verified": true,
+  "split_disjoint": true,
+  "exact_auxiliary_links_verified": true,
+  "head_monotonicity_verified": true,
+  "gradient_sum_verified": true,
+  "additional_scorer_updates": 600,
+  "additional_head_updates_per_branch": 200,
+  "O_heads": "Levels on detached scores; no feedback into the ordinal scorer",
+  "head_penalty": 0.0,
+  "test_or_stability_indicator_used_for_selection": false,
+  "unseen_outcomes": "Unavailable: cell-specific heads have no zero-shot unseen-city calibration",
+  "slope_correlation": "Changing tracts only; slope includes an intercept",
+  "auxiliary_interpretation": "Same-H counterfactual acquisition views, not the actual other-date endpoint of a changing tract"
+}

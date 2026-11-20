@@ -1,0 +1,91 @@
+{
+  "rep": 101,
+  "seeds": {
+    "cities": 2454330349794379136,
+    "paired": 4623255278271598453,
+    "split": 10049588972676283076,
+    "fit_links": 17147895197996669834,
+    "validation_links": 2586107664024588646,
+    "cutoff_cities": 4345903353748067518,
+    "cutoff": 4060165014198570470,
+    "seen": 7161619817454723394,
+    "unseen_cities": 11836689668300832042,
+    "unseen": 8048824815535590895,
+    "seen_dose": 10620580988340089223,
+    "unseen_dose": 15214066110325421116
+  },
+  "noise_seeds": {
+    "transitory": 15778146109573371919,
+    "persistent": 7877526071758178899,
+    "replacement": 504999146725808976
+  },
+  "weights": {
+    "A": {
+      "level": 0.03049054076748103,
+      "full": [
+        3.049054076748103,
+        1.0332961012498798
+      ],
+      "level_change_ratio": 0.1,
+      "grid_winner": "rW0.1_rD0",
+      "grid_winner_score": 1.0527461663949274,
+      "level_candidate": "rW0.1_rD0",
+      "full_candidate": "rW10_rD10",
+      "l2_delta_candidate": "L2_delta_0.1",
+      "gradient_reference": 0.002057146929597608,
+      "gradient_scale_w": 0.3049054076748103,
+      "gradient_scale_d": 0.10332961012498798,
+      "gradient_norms": {
+        "rank": 0.0014546230270065183,
+        "weighted_stability": 0.0014546220606244287,
+        "level": 0.006746836487044564,
+        "change": 0.019908590839637093
+      }
+    },
+    "B": {
+      "level": 0.04058724543641553,
+      "full": [
+        0.40587245436415526,
+        0.008783122793117402
+      ],
+      "level_change_ratio": 0.1,
+      "grid_winner": "rW0_rD0",
+      "grid_winner_score": 1.1284061736652544,
+      "level_candidate": "rW0.1_rD0",
+      "full_candidate": "rW1_rD0.1",
+      "l2_delta_candidate": "L2_delta_0.1",
+      "gradient_reference": 0.0022701667403858287,
+      "gradient_scale_w": 0.40587245436415526,
+      "gradient_scale_d": 0.08783122793117402,
+      "gradient_norms": {
+        "rank": 0.0016052502526889112,
+        "weighted_stability": 0.001605250340413048,
+        "level": 0.005593300841128279,
+        "change": 0.025846920211166444
+      }
+    },
+    "C": {
+      "level": 3.1714917690680795,
+      "full": [
+        0.31714917690680794,
+        0.00595011506951599
+      ],
+      "level_change_ratio": 0.1,
+      "grid_winner": "rW10_rD0",
+      "grid_winner_score": 1.1207790250798109,
+      "level_candidate": "rW10_rD0",
+      "full_candidate": "rW1_rD0.1",
+      "l2_delta_candidate": "L2_delta_0.1",
+      "gradient_reference": 0.002354187078474516,
+      "gradient_scale_w": 0.31714917690680794,
+      "gradient_scale_d": 0.0595011506951599,
+      "gradient_norms": {
+        "rank": 0.0016646618622411442,
+        "weighted_stability": 0.0016646614325009825,
+        "level": 0.007422964490827852,
+        "change": 0.03956540421437626
+      }
+    }
+  },
+  "tests_used_for_selection": false
+}

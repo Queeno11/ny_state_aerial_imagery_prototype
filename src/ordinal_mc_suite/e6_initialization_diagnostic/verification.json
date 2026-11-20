@@ -1,0 +1,9 @@
+{
+  "identical_scratch_scorer_and_head_initializations": true,
+  "warm_initial_checkpoint_eligible": true,
+  "test_and_oracle_evaluated_only_after_training": true,
+  "fixed_scorer_updates_per_path": 3000,
+  "total_new_scorer_updates": 9000,
+  "original_checkpoints_unchanged": true,
+  "selected_checkpoints_checked_against_logged_validation": true
+}

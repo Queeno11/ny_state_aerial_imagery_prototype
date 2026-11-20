@@ -1,0 +1,37 @@
+{
+  "role": "fit and observed validation only",
+  "rep": 101,
+  "fit_seed": 1591031282,
+  "split_seed": 1810514109,
+  "context_seed": 1957380114,
+  "fit_aux_seed": 2506020537,
+  "val_aux_seed": 3697073763,
+  "scorer_seed": 1199458400,
+  "train_ids_sha256": "ffee75206a0218b6be10380ec400ab600f152524e7405b39f2e7900e1243c7e3",
+  "validation_ids_sha256": "9caa6a9c3ae5e2ae845bf9c54c5bc8d1c1bf73e972dbf1e0e3b595ed19410a1f",
+  "anchor_update": 875,
+  "anchor_hash": "28de5b26e22beac5bdf0c34443bf422c494a689a7992b36216cd905a26f1031b",
+  "fit_tracts": 6560,
+  "validation_tracts": 1632,
+  "denoms": {
+    "W": 17.148015087837138,
+    "delta_W": 9.685957231801027
+  },
+  "gradient_norms": {
+    "rank": 0.014176971279084682,
+    "weighted_stability": 0.012405426241457462,
+    "ref": 0.018838288533734517,
+    "ordinal_net": 0.0043983859941363335,
+    "level": 0.0557532012462616,
+    "change": 0.18737369775772095,
+    "rep": 101,
+    "ratio_W": 0.33788711881360667,
+    "ratio_D": 0.10053859618062783
+  },
+  "head_fit": {
+    "iterations": 447,
+    "projected_gradient": 1.6283046477827412e-07,
+    "solver_status": "CONVERGENCE: RELATIVE REDUCTION OF F <= FACTR*EPSMCH",
+    "objective": 1.050500598097231
+  }
+}

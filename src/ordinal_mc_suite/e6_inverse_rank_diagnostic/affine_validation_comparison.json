@@ -1,0 +1,46 @@
+{
+  "intercept": -1.50240549613399,
+  "slope": 0.6083173082910001,
+  "fit_variance_R": 1.6440113661416984,
+  "n_fit": 13120,
+  "n_validation": 3264,
+  "positive_slope_constraint_satisfied": true,
+  "coefficients_fitted_on": "fitting observations only",
+  "network_updates": 0,
+  "metrics": {
+    "train": {
+      "frozen_uncalibrated": {
+        "raw_mse": 7.10702387818642,
+        "standardized_mse": 4.32297733735611
+      },
+      "frozen_affine": {
+        "raw_mse": 0.6845565224473972,
+        "standardized_mse": 0.4163940326361435
+      },
+      "joint_inverse": {
+        "raw_mse": 0.699482057567384,
+        "standardized_mse": 0.42547276252048444
+      }
+    },
+    "val": {
+      "frozen_uncalibrated": {
+        "raw_mse": 7.061616419617948,
+        "standardized_mse": 4.295357419693961
+      },
+      "frozen_affine": {
+        "raw_mse": 0.6914514475661869,
+        "standardized_mse": 0.42058799702154265
+      },
+      "joint_inverse": {
+        "raw_mse": 0.7063188478362471,
+        "standardized_mse": 0.4296313653195078
+      }
+    }
+  },
+  "validation_rank_frozen": 0.4264393254326486,
+  "validation_rank_joint": 0.45365192338520877,
+  "common_validation_rule_frozen_affine": 0.8470273224541913,
+  "common_validation_rule_joint": 0.8832832887047166,
+  "maximum_normalized_change_difference": 8.326672684688674e-16,
+  "source_checkpoint_unchanged": true
+}

@@ -19,7 +19,10 @@ DEFAULT={
    ['gumbel',0.],['student',3.],['cell_scale',.7],['feature_scale',.7],['median_violation',.7]]},
  'experiment3':{'losses':LOSSES,'arms':['none','temporal','cross_city','both'],'nuisance_cases':[[1.,1.],[0.,1.],[1.,0.]]},
  'experiment4':{'losses':LOSSES,'arms':['temporal','cross_city','both'],'cases':[
-   ['exact',0.],['drift',.15],['random_false',.2],['systematic_false',.2]]}
+   ['exact',0.],['drift',.15],['random_false',.2],['systematic_false',.2]]},
+ 'experiment5':{'losses':LOSSES,'arms':['none','temporal','both'],
+   'change_strength_grid':[0.,.15,.4,.8],'contamination_grid':[0.,.2,.5],
+   'changed_share':.5,'false_positive_target':.05,'truth_threshold':.05}
 }
 
 def preset(name):
@@ -76,18 +79,18 @@ def validate(d):
     if 0 not in d['lambda_grid']: raise ValueError('Tuned lambda_grid must include zero')
     if d['dtype'] not in ('float32','float64') or d['device'] not in ('cpu','cuda'): raise ValueError('Invalid dtype/device')
     if d['device']=='cuda' and d['workers']!=1: raise ValueError('Multiple workers require --device cpu; use --workers 1 for CUDA')
-    for exp in (1,2,3,4):
+    for exp in (1,2,3,4,5):
         e=d[f'experiment{exp}']
         if not e['losses'] or not set(e['losses'])<=set(LOSSES): raise ValueError('Invalid losses')
         for key,value in e.items():
-            if not value or len({json.dumps(x,sort_keys=True) for x in value})!=len(value): raise ValueError(f'Empty or duplicate experiment{exp}.{key}')
+            if isinstance(value,list) and (not value or len({json.dumps(x,sort_keys=True) for x in value})!=len(value)): raise ValueError(f'Empty or duplicate experiment{exp}.{key}')
     e=d['experiment1']
     if not set(e['methods'])<=set(DEFAULT['experiment1']['methods']) or 'rank_common' not in e['methods']: raise ValueError('Retain rank_common reference')
     if 'common_logit' not in e['losses']: raise ValueError('Exp1 requires common_logit reference')
     if not set(e['psi_shapes'])<={'tanh','asinh'} or min(e['composition_grid'])<0: raise ValueError('Invalid exp1 transform/composition')
     for family,v in e['cases']:
         if family not in ('common','multiplier','location_scale','shape','additive') or v<0 or (family=='common' and v!=0): raise ValueError('Invalid transform case')
-    for exp in (2,3,4):
+    for exp in (2,3,4,5):
         if not set(d[f'experiment{exp}']['arms'])<={'none','temporal','cross_city','both'}: raise ValueError('Invalid arm')
     if 'none' not in d['experiment3']['arms'] or 'none' in d['experiment4']['arms']: raise ValueError('Invalid baseline arms')
     for a,c in d['experiment3']['nuisance_cases']:
@@ -96,11 +99,17 @@ def validate(d):
         if family not in ('gumbel','normal','student','chi2','mixture','cell_scale','feature_scale','median_violation') or v<0 or (family=='student' and v<=2) or (family=='chi2' and v<=0): raise ValueError('Invalid error case')
     for family,v in d['experiment4']['cases']:
         if family not in ('exact','drift','random_false','systematic_false') or v<0 or ('false' in family and v>1) or (family=='exact' and v!=0): raise ValueError('Invalid link case')
+    e=d['experiment5']
+    if 'none' not in e['arms']: raise ValueError('Exp5 requires an unlinked baseline')
+    if min(e['change_strength_grid'])<0: raise ValueError('Change strengths must be nonnegative')
+    if min(e['contamination_grid'])<0 or max(e['contamination_grid'])>1: raise ValueError('Contamination must be between zero and one')
+    if not 0<e['changed_share']<1 or not 0<e['false_positive_target']<1 or e['truth_threshold']<0: raise ValueError('Invalid change calibration settings')
+    if any(f=='chi2' and v<2 for f,v in d['experiment2']['cases']): raise ValueError('chi2 ML requires df>=2 (otherwise likelihood is unbounded)')
 
 def parse_args():
     p=argparse.ArgumentParser(description='Manuscript-aligned Monte Carlo suite. --plan reports cost; --check audits formulas.')
     p.add_argument('--preset',choices=['smoke','pilot','main'],default='smoke'); p.add_argument('--config',type=Path)
-    p.add_argument('--experiments',nargs='+',default=['all'],choices=['all','1','2','3','4']); p.add_argument('--out',type=Path,default=Path('results'))
+    p.add_argument('--experiments',nargs='+',default=['all'],choices=['all','1','2','3','4','5']); p.add_argument('--out',type=Path,default=Path('results'))
     for k in ('resume','plan','check'): p.add_argument('--'+k,action='store_true')
     for k in ('models','truths','n','city_grid','ridge_grid','lambda_grid','hidden'):
         p.add_argument('--'+k.replace('_','-'),nargs='+',type=int if k in ('n','city_grid','hidden') else float if 'grid' in k else str)
@@ -114,8 +123,8 @@ def parse_args():
         if hasattr(args,k) and getattr(args,k) is not None: d[k]=getattr(args,k)
     if args.cities is not None: d['city_grid']=[args.cities]
     if args.losses:
-        for e in (1,2,3,4): d[f'experiment{e}']['losses']=args.losses
-    validate(d); experiments=[1,2,3,4] if 'all' in args.experiments else sorted(set(map(int,args.experiments)))
+        for e in (1,2,3,4,5): d[f'experiment{e}']['losses']=args.losses
+    validate(d); experiments=[1,2,3,4,5] if 'all' in args.experiments else sorted(set(map(int,args.experiments)))
     return args,d,experiments
 
 def runtime(d):

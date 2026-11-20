@@ -1,0 +1,20 @@
+{
+  "timed_steps": 10,
+  "warmup_steps": 4,
+  "fit_endpoints": 13120,
+  "fit_pairs": 2676480,
+  "median_seconds": 0.006787259015254676,
+  "mean_seconds": 0.007322906807530671,
+  "refit_seconds": 0.025536017026752234,
+  "head_info": {
+    "iterations": 327,
+    "projected_gradient": 1.2370978597076032e-07,
+    "solver_status": "CONVERGENCE: RELATIVE REDUCTION OF F <= FACTR*EPSMCH",
+    "objective": 1.0472057903927456
+  },
+  "gpu": "NVIDIA GeForce RTX 3070",
+  "illustrative_weights": [
+    0.1,
+    0.02
+  ]
+}

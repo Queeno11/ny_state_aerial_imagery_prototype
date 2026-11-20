@@ -1,0 +1,94 @@
+{
+  "config": {
+    "seed": 2026110917,
+    "replications": [
+      1,
+      2,
+      3,
+      4,
+      5
+    ],
+    "calibration_replication": 101,
+    "cities": 20,
+    "paired_tracts": 200,
+    "fit_tracts": 160,
+    "test_tracts": 256,
+    "stability_views": 2,
+    "lambda_S": 0.3,
+    "tau": 0.1,
+    "gradient_budgets": [
+      0.0,
+      0.1,
+      1.0
+    ],
+    "additional_gradient_budgets": [
+      [
+        10.0,
+        0.0
+      ],
+      [
+        10.0,
+        10.0
+      ]
+    ],
+    "level_change_ratios": [
+      0.1,
+      1.0
+    ],
+    "curvature_per_level": 0.001,
+    "sphere_grid": 48,
+    "optimizer_maxiter": 130,
+    "test_doses": [
+      -0.4,
+      -0.15,
+      -0.05,
+      0.0,
+      0.05,
+      0.15,
+      0.4
+    ],
+    "cutoff_quantile": 0.95
+  },
+  "noise_namespace": "simple-index-tract-persistent-halfvariance-v1",
+  "total_endpoint_noise_variance": "sigma_city squared",
+  "persistent_variance_share": 0.5,
+  "transitory_variance_share": 0.5,
+  "stable_pair_correlation": 0.5,
+  "changed_pair_correlation": 0.0,
+  "source_sha256": {
+    "C:\\Working Papers\\NY State Aerial Imagery Prototype\\ny_state_aerial_imagery_prototype\\src\\ordinal_mc_suite\\simple_index_persistent_pilot\\correlated_ml.py": "925a62abe33e878b70f74786ff822d5d36df30027023fb9d3b43315fbbbfefb7",
+    "C:\\Working Papers\\NY State Aerial Imagery Prototype\\ny_state_aerial_imagery_prototype\\src\\ordinal_mc_suite\\simple_index_persistent_pilot\\persistent_data.py": "84dfe6f15d933a0745efe6ba31a1e64cfe99b932eb9bd3eaa6c1313d8799eeb4",
+    "C:\\Working Papers\\NY State Aerial Imagery Prototype\\ny_state_aerial_imagery_prototype\\src\\ordinal_mc_suite\\simple_index_persistent_pilot\\prior.py": "87a0b8e5860ea0b1224f9f50cc6b5ba5e03deab0e19cc6e4e54540e3f4fae23f",
+    "C:\\Working Papers\\NY State Aerial Imagery Prototype\\ny_state_aerial_imagery_prototype\\src\\ordinal_mc_suite\\simple_index_persistent_pilot\\run_persistent.py": "13d257bab5c497b47333ffb1a02e19c35268688d31b807255bf70ca918b29f0f",
+    "C:\\Working Papers\\NY State Aerial Imagery Prototype\\ny_state_aerial_imagery_prototype\\src\\ordinal_mc_suite\\simple_index_pilot\\data.py": "f20f060eb4d3fcbd637a1851c230e3e1c13f4ca110a322c8bc07137e26a2f8f8",
+    "C:\\Working Papers\\NY State Aerial Imagery Prototype\\ny_state_aerial_imagery_prototype\\src\\ordinal_mc_suite\\simple_index_pilot\\losses.py": "9f824cdae6962db2f137d3f531b9c7bd6ba5e319fee170724227b7e6b7586f0f",
+    "C:\\Working Papers\\NY State Aerial Imagery Prototype\\ny_state_aerial_imagery_prototype\\src\\ordinal_mc_suite\\simple_index_pilot\\estimators.py": "85fa68fa49a66ba6deefa368842ee473f4b6b84b0487f4b44e11d6d734dcf1a2",
+    "C:\\Working Papers\\NY State Aerial Imagery Prototype\\ny_state_aerial_imagery_prototype\\src\\ordinal_mc_suite\\simple_index_pilot\\classical.py": "cf6f33ebba59d55e1009bfcddbe5bcf53435c98a4aba35d3980f38c27e15e3ef",
+    "C:\\Working Papers\\NY State Aerial Imagery Prototype\\ny_state_aerial_imagery_prototype\\src\\ordinal_mc_suite\\simple_index_pilot\\calibrate_10pct.py": "edbbf4353096bce9e6d820031676a646cb4f97f895a5f664a4cd9f0b67780921",
+    "C:\\Working Papers\\NY State Aerial Imagery Prototype\\ny_state_aerial_imagery_prototype\\src\\ordinal_mc_suite\\simple_index_pilot\\changed_only_delta.py": "5131c8a3509eca604a42a2d22c4c1dc5b384357f58c3466626f984925e12ea66"
+  },
+  "original_run_manifest_sha256": "bd4d7591043d84bb718d13c872447f53f3eb450dcaef1083b55035741a5c9a04",
+  "original_calibration_manifest_sha256": "d37dbdd09dbf537649f9927f289e799ef74c170d3aa7e5eb6045a0c885f87d8e",
+  "primary_target": "conditional mean psi_city(f), integrating persistent and transitory noise",
+  "detection_doses": [
+    -0.4,
+    -0.15,
+    -0.05,
+    -0.02,
+    -0.01,
+    -0.005,
+    -0.002,
+    0.0,
+    0.002,
+    0.005,
+    0.01,
+    0.02,
+    0.05,
+    0.15,
+    0.4
+  ],
+  "working_likelihood": "Gaussian_ML*_working_independence ignores pair correlation",
+  "oracle_likelihood": "Gaussian_ML*_correlated_oracle knows true change-status covariance shape; city sigma estimated",
+  "fixed_oldweights": "level and full ordinal coefficients from old independent-noise tuning; no retuning",
+  "platform": "Windows-11-10.0.26200-SP0"
+}

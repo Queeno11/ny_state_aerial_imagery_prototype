@@ -1,0 +1,32 @@
+{
+  "job": {
+    "rep": 1,
+    "cities": 32,
+    "truth": "quadratic",
+    "model": "nn"
+  },
+  "fit_variance_R": 1.6440113661416984,
+  "n_fit": 13120,
+  "n_validation": 3264,
+  "objective": "L_E5 + lambda_R * mean((s(X)-Psi_inverse(W))^2)/Var_fit(R)",
+  "retained_rank": true,
+  "retained_stability": true,
+  "raw_rank_gaps_unchanged": true,
+  "scorer_architecture_unchanged": true,
+  "inverse_maps_agree": true,
+  "oracle_inverse_verified": true,
+  "noise_free_f_used_for_training": false,
+  "inverse_selection_rule": "validation rank logistic + validation noisy R MSE / Var_fit(R); fixed 1:1 weights",
+  "D_selection_rule": "validation rank logistic",
+  "total_scorer_updates": 800,
+  "max_updates_per_candidate": 100,
+  "initial_checkpoint_eligible": true,
+  "source_checkpoint_unchanged": true,
+  "selected": {
+    "weight": 10.0,
+    "lr": 0.001,
+    "best_step": 100,
+    "selection": 0.8832832887047166
+  },
+  "note": "One-replication diagnostic. Separate exploratory candidate test metrics are not selection evidence."
+}

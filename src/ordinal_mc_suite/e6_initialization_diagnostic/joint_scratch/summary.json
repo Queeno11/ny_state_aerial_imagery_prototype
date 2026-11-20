@@ -1,0 +1,20 @@
+{
+  "path": "joint_scratch",
+  "selected_step": 670,
+  "selected_validation": 1.8144877927730034,
+  "patience_stop_step": 870,
+  "validation_selection": "rank logistic + standardized level MSE + standardized change MSE",
+  "executed_scorer_updates": 3000,
+  "executed_head_updates": 3000,
+  "inherited_scorer_updates_executed": 0,
+  "inherited_selected_scorer_ancestry": 0,
+  "total_scorer_updates_executed": 3000,
+  "selected_scorer_ancestry": 670,
+  "fixed_endpoint_scorer_ancestry": 3000,
+  "scorer_initial_hash": "ae6012432665bcee59ec3fcb7787409867fa3cb9b8c04af26617d8bc9dac957c",
+  "head_initial_hash": "6d78212f30f03798c0a53a02a3f0aeb87e4c052ce489a3201b8529701c8149b7",
+  "wall_seconds": 632.4862359830004,
+  "scorer_clipped_updates": 4,
+  "head_clipped_updates": 0,
+  "selected_at_budget_boundary": false
+}

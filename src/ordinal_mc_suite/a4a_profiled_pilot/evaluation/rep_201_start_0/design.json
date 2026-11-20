@@ -1,0 +1,27 @@
+{
+  "role": "replay",
+  "seeds": {
+    "contexts": 2301377957,
+    "paired": 2934624130,
+    "split": 3932056755,
+    "fit_aux": 2221891289,
+    "val_aux": 509719886,
+    "cutoff_contexts": 825216239,
+    "cutoff": 695203438,
+    "seen": 742299555,
+    "unseen_contexts": 2173843552,
+    "unseen": 164482116,
+    "seen_regimes": 445023670,
+    "unseen_regimes": 620111418
+  },
+  "scorer_seed": 2996503234,
+  "fit_tracts": 6560,
+  "validation_tracts": 1632,
+  "exact_fit_links": 26240,
+  "denoms": {
+    "W": 16.8562781792215,
+    "delta_W": 9.435297372734828
+  },
+  "train_tract_ids_sha256": "9ef1b83ced4862be6e64730c7e1c7760798ac9f457ebf5ebd9f9b7633f3c67f7",
+  "val_tract_ids_sha256": "53a1ede725ebcdd3511d65ea1fc2ce6f06f3844b50c676885b0d244d6b9feaad"
+}

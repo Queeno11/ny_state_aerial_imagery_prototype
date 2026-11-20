@@ -1,0 +1,27 @@
+{
+  "role": "confirmation",
+  "seeds": {
+    "contexts": 4280618942,
+    "paired": 2845764762,
+    "split": 4184176866,
+    "fit_aux": 1806034049,
+    "val_aux": 1235699860,
+    "cutoff_contexts": 4139062926,
+    "cutoff": 1181251565,
+    "seen": 199776252,
+    "unseen_contexts": 2164070537,
+    "unseen": 338315275,
+    "seen_regimes": 2098965657,
+    "unseen_regimes": 3157722332
+  },
+  "scorer_seed": 1057167968,
+  "train_tract_ids_sha256": "9a845a5b19a357bf5f06509d5d29cdb600363dca83c334decbc15960e593b399",
+  "val_tract_ids_sha256": "98277b4e2cb455e2296bc1ee91b62c9a73e219422841cd1df2b2dee796d8a6f1",
+  "fit_tracts": 6560,
+  "validation_tracts": 1632,
+  "exact_fit_links": 26240,
+  "denoms": {
+    "W": 16.686858783051985,
+    "delta_W": 9.721740491281798
+  }
+}

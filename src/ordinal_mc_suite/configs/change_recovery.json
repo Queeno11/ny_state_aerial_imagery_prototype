@@ -1,0 +1,21 @@
+{
+  "seed": 20261102,
+  "models": ["linear", "nn"],
+  "truths": ["linear", "quadratic"],
+  "reps": 30,
+  "cities": 16,
+  "n": [32],
+  "epochs": 500,
+  "lbfgs_steps": 200,
+  "audit_steps": 100,
+  "restarts": 3,
+  "experiment5": {
+    "losses": ["common_logit"],
+    "arms": ["none", "temporal", "both"],
+    "change_strength_grid": [0.0, 0.15, 0.4, 0.8],
+    "contamination_grid": [0.0, 0.2, 0.5],
+    "changed_share": 0.5,
+    "false_positive_target": 0.05,
+    "truth_threshold": 0.05
+  }
+}

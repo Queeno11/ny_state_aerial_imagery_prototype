@@ -1,0 +1,11 @@
+{
+  "completed": true,
+  "full_mc_run": false,
+  "original_results_unchanged": true,
+  "split_disjoint": true,
+  "test_evaluated_only_after_selection": true,
+  "early_checkpoints_selected_by_validation": true,
+  "matched_split_for_fixed_and_early": true,
+  "automated_tests_passed": 6,
+  "automated_tests_failed": 0
+}

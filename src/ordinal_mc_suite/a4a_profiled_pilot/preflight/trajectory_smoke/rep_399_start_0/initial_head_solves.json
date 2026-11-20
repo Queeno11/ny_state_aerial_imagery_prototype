@@ -1,0 +1,34 @@
+{
+  "common": {
+    "iterations": 324,
+    "projected_gradient": 4.3047240039228996e-07,
+    "solver_status": "ABNORMAL: ",
+    "objective": 1.5919199261624921
+  },
+  "own": {
+    "L": {
+      "iterations": 178,
+      "projected_gradient": 9.653594475189653e-08,
+      "solver_status": "CONVERGENCE: NORM OF PROJECTED GRADIENT <= PGTOL",
+      "objective": 0.6793755559187303
+    },
+    "LC": {
+      "iterations": 92,
+      "projected_gradient": 7.059672515758592e-08,
+      "solver_status": "CONVERGENCE: NORM OF PROJECTED GRADIENT <= PGTOL",
+      "objective": 0.7122150213153345
+    },
+    "LD": {
+      "iterations": 234,
+      "projected_gradient": 7.564077046662288e-08,
+      "solver_status": "CONVERGENCE: NORM OF PROJECTED GRADIENT <= PGTOL",
+      "objective": 0.9936800507910786
+    },
+    "LDC": {
+      "iterations": 125,
+      "projected_gradient": 6.167462979211891e-08,
+      "solver_status": "CONVERGENCE: NORM OF PROJECTED GRADIENT <= PGTOL",
+      "objective": 1.0310087889891935
+    }
+  }
+}

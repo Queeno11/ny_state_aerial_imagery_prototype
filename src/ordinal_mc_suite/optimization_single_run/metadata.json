@@ -1,0 +1,456 @@
+{
+  "replication": 1,
+  "truth": "linear",
+  "n": 32,
+  "cities": 16,
+  "change_strength": 0.4,
+  "contamination": 0.0,
+  "criterion": "common_logit + lambda_t*S_t/V + lambda_c*S_c/V; ridge=0",
+  "original_csv_sha256": "a4dc16dab59ee38de952f7fc2e664a57bb1ae055c6389bb558d3138237832f64",
+  "config": {
+    "seed": 20261102,
+    "function_seed": 983,
+    "models": [
+      "linear",
+      "nn"
+    ],
+    "truths": [
+      "linear",
+      "quadratic"
+    ],
+    "n": [
+      32
+    ],
+    "city_grid": [
+      4,
+      8
+    ],
+    "reps": 30,
+    "cities": 16,
+    "views": 2,
+    "noise_sd": 0.7,
+    "bayes_target": 0.2,
+    "acquisition_strength": 1.0,
+    "group_strength": 1.0,
+    "validation_fraction": 0.25,
+    "pair_mode": "all",
+    "pairs_per_label": 8,
+    "test_per_city": 128,
+    "test_pairs": 3000,
+    "hidden": [
+      32,
+      16
+    ],
+    "weight_bound": 10.0,
+    "rff": 16,
+    "epochs": 500,
+    "restarts": 3,
+    "lbfgs_steps": 200,
+    "audit_steps": 100,
+    "lr": 0.01,
+    "tau": 0.1,
+    "ridge_grid": [
+      0.0
+    ],
+    "lambda_grid": [
+      0.0,
+      0.3
+    ],
+    "lambda_t": 0.3,
+    "lambda_c": 0.3,
+    "dtype": "float64",
+    "device": "cpu",
+    "threads": 1,
+    "workers": 1,
+    "grad_tol": 1e-05,
+    "audit_tol": 1e-05,
+    "false_jump": 1.0,
+    "experiment1": {
+      "psi_shapes": [
+        "tanh"
+      ],
+      "cases": [
+        [
+          "common",
+          0.0
+        ],
+        [
+          "multiplier",
+          1.0
+        ],
+        [
+          "location_scale",
+          1.0
+        ],
+        [
+          "shape",
+          1.0
+        ]
+      ],
+      "composition_grid": [
+        0.0,
+        0.7
+      ],
+      "losses": [
+        "common_logit",
+        "heterogeneous_logit",
+        "ordinal_smooth"
+      ],
+      "methods": [
+        "rank_common",
+        "rank_heterogeneous",
+        "rank_ordinal",
+        "raw_levels",
+        "log_cell_fe",
+        "within_zscore",
+        "within_percentile",
+        "oracle_latent",
+        "oracle_inverse"
+      ]
+    },
+    "experiment2": {
+      "losses": [
+        "common_logit",
+        "heterogeneous_logit",
+        "ordinal_smooth"
+      ],
+      "arms": [
+        "none"
+      ],
+      "cases": [
+        [
+          "gumbel",
+          0.0
+        ],
+        [
+          "student",
+          3.0
+        ],
+        [
+          "cell_scale",
+          0.7
+        ],
+        [
+          "feature_scale",
+          0.7
+        ],
+        [
+          "median_violation",
+          0.7
+        ]
+      ]
+    },
+    "experiment3": {
+      "losses": [
+        "common_logit",
+        "heterogeneous_logit",
+        "ordinal_smooth"
+      ],
+      "arms": [
+        "none",
+        "temporal",
+        "cross_city",
+        "both"
+      ],
+      "nuisance_cases": [
+        [
+          1.0,
+          1.0
+        ],
+        [
+          0.0,
+          1.0
+        ],
+        [
+          1.0,
+          0.0
+        ]
+      ]
+    },
+    "experiment4": {
+      "losses": [
+        "common_logit",
+        "heterogeneous_logit",
+        "ordinal_smooth"
+      ],
+      "arms": [
+        "temporal",
+        "cross_city",
+        "both"
+      ],
+      "cases": [
+        [
+          "exact",
+          0.0
+        ],
+        [
+          "drift",
+          0.15
+        ],
+        [
+          "random_false",
+          0.2
+        ],
+        [
+          "systematic_false",
+          0.2
+        ]
+      ]
+    },
+    "experiment5": {
+      "losses": [
+        "common_logit"
+      ],
+      "arms": [
+        "none",
+        "temporal",
+        "both"
+      ],
+      "change_strength_grid": [
+        0.0,
+        0.15,
+        0.4,
+        0.8
+      ],
+      "contamination_grid": [
+        0.0,
+        0.2,
+        0.5
+      ],
+      "changed_share": 0.5,
+      "false_positive_target": 0.05,
+      "truth_threshold": 0.05
+    }
+  },
+  "python": "3.13.7",
+  "numpy": "2.2.6",
+  "torch": "2.15.0+cpu",
+  "original_runtime": {
+    "config": {
+      "seed": 20261102,
+      "function_seed": 983,
+      "models": [
+        "linear",
+        "nn"
+      ],
+      "truths": [
+        "linear",
+        "quadratic"
+      ],
+      "n": [
+        32
+      ],
+      "city_grid": [
+        4,
+        8
+      ],
+      "reps": 30,
+      "cities": 16,
+      "views": 2,
+      "noise_sd": 0.7,
+      "bayes_target": 0.2,
+      "acquisition_strength": 1.0,
+      "group_strength": 1.0,
+      "validation_fraction": 0.25,
+      "pair_mode": "all",
+      "pairs_per_label": 8,
+      "test_per_city": 128,
+      "test_pairs": 3000,
+      "hidden": [
+        32,
+        16
+      ],
+      "weight_bound": 10.0,
+      "rff": 16,
+      "epochs": 500,
+      "restarts": 3,
+      "lbfgs_steps": 200,
+      "audit_steps": 100,
+      "lr": 0.01,
+      "tau": 0.1,
+      "ridge_grid": [
+        0.0
+      ],
+      "lambda_grid": [
+        0.0,
+        0.3
+      ],
+      "lambda_t": 0.3,
+      "lambda_c": 0.3,
+      "dtype": "float64",
+      "device": "cpu",
+      "threads": 1,
+      "grad_tol": 1e-05,
+      "audit_tol": 1e-05,
+      "false_jump": 1.0,
+      "experiment1": {
+        "psi_shapes": [
+          "tanh"
+        ],
+        "cases": [
+          [
+            "common",
+            0.0
+          ],
+          [
+            "multiplier",
+            1.0
+          ],
+          [
+            "location_scale",
+            1.0
+          ],
+          [
+            "shape",
+            1.0
+          ]
+        ],
+        "composition_grid": [
+          0.0,
+          0.7
+        ],
+        "losses": [
+          "common_logit",
+          "heterogeneous_logit",
+          "ordinal_smooth"
+        ],
+        "methods": [
+          "rank_common",
+          "rank_heterogeneous",
+          "rank_ordinal",
+          "raw_levels",
+          "log_cell_fe",
+          "within_zscore",
+          "within_percentile",
+          "oracle_latent",
+          "oracle_inverse"
+        ]
+      },
+      "experiment2": {
+        "losses": [
+          "common_logit",
+          "heterogeneous_logit",
+          "ordinal_smooth"
+        ],
+        "arms": [
+          "none"
+        ],
+        "cases": [
+          [
+            "gumbel",
+            0.0
+          ],
+          [
+            "student",
+            3.0
+          ],
+          [
+            "cell_scale",
+            0.7
+          ],
+          [
+            "feature_scale",
+            0.7
+          ],
+          [
+            "median_violation",
+            0.7
+          ]
+        ]
+      },
+      "experiment3": {
+        "losses": [
+          "common_logit",
+          "heterogeneous_logit",
+          "ordinal_smooth"
+        ],
+        "arms": [
+          "none",
+          "temporal",
+          "cross_city",
+          "both"
+        ],
+        "nuisance_cases": [
+          [
+            1.0,
+            1.0
+          ],
+          [
+            0.0,
+            1.0
+          ],
+          [
+            1.0,
+            0.0
+          ]
+        ]
+      },
+      "experiment4": {
+        "losses": [
+          "common_logit",
+          "heterogeneous_logit",
+          "ordinal_smooth"
+        ],
+        "arms": [
+          "temporal",
+          "cross_city",
+          "both"
+        ],
+        "cases": [
+          [
+            "exact",
+            0.0
+          ],
+          [
+            "drift",
+            0.15
+          ],
+          [
+            "random_false",
+            0.2
+          ],
+          [
+            "systematic_false",
+            0.2
+          ]
+        ]
+      },
+      "experiment5": {
+        "losses": [
+          "common_logit"
+        ],
+        "arms": [
+          "none",
+          "temporal",
+          "both"
+        ],
+        "change_strength_grid": [
+          0.0,
+          0.15,
+          0.4,
+          0.8
+        ],
+        "contamination_grid": [
+          0.0,
+          0.2,
+          0.5
+        ],
+        "changed_share": 0.5,
+        "false_positive_target": 0.05,
+        "truth_threshold": 0.05
+      }
+    },
+    "experiments": [
+      5
+    ],
+    "source_sha256": "7a6fcb6966caa7cc611a7988f538cbd0ea1c88e3992c51e633a29ed93dae8cd5",
+    "python": "3.10.20",
+    "numpy": "2.2.6",
+    "torch": "2.5.1",
+    "execution": {
+      "workers": 8,
+      "threads_per_worker": 1
+    }
+  },
+  "test_metrics_used_for_selection": false
+}

@@ -1,0 +1,13 @@
+{
+  "completed": true,
+  "original_results_unchanged": true,
+  "sample_replay_verified": true,
+  "gradient_tests_passed": true,
+  "linear_embedding_test_passed": true,
+  "accepted_lbfgs_paths_nonincreasing": true,
+  "candidate_fits": 12,
+  "recorded_checkpoints": 78,
+  "full_monte_carlo_run": false,
+  "pytest_tests_passed": 7,
+  "pytest_tests_failed": 0
+}

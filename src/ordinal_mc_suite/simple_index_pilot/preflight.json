@@ -1,0 +1,76 @@
+{
+  "numerical": {
+    "A": {
+      "derivative_error": 3.127440858369246e-10,
+      "conditional_ml": {
+        "objective": -0.0025401739891576236,
+        "min_tangent_grad": 1.3699726602031965e-08,
+        "starts": 4,
+        "successful_starts": 4,
+        "evaluations": 58,
+        "start_best_spread": 1.1102230246251565e-16
+      },
+      "fe_fitted_value_max_difference": 1.7763568394002505e-15
+    },
+    "B": {
+      "derivative_error": 2.84738385647465e-10,
+      "conditional_ml": {
+        "objective": -0.007845503706240486,
+        "grid_min": 0.44372434224305035,
+        "evaluations": 39,
+        "min_tangent_grad": 1.0989234812401401e-10,
+        "any_success": true,
+        "successful_starts": 4,
+        "starts": 4,
+        "start_best_spread": 1.449737733612082
+      }
+    },
+    "C": {
+      "derivative_error": 8.853623389981635e-11,
+      "conditional_ml": {
+        "objective": -0.02684752963754672,
+        "grid_min": 0.43949119370324385,
+        "evaluations": 39,
+        "min_tangent_grad": 5.467713569389223e-10,
+        "any_success": true,
+        "successful_starts": 4,
+        "starts": 4,
+        "start_best_spread": 1.5146312472286627
+      }
+    }
+  },
+  "actual_size": {
+    "fit_endpoints": 6400,
+    "unordered_pairs": 508800,
+    "mean_eval_seconds": 0.010860709985718132,
+    "rank_grid_seconds": 0.4221763997338712,
+    "four_start_profile_seconds": 0.5982031002640724,
+    "profile": {
+      "objective": 0.2325494483228878,
+      "grid_min": 0.29790385399064856,
+      "evaluations": 58,
+      "min_tangent_grad": 2.0451402452361253e-09,
+      "any_success": true,
+      "successful_starts": 4,
+      "starts": 4,
+      "start_best_spread": 9.742207041085749e-15
+    },
+    "mixed_b_seconds": 1.0434243003837764,
+    "mixed_b": {
+      "converged": false,
+      "specification": "unstructured",
+      "llf": -9262.08554095004,
+      "residual_scale": 1.0064731010007248,
+      "covariance_eigen_min": 0.0003059425438299107,
+      "covariance_eigen_max": 1.495392483292303,
+      "covariance_rank": 4,
+      "warnings": "Maximum Likelihood optimization failed to converge. Check mle_retvals | Retrying MixedLM optimization with bfgs | MixedLM optimization failed, trying a different optimizer may help. | Gradient optimization failed, |grad| = 390.596671 | The MLE may be on the boundary of the parameter space. | The Hessian matrix at the estimated parameter values is not positive definite.",
+      "blup_matches_package": true
+    },
+    "statsmodels": "0.14.5",
+    "baseline_f_variance": 1.0,
+    "case_c_gaussian_variance_ratio": 1.0,
+    "case_c_linear_projection_factor_formula": "(1+3k)/sqrt(1+6k+15k^2)",
+    "date_1_f_variance": 1.045625
+  }
+}

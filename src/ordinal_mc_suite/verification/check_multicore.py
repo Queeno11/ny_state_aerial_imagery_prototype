@@ -16,14 +16,14 @@ ROOT=Path(__file__).resolve().parents[1]
 
 def records(path):
     with path.open(newline='') as f:
-        return sorted(list(csv.DictReader(f)),key=lambda r:(int(r['rep']),r['model'],r['arm'],r.get('reg',''),r.get('restart','')))
+        return sorted(list(csv.DictReader(f)),key=lambda r:(int(r['rep']),r['model'],r['method'],r['arm'],r.get('reg',''),r.get('restart','')))
 
 def compare(a,b):
     assert len(a)==len(b),(len(a),len(b))
     for left,right in zip(a,b):
         assert left.keys()==right.keys()
         for key,value in left.items():
-            if key in ('seconds','total_candidate_seconds'):continue
+            if key in ('seconds','total_candidate_seconds','ml_seconds'):continue
             other=right[key]
             try:
                 x,y=float(value),float(other)

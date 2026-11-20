@@ -1,0 +1,100 @@
+{
+  "runs": [
+    {
+      "started": "2026-11-16 23:32:14",
+      "argv": [
+        "--stage",
+        "all",
+        "--reps",
+        "5",
+        "--workers",
+        "4"
+      ],
+      "stages": [
+        "1",
+        "2",
+        "3",
+        "4"
+      ],
+      "reps": 5,
+      "anchor_reps": 5,
+      "workers": 4,
+      "tasks": 50,
+      "python": "3.10.20",
+      "numpy": "2.2.6",
+      "scipy": "1.15.2",
+      "host": "DESKTOP-IQSDPPI",
+      "finished": "2026-11-16 23:37:16",
+      "wall_seconds": 302.2,
+      "arms_not_ok": 0
+    }
+  ],
+  "config": {
+    "seed": 20261116,
+    "p_h": 2,
+    "p_a": 4,
+    "signal": [
+      1.0,
+      0.7
+    ],
+    "city_sd": 0.5,
+    "change_sd": 0.5,
+    "n_draw": 250,
+    "rhos": [
+      0.0,
+      0.8
+    ],
+    "maps": [
+      "a",
+      "b",
+      "c"
+    ],
+    "logbeta_sd": 0.3,
+    "kappa": 0.5,
+    "lambda_range": 0.9,
+    "ml_lambda_bound": 0.95,
+    "small_sizes": [
+      [
+        8,
+        10
+      ],
+      [
+        8,
+        40
+      ],
+      [
+        32,
+        10
+      ],
+      [
+        32,
+        40
+      ]
+    ],
+    "anchor_size": [
+      64,
+      250
+    ],
+    "reps": 5,
+    "anchor_reps": 5,
+    "target_cities": 8,
+    "test_n": 1000,
+    "cal_n": 20,
+    "reference_size": 200000,
+    "joint_w": 0.5,
+    "sphere_gtol": 1e-09,
+    "joint_gtol": 1e-10,
+    "ml_gtol": 1e-08,
+    "max_iter": 3000,
+    "newton_tol": 1e-11,
+    "mm_spec": "unstructured"
+  },
+  "theta_star": [
+    0.5710317115885171,
+    0.005640265874454873,
+    -0.28868689784192453,
+    -0.7574921732668055,
+    -0.1291262024508665,
+    0.009103738556797962
+  ]
+}

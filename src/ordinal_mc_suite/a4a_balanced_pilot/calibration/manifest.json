@@ -1,0 +1,160 @@
+{
+  "stage": "calibration",
+  "config": {
+    "seed": 20261109,
+    "replications": [
+      1,
+      2,
+      3
+    ],
+    "start_ids": [
+      0
+    ],
+    "function_seed": 983,
+    "cities": 32,
+    "tracts_per_city": 256,
+    "test_tracts_per_city": 256,
+    "validation_fraction": 0.2,
+    "views": 2,
+    "composition": 0.0,
+    "acquisition_strength": 1.0,
+    "group_strength": 1.0,
+    "hidden": [
+      32,
+      16
+    ],
+    "weight_bound": 10.0,
+    "training_step": 0.4,
+    "changed_share": 0.5,
+    "kappa_base": 0.6,
+    "kappa_amplitude": 0.2,
+    "kappa_time_shift": 0.5,
+    "noise_ratio": 0.8,
+    "population_seed": 6120093,
+    "population_pairs": 250000,
+    "lambda_stability": 0.3,
+    "baseline_updates": 1500,
+    "joint_updates": 1000,
+    "head_max_iter": 1000,
+    "check_every": 25,
+    "baseline_lr": 0.001,
+    "joint_lr": 0.0001,
+    "head_lr": 0.001,
+    "taus": [
+      0.5,
+      0.2,
+      0.1
+    ],
+    "tau_fractions": [
+      0.0,
+      0.4,
+      0.7
+    ],
+    "joint_weights": [
+      0.1
+    ],
+    "gamma": 0.01,
+    "knot_quantiles": [
+      0.2,
+      0.5,
+      0.8
+    ],
+    "min_slope": 0.0001,
+    "min_score_variance": 1e-12,
+    "change_bins": [
+      0.0,
+      0.05,
+      0.15,
+      0.35,
+      0.65
+    ],
+    "cutoff_quantile": 0.95,
+    "dose_steps": [
+      -0.8,
+      -0.4,
+      -0.15,
+      -0.05,
+      0.0,
+      0.05,
+      0.15,
+      0.4,
+      0.8
+    ]
+  },
+  "design": {
+    "base_config": "../a4a_change_pilot/config.json",
+    "calibration_reps": [
+      101,
+      102
+    ],
+    "replay_reps": [
+      1,
+      2,
+      3
+    ],
+    "confirmation_reps": [
+      201,
+      202,
+      203
+    ],
+    "gradient_budgets": [
+      0.0,
+      0.1,
+      0.3,
+      1.0
+    ],
+    "old_weights": [
+      0.1,
+      0.1,
+      0.0
+    ],
+    "old_curvature": 0.01,
+    "gamma_grid": [
+      0.0,
+      0.001,
+      0.01,
+      0.1
+    ],
+    "tie_tolerance": 1e-06,
+    "adam_checkpoints": [
+      25,
+      250,
+      1000
+    ]
+  },
+  "device": "cuda",
+  "config_sha256": "5d451db9e15fa0950b1590437f7f0c49dae31e98e73153c6cf8707ba127583f5",
+  "design_sha256": "5dfbe0e1fce4f2d78273c5fb9a0ec8037359ea780db7156679cd3bc4759836a9",
+  "selected_sha256": null,
+  "source_sha256": {
+    "a4a_balanced_pilot/benchmark.py": "0202a15c579138b7e2f6557f2e7775c4f128e7b419dd517499077867b8893a28",
+    "a4a_balanced_pilot/calibrate.py": "3fd0b528b01095c6fe0c6cb4b36599d5da10a44c5d8255abd458d9ed1bd97bcb",
+    "a4a_balanced_pilot/prior.py": "ecf2b3fdea6b4b417d422c008d7a8ffd6c70cabef028aa5491d8db5d08573332",
+    "a4a_balanced_pilot/weighted.py": "cf8bc540e9bbd28684a9333fdf5d01784a38f8ce445b9fd8ef5b21ec2a52dfa8",
+    "a4a_change_pilot/audit.py": "1454e8a2318f96d2047add3791b1e6313a1f8ec8b0ac3d3b5c2133b92b7af8e9",
+    "a4a_change_pilot/data.py": "1216127ca1e677938d34cb04404e82221007c7003e99fb8f4983902e76102ed6",
+    "a4a_change_pilot/dose_metrics.py": "a4887ace4c5300a4535bc5250cd993ae896925bba54dd4d1c19b17b0b13f2d95",
+    "a4a_change_pilot/evaluation.py": "11643219aa09a09c240f796e7bb08f9d51c24bf86b8e28ade26efcf21b0f20bd",
+    "a4a_change_pilot/fitting.py": "84b30b2e33a749734a516beff3cc6244c042690d2e250c927a66aad2fef78416",
+    "a4a_change_pilot/heads.py": "470c0148a8214b38f90057c3a5e183640553cc0fe1b2b9b6cb273492075b58d6",
+    "a4a_change_pilot/preflight.py": "6e46ac22169f93ddac2c72f53b061f730de132d9b9d6b8f4a3839404dab8ddf0",
+    "a4a_change_pilot/report.py": "9d9b7a52e2fb4b9158336f7b96f4f11238021dd931a537c50f788376c71f3561",
+    "a4a_change_pilot/run.py": "eae2d2d997de621f9c2e944c3cde3272ffb1341d8c39d6b85e65606c56ac8891",
+    "a4a_change_pilot/training.py": "199e46943ecdb0eee09cf3e9dae8f77e185c433e8f5ee4bf8a3fe65879fda450",
+    "ordinal_mc/core.py": "b3d66a58ceb2a5beb44de45350f3db371087ffe1afb921ae505cf125a5161d58",
+    "ordinal_mc/design.py": "5d41373358a415f1942f3468ac1d43a5da52987bbcfe52f8457a79e4407ffaa6",
+    "ordinal_mc/e6/data.py": "1c00e9873a1bbcbf80cc008142fc69eed47b300d59fbaa5c11c09f558808a09e"
+  },
+  "versions": {
+    "python": "3.10.20",
+    "torch": "2.5.1",
+    "numpy": "2.2.6",
+    "scipy": "1.15.2"
+  },
+  "scorer_dtype": "float32",
+  "head_refit_dtype": "float64",
+  "gpu": "NVIDIA GeForce RTX 3070",
+  "selector": "actual observed misranking + .3*external stability + level MSE/Vfit(W) + paired change MSE/Varfit(delta W), common unpenalized head refit",
+  "coefficient_rule": "median over fitting-only anchors of hypot(rank_grad,.3*stable_grad)/cardinal_grad times the candidate relative budget",
+  "candidate_tie_rule": "among mean validation minima within design tolerance, prefer lower sum of relative cardinal budgets, then lower gamma, then candidate name"
+}

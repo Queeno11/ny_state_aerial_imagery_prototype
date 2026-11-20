@@ -1,0 +1,587 @@
+{
+  "stem": "seed1_setting1_ranknet_links1",
+  "elapsed_seconds": 8.686913746991195,
+  "provenance": {
+    "setting": 1,
+    "shape": "linear",
+    "map": "M1",
+    "change_mechanism": "simple",
+    "rho": 0.0,
+    "rejection_rate": 0.8547105561861521,
+    "rejection_attempts": 7048,
+    "endpoint_min": [
+      -1.729979026712515,
+      -1.7303945446609013,
+      -1.7304212060834512
+    ],
+    "endpoint_max": [
+      1.7314119671044943,
+      1.7317740606815994,
+      1.7298375889351219
+    ],
+    "empirical_residual_corr": 0.044047929772961125,
+    "vstar": 1.6037698259772428,
+    "effective_coefficients": {
+      "levels": {
+        "average": 0.3117654365989393,
+        "difference": 0.07794135914973482
+      },
+      "changes": {
+        "average": 0.12470617463957569,
+        "difference": 0.12470617463957573
+      }
+    }
+  },
+  "arms": {
+    "A": {
+      "selected_step": 400,
+      "validation": 0.5326835284736914,
+      "validation_trace": [
+        {
+          "step": 0,
+          "value": 0.692331671285179
+        },
+        {
+          "step": 25,
+          "value": 0.6960520590028566
+        },
+        {
+          "step": 50,
+          "value": 0.6972917780364888
+        },
+        {
+          "step": 75,
+          "value": 0.6951041154465467
+        },
+        {
+          "step": 100,
+          "value": 0.6914846849863172
+        },
+        {
+          "step": 125,
+          "value": 0.6870701078972143
+        },
+        {
+          "step": 150,
+          "value": 0.6817933109177855
+        },
+        {
+          "step": 175,
+          "value": 0.6755142806627976
+        },
+        {
+          "step": 200,
+          "value": 0.6681601061640665
+        },
+        {
+          "step": 225,
+          "value": 0.659336227262733
+        },
+        {
+          "step": 250,
+          "value": 0.6488226156905915
+        },
+        {
+          "step": 275,
+          "value": 0.6366772130862365
+        },
+        {
+          "step": 300,
+          "value": 0.622070633219827
+        },
+        {
+          "step": 325,
+          "value": 0.6046901410716273
+        },
+        {
+          "step": 350,
+          "value": 0.5844924732093428
+        },
+        {
+          "step": 375,
+          "value": 0.561485778970976
+        },
+        {
+          "step": 400,
+          "value": 0.5326835284736914
+        }
+      ],
+      "updates": 400,
+      "gradients": [
+        {
+          "step": 1,
+          "rank_norm": 0.13277742347671745,
+          "weighted_temporal_norm": 2.03694332893481,
+          "weighted_cross_norm": 12.739323830526848,
+          "ordinal_norm": 13.124760337556049,
+          "cardinal_norm": 0.0,
+          "ordinal_cardinal_cosine": null,
+          "temporal_cardinal_cosine": null,
+          "cross_cardinal_cosine": null,
+          "rank_temporal_cosine": 0.15797361917544717
+        },
+        {
+          "step": 200,
+          "rank_norm": 0.16547149183133067,
+          "weighted_temporal_norm": 0.04124548396538103,
+          "weighted_cross_norm": 0.06424341060480003,
+          "ordinal_norm": 0.17559935338751845,
+          "cardinal_norm": 0.0,
+          "ordinal_cardinal_cosine": null,
+          "temporal_cardinal_cosine": null,
+          "cross_cardinal_cosine": null,
+          "rank_temporal_cosine": -0.15039484073270307
+        },
+        {
+          "step": 400,
+          "rank_norm": 0.2558298844260638,
+          "weighted_temporal_norm": 0.01781973960149373,
+          "weighted_cross_norm": 0.028051341773563155,
+          "ordinal_norm": 0.2559474965858776,
+          "cardinal_norm": 0.0,
+          "ordinal_cardinal_cosine": null,
+          "temporal_cardinal_cosine": null,
+          "cross_cardinal_cosine": null,
+          "rank_temporal_cosine": -0.09879395662190421
+        }
+      ],
+      "convergence": "fixed-budget endpoint"
+    },
+    "B": {
+      "success": true,
+      "iterations": 1,
+      "objective": 0.10039653862268762
+    },
+    "C": {
+      "selected_step": 200,
+      "validation": 0.6735389559634621,
+      "validation_trace": [
+        {
+          "step": 0,
+          "value": 0.7351598098251603
+        },
+        {
+          "step": 25,
+          "value": 0.7131401911064051
+        },
+        {
+          "step": 50,
+          "value": 0.7051350346790928
+        },
+        {
+          "step": 75,
+          "value": 0.6985297867187036
+        },
+        {
+          "step": 100,
+          "value": 0.6929780606755742
+        },
+        {
+          "step": 125,
+          "value": 0.687524018025774
+        },
+        {
+          "step": 150,
+          "value": 0.682901757135304
+        },
+        {
+          "step": 175,
+          "value": 0.6777712560568739
+        },
+        {
+          "step": 200,
+          "value": 0.6735389559634621
+        }
+      ],
+      "updates": 200,
+      "gradients": [
+        {
+          "step": 1,
+          "rank_norm": 0.2605477939653984,
+          "weighted_temporal_norm": 0.016585710004373488,
+          "weighted_cross_norm": 0.0261950364746111,
+          "ordinal_norm": 0.2648426391218782,
+          "cardinal_norm": 0.22492821931905874,
+          "ordinal_cardinal_cosine": -0.16936876121700392,
+          "temporal_cardinal_cosine": 0.02111690514007167,
+          "cross_cardinal_cosine": -0.3211013756605736,
+          "rank_temporal_cosine": -0.010918172132783864
+        },
+        {
+          "step": 100,
+          "rank_norm": 0.17098996957983165,
+          "weighted_temporal_norm": 0.0053471590405390155,
+          "weighted_cross_norm": 0.021384121767311186,
+          "ordinal_norm": 0.1747120352591545,
+          "cardinal_norm": 0.2666961777691049,
+          "ordinal_cardinal_cosine": -0.7927946247282022,
+          "temporal_cardinal_cosine": -0.057204986371634174,
+          "cross_cardinal_cosine": 0.06352403818033328,
+          "rank_temporal_cosine": 0.025512539211138593
+        },
+        {
+          "step": 200,
+          "rank_norm": 0.1776763479860191,
+          "weighted_temporal_norm": 0.0034484329300863434,
+          "weighted_cross_norm": 0.00786742249323518,
+          "ordinal_norm": 0.17813614846441167,
+          "cardinal_norm": 0.23728797535833673,
+          "ordinal_cardinal_cosine": -0.6914140414225005,
+          "temporal_cardinal_cosine": -0.17246985365258577,
+          "cross_cardinal_cosine": 0.07802681680628726,
+          "rank_temporal_cosine": 0.005247266265731928
+        }
+      ],
+      "convergence": "fixed-budget endpoint"
+    },
+    "D": {
+      "selected_step": 200,
+      "validation": 0.6730873799409713,
+      "validation_trace": [
+        {
+          "step": 0,
+          "value": 0.7364177127304231
+        },
+        {
+          "step": 25,
+          "value": 0.7121537134473445
+        },
+        {
+          "step": 50,
+          "value": 0.7042895759448122
+        },
+        {
+          "step": 75,
+          "value": 0.6976322359182047
+        },
+        {
+          "step": 100,
+          "value": 0.6916261372063774
+        },
+        {
+          "step": 125,
+          "value": 0.6864787827229674
+        },
+        {
+          "step": 150,
+          "value": 0.6819356613511212
+        },
+        {
+          "step": 175,
+          "value": 0.6769760183933902
+        },
+        {
+          "step": 200,
+          "value": 0.6730873799409713
+        }
+      ],
+      "updates": 200,
+      "gradients": [
+        {
+          "step": 1,
+          "rank_norm": 0.2605477939653984,
+          "weighted_temporal_norm": 0.016585710004373488,
+          "weighted_cross_norm": 0.0261950364746111,
+          "ordinal_norm": 0.2648426391218782,
+          "cardinal_norm": 0.10212300620396751,
+          "ordinal_cardinal_cosine": 0.0400229589032549,
+          "temporal_cardinal_cosine": 0.12642902383961785,
+          "cross_cardinal_cosine": -0.24661570563489074,
+          "rank_temporal_cosine": -0.010918172132783864
+        },
+        {
+          "step": 100,
+          "rank_norm": 0.1502681969645772,
+          "weighted_temporal_norm": 0.006082893837555105,
+          "weighted_cross_norm": 0.013315102716275815,
+          "ordinal_norm": 0.15225531263173772,
+          "cardinal_norm": 0.2183894858909486,
+          "ordinal_cardinal_cosine": -0.8600633449307443,
+          "temporal_cardinal_cosine": 0.028270161417962323,
+          "cross_cardinal_cosine": -0.04521524014103212,
+          "rank_temporal_cosine": -0.03918453084121552
+        },
+        {
+          "step": 200,
+          "rank_norm": 0.15333440413314317,
+          "weighted_temporal_norm": 0.004278878156045632,
+          "weighted_cross_norm": 0.007754969382725888,
+          "ordinal_norm": 0.15336282993931377,
+          "cardinal_norm": 0.15921109037037035,
+          "ordinal_cardinal_cosine": -0.7602270124233317,
+          "temporal_cardinal_cosine": -0.2638722994807484,
+          "cross_cardinal_cosine": -0.03141879985357401,
+          "rank_temporal_cosine": -0.08581619635893964
+        }
+      ],
+      "convergence": "fixed-budget endpoint"
+    },
+    "O": {
+      "selected_step": 200,
+      "validation": 0.44780951682781245,
+      "validation_trace": [
+        {
+          "step": 0,
+          "value": 0.5326835284736914
+        },
+        {
+          "step": 25,
+          "value": 0.48216524179679954
+        },
+        {
+          "step": 50,
+          "value": 0.4563120665023821
+        },
+        {
+          "step": 75,
+          "value": 0.4501493192281902
+        },
+        {
+          "step": 100,
+          "value": 0.44854457032174
+        },
+        {
+          "step": 125,
+          "value": 0.448016671734193
+        },
+        {
+          "step": 150,
+          "value": 0.44821442191840866
+        },
+        {
+          "step": 175,
+          "value": 0.447802478093585
+        },
+        {
+          "step": 200,
+          "value": 0.44780951682781245
+        }
+      ],
+      "updates": 200,
+      "gradients": [
+        {
+          "step": 1,
+          "rank_norm": 0.2605477939653984,
+          "weighted_temporal_norm": 0.016585710004373488,
+          "weighted_cross_norm": 0.0261950364746111,
+          "ordinal_norm": 0.2648426391218782,
+          "cardinal_norm": 0.0,
+          "ordinal_cardinal_cosine": null,
+          "temporal_cardinal_cosine": null,
+          "cross_cardinal_cosine": null,
+          "rank_temporal_cosine": -0.010918172132783864
+        },
+        {
+          "step": 100,
+          "rank_norm": 0.07478657755891492,
+          "weighted_temporal_norm": 0.003586035799167889,
+          "weighted_cross_norm": 0.006576777265353844,
+          "ordinal_norm": 0.07497837854592854,
+          "cardinal_norm": 0.0,
+          "ordinal_cardinal_cosine": null,
+          "temporal_cardinal_cosine": null,
+          "cross_cardinal_cosine": null,
+          "rank_temporal_cosine": 7.652038974233916e-06
+        },
+        {
+          "step": 200,
+          "rank_norm": 0.06583533953454242,
+          "weighted_temporal_norm": 0.0020702161150838476,
+          "weighted_cross_norm": 0.004685810620745296,
+          "ordinal_norm": 0.0652957029126866,
+          "cardinal_norm": 0.0,
+          "ordinal_cardinal_cosine": null,
+          "temporal_cardinal_cosine": null,
+          "cross_cardinal_cosine": null,
+          "rank_temporal_cosine": -0.28390140936401764
+        }
+      ],
+      "convergence": "fixed-budget endpoint"
+    },
+    "scratch_C": {
+      "selected_step": 200,
+      "validation": 0.8627919091218238,
+      "validation_trace": [
+        {
+          "step": 0,
+          "value": 1.5828625610824547
+        },
+        {
+          "step": 25,
+          "value": 1.0570157141924954
+        },
+        {
+          "step": 50,
+          "value": 0.9214668953778953
+        },
+        {
+          "step": 75,
+          "value": 0.8848005745485403
+        },
+        {
+          "step": 100,
+          "value": 0.877150862385387
+        },
+        {
+          "step": 125,
+          "value": 0.8724645476470753
+        },
+        {
+          "step": 150,
+          "value": 0.8680198976221052
+        },
+        {
+          "step": 175,
+          "value": 0.8650660935813128
+        },
+        {
+          "step": 200,
+          "value": 0.8627919091218238
+        }
+      ],
+      "updates": 200,
+      "gradients": [
+        {
+          "step": 1,
+          "rank_norm": 0.13277742347671745,
+          "weighted_temporal_norm": 2.03694332893481,
+          "weighted_cross_norm": 12.739323830526848,
+          "ordinal_norm": 13.124760337556049,
+          "cardinal_norm": 7.02559686808849,
+          "ordinal_cardinal_cosine": 0.38413557821151445,
+          "temporal_cardinal_cosine": -0.3440902734815895,
+          "cross_cardinal_cosine": 0.4479524971901745,
+          "rank_temporal_cosine": 0.15797361917544717
+        },
+        {
+          "step": 100,
+          "rank_norm": 0.1316259640237503,
+          "weighted_temporal_norm": 0.10119574590537236,
+          "weighted_cross_norm": 0.3790616937668742,
+          "ordinal_norm": 0.4429457267514538,
+          "cardinal_norm": 0.8447915444873433,
+          "ordinal_cardinal_cosine": -0.7055580363160808,
+          "temporal_cardinal_cosine": -0.08057610471626571,
+          "cross_cardinal_cosine": -0.6888781908674246,
+          "rank_temporal_cosine": 0.372913534264331
+        },
+        {
+          "step": 200,
+          "rank_norm": 0.15431612805632025,
+          "weighted_temporal_norm": 0.049224759734938416,
+          "weighted_cross_norm": 0.24181969581820154,
+          "ordinal_norm": 0.2920601037325278,
+          "cardinal_norm": 0.7647632436148186,
+          "ordinal_cardinal_cosine": -0.3976496978109448,
+          "temporal_cardinal_cosine": -0.10068305850672887,
+          "cross_cardinal_cosine": -0.3728285949889462,
+          "rank_temporal_cosine": 0.376685220459653
+        }
+      ],
+      "convergence": "fixed-budget endpoint"
+    },
+    "scratch_D": {
+      "selected_step": 200,
+      "validation": 0.8682552564289044,
+      "validation_trace": [
+        {
+          "step": 0,
+          "value": 1.2158638137377622
+        },
+        {
+          "step": 25,
+          "value": 1.0799119543886662
+        },
+        {
+          "step": 50,
+          "value": 0.9626168917169009
+        },
+        {
+          "step": 75,
+          "value": 0.9003706858217727
+        },
+        {
+          "step": 100,
+          "value": 0.8823995167538835
+        },
+        {
+          "step": 125,
+          "value": 0.8760373333312024
+        },
+        {
+          "step": 150,
+          "value": 0.8726727062857919
+        },
+        {
+          "step": 175,
+          "value": 0.8702151828106283
+        },
+        {
+          "step": 200,
+          "value": 0.8682552564289044
+        }
+      ],
+      "updates": 200,
+      "gradients": [
+        {
+          "step": 1,
+          "rank_norm": 0.13277742347671745,
+          "weighted_temporal_norm": 2.03694332893481,
+          "weighted_cross_norm": 12.739323830526848,
+          "ordinal_norm": 13.124760337556049,
+          "cardinal_norm": 2.869012818592811,
+          "ordinal_cardinal_cosine": 0.3726706431440209,
+          "temporal_cardinal_cosine": -0.27816153507052593,
+          "cross_cardinal_cosine": 0.4251840512227925,
+          "rank_temporal_cosine": 0.15797361917544717
+        },
+        {
+          "step": 100,
+          "rank_norm": 0.13778288671351518,
+          "weighted_temporal_norm": 0.08297163387696103,
+          "weighted_cross_norm": 0.33844492013324284,
+          "ordinal_norm": 0.4170243411460632,
+          "cardinal_norm": 0.5342854731072927,
+          "ordinal_cardinal_cosine": -0.7645106873615886,
+          "temporal_cardinal_cosine": -0.28078253059877173,
+          "cross_cardinal_cosine": -0.6403433729412693,
+          "rank_temporal_cosine": 0.25465795576959366
+        },
+        {
+          "step": 200,
+          "rank_norm": 0.16393973161692785,
+          "weighted_temporal_norm": 0.040103852019171715,
+          "weighted_cross_norm": 0.18761902638556954,
+          "ordinal_norm": 0.2791294777638867,
+          "cardinal_norm": 0.41963291996312807,
+          "ordinal_cardinal_cosine": -0.5657742422134862,
+          "temporal_cardinal_cosine": -0.19357832135993325,
+          "cross_cardinal_cosine": -0.510307095143995,
+          "rank_temporal_cosine": 0.33876302935191027
+        }
+      ],
+      "convergence": "fixed-budget endpoint"
+    }
+  },
+  "links": {
+    "temporal_pairs": 1024,
+    "cross_pairs": 410,
+    "cross_origin_cities": 16,
+    "cross_destination_cities": 16,
+    "cross_coverage": 0.2001953125,
+    "cross_graph_components": 1,
+    "cross_graph_connected": true
+  },
+  "frozen_heads": {
+    "A": {
+      "success": true,
+      "iterations": 1,
+      "objective": 0.10738710729793124
+    },
+    "B": {
+      "success": true,
+      "iterations": 1,
+      "objective": 0.10039653862268762
+    }
+  }
+}

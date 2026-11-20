@@ -1,0 +1,16 @@
+{
+  "passed": true,
+  "new_scorer_fits": 30,
+  "head_calibration_sets": 60,
+  "score_freeze_checks": 60,
+  "all_original_model_files_unchanged": true,
+  "shared_calibration_and_test_hashes_match": true,
+  "oracle_mask_matches_true_change": true,
+  "stable_delta_contributions_zero": true,
+  "all_pair_denominators_unchanged": true,
+  "max_head_gradient": 6.279698983036042e-16,
+  "max_tangent_gradient": 4.775495917555655e-08,
+  "max_finite_difference_error": 3.387255684272894e-10,
+  "calibration_features_and_outcomes_identical_to_prior": true,
+  "elapsed_seconds": 16.7550113000907
+}

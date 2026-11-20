@@ -1,0 +1,22 @@
+{
+  "rep": 102,
+  "candidate": "rW0.3_rD0",
+  "lambda_W": 0.08386289786602934,
+  "lambda_D": 0.0,
+  "gamma": 0.0,
+  "selected_update": 0,
+  "validation": 1.2613062332822687,
+  "val_rank": 0.15568627417087555,
+  "val_stability": 0.002738631097599864,
+  "val_common_level": 0.25493935784436417,
+  "val_common_change": 0.8498590119377489,
+  "val_native_level": 0.25493935688590125,
+  "val_native_change": 0.8498590095897347,
+  "val_native_composite": 1.2613062299757916,
+  "zero_validation": 1.2613062332822687,
+  "fixed_validation": 1.2759353189246683,
+  "active_validation": 1.2619222017072893,
+  "max_head_projected_grad": 9.405331407030815e-07,
+  "elapsed_seconds": 5.94024421996437,
+  "executed_updates": 1000
+}

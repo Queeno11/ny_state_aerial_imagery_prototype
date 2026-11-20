@@ -1,0 +1,228 @@
+{
+  "original_run": "C:/Working Papers/NY State Aerial Imagery Prototype/ny_state_aerial_imagery_prototype/src/ordinal_mc_suite/simple_index_pilot/run_5rep",
+  "original_manifest_sha256": "bd4d7591043d84bb718d13c872447f53f3eb450dcaef1083b55035741a5c9a04",
+  "saved_model_source_sha256": {
+    "rep_1\\case_A_models.json": "79b57e43fc22f3b97d367dcd60ea71b7ee308d712d7481750e2bb00905a5c468",
+    "rep_1\\case_B_models.json": "89120488b8fdce1fe212463cdb147a53b9a3368383a083806bffcf196a063aff",
+    "rep_1\\case_C_models.json": "a0bcecbb941a73b6d3e2009588f6cf08765570088f5364b7c19f5c1f9abdce94",
+    "rep_2\\case_A_models.json": "89228079612ff2bb49a6f3e5ea9a74343688ff254665dcddd2096094ab480d70",
+    "rep_2\\case_B_models.json": "9287a068488a93a0548a10639da48ffeaee9bc98dc26f3ad0ee1c84a7ecc8d2c",
+    "rep_2\\case_C_models.json": "be7d144d2503d8bbac94691e7b700030006351b5a02ce7b510cc17b7516774c6",
+    "rep_3\\case_A_models.json": "ac721897a8676b2440138eb61f88c4d0db8221d9efab967d531eb3c4b1f455ea",
+    "rep_3\\case_B_models.json": "dd258f232379a8f232f9258f0b05143dd39d982173b212ab8c5671ea67f8aca4",
+    "rep_3\\case_C_models.json": "2e3ad95736f7bfabc3767a5fbfb575581679e8b9e5dcc78f0acb28b9ea5b2519",
+    "rep_4\\case_A_models.json": "6bdb02b7992d67c214e64600dd452c37e65ff6332adcec3054f2a401a7bd354a",
+    "rep_4\\case_B_models.json": "ce1a8a24ac0aa604d4bf352c8a3f10ae8feb2675ab699272520b334bc05ca08f",
+    "rep_4\\case_C_models.json": "45d34fa8bdfb5090910c82b84275f91d6c04e550487e378f8d3897f7b1246fce",
+    "rep_5\\case_A_models.json": "a72224e610b7935095cbb6bf2b3039b84b9beea53e7866b01cc549eb3757ef75",
+    "rep_5\\case_B_models.json": "c0bd6382f89d4325c008469b27c7070727065ec27cc683dafa1392551ec90c0b",
+    "rep_5\\case_C_models.json": "6d897883f5b04cf78409e9850356ba322755cabc1ade3e1d84f5dca17f2eddeb"
+  },
+  "code_sha256": {
+    "calibrate_10pct.py": "edbbf4353096bce9e6d820031676a646cb4f97f895a5f664a4cd9f0b67780921",
+    "data.py": "f20f060eb4d3fcbd637a1851c230e3e1c13f4ca110a322c8bc07137e26a2f8f8",
+    "losses.py": "9f824cdae6962db2f137d3f531b9c7bd6ba5e319fee170724227b7e6b7586f0f"
+  },
+  "config": {
+    "seed": 2026110917,
+    "replications": [
+      1,
+      2,
+      3,
+      4,
+      5
+    ],
+    "calibration_replication": 101,
+    "cities": 20,
+    "paired_tracts": 200,
+    "fit_tracts": 160,
+    "test_tracts": 256,
+    "stability_views": 2,
+    "lambda_S": 0.3,
+    "tau": 0.1,
+    "gradient_budgets": [
+      0.0,
+      0.1,
+      1.0
+    ],
+    "additional_gradient_budgets": [
+      [
+        10.0,
+        0.0
+      ],
+      [
+        10.0,
+        10.0
+      ]
+    ],
+    "level_change_ratios": [
+      0.1,
+      1.0
+    ],
+    "curvature_per_level": 0.001,
+    "sphere_grid": 48,
+    "optimizer_maxiter": 130,
+    "test_doses": [
+      -0.4,
+      -0.15,
+      -0.05,
+      0.0,
+      0.05,
+      0.15,
+      0.4
+    ],
+    "cutoff_quantile": 0.95
+  },
+  "seed_namespace": "simple-index-frozen-head-10pct-v1",
+  "panels": {
+    "1": {
+      "seen": {
+        "panel_seed": 10861405748276511066,
+        "split_seed": 8631895271024742391,
+        "city_effect_seed": 1161651444193665111,
+        "calibration_ids_sha256": "de48786bb42038b4ef403ecf2c08791bb13e7c935d6ae75cbc8b5a3b72fba784",
+        "evaluation_ids_sha256": "402fa9370c51cebc7b6b1266e4696260a24957cd1ddc6f7bf11867f9a61a8b48",
+        "calibration_features_sha256": "4f9460a3f0aa3f3619432409030d5dac16fbd6680f883f7ceb854c5b9b2440bd",
+        "evaluation_features_sha256": "c6bffbd7fd49d02ad7976d870eae23b618e0f4b167738e1e435d4f478b0c3815",
+        "calibration_tracts_per_city": 28,
+        "evaluation_tracts_per_city": 252,
+        "city_count": 20,
+        "calibration_dates_per_tract": 2
+      },
+      "unseen": {
+        "panel_seed": 2257115803818164493,
+        "split_seed": 9599443065238043460,
+        "city_effect_seed": 9976364559024813004,
+        "calibration_ids_sha256": "ce03bdc4f14f1bea7691cb9427ca4b26ca3a61f5c4c107e50b400a3e29a6a588",
+        "evaluation_ids_sha256": "a44396af44ee109870f90389c72ec15b2cc56b26400b36fff2d587bd61eae1c0",
+        "calibration_features_sha256": "6b3e5806e476e5dc42f8429cc575c25601d693d181f47679a7b356304b33cee7",
+        "evaluation_features_sha256": "aba7c3e7a5ee6d69c90904d4bacc092bedc25e3b46094d70adcb5c4d0d5c8b33",
+        "calibration_tracts_per_city": 28,
+        "evaluation_tracts_per_city": 252,
+        "city_count": 20,
+        "calibration_dates_per_tract": 2
+      }
+    },
+    "2": {
+      "seen": {
+        "panel_seed": 13323502190566847889,
+        "split_seed": 14568869105299180784,
+        "city_effect_seed": 16909716968972137601,
+        "calibration_ids_sha256": "a4bd2f41a1a30745283e1ffa51fb4d985e6ec2d6298810ba139ebc8c93525d90",
+        "evaluation_ids_sha256": "fb514d18cdecaea61ea34560f4717a838f41f13feddad0055735abe496e9e625",
+        "calibration_features_sha256": "c6b6b68e478899fdb9dbaf47755f7108083696ea73929ca4d7f09cf34c5894bb",
+        "evaluation_features_sha256": "6fb078ba9db1977a58da64373e0e336422d839d0b34c25dffa9eba0133585e2c",
+        "calibration_tracts_per_city": 28,
+        "evaluation_tracts_per_city": 252,
+        "city_count": 20,
+        "calibration_dates_per_tract": 2
+      },
+      "unseen": {
+        "panel_seed": 540539175878755481,
+        "split_seed": 12573728583000157441,
+        "city_effect_seed": 11099329439909833847,
+        "calibration_ids_sha256": "f29b2f4b89f23a5a2085e3732885517f0a3d14ca430277a204131ad65378ba4c",
+        "evaluation_ids_sha256": "d33fb2a84910b6e700d1f72ec46d8edabddcf0205a8c3495bcd3b6484c4298a5",
+        "calibration_features_sha256": "a78ae77a37002c91787acbc150d9cbd9832862af73cccdd4e403ae20e44167d4",
+        "evaluation_features_sha256": "3fa758bc144bf68b9cc0a995d11726435811f63875dbcc85b851e4333eeedb33",
+        "calibration_tracts_per_city": 28,
+        "evaluation_tracts_per_city": 252,
+        "city_count": 20,
+        "calibration_dates_per_tract": 2
+      }
+    },
+    "3": {
+      "seen": {
+        "panel_seed": 5654074412371182596,
+        "split_seed": 17778974097259121738,
+        "city_effect_seed": 4251110956832861326,
+        "calibration_ids_sha256": "576eecf9ce2857483ba123e1e07f3e0f81daf1fd4803efd772f16cf5588e4d69",
+        "evaluation_ids_sha256": "2f4cc784e4c697f6095c75851571fa7bbfceadad5133b5f9f7e9c7cf966b0c3a",
+        "calibration_features_sha256": "8422c6ac00ef5dbf3286d45d35901ae04c4e2eaf4216d1317b6f0f830100ba71",
+        "evaluation_features_sha256": "329a5c6b82f73001675a1385d8c0aa1b0a9fd2f6c748a65b72dc8ed500fc92ae",
+        "calibration_tracts_per_city": 28,
+        "evaluation_tracts_per_city": 252,
+        "city_count": 20,
+        "calibration_dates_per_tract": 2
+      },
+      "unseen": {
+        "panel_seed": 14820496951868289329,
+        "split_seed": 14711229557452316039,
+        "city_effect_seed": 14189253585129136525,
+        "calibration_ids_sha256": "8ceb3770acdd8320a5582dc8e502390c3cffdb7864daf95d2d17b352728ea573",
+        "evaluation_ids_sha256": "b36fa63e837d4002f63da98266b7b7bd77f71ca3e7681a5bbda03b413cbd9ab5",
+        "calibration_features_sha256": "d68f4cf186737c21ef11a78f074d4058f96618b8fc6993ba7c66356dfb72cb6c",
+        "evaluation_features_sha256": "bf389b574a743648a61362b194886c3d2f9cd1dbb6a40d00d0dc4c3bd91288c3",
+        "calibration_tracts_per_city": 28,
+        "evaluation_tracts_per_city": 252,
+        "city_count": 20,
+        "calibration_dates_per_tract": 2
+      }
+    },
+    "4": {
+      "seen": {
+        "panel_seed": 4590843160863949803,
+        "split_seed": 12870407037440699339,
+        "city_effect_seed": 9296284767202369756,
+        "calibration_ids_sha256": "d941026e5e78bcc8f171a7f5e1de3daec850e7e7c7b7e38ea97d18e7263a383b",
+        "evaluation_ids_sha256": "3d13dea8a9a92c31ddd48e4b4acb5ea122faad838c17e23574c92e7cd44101ff",
+        "calibration_features_sha256": "4746c541a8289925008e16b9a1181fb9bfbd19e097d3f47fdd6515971c31362d",
+        "evaluation_features_sha256": "57850b55359f9be6e5e43dda776a8b9b78800f82c3ddcb1dae551a3bcd5713b6",
+        "calibration_tracts_per_city": 28,
+        "evaluation_tracts_per_city": 252,
+        "city_count": 20,
+        "calibration_dates_per_tract": 2
+      },
+      "unseen": {
+        "panel_seed": 14324525994746808544,
+        "split_seed": 2800115344338561884,
+        "city_effect_seed": 17358833881672352252,
+        "calibration_ids_sha256": "b1a06a998a450876b55dba00f59f151ce26a142fcf58a3605141a8a1ac33afcd",
+        "evaluation_ids_sha256": "bab401ddb8e19347586de133c320558c3d57689deff00836002778329a5bd582",
+        "calibration_features_sha256": "3e13cf4173ab5847c5e3b3214679c56776aae2a94c3dc56efa6073d999732bef",
+        "evaluation_features_sha256": "c1a501813c5476fe84e85a0dbb87d3105cc8aa957bdf341f4176f3be6cdf3b08",
+        "calibration_tracts_per_city": 28,
+        "evaluation_tracts_per_city": 252,
+        "city_count": 20,
+        "calibration_dates_per_tract": 2
+      }
+    },
+    "5": {
+      "seen": {
+        "panel_seed": 116202078622685889,
+        "split_seed": 2835535848080150977,
+        "city_effect_seed": 2719007641596453620,
+        "calibration_ids_sha256": "2698d94b46e46cdf4e13449eb8a9bf2cc168b70fcd8fc8617b15f5836e1c48a1",
+        "evaluation_ids_sha256": "acc4f06a368ed414044ac2939920096ef9aad7a7ea3d53338b7f6ec76aeb294a",
+        "calibration_features_sha256": "06354e3487b6b01e1aa07af39f2264f04ddb47c98ffac86af498f8cfee7760a5",
+        "evaluation_features_sha256": "4f20911e00070ef3571051b62f02b0a6300742b76cc82bee19b769fccb413a22",
+        "calibration_tracts_per_city": 28,
+        "evaluation_tracts_per_city": 252,
+        "city_count": 20,
+        "calibration_dates_per_tract": 2
+      },
+      "unseen": {
+        "panel_seed": 9613359285243925208,
+        "split_seed": 4590319872783520804,
+        "city_effect_seed": 3039998013959887311,
+        "calibration_ids_sha256": "5a7e76b8ff6ba1952c0f30b5b513793de721f57dcc76136ac172d136d0fb7a4d",
+        "evaluation_ids_sha256": "f23eaf41f13a9e48155588dc532e57b5a580cde114baa28c005b5d0fd845a815",
+        "calibration_features_sha256": "6cf2fb1e7160f03a341adbb54b003599f2ba792129ba121ba9d1cfd9c40c39e8",
+        "evaluation_features_sha256": "dc0dc1684c3e50b0e3a2f850656c29d3fc16d828d9aaf0a2673fdf930f178497",
+        "calibration_tracts_per_city": 28,
+        "evaluation_tracts_per_city": 252,
+        "city_count": 20,
+        "calibration_dates_per_tract": 2
+      }
+    }
+  },
+  "separate_diagnostic": "true f as a frozen score with the same observed calibration W and an estimated head",
+  "head_criterion": "unpenalized unweighted constrained least squares on observed calibration W",
+  "head_inputs": "frozen global unit-normalized score and city; common positive slope A, city affine B, city monotone cubic C; same map both dates",
+  "city_aggregation": "equal-city mean and sample SD of MSE within each replication, then mean over five replications",
+  "versions": {
+    "python": "3.13.7",
+    "numpy": "2.2.6",
+    "pandas": "2.3.2"
+  }
+}

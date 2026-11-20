@@ -1,0 +1,7 @@
+{
+  "single_replication_each": true,
+  "ranking_invariance_max_error": 0.0,
+  "validation_checkpoint_checks_passed": true,
+  "automated_tests_passed": 10,
+  "full_mc_run": false
+}

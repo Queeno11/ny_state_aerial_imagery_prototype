@@ -1,0 +1,34 @@
+{
+  "common": {
+    "iterations": 469,
+    "projected_gradient": 2.9097989795445756e-07,
+    "solver_status": "CONVERGENCE: RELATIVE REDUCTION OF F <= FACTR*EPSMCH",
+    "objective": 1.0549876790013715
+  },
+  "own": {
+    "L": {
+      "iterations": 232,
+      "projected_gradient": 8.692737318849453e-08,
+      "solver_status": "CONVERGENCE: NORM OF PROJECTED GRADIENT <= PGTOL",
+      "objective": 0.23420771718427155
+    },
+    "LC": {
+      "iterations": 84,
+      "projected_gradient": 8.141790874827137e-08,
+      "solver_status": "CONVERGENCE: NORM OF PROJECTED GRADIENT <= PGTOL",
+      "objective": 0.23691793502053654
+    },
+    "LD": {
+      "iterations": 367,
+      "projected_gradient": 9.55498368759855e-08,
+      "solver_status": "CONVERGENCE: NORM OF PROJECTED GRADIENT <= PGTOL",
+      "objective": 0.5051347611586425
+    },
+    "LDC": {
+      "iterations": 152,
+      "projected_gradient": 8.884668079023328e-08,
+      "solver_status": "CONVERGENCE: NORM OF PROJECTED GRADIENT <= PGTOL",
+      "objective": 0.5103635435860167
+    }
+  }
+}

@@ -1,0 +1,9 @@
+{
+  "budget_verified": true,
+  "positive_slopes": true,
+  "finite_paths": true,
+  "initial_OLS_stationary": true,
+  "scorer_gradient_nonzero": true,
+  "validation_selection_verified": true,
+  "source_checkpoint_unchanged": true
+}

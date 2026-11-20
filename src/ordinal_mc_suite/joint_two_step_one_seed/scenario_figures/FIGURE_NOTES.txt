@@ -1,0 +1,7 @@
+Ordinal joint-versus-two-step pilot: scenario figures
+
+M1: settings [1, 4]; Additive cell effects; the four panels show f, mu, delta f and delta mu MSE.
+M2: settings [2, 5]; Cell-specific affine maps; the four panels show f, mu, delta f and delta mu MSE.
+M3: settings [3, 6, 7, 8]; Nonlinear monotone maps; the four panels show f, mu, delta f and delta mu MSE.
+
+Evaluation: held-out target-city test tracts after separate local outcome-head calibration. Latent NN scores have a single positive source-fitting affine alignment to true f, used only for evaluation. All tract types are included. Symbols distinguish ranking losses, colors estimation procedures. All plotted values are mean squared errors, not RMSE. No averaging over distinct DGPs or link regimes. Maximum likelihood knows the structural basis, noise distribution/parameters and latent normalization. Its cell maps and structural coefficients are estimated. It is an information-advantaged reference, not a guaranteed finite-sample optimum. Open MLE diamonds flag target-calibration nonconvergence for outcome panels; source-only latent predictions do not depend on that target calibration. Oracle f and mu errors are zero and explicitly labeled outside the logarithmic axes. Scratch methods have 200 total updates; warm joint and ordinal continuation have 600, and A/B have 400 scorer updates. One seed supplies no Monte Carlo uncertainty estimate.

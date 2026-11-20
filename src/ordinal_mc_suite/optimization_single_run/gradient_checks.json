@@ -1,0 +1,41 @@
+{
+  "numpy_objective_max_error": 4.440892098500626e-16,
+  "directional_checks": [
+    {
+      "direction": 0,
+      "epsilon": 1e-05,
+      "analytic": -0.13884355363449305,
+      "numeric": -0.13884355362092649,
+      "scaled_error": 1.1912579647257275e-11
+    },
+    {
+      "direction": 1,
+      "epsilon": 1e-06,
+      "analytic": -0.33321650830238636,
+      "numeric": -0.33321650838580297,
+      "scaled_error": 6.256793734232058e-11
+    },
+    {
+      "direction": 2,
+      "epsilon": 1e-06,
+      "analytic": 0.08678191006663921,
+      "numeric": 0.0867819101024736,
+      "scaled_error": 3.297293659210129e-11
+    },
+    {
+      "direction": 3,
+      "epsilon": 1e-07,
+      "analytic": 0.36713062939302465,
+      "numeric": 0.3671306292307719,
+      "scaled_error": 1.1868124617306162e-10
+    },
+    {
+      "direction": 4,
+      "epsilon": 1e-06,
+      "analytic": -0.0013043809595346123,
+      "numeric": -0.001304381269662258,
+      "scaled_error": 3.097236481568223e-10
+    }
+  ],
+  "penalty_gradient_max_error": 1.6653345369377348e-16
+}

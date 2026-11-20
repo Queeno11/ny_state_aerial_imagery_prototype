@@ -1,0 +1,9 @@
+{
+  "expected_fits": 5760,
+  "saved_fits": 5760,
+  "replications": 30,
+  "summary_cells_verified": 960,
+  "ml_not_converged": 0,
+  "linked_nn_fits": 1440,
+  "linked_nn_audit_unstable": 1440
+}

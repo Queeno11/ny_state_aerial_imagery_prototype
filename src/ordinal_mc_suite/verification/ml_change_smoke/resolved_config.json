@@ -1,0 +1,178 @@
+{
+  "seed": 72101,
+  "function_seed": 983,
+  "models": [
+    "linear"
+  ],
+  "truths": [
+    "linear"
+  ],
+  "n": [
+    16
+  ],
+  "city_grid": [
+    2
+  ],
+  "reps": 1,
+  "cities": 2,
+  "views": 1,
+  "noise_sd": 0.7,
+  "bayes_target": 0.2,
+  "acquisition_strength": 1.0,
+  "group_strength": 1.0,
+  "validation_fraction": 0.25,
+  "pair_mode": "all",
+  "pairs_per_label": 8,
+  "test_per_city": 24,
+  "test_pairs": 128,
+  "hidden": [
+    32,
+    16
+  ],
+  "weight_bound": 10.0,
+  "rff": 16,
+  "epochs": 10,
+  "restarts": 1,
+  "lbfgs_steps": 10,
+  "audit_steps": 3,
+  "lr": 0.01,
+  "tau": 0.1,
+  "ridge_grid": [
+    0.0
+  ],
+  "lambda_grid": [
+    0.0,
+    0.3
+  ],
+  "lambda_t": 0.3,
+  "lambda_c": 0.3,
+  "dtype": "float64",
+  "device": "cpu",
+  "threads": 1,
+  "workers": 3,
+  "grad_tol": 1e-05,
+  "audit_tol": 1e-05,
+  "false_jump": 1.0,
+  "experiment1": {
+    "psi_shapes": [
+      "tanh"
+    ],
+    "cases": [
+      [
+        "common",
+        0.0
+      ],
+      [
+        "shape",
+        1.0
+      ]
+    ],
+    "composition_grid": [
+      0.0
+    ],
+    "losses": [
+      "common_logit"
+    ],
+    "methods": [
+      "rank_common",
+      "raw_levels"
+    ]
+  },
+  "experiment2": {
+    "losses": [
+      "common_logit"
+    ],
+    "arms": [
+      "none"
+    ],
+    "cases": [
+      [
+        "gumbel",
+        0.0
+      ],
+      [
+        "normal",
+        0.0
+      ],
+      [
+        "student",
+        5.0
+      ],
+      [
+        "chi2",
+        4.0
+      ],
+      [
+        "mixture",
+        1.0
+      ],
+      [
+        "cell_scale",
+        0.7
+      ],
+      [
+        "feature_scale",
+        0.7
+      ],
+      [
+        "median_violation",
+        0.7
+      ]
+    ]
+  },
+  "experiment3": {
+    "losses": [
+      "common_logit"
+    ],
+    "arms": [
+      "none",
+      "temporal"
+    ],
+    "nuisance_cases": [
+      [
+        1.0,
+        1.0
+      ]
+    ]
+  },
+  "experiment4": {
+    "losses": [
+      "common_logit"
+    ],
+    "arms": [
+      "temporal"
+    ],
+    "cases": [
+      [
+        "exact",
+        0.0
+      ],
+      [
+        "random_false",
+        0.2
+      ]
+    ]
+  },
+  "experiment5": {
+    "losses": [
+      "common_logit"
+    ],
+    "arms": [
+      "none",
+      "temporal",
+      "both"
+    ],
+    "change_strength_grid": [
+      0.0,
+      0.4,
+      0.8
+    ],
+    "contamination_grid": [
+      0.0,
+      0.5
+    ],
+    "changed_share": 0.5,
+    "false_positive_target": 0.05,
+    "truth_threshold": 0.05
+  }
+}

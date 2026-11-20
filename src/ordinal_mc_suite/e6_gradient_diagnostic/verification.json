@@ -1,0 +1,6 @@
+{
+  "gradient_sums_match_autograd": true,
+  "saved_selected_checkpoint_replayed_at_step20": true,
+  "clipping_never_active": true,
+  "level_penalty_has_no_direct_scorer_dependence": true
+}

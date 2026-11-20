@@ -1,0 +1,8 @@
+{
+  "accepted_Q_scorer_steps_cardinal_nonincreasing": true,
+  "all_Q_training_constraints_satisfied": true,
+  "max_residual_identity_discrepancy": 3.552713678800501e-15,
+  "max_integration_mean_discrepancy": 1.7763568394002505e-15,
+  "max_integration_variance_discrepancy": 5.3290705182007506e-15,
+  "F_A_exact_scorer_and_metric_equality": true
+}

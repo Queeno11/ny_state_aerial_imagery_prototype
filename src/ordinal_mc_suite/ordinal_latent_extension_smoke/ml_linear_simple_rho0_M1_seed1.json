@@ -1,0 +1,179 @@
+{
+  "fit_fingerprint": {
+    "c": "f54717a1a69a8075bd82874b074c0524b0a7944107396c43e15d5454a3f70c39",
+    "category": "dfd62a808404b1bd4a4bbb4eeb028ff956f329bd1fa826618640de2b09c916b3",
+    "contexts": "0f9d355d58e0b6c83d808e1a1ad396de45b62df6d2afaee28e4457bdbdebe529",
+    "f": "1614feec899d6a9f87f5eb7dd8838b5b827eb3fe431c907cd4d93c7a04768bac",
+    "h": "73a68bc31d52c7d7160e01aa9983df2a9cb33e6c7d639e2d3025f2874ec6b158",
+    "r": "594eaae60651f6557d544216f75cab28a632a5b012c4a79b68ab992ad221f9ce",
+    "w": "d1f69575c30367184b98fdb7fa4030dc2aa816e54d370579b6ec4ebcad05add1",
+    "x": "4eb8be621ec246d7b521ce0a69dfbb8d0e812ba52066c091e24e28ff68e3bcb9"
+  },
+  "map": "M1",
+  "optimization": {
+    "closure_calls": 16,
+    "convergence": "gradient tolerance met",
+    "device": "cuda",
+    "final_nll": 1.0424777586973288,
+    "first_basis_coefficient_fixed_to_one": true,
+    "gradient_check_tolerance": 0.0001,
+    "gradient_norm": 1.2989672970406578e-06,
+    "initial_nll": 2.011005762503804,
+    "iteration_cap_reached": false,
+    "iterations": 16,
+    "known_rho": 0.0,
+    "known_sigma": 0.8,
+    "max_iterations": 20,
+    "objective_improvement": 0.9685280038064752,
+    "selection": "lowest finite source fitting NLL",
+    "slope_floor": 0.0001,
+    "start": 0,
+    "starts": [
+      {
+        "closure_calls": 16,
+        "convergence": "gradient tolerance met",
+        "final_nll": 1.0424777586973288,
+        "gradient_check_tolerance": 0.0001,
+        "gradient_norm": 1.2989672970406578e-06,
+        "initial_nll": 2.011005762503804,
+        "iteration_cap_reached": false,
+        "iterations": 16,
+        "max_iterations": 20,
+        "objective_improvement": 0.9685280038064752,
+        "parameters": {
+          "a": [
+            0.216893858256549,
+            1.074966483127328,
+            -0.6853940808993584,
+            -0.31378450977288774,
+            -0.39453475869555255,
+            -0.07431342881524938,
+            -0.5948149281372059,
+            -0.11318877032196274
+          ],
+          "b": [
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0
+          ],
+          "coeff": [
+            1.0,
+            0.4209024607150766,
+            -0.3815155881420974
+          ],
+          "k": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ]
+        },
+        "start": 0
+      },
+      {
+        "closure_calls": 19,
+        "convergence": "gradient tolerance met",
+        "final_nll": 1.04247775869788,
+        "gradient_check_tolerance": 0.0001,
+        "gradient_norm": 1.6500924020258917e-06,
+        "initial_nll": 2.025268263265501,
+        "iteration_cap_reached": false,
+        "iterations": 19,
+        "max_iterations": 20,
+        "objective_improvement": 0.9827905045676211,
+        "parameters": {
+          "a": [
+            0.21689637158322456,
+            1.074969354528731,
+            -0.6853934200341243,
+            -0.31378389587357935,
+            -0.3945353118379422,
+            -0.07431376925228908,
+            -0.5948136912041432,
+            -0.11318710867165678
+          ],
+          "b": [
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0
+          ],
+          "coeff": [
+            1.0,
+            0.4209025110720729,
+            -0.38151609963142036
+          ],
+          "k": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ]
+        },
+        "start": 1
+      }
+    ],
+    "tanh_shape_open_bounds": [
+      0.0,
+      2.0
+    ]
+  },
+  "parameters": {
+    "a": [
+      0.216893858256549,
+      1.074966483127328,
+      -0.6853940808993584,
+      -0.31378450977288774,
+      -0.39453475869555255,
+      -0.07431342881524938,
+      -0.5948149281372059,
+      -0.11318877032196274
+    ],
+    "b": [
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0
+    ],
+    "coeff": [
+      1.0,
+      0.4209024607150766,
+      -0.3815155881420974
+    ],
+    "k": [
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0
+    ]
+  },
+  "scenario": "linear/simple/rho0",
+  "seed": 1,
+  "source_fit_cities": 4,
+  "source_fit_n": 16
+}

@@ -1,0 +1,131 @@
+{
+  "job": {
+    "rep": 1,
+    "cities": 32,
+    "truth": "quadratic",
+    "model": "nn"
+  },
+  "config": {
+    "seed": 20261103,
+    "function_seed": 983,
+    "replications": 30,
+    "cities": [
+      32,
+      64
+    ],
+    "cases": [
+      [
+        "linear",
+        "linear"
+      ],
+      [
+        "quadratic",
+        "nn"
+      ]
+    ],
+    "labels_per_city": 512,
+    "validation_fraction": 0.2,
+    "views": 2,
+    "noise_sd": 0.7,
+    "bayes_target": 0.2,
+    "hidden": [
+      32,
+      16
+    ],
+    "weight_bound": 10.0,
+    "acquisition_strength": 1.0,
+    "group_strength": 1.0,
+    "alpha": 0.0,
+    "lambda_t": 0.3,
+    "test_per_city": 128,
+    "test_pairs": 3000,
+    "change_strengths": [
+      0.0,
+      0.15,
+      0.4,
+      0.8
+    ],
+    "changed_share": 0.5,
+    "truth_threshold": 0.05,
+    "false_positive_target": 0.05,
+    "actual_size_edges": [
+      0.05,
+      0.15,
+      0.3,
+      0.6
+    ],
+    "quadrature_nodes": 128,
+    "maps": [
+      "affine",
+      "nonlinear"
+    ],
+    "heads": [
+      "affine",
+      "spline"
+    ],
+    "level_weights": [
+      0.1,
+      1.0,
+      10.0
+    ],
+    "validation_rank_weight": 1.0,
+    "validation_level_weight": 1.0,
+    "kappa_base": 0.6,
+    "kappa_amplitude": 0.2,
+    "kappa_time_shift": 0.5,
+    "restarts": 3,
+    "threads": 1,
+    "workers": 8,
+    "baseline": {
+      "adam_steps": 3000,
+      "lr": 0.01,
+      "check_every": 10,
+      "patience": 20,
+      "lbfgs_steps": 400,
+      "lbfgs_chunk": 10,
+      "lbfgs_patience": 10
+    },
+    "head_training": {
+      "steps": 600,
+      "lr": 0.02,
+      "check_every": 10,
+      "patience": 20,
+      "knots": [
+        0.2,
+        0.5,
+        0.8
+      ],
+      "kappa_G": 0.01,
+      "pool_relative": 10.0
+    },
+    "joint": {
+      "steps": 600,
+      "scorer_lr": 0.001,
+      "head_lr": 0.01,
+      "check_every": 10,
+      "patience": 20
+    },
+    "oracle_R": {
+      "enabled": true,
+      "steps": 600,
+      "lr": 0.001
+    },
+    "min_delta": 1e-05
+  },
+  "runtime": {
+    "python": "3.10.20",
+    "torch": "2.5.1",
+    "numpy": "2.2.6"
+  },
+  "source_checkpoint_sha256": "0bb8381fbc821d5dfe4392b0b9c5b58a669d300afca82037418590382e55a4d2",
+  "baseline_validation_reproduced": true,
+  "feature_transforms_reproduced": true,
+  "checkpoint_unchanged": true,
+  "monte_carlo_rerun": false,
+  "short_diagnostic_steps": 20,
+  "head_anchor_weight": 10.0,
+  "head_anchor_map": "nonlinear",
+  "head_anchor_family": "affine",
+  "test_or_latent_targets_used": false,
+  "note": "lambda=0 path retains the joint head optimizer/penalty to isolate lambda; it is not the original D arm"
+}

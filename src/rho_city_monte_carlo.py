@@ -20,8 +20,9 @@ Optional shrinkage of city log-calibrations (zero by default):
 
 DEFAULT DESIGN
 --------------
-3 replications x 2 noise scenarios x 3 estimators = 18 bounded fits, each with
-1,500 optimizer steps. 120 cities; 4 years; total TRAINING observations per city
+3 replications x 2 noise scenarios x 4 estimators = 24 fits. The three NN
+estimators use 1,500 optimizer steps; parametric ML uses SciPy. 120 cities;
+4 years; total TRAINING observations per city
 are 20, 80, 300, 1,000, or 2,000, allocated across years. The balanced default
 design has 81,600 training observations. Validation/test populations are freshly
 generated and equally large in every city, so small-city performance is measured
@@ -50,11 +51,14 @@ DGP AND IDENTIFICATION
   because R is not standard normal. Log(W) is stored to preserve ordering without
   overflow; it is exactly the same ranking supervision as W.
 
-ESTIMATORS (same architecture, initial weights, and minibatch stream)
+ESTIMATORS (NN arms share architecture, initial weights, and minibatch stream)
 ------------------------------------------------------------------
 shared: learn ONE positive calibration, constrained equal across all cities.
 city:   learn ONE positive calibration PER CITY, shared across years.
 oracle: use the true rho_c while still learning f with exactly the same NN.
+ml_correct: estimate the true cubic structural family by full observation ML,
+  with known measurement maps and rho_c. This oracle-nuisance parametric
+  benchmark estimates coefficients from training log-labels; it never uses f.
 
 A learned shared scalar is a fairer homogeneous baseline than fixing rho=1:
 with a normalized score, a fixed value would impose an arbitrary noise level.
@@ -118,7 +122,7 @@ from torch import nn
 from torch.nn import functional as F
 
 
-METHODS = ("shared", "city", "oracle")
+METHODS = ("shared", "city", "oracle", "ml_correct")
 SIZE_LEVELS = np.array([20, 80, 300, 1000, 2000])
 EULER_GAMMA = 0.5772156649015329
 RHO_BOUNDS = (0.1, 10.0)
@@ -281,6 +285,27 @@ class ScoreNN(nn.Module):
         return self.net(x).squeeze(-1)
 
 
+def cubic_basis(x):
+    x=np.asarray(x,dtype=float)
+    w=np.array([.45,.35,.30,.25,.20,.15]); v=np.array([.10,.20,.45,.30,.20,.10])
+    return np.column_stack((np.ones(len(x)),x@w,(x@w)**3,(x@v)**3,x[:,0]**3,x[:,1]**3))
+
+
+class MLScore(nn.Module):
+    """Fitted parametric score in the DGP's identified units."""
+    def __init__(self,beta):
+        super().__init__()
+        self.beta=nn.Parameter(torch.as_tensor(beta,dtype=torch.float64),requires_grad=False)
+        self.ml_physical_units=True
+
+    def forward(self,x):
+        x=x.double()
+        w=x.new_tensor([.45,.35,.30,.25,.20,.15]); v=x.new_tensor([.10,.20,.45,.30,.20,.10])
+        z=torch.stack((torch.ones(len(x),device=x.device,dtype=x.dtype),x@w,(x@w)**3,
+                       (x@v)**3,x[:,0]**3,x[:,1]**3),dim=1)
+        return z@self.beta
+
+
 class Calibrator(nn.Module):
     def __init__(self, method, true_rho, device):
         super().__init__()
@@ -304,6 +329,8 @@ class Calibrator(nn.Module):
 
 
 def normalization(model, reference):
+    if getattr(model,'ml_physical_units',False):
+        return model.beta.new_tensor(0.),model.beta.new_tensor(1.)
     raw = model(reference)
     return raw.mean(), raw.std(unbiased=False).clamp_min(1e-5)
 
@@ -345,11 +372,21 @@ def correlation(x, y):
 
 
 def fit_one(a, d, method, initial, rep, log_sd, device, folder):
-    model = ScoreNN(a.width).to(device)
-    model.load_state_dict(copy.deepcopy(initial))
-    cal = Calibrator(method, d["rho"], device)
+    ml_stats={}; ml_start=time.perf_counter()
+    if method=='ml_correct':
+        from ordinal_mc_suite.ordinal_mc.likelihood import fit_coefficients
+        tr=d['train']; cell=tr['cell']; city=tr['city']
+        response=(tr['log_w']-d['mu'].reshape(-1)[cell])/d['sigma'].reshape(-1)[cell]
+        # This DGP uses unstandardized centered Gumbels divided by rho.
+        scale=np.pi/np.sqrt(6)/d['rho'][city]
+        beta,ml_stats=fit_coefficients(cubic_basis(tr['x']),response,scale,'gumbel',0.)
+        model=MLScore(beta).to(device)
+    else:
+        model = ScoreNN(a.width).to(device)
+        model.load_state_dict(copy.deepcopy(initial))
+    cal = Calibrator('oracle' if method=='ml_correct' else method, d["rho"], device)
     groups = [{"params": list(model.parameters()), "lr": a.lr, "weight_decay": 1e-5}]
-    if method != "oracle":
+    if method not in ("oracle","ml_correct"):
         groups.append({"params": [cal.log_rho], "lr": a.rho_lr, "weight_decay": 0.0})
     optimizer = torch.optim.AdamW(groups)
     # Identical generator seeds guarantee identical groups and sampled units by method.
@@ -370,7 +407,7 @@ def fit_one(a, d, method, initial, rep, log_sd, device, folder):
     group_probs /= group_probs.sum()
     histories, best_state = [], None
     best_nll, best_step = float("inf"), 0
-    start = time.perf_counter()
+    start = ml_start if method=='ml_correct' else time.perf_counter()
 
     def validate(step, train_loss):
         nonlocal best_nll, best_state, best_step
@@ -393,7 +430,7 @@ def fit_one(a, d, method, initial, rep, log_sd, device, folder):
               flush=True)
 
     validate(0, float("nan"))
-    for step in range(1, a.steps+1):
+    for step in range(1, (0 if method=='ml_correct' else a.steps)+1):
         model.train()
         if a.weighting == "city":
             cells = torch.randint(len(counts), (a.groups_per_step,),
@@ -488,12 +525,17 @@ def fit_one(a, d, method, initial, rep, log_sd, device, folder):
                    log_rho_correlation=correlation(np.log(rho_hat), np.log(d["rho"])),
                    rho_at_bounds_fraction=float(np.mean((rho_hat <= 0.1001) | (rho_hat >= 9.999))),
                    alignment_slope=slope, alignment_intercept=intercept)
+    metrics.update(ml_success=ml_stats.get('ml_success'),ml_message=ml_stats.get('ml_message'),
+                   ml_train_nll=ml_stats.get('ml_train_nll'))
     # Save inference-ready normalization constants: no reference sample needed to deploy.
     torch.save(dict(model_state={k: v.cpu() for k, v in model.state_dict().items()},
                     width=a.width, input_dimension=6, raw_score_mean=float(center.cpu()),
                     raw_score_sd=float(scale.cpu()), rho_hat=rho_hat.tolist(),
                     method=method, best_step=best_step,
-                    inference="f_hat(x)=(ScoreNN(x)-raw_score_mean)/raw_score_sd"),
+                    model_type='true_cubic_basis' if method=='ml_correct' else 'ScoreNN',
+                    ml_information='known cubic basis, measurement map and rho; fitted coefficients' if method=='ml_correct' else None,
+                    inference="f_hat(x)=cubic_basis(x)@beta; beta is model_state['beta']" if method=='ml_correct'
+                      else "f_hat(x)=(ScoreNN(x)-raw_score_mean)/raw_score_sd"),
                folder/f"{method}_checkpoint.pt")
     np.savez_compressed(folder/f"{method}_predictions.npz", city=d["test"]["city"],
                         f_true=truth, f_hat=st, rho_true=d["rho"], rho_hat=rho_hat,
@@ -530,7 +572,8 @@ def diagnostic_plot(path, method, log_sd, truth, score, rho, rho_hat, sizes, row
 
 SUMMARY_METRICS = ("f_r2", "aligned_f_r2", "f_rmse", "test_nll", "test_kl",
                    "probability_rmse", "cross_city_latent_accuracy", "delta_f_rmse",
-                   "log_rho_rmse", "city_weighted_rmse", "building_weighted_rmse")
+                   "log_rho_rmse", "city_weighted_rmse", "building_weighted_rmse",
+                   "latent_pair_accuracy", "observed_pair_accuracy")
 
 
 def summarize(a, metrics, city_rows, histories):
@@ -546,7 +589,7 @@ def summarize(a, metrics, city_rows, histories):
                                     metric=metric, mean=float(values.mean()),
                                     mc_se=float(values.std(ddof=1)/np.sqrt(len(values)))
                                     if len(values) > 1 else float("nan"), reps=len(values)))
-        for comparison in ("city", "oracle"):
+        for comparison in ("city", "oracle", "ml_correct"):
             for metric in SUMMARY_METRICS:
                 diffs = []
                 for rep in range(a.reps):
@@ -574,7 +617,7 @@ def summary_plot(a, metrics, city_rows, histories):
     import matplotlib.pyplot as plt
     fig, axes = plt.subplots(len(a.log_rho_sds), 4,
                              figsize=(16, 4*len(a.log_rho_sds)), squeeze=False)
-    colors = {"shared": "#64748b", "city": "#2563eb", "oracle": "#059669"}
+    colors = {"shared": "#64748b", "city": "#2563eb", "oracle": "#059669", "ml_correct":"#b45309"}
     for row, sd in enumerate(a.log_rho_sds):
         for method in METHODS:
             ms = [r for r in metrics if r["log_rho_sd"] == sd and r["method"] == method]
@@ -594,9 +637,10 @@ def summary_plot(a, metrics, city_rows, histories):
             hs = [r for r in histories if r["log_rho_sd"] == sd and r["method"] == method]
             steps = sorted(set(r["step"] for r in hs))
             vals = [np.mean([r["val_nll"] for r in hs if r["step"] == s]) for s in steps]
-            axes[row, 3].plot(steps, vals, color=colors[method], label=method)
+            axes[row, 3].plot(steps, vals, color=colors[method], label=method,
+                              marker='o' if method=='ml_correct' else None)
         for col, title in enumerate(("Latent index R2 (higher better)", "Probability KL (lower better)")):
-            axes[row, col].set(xticks=range(3), xticklabels=METHODS,
+            axes[row, col].set(xticks=range(len(METHODS)), xticklabels=METHODS,
                                title=f"SD(log rho)={sd:g}: {title}")
         axes[row, 2].set(xscale="log", xlabel="Training city size", ylabel="Mean city index RMSE")
         axes[row, 3].set(xlabel="Optimizer step", ylabel="Validation observed NLL")
@@ -628,7 +672,7 @@ def main():
     json_write(a.out/"config.json", config)
     (a.out/"README.txt").write_text(__doc__, encoding="utf-8")
     total_fits = a.reps*len(a.log_rho_sds)*len(METHODS)
-    print(f"Device: {device}; {total_fits} fits x {a.steps} steps; output: {a.out.resolve()}", flush=True)
+    print(f"Device: {device}; {total_fits} fits ({a.steps} steps per NN; SciPy ML); output: {a.out.resolve()}", flush=True)
     if device.type == "cpu":
         print("CPU selected: consider --reps 1 --steps 600 for the first run.", flush=True)
     all_metrics, all_cities, all_histories = [], [], []

@@ -1,0 +1,146 @@
+{
+  "A": {
+    "unstructured": {
+      "converged": false,
+      "specification": "unstructured",
+      "llf": -9198.950449890934,
+      "residual_scale": 1.0101470970136137,
+      "covariance_eigen_min": 2.22557557630879e-05,
+      "covariance_eigen_max": 0.26821586585721147,
+      "covariance_rank": 4,
+      "warnings": "Maximum Likelihood optimization failed to converge. Check mle_retvals | Retrying MixedLM optimization with bfgs | MixedLM optimization failed, trying a different optimizer may help. | Gradient optimization failed, |grad| = 194.988659 | The MLE may be on the boundary of the parameter space. | The Hessian matrix at the estimated parameter values is not positive definite.",
+      "random_effect_dimension": 4,
+      "random_index_direction": null,
+      "blup_matches_package": true,
+      "seconds": 1.0547992000356317
+    },
+    "diagonal": {
+      "converged": true,
+      "specification": "diagonal",
+      "llf": -9199.703329122462,
+      "residual_scale": 1.0119809337663388,
+      "covariance_eigen_min": 8.308977048378083e-06,
+      "covariance_eigen_max": 0.26852432567595796,
+      "covariance_rank": 4,
+      "warnings": "The MLE may be on the boundary of the parameter space. | The Hessian matrix at the estimated parameter values is not positive definite.",
+      "random_effect_dimension": 4,
+      "random_index_direction": null,
+      "blup_matches_package": true,
+      "seconds": 0.3564681001007557
+    },
+    "index": {
+      "converged": true,
+      "specification": "index",
+      "llf": -9200.169960997544,
+      "residual_scale": 1.0133840285056739,
+      "covariance_eigen_min": 9.208031067384619e-06,
+      "covariance_eigen_max": 0.2689887237564691,
+      "covariance_rank": 2,
+      "warnings": "The MLE may be on the boundary of the parameter space.",
+      "random_effect_dimension": 2,
+      "random_index_direction": [
+        0.8906095807993029,
+        0.45475386194314354,
+        -0.0036741851186739096
+      ],
+      "blup_matches_package": true,
+      "seconds": 0.1112504000775516
+    }
+  },
+  "B": {
+    "unstructured": {
+      "converged": false,
+      "specification": "unstructured",
+      "llf": -9245.636922378468,
+      "residual_scale": 1.0103156581116133,
+      "covariance_eigen_min": 3.6656314021392435e-05,
+      "covariance_eigen_max": 0.28508464086045493,
+      "covariance_rank": 4,
+      "warnings": "Maximum Likelihood optimization failed to converge. Check mle_retvals | Retrying MixedLM optimization with bfgs | MixedLM optimization failed, trying a different optimizer may help. | Gradient optimization failed, |grad| = 218.977924 | The MLE may be on the boundary of the parameter space. | The Hessian matrix at the estimated parameter values is not positive definite.",
+      "random_effect_dimension": 4,
+      "random_index_direction": null,
+      "blup_matches_package": true,
+      "seconds": 0.42958639981225133
+    },
+    "diagonal": {
+      "converged": true,
+      "specification": "diagonal",
+      "llf": -9287.06259223197,
+      "residual_scale": 1.0132878188260512,
+      "covariance_eigen_min": 0.00025535109764084773,
+      "covariance_eigen_max": 0.2650995955595545,
+      "covariance_rank": 4,
+      "warnings": "The MLE may be on the boundary of the parameter space.",
+      "random_effect_dimension": 4,
+      "random_index_direction": null,
+      "blup_matches_package": true,
+      "seconds": 0.09219510015100241
+    },
+    "index": {
+      "converged": true,
+      "specification": "index",
+      "llf": -9246.858070148864,
+      "residual_scale": 1.0128544585540047,
+      "covariance_eigen_min": 0.07396110724686275,
+      "covariance_eigen_max": 0.28191789546537266,
+      "covariance_rank": 2,
+      "warnings": "",
+      "random_effect_dimension": 2,
+      "random_index_direction": [
+        0.8894459134843796,
+        0.4569774627580142,
+        -0.007587194289421084
+      ],
+      "blup_matches_package": true,
+      "seconds": 0.02468070015311241
+    }
+  },
+  "C": {
+    "unstructured": {
+      "converged": true,
+      "specification": "unstructured",
+      "llf": -9237.165204932255,
+      "residual_scale": 1.011315472996546,
+      "covariance_eigen_min": 2.5012087070506172e-06,
+      "covariance_eigen_max": 0.2891986322691159,
+      "covariance_rank": 4,
+      "warnings": "The MLE may be on the boundary of the parameter space. | The Hessian matrix at the estimated parameter values is not positive definite.",
+      "random_effect_dimension": 4,
+      "random_index_direction": null,
+      "blup_matches_package": true,
+      "seconds": 0.15724100032821298
+    },
+    "diagonal": {
+      "converged": true,
+      "specification": "diagonal",
+      "llf": -9275.87340412357,
+      "residual_scale": 1.0131364258318356,
+      "covariance_eigen_min": 0.0002630045337730765,
+      "covariance_eigen_max": 0.2711037318265845,
+      "covariance_rank": 4,
+      "warnings": "The MLE may be on the boundary of the parameter space.",
+      "random_effect_dimension": 4,
+      "random_index_direction": null,
+      "blup_matches_package": true,
+      "seconds": 0.09126449981704354
+    },
+    "index": {
+      "converged": true,
+      "specification": "index",
+      "llf": -9240.871110687807,
+      "residual_scale": 1.013157167648278,
+      "covariance_eigen_min": 0.07691673220485531,
+      "covariance_eigen_max": 0.285172504238582,
+      "covariance_rank": 2,
+      "warnings": "",
+      "random_effect_dimension": 2,
+      "random_index_direction": [
+        0.8889677812773509,
+        0.45793118279245726,
+        -0.00594269948132647
+      ],
+      "blup_matches_package": true,
+      "seconds": 0.029748099856078625
+    }
+  }
+}

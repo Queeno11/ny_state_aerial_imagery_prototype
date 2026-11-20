@@ -1,0 +1,116 @@
+{
+  "source": "/mnt/c/Working Papers/NY State Aerial Imagery Prototype/ny_state_aerial_imagery_prototype/src/ordinal_mc_suite/e6_observed_change_diagnostic",
+  "settings": {
+    "replication": 1,
+    "cities": 32,
+    "paths": [
+      "ordinal_scratch",
+      "joint_scratch",
+      "extended_warm"
+    ],
+    "workers": 3,
+    "threads_per_worker": 1,
+    "updates_per_path": 3000,
+    "scorer_lr": 0.001,
+    "head_lr": 0.001,
+    "lambda_stability": 0.3,
+    "lambda_W": 1.0,
+    "lambda_delta": 1.0,
+    "head_penalty": 0.0,
+    "validation_every": 10,
+    "validation_patience_checks": 20,
+    "validation_min_delta": 1e-05,
+    "trajectory_every": 100,
+    "extra_checkpoints": [
+      0,
+      25,
+      50,
+      200
+    ],
+    "validation_joint_weights": {
+      "rank": 1.0,
+      "level": 1.0,
+      "change": 1.0
+    },
+    "fixed_budget_policy": "Freeze the validation-stopped selected checkpoint once patience is reached; continue only for the predeclared fixed-budget trajectory and endpoint. No later checkpoint replaces that selection.",
+    "ordinal_heads": "Same initial head as joint scratch; concurrent level-plus-change updates on detached scores, without feedback into ordinal scorer.",
+    "warm_initialization": "Original paired diagnostic A_0 scorer and calibrated level head; fresh Adam state. No Q checkpoint or oracle-selected state."
+  },
+  "summaries": [
+    {
+      "path": "ordinal_scratch",
+      "selected_step": 1130,
+      "selected_validation": 0.41997037925693514,
+      "patience_stop_step": 1330,
+      "validation_selection": "rank logistic",
+      "executed_scorer_updates": 3000,
+      "executed_head_updates": 3000,
+      "inherited_scorer_updates_executed": 0,
+      "inherited_selected_scorer_ancestry": 0,
+      "total_scorer_updates_executed": 3000,
+      "selected_scorer_ancestry": 1130,
+      "fixed_endpoint_scorer_ancestry": 3000,
+      "scorer_initial_hash": "ae6012432665bcee59ec3fcb7787409867fa3cb9b8c04af26617d8bc9dac957c",
+      "head_initial_hash": "6d78212f30f03798c0a53a02a3f0aeb87e4c052ce489a3201b8529701c8149b7",
+      "wall_seconds": 648.5111949239799,
+      "scorer_clipped_updates": 0,
+      "head_clipped_updates": 959,
+      "selected_at_budget_boundary": false
+    },
+    {
+      "path": "joint_scratch",
+      "selected_step": 670,
+      "selected_validation": 1.8144877927730034,
+      "patience_stop_step": 870,
+      "validation_selection": "rank logistic + standardized level MSE + standardized change MSE",
+      "executed_scorer_updates": 3000,
+      "executed_head_updates": 3000,
+      "inherited_scorer_updates_executed": 0,
+      "inherited_selected_scorer_ancestry": 0,
+      "total_scorer_updates_executed": 3000,
+      "selected_scorer_ancestry": 670,
+      "fixed_endpoint_scorer_ancestry": 3000,
+      "scorer_initial_hash": "ae6012432665bcee59ec3fcb7787409867fa3cb9b8c04af26617d8bc9dac957c",
+      "head_initial_hash": "6d78212f30f03798c0a53a02a3f0aeb87e4c052ce489a3201b8529701c8149b7",
+      "wall_seconds": 632.4862359830004,
+      "scorer_clipped_updates": 4,
+      "head_clipped_updates": 0,
+      "selected_at_budget_boundary": false
+    },
+    {
+      "path": "extended_warm",
+      "selected_step": 0,
+      "selected_validation": 1.5272938650922367,
+      "patience_stop_step": 200,
+      "validation_selection": "rank logistic + standardized level MSE + standardized change MSE",
+      "executed_scorer_updates": 3000,
+      "executed_head_updates": 3000,
+      "inherited_scorer_updates_executed": 520,
+      "inherited_selected_scorer_ancestry": 320,
+      "total_scorer_updates_executed": 3520,
+      "selected_scorer_ancestry": 320,
+      "fixed_endpoint_scorer_ancestry": 3320,
+      "scorer_initial_hash": "7f1ea88d564b50093733ff7db21f2f782859ff706ec7ce272b905616ca04ec72",
+      "head_initial_hash": "806e0b3d60fe8c9605fc3227059e9aa8916c19ad2a12a42165e12e26775f3bfe",
+      "wall_seconds": 610.5756989780057,
+      "scorer_clipped_updates": 0,
+      "head_clipped_updates": 0,
+      "selected_at_budget_boundary": false
+    }
+  ],
+  "source_hashes_unchanged": {
+    "/mnt/c/Working Papers/NY State Aerial Imagery Prototype/ny_state_aerial_imagery_prototype/src/ordinal_mc_suite/e6_observed_change_diagnostic/checkpoints.pt": "5025d59a150405d7748457b868e4d68b6a1ee75e2c6bcc59ad51d14c1b49b7e9",
+    "/mnt/c/Working Papers/NY State Aerial Imagery Prototype/ny_state_aerial_imagery_prototype/src/ordinal_mc_suite/e6_observed_change_diagnostic/config.json": "16c51886c2784da9b74f34113f50af3b97b4ec06809bae848d899710a3e48447",
+    "/mnt/c/Working Papers/NY State Aerial Imagery Prototype/ny_state_aerial_imagery_prototype/src/ordinal_mc_suite/e6_observed_change_diagnostic/metadata.json": "6b1d0167064d1c889d9ccde15210731d42ebe00337010c3748d4d7c9651f75d4"
+  },
+  "identical_scratch_scorer_and_heads_verified": true,
+  "all_training_before_test_evaluation": true,
+  "test_or_latent_targets_used_for_selection": false,
+  "total_new_scorer_updates": 9000,
+  "selection_policy": "Freeze the validation-stopped selected checkpoint once patience is reached; continue only for the predeclared fixed-budget trajectory and endpoint. No later checkpoint replaces that selection.",
+  "runtime": {
+    "torch": "2.5.1",
+    "numpy": "2.2.6"
+  },
+  "notes": "One replication, one LR pair and one weight setting. Initial head knots/normalization use fitting scores only and remain fixed per path. Warm start inherits calibrated head and scorer; this does not isolate scorer initialization from head preparation."
+}

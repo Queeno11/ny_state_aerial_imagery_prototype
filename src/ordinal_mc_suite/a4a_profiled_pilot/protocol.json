@@ -1,0 +1,17 @@
+{
+  "replay": [201, 202, 203],
+  "confirmation": [301, 302, 303],
+  "tie_tolerance": 0.000001,
+  "head_tie_order": ["L", "LC", "LD", "LDC"],
+  "head_complexity": {"L": 1, "LC": 2, "LD": 2, "LDC": 3},
+  "paths": {
+    "O": ["ordinal", null],
+    "Legacy_Adam_LDC": ["legacy", "LDC"],
+    "Adam_LD": ["adam", "LD"],
+    "Adam_LDC": ["adam", "LDC"],
+    "Profile_L": ["profile", "L"],
+    "Profile_LC": ["profile", "LC"],
+    "Profile_LD": ["profile", "LD"],
+    "Profile_LDC": ["profile", "LDC"]
+  }
+}

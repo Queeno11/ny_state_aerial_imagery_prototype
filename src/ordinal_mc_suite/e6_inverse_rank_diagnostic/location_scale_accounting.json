@@ -1,0 +1,14 @@
+{
+  "initial_score_mean": 2.430845791759576,
+  "initial_score_sd": 1.6102084312647926,
+  "R_mean": -0.02367992722029982,
+  "R_sd": 1.282190066309086,
+  "direct_standardized_R_mse": 4.32297733735611,
+  "mean_offset_contribution": 3.664631905357765,
+  "after_centering_standardized_R_mse": 0.6583454319983439,
+  "fitting_affine_intercept": -1.50240549613399,
+  "fitting_affine_slope": 0.6083173082910001,
+  "after_affine_fit_standardized_R_mse": 0.4163940326361435,
+  "diagnostic_only": true,
+  "additional_scorer_updates": 0
+}

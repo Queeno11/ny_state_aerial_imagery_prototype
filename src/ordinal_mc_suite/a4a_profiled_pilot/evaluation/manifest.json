@@ -1,0 +1,203 @@
+{
+  "stage": "profiled",
+  "device": "cuda",
+  "config": {
+    "seed": 20261109,
+    "replications": [
+      1,
+      2,
+      3
+    ],
+    "start_ids": [
+      0
+    ],
+    "function_seed": 983,
+    "cities": 32,
+    "tracts_per_city": 256,
+    "test_tracts_per_city": 256,
+    "validation_fraction": 0.2,
+    "views": 2,
+    "composition": 0.0,
+    "acquisition_strength": 1.0,
+    "group_strength": 1.0,
+    "hidden": [
+      32,
+      16
+    ],
+    "weight_bound": 10.0,
+    "training_step": 0.4,
+    "changed_share": 0.5,
+    "kappa_base": 0.6,
+    "kappa_amplitude": 0.2,
+    "kappa_time_shift": 0.5,
+    "noise_ratio": 0.8,
+    "population_seed": 6120093,
+    "population_pairs": 250000,
+    "lambda_stability": 0.3,
+    "baseline_updates": 1500,
+    "joint_updates": 1000,
+    "head_max_iter": 1000,
+    "check_every": 25,
+    "baseline_lr": 0.001,
+    "joint_lr": 0.0001,
+    "head_lr": 0.001,
+    "taus": [
+      0.5,
+      0.2,
+      0.1
+    ],
+    "tau_fractions": [
+      0.0,
+      0.4,
+      0.7
+    ],
+    "joint_weights": [
+      0.1
+    ],
+    "gamma": 0.01,
+    "knot_quantiles": [
+      0.2,
+      0.5,
+      0.8
+    ],
+    "min_slope": 0.0001,
+    "min_score_variance": 1e-12,
+    "change_bins": [
+      0.0,
+      0.05,
+      0.15,
+      0.35,
+      0.65
+    ],
+    "cutoff_quantile": 0.95,
+    "dose_steps": [
+      -0.8,
+      -0.4,
+      -0.15,
+      -0.05,
+      0.0,
+      0.05,
+      0.15,
+      0.4,
+      0.8
+    ]
+  },
+  "protocol": {
+    "replay": [
+      201,
+      202,
+      203
+    ],
+    "confirmation": [
+      301,
+      302,
+      303
+    ],
+    "tie_tolerance": 1e-06,
+    "head_tie_order": [
+      "L",
+      "LC",
+      "LD",
+      "LDC"
+    ],
+    "head_complexity": {
+      "L": 1,
+      "LC": 2,
+      "LD": 2,
+      "LDC": 3
+    },
+    "paths": {
+      "O": [
+        "ordinal",
+        null
+      ],
+      "Legacy_Adam_LDC": [
+        "legacy",
+        "LDC"
+      ],
+      "Adam_LD": [
+        "adam",
+        "LD"
+      ],
+      "Adam_LDC": [
+        "adam",
+        "LDC"
+      ],
+      "Profile_L": [
+        "profile",
+        "L"
+      ],
+      "Profile_LC": [
+        "profile",
+        "LC"
+      ],
+      "Profile_LD": [
+        "profile",
+        "LD"
+      ],
+      "Profile_LDC": [
+        "profile",
+        "LDC"
+      ]
+    }
+  },
+  "weights": {
+    "L": [
+      0.02795429928867645,
+      0.0,
+      0.0
+    ],
+    "LC": [
+      0.02795429928867645,
+      0.0,
+      0.001
+    ],
+    "LD": [
+      0.02795429928867645,
+      0.009197691504151844,
+      0.0
+    ],
+    "LDC": [
+      0.02795429928867645,
+      0.009197691504151844,
+      0.001
+    ]
+  },
+  "config_sha256": "5d451db9e15fa0950b1590437f7f0c49dae31e98e73153c6cf8707ba127583f5",
+  "protocol_sha256": "dfc1b6aa613b5e4d6f63d8fda6d8d868546846d559579078fd43b038b2877f27",
+  "coefficient_sha256": "c89723cbf22aa3aaa127fe707975e4b01d4bab9ed74c0e09d602774136da1282",
+  "versions": {
+    "python": "3.10.20",
+    "torch": "2.5.1",
+    "numpy": "2.2.6",
+    "scipy": "1.15.2"
+  },
+  "gpu": "NVIDIA GeForce RTX 3070",
+  "source_sha256": {
+    "a4a_profiled_pilot/paths.py": "c66217df1cd57a8113555351143e6153a68fcc59d3985d7e8b78e44eebd529ca",
+    "a4a_profiled_pilot/preflight_profile.py": "f58923e8d10bd4f054e26ab7158337f326dfc006c55e6ba2a647019009907a5b",
+    "a4a_profiled_pilot/prior.py": "207c52a14c6695a38c34ea9ec86334e353d22d5bbfd11750c6830246c0b8a2cd",
+    "a4a_profiled_pilot/profile_objective.py": "9641efaa168144e5c28e46849e70fda9a2ce76dd902094154295be57ab32be5e",
+    "a4a_profiled_pilot/run_profiled.py": "e947f602bb2c31d7ed0799cb4cef9a9200d7394e2280895de6dec739a095d61b",
+    "a4a_change_pilot/audit.py": "1454e8a2318f96d2047add3791b1e6313a1f8ec8b0ac3d3b5c2133b92b7af8e9",
+    "a4a_change_pilot/data.py": "1216127ca1e677938d34cb04404e82221007c7003e99fb8f4983902e76102ed6",
+    "a4a_change_pilot/dose_metrics.py": "a4887ace4c5300a4535bc5250cd993ae896925bba54dd4d1c19b17b0b13f2d95",
+    "a4a_change_pilot/evaluation.py": "11643219aa09a09c240f796e7bb08f9d51c24bf86b8e28ade26efcf21b0f20bd",
+    "a4a_change_pilot/fitting.py": "84b30b2e33a749734a516beff3cc6244c042690d2e250c927a66aad2fef78416",
+    "a4a_change_pilot/heads.py": "470c0148a8214b38f90057c3a5e183640553cc0fe1b2b9b6cb273492075b58d6",
+    "a4a_change_pilot/preflight.py": "6e46ac22169f93ddac2c72f53b061f730de132d9b9d6b8f4a3839404dab8ddf0",
+    "a4a_change_pilot/report.py": "9d9b7a52e2fb4b9158336f7b96f4f11238021dd931a537c50f788376c71f3561",
+    "a4a_change_pilot/run.py": "eae2d2d997de621f9c2e944c3cde3272ffb1341d8c39d6b85e65606c56ac8891",
+    "a4a_change_pilot/training.py": "199e46943ecdb0eee09cf3e9dae8f77e185c433e8f5ee4bf8a3fe65879fda450",
+    "ordinal_mc/core.py": "b3d66a58ceb2a5beb44de45350f3db371087ffe1afb921ae505cf125a5161d58",
+    "ordinal_mc/design.py": "5d41373358a415f1942f3468ac1d43a5da52987bbcfe52f8457a79e4407ffaa6",
+    "ordinal_mc/e6/data.py": "1c00e9873a1bbcbf80cc008142fc69eed47b300d59fbaa5c11c09f558808a09e"
+  },
+  "selector": "actual validation rank + .3*external stability + standardized level and change MSE, evaluated with the primary trained head",
+  "known_controls": {
+    "reused": true,
+    "new_scorer_updates": 0,
+    "manifest": "a4a_balanced_pilot/evaluation/known/manifest.json",
+    "sha256": "b8d816f423e42aaf0dda07a7927327fce07d7ecc023aca59a02a02d2aee03399"
+  }
+}

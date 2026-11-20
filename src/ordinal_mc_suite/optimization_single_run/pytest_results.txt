@@ -1,0 +1,1 @@
+tests/test_e5_optimization_diagnostic.py: 7 passed in 9.96s

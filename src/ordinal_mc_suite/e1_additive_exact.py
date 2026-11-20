@@ -7,6 +7,8 @@ multiplier b_ct and every draw (features, noise, splits, test pairs) are those o
 finished E1 run, so s=0 must reproduce its log_cell_fe errors exactly (checked).
 Ranking errors are reused from that run: every map here preserves all within-cell
 orderings, so a ranking fit is literally the same fit under every s.
+The correctly specified ML benchmark is fitted from the same training labels
+with known transformation/error mechanisms. Its fit is also invariant to s.
 
     python e1_additive_exact.py [--scales 0 1 5 10 25 100] [--out e1_additive_exact]
 
@@ -27,6 +29,7 @@ from ordinal_mc.config import merge, preset, validate
 from ordinal_mc.core import misranking
 from ordinal_mc.design import PopulationDGP, make_design
 from ordinal_mc.experiments import scenario
+from ordinal_mc.likelihood import fit_ml
 
 SUITE_DIR = Path(__file__).resolve().parent
 CONFIG = SUITE_DIR / "configs" / "e1_additive.json"
@@ -81,7 +84,11 @@ def run(cfg: SimpleNamespace, scales: list[float]) -> pd.DataFrame:
         cfg.cities = cities
         for rep in range(1, cfg.reps + 1):
             design = make_design(cfg, dgp, rep, cfg.n[0], cfg.truths[0], BASE_SCENARIO)
-            rows += [dict(cities=cities, rep=rep, scale=s, risk=log_fe_risk(design, s)) for s in scales]
+            predict,info=fit_ml(design,cfg.truths[0],BASE_SCENARIO,dgp)
+            test,pairs=design['tests']['unseen']; i,j=pairs['within']; score=predict(test['x'])
+            ml_risk=misranking(score[j]-score[i],test['f'][j]-test['f'][i])
+            rows += [dict(cities=cities, rep=rep, scale=s, risk=log_fe_risk(design, s),
+                          ml_risk=ml_risk,ml_success=info['ml_success'],ml_message=info['ml_message']) for s in scales]
     return pd.DataFrame(rows)
 
 
@@ -116,7 +123,10 @@ def summarize(records: pd.DataFrame, fits: pd.DataFrame) -> pd.DataFrame:
     parts = []
     for s in sorted(records.scale.unique()):
         stage, strength = _stage(s)
-        for method, df in (("log_cell_fe", records[records.scale == s]), ("rank_common", rank)):
+        methods=[("log_cell_fe", records[records.scale == s]), ("rank_common", rank)]
+        if 'ml_risk' in records:
+            methods.append(('ml_correct',records[records.scale==s].drop(columns='risk').rename(columns={'ml_risk':'risk'})))
+        for method, df in methods:
             g = df.groupby("cities").risk.agg(["mean", "std", "count"]).reset_index()
             g = g.rename(columns={"std": "mc_sd", "count": "repetitions"})
             g["mc_se"] = g.mc_sd / np.sqrt(g.repetitions)

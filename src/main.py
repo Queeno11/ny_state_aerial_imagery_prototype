@@ -111,6 +111,40 @@ def write_cache_marker(savename, cache_dir=None):
     )
 
 
+def resolve_cache_reuse(cache_owner, savename, reuse_of=None, *, retrain=False,
+                        resume_cache=False, cache_dir=None):
+    """Decide whether the shard cache is kept, and whether to claim its marker.
+
+    Returns ``(resume_cache, write_marker)``:
+
+    * the marker names this run -> keep the shards (cache-only resume);
+    * ``reuse_of`` names the marker's owner -> keep the shards and leave the
+      marker with its owner (shards are images + labels, model-independent, so
+      the ACS-covariate run can train on the base run's cache and the base run
+      can still resume on it);
+    * ``reuse_of`` set but the cache belongs to someone else -> raise, never
+      fall through to the default, which clears the directory;
+    * otherwise the legacy behaviour (claim the marker; keep shards only when
+      resuming a model checkpoint). ``retrain`` always rebuilds.
+    """
+    if retrain:
+        return False, True
+    if cache_owner == savename:
+        if not resume_cache:
+            print(f"🟡 No model checkpoint, but cache marker matches '{savename}': "
+                  f"resuming partial shard cache instead of rebuilding.")
+        return True, True
+    if reuse_of:
+        if cache_owner != reuse_of:
+            raise RuntimeError(
+                f"reuse_cache_of='{reuse_of}' but the shard cache in {cache_dir} belongs "
+                f"to '{cache_owner}'. Point cache_subdir at that run's cache or unset "
+                f"reuse_cache_of to build a fresh one.")
+        print(f"♻️  Training on '{reuse_of}''s shard cache (marker left unchanged).")
+        return True, False
+    return resume_cache, True
+
+
 def select_resume_checkpoint(checkpoint_dir, savename, retrain=False):
     """Pick the best readable checkpoint to resume ``savename`` from, or None.
 
@@ -1203,7 +1237,8 @@ class InBatchRankingDataset(Dataset):
     The HybridBatchSampler constructs valid hybrid batches at iteration time
     using the exposed metadata (year_to_idxs, building_to_idxs).
     """
-    def __init__(self, cache_manager: CyclicCacheManager, transform=None, se_lookup=None):
+    def __init__(self, cache_manager: CyclicCacheManager, transform=None, se_lookup=None,
+                 cov_lookup=None):
         if not cache_manager._is_initialized:
             raise RuntimeError(
                 "Call cache_manager.build_initial_cache() before instantiating InBatchRankingDataset."
@@ -1211,6 +1246,7 @@ class InBatchRankingDataset(Dataset):
         self.cache_manager = cache_manager
         self.transform = transform
         self.se_lookup = se_lookup
+        self.cov_lookup = cov_lookup   # src.data.covariates.CovariateLookup or None
         self.images = None
         self.scores = None
         self.geoids = None
@@ -1263,6 +1299,10 @@ class InBatchRankingDataset(Dataset):
         self.metas            = torch.cat(mt_list)
         self.score_bins       = torch.cat(sb_list)
         self.cbsa_ids         = torch.cat(cb_list)
+        if getattr(self, "cov_lookup", None) is not None:
+            # ACS covariates replace the legacy dist_to_center column as the
+            # model's metadata, looked up by the shard's (tract, label year).
+            self.metas = covariate_metas(self.cov_lookup, self.geoids, self.years)
 
         if getattr(self, 'se_lookup', None) is not None and len(self.se_lookup) > 0:
             se_list = []
@@ -1459,11 +1499,12 @@ class StaticShardedDataset(Dataset):
     Only keeps one shard in RAM at a time to prevent OOM when the validation set is massive.
     Validation shards store single images using the keys 'images' and 'scores'.
     """
-    def __init__(self, active_shards, transform=None, verbose=True):
+    def __init__(self, active_shards, transform=None, verbose=True, cov_lookup=None):
         if not active_shards:
             raise RuntimeError("No active shards to load.")
         self.shard_paths = active_shards
         self.transform = transform
+        self.cov_lookup = cov_lookup   # src.data.covariates.CovariateLookup or None
         self.current_shard_idx = -1
         self.images = None
         self.scores = None
@@ -1502,6 +1543,11 @@ class StaticShardedDataset(Dataset):
         self.years   = data.get("years")
         self.structural_change = data.get("structural_change")
         self.cbsa_ids = data.get("cbsa_ids")   # absent in pre-US shards -> 0 per item
+        if getattr(self, "cov_lookup", None) is not None:
+            if data.get("geoids") is None or self.years is None:
+                raise RuntimeError(f"{self.shard_paths[shard_idx]} has no geoids/years: "
+                                   f"cannot look up ACS covariates for it.")
+            self.metas = covariate_metas(self.cov_lookup, data["geoids"], self.years)
         self.current_shard_idx = shard_idx
 
     def __len__(self):
@@ -1584,6 +1630,17 @@ def _subsample_val_buildings(df_val, n_buildings_per_tract=1, seed=825):
     return out.iloc[order].reset_index(drop=True)
 
 
+def covariate_metas(cov_lookup, geoids, years, hashed=True):
+    """(n, k) float32 metadata tensor of ACS covariates.
+
+    Shards store ``stable_geoid_hash(GEOID)`` ids, hence ``hashed=True`` by
+    default; prediction frames pass GEOID strings with ``hashed=False``.
+    """
+    g = geoids.cpu().numpy() if torch.is_tensor(geoids) else np.asarray(geoids)
+    y = years.cpu().numpy() if torch.is_tensor(years) else np.asarray(years)
+    return torch.from_numpy(cov_lookup.lookup(g, y, hashed=hashed))
+
+
 def build_se_lookup(indicator_token):
     import pandas as pd
     from src.data.process_acs import PROCESSED_DATA_DIR, PANEL_YEARS
@@ -1655,13 +1712,20 @@ def setup_dataloaders(df_train, dfs_val_dict, df_test, all_years_datasets, param
     # Build SE lookup for MOE filter
     indicator = params.get("indicator", "W2_r5")
     se_lookup = build_se_lookup(indicator)
+    cov_lookup = covariate_lookup_for(params)   # None unless scalemae_cov
 
     # In-Batch Pairwise Ranking: individual images + metadata, grouped by HybridBatchSampler
     train_dataset = InBatchRankingDataset(
         cache_manager=train_cache_manager,
         transform=train_transform_cpu,
         se_lookup=se_lookup,
+        cov_lookup=cov_lookup,
     )
+    if cov_lookup is not None:
+        cov = cov_lookup.coverage(train_dataset.geoids.numpy(), train_dataset.years.numpy(),
+                                  hashed=True)
+        print(f"🧮 ACS covariates {cov_lookup.names}: {cov:.1%} of training rows matched "
+              f"(unmatched rows get 0 = CBSA-year mean)")
     hybrid_sampler = HybridBatchSampler(
         dataset=train_dataset,
         batch_size_cs=batch_size,
@@ -1679,7 +1743,8 @@ def setup_dataloaders(df_train, dfs_val_dict, df_test, all_years_datasets, param
             if name in val_cache_manager and val_cache_manager[name] is not None:
                 val_dataset = StaticShardedDataset(
                     active_shards=val_cache_manager[name].active_shards,
-                    transform=eval_transform # No random augmentations
+                    transform=eval_transform, # No random augmentations
+                    cov_lookup=cov_lookup,
                 )
                 val_loaders[name] = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=0)
 
@@ -1778,6 +1843,66 @@ def validate_loss_config(params):
                              "ranking-loss gradients.")
 
 
+def meta_dim_of(params):
+    """Late-fusion width: one input per ACS covariate (0 = imagery only)."""
+    return len(params.get("covariates") or ())
+
+
+def validate_covariate_config(params):
+    """``scalemae_cov`` and ``covariates`` go together; names must exist.
+
+    Covariates on an imagery-only model would be silently ignored (meta_dim is
+    taken from them, but only ``scalemae_cov`` refuses mis-shaped metadata), and
+    ``scalemae_cov`` without covariates has nothing to fuse.
+    """
+    covs = params.get("covariates")
+    is_cov_model = params.get("model_name") == "scalemae_cov"
+    if is_cov_model and not covs:
+        raise ValueError("model_name='scalemae_cov' needs params['covariates'] "
+                         "(e.g. ('edu_ba_share', 'age_25_54_share')).")
+    if covs and not is_cov_model:
+        raise ValueError("params['covariates'] is only supported with model_name='scalemae_cov'.")
+    if covs:
+        from src.data.covariates import COVARIATE_NAMES
+        unknown = set(covs) - set(COVARIATE_NAMES)
+        if unknown:
+            raise ValueError(f"unknown covariates {sorted(unknown)}; available: {COVARIATE_NAMES}")
+    if params.get("train_scope", "all") not in ("all", "head"):
+        raise ValueError(f"train_scope must be 'all' or 'head', got {params.get('train_scope')!r}")
+
+
+def covariate_lookup_for(params):
+    """The tract-year covariate lookup for this run, or None (imagery only)."""
+    if not params.get("covariates"):
+        return None
+    from src.data import covariates
+    return covariates.load_lookup(params["covariates"])
+
+
+def warm_start_run(model, init_from, models_dir=None):
+    """Load ``init_from``'s best head + LoRA into a fresh ``model`` (in place)."""
+    ckpt_dir = Path(models_dir or MODELS_DIR) / "models_by_epoch" / init_from
+    head_path = ckpt_dir / f"{init_from}_best.pth"
+    if not head_path.exists():
+        raise FileNotFoundError(f"init_from='{init_from}': no best checkpoint at {head_path}")
+    lora_dir = ckpt_dir / f"{init_from}_best_lora"
+    report = custom_models.warm_start_from_checkpoint(
+        model, head_path, lora_dir if lora_dir.exists() else None)
+    print(f"🔥 Warm start from '{init_from}': head {head_path.name}"
+          + (f", LoRA {report['lora_tensors']} tensors" if report["lora"] else ", no LoRA adapter"))
+    return report
+
+
+def apply_train_scope(model, scope):
+    """Freeze the backbone for ``scope='head'``; return the trainable count."""
+    if scope == "head":
+        for p in model.backbone.parameters():
+            p.requires_grad = False
+    n = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"🎯 train_scope='{scope}': {n:,} trainable parameters")
+    return n
+
+
 def fill_params_defaults(params):
 
     default_params = {
@@ -1873,12 +1998,20 @@ def fill_params_defaults(params):
         "mix_pools": False,          # True: batches mix cities/years (mse only)
         "cache_subdir": None,        # shard cache under CACHE_DIR/<this>; keeps a baseline from clearing the ordinal run's shards
         "level_label_stats": None,   # {mu, sd, ...} of the log_level target; set by run() from generate_datasets' fit
+        # ACS-covariate diagnostic (model_name="scalemae_cov"; launched by src/run_cov_model.py).
+        # Tract-year covariates fused into the head next to the image features — see
+        # src/data/covariates.py for why this is a diagnostic, not the paper's model.
+        "covariates": None,          # e.g. ("edu_ba_share", "age_25_54_share"); meta_dim = len(covariates)
+        "init_from": None,           # savename whose _best head + LoRA warm-start a fresh run (covariate weights start at 0)
+        "reuse_cache_of": None,      # savename that owns the shard cache to train on (shards are model-independent); refuses to clear it
+        "train_scope": "all",        # "all" (LoRA + head) | "head" (backbone frozen; only the late-fusion head trains)
     }
     validate_parameters(params, default_params)
 
     # Merge default and provided hyperparameters (keep from params)
     updated_params = {**default_params, **params}
     validate_loss_config(updated_params)
+    validate_covariate_config(updated_params)
     print("-" * 40)
     print("Runtime Parameters:")
     for k, v in updated_params.items():
@@ -2807,6 +2940,7 @@ def predict_buildings_chunked(model, df, all_years_datasets, params,
             "src.prediction.predict_year_chunked instead."
         )
     model.eval()
+    cov_lookup = covariate_lookup_for(params)   # ACS covariates (scalemae_cov) or None
 
     # ── Hyperparameters ───────────────────────────────────────────────────────
     batch_size      = params.get("batch_size", 32) * 8   # scale up for eval
@@ -2932,10 +3066,15 @@ def predict_buildings_chunked(model, df, all_years_datasets, params,
         tensors, rows = zip(*items)
         # eval_transform: uint16→float32 scale + ImageNet normalise
         batch_tensor = eval_transform(torch.stack(tensors))
-        metas_tensor = torch.tensor(
-            [r.get("dist_to_center", 0.0) for r in rows],
-            dtype=torch.float32
-        ).unsqueeze(1)
+        if cov_lookup is not None:
+            metas_tensor = covariate_metas(
+                cov_lookup, [str(r.get("GEOID", "")) for r in rows],
+                [int(r.get("year", 0)) for r in rows], hashed=False)
+        else:
+            metas_tensor = torch.tensor(
+                [r.get("dist_to_center", 0.0) for r in rows],
+                dtype=torch.float32
+            ).unsqueeze(1)
         return (
             batch_tensor,
             metas_tensor,
@@ -3341,7 +3480,7 @@ def load_best_model(params, savename, device):
         kind=params["kind"],
         bands=params["nbands"],
         image_size=params["image_size"],
-        meta_dim=0,  # Must match training (dist_to_center covariate disabled)
+        meta_dim=meta_dim_of(params),  # Must match training: 0 (dist_to_center disabled) or one per ACS covariate
     )
 
     best_model_path = MODELS_DIR / "models_by_epoch" / savename / f"{savename}_best.pth"
@@ -3447,11 +3586,11 @@ def run(
         # if it matches, keep them and let build_initial_cache() top up the missing
         # ones instead of refetching everything. retrain=True still forces a full
         # rebuild, and a different savename (new run_id / split) clears as before.
-        if not retrain and not resume_cache and read_cache_marker(run_cache_dir) == savename:
-            resume_cache = True
-            print(f"🟡 No model checkpoint, but cache marker matches '{savename}': "
-                  f"resuming partial shard cache instead of rebuilding.")
-        write_cache_marker(savename, run_cache_dir)
+        resume_cache, write_marker = resolve_cache_reuse(
+            read_cache_marker(run_cache_dir), savename, params.get("reuse_cache_of"),
+            retrain=retrain, resume_cache=resume_cache, cache_dir=run_cache_dir)
+        if write_marker:
+            write_cache_marker(savename, run_cache_dir)
 
         print("Building Initial Cache...")
         if small_sample:
@@ -3598,7 +3737,7 @@ def run(
             bands=nbands,
             image_size=image_size,
             weights=weights,
-            meta_dim=0,
+            meta_dim=meta_dim_of(params),   # 0 unless the ACS-covariate diagnostic (scalemae_cov)
             m_base=params.get("m_base", 1.0),
             m_min=params.get("m_min", 0.1),
             lambda_s=params.get("lambda_s", 1.0),
@@ -3608,6 +3747,11 @@ def run(
         )
 
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        # Warm start BEFORE the optimizer exists: the adapter is loaded into the
+        # parameters the optimizer will hold (see warm_start_from_checkpoint).
+        if resume_model_checkpoint is None and params.get("init_from"):
+            warm_start_run(model, params["init_from"])
+        apply_train_scope(model, params.get("train_scope", "all"))
         optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=0.05)
         # scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         #     optimizer, mode='max', factor=0.5, patience=30, min_lr=learning_rate/20

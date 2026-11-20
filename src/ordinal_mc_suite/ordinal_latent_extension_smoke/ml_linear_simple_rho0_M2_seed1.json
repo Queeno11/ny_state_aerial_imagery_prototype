@@ -1,0 +1,179 @@
+{
+  "fit_fingerprint": {
+    "c": "f54717a1a69a8075bd82874b074c0524b0a7944107396c43e15d5454a3f70c39",
+    "category": "dfd62a808404b1bd4a4bbb4eeb028ff956f329bd1fa826618640de2b09c916b3",
+    "contexts": "0f9d355d58e0b6c83d808e1a1ad396de45b62df6d2afaee28e4457bdbdebe529",
+    "f": "1614feec899d6a9f87f5eb7dd8838b5b827eb3fe431c907cd4d93c7a04768bac",
+    "h": "73a68bc31d52c7d7160e01aa9983df2a9cb33e6c7d639e2d3025f2874ec6b158",
+    "r": "594eaae60651f6557d544216f75cab28a632a5b012c4a79b68ab992ad221f9ce",
+    "w": "d1f69575c30367184b98fdb7fa4030dc2aa816e54d370579b6ec4ebcad05add1",
+    "x": "4eb8be621ec246d7b521ce0a69dfbb8d0e812ba52066c091e24e28ff68e3bcb9"
+  },
+  "map": "M2",
+  "optimization": {
+    "closure_calls": 21,
+    "convergence": "gradient tolerance met",
+    "device": "cuda",
+    "final_nll": 2.644733405872647,
+    "first_basis_coefficient_fixed_to_one": true,
+    "gradient_check_tolerance": 0.0001,
+    "gradient_norm": 2.278902736218883e-05,
+    "initial_nll": 5.901961147110109,
+    "iteration_cap_reached": true,
+    "iterations": 20,
+    "known_rho": 0.0,
+    "known_sigma": 0.8,
+    "max_iterations": 20,
+    "objective_improvement": 3.257227741237462,
+    "selection": "lowest finite source fitting NLL",
+    "slope_floor": 0.0001,
+    "start": 1,
+    "starts": [
+      {
+        "closure_calls": 22,
+        "convergence": "gradient tolerance met",
+        "final_nll": 2.6447334142119736,
+        "gradient_check_tolerance": 0.0001,
+        "gradient_norm": 4.48104200697938e-05,
+        "initial_nll": 5.858996265858902,
+        "iteration_cap_reached": true,
+        "iterations": 20,
+        "max_iterations": 20,
+        "objective_improvement": 3.2142628516469287,
+        "parameters": {
+          "a": [
+            0.09064963164242036,
+            1.7601883159590617,
+            -0.31455263313861737,
+            0.06345824366596166,
+            -0.5455000897029647,
+            -0.16108366924357084,
+            -0.5530239551700872,
+            0.09516655655368372
+          ],
+          "b": [
+            2.6802599217011136,
+            2.028444419235336,
+            2.170318652780322,
+            2.561598472773379,
+            1.95657321469857,
+            2.5762342612054514,
+            2.111088966012485,
+            2.1829453677737085
+          ],
+          "coeff": [
+            1.0,
+            0.4006822261116019,
+            -0.38427351505232316
+          ],
+          "k": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ]
+        },
+        "start": 0
+      },
+      {
+        "closure_calls": 21,
+        "convergence": "gradient tolerance met",
+        "final_nll": 2.644733405872647,
+        "gradient_check_tolerance": 0.0001,
+        "gradient_norm": 2.278902736218883e-05,
+        "initial_nll": 5.901961147110109,
+        "iteration_cap_reached": true,
+        "iterations": 20,
+        "max_iterations": 20,
+        "objective_improvement": 3.257227741237462,
+        "parameters": {
+          "a": [
+            0.09099926601293001,
+            1.7601342811868441,
+            -0.3145911135018172,
+            0.06352549087703861,
+            -0.545492730867359,
+            -0.1612210900186469,
+            -0.5529017036056632,
+            0.09508158686814443
+          ],
+          "b": [
+            2.6803226914487173,
+            2.0284302482210754,
+            2.17028073179692,
+            2.561486045993006,
+            1.956505832316052,
+            2.576312430036012,
+            2.111075527443048,
+            2.182848112695639
+          ],
+          "coeff": [
+            1.0,
+            0.4006729746491627,
+            -0.3842660184975555
+          ],
+          "k": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ]
+        },
+        "start": 1
+      }
+    ],
+    "tanh_shape_open_bounds": [
+      0.0,
+      2.0
+    ]
+  },
+  "parameters": {
+    "a": [
+      0.09099926601293001,
+      1.7601342811868441,
+      -0.3145911135018172,
+      0.06352549087703861,
+      -0.545492730867359,
+      -0.1612210900186469,
+      -0.5529017036056632,
+      0.09508158686814443
+    ],
+    "b": [
+      2.6803226914487173,
+      2.0284302482210754,
+      2.17028073179692,
+      2.561486045993006,
+      1.956505832316052,
+      2.576312430036012,
+      2.111075527443048,
+      2.182848112695639
+    ],
+    "coeff": [
+      1.0,
+      0.4006729746491627,
+      -0.3842660184975555
+    ],
+    "k": [
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0
+    ]
+  },
+  "scenario": "linear/simple/rho0",
+  "seed": 1,
+  "source_fit_cities": 4,
+  "source_fit_n": 16
+}

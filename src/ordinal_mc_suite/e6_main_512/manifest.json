@@ -1,0 +1,187 @@
+{
+  "experiment": "E6",
+  "signature": "4a8ccf74508b35f900c140c74df1a325920d26391197a3ba848609eace39df2c",
+  "config": {
+    "seed": 20261103,
+    "function_seed": 983,
+    "replications": 30,
+    "cities": [
+      32,
+      64
+    ],
+    "cases": [
+      [
+        "linear",
+        "linear"
+      ],
+      [
+        "quadratic",
+        "nn"
+      ]
+    ],
+    "labels_per_city": 512,
+    "validation_fraction": 0.2,
+    "views": 2,
+    "noise_sd": 0.7,
+    "bayes_target": 0.2,
+    "hidden": [
+      32,
+      16
+    ],
+    "weight_bound": 10.0,
+    "acquisition_strength": 1.0,
+    "group_strength": 1.0,
+    "alpha": 0.0,
+    "lambda_t": 0.3,
+    "test_per_city": 128,
+    "test_pairs": 3000,
+    "change_strengths": [
+      0.0,
+      0.15,
+      0.4,
+      0.8
+    ],
+    "changed_share": 0.5,
+    "truth_threshold": 0.05,
+    "false_positive_target": 0.05,
+    "actual_size_edges": [
+      0.05,
+      0.15,
+      0.3,
+      0.6
+    ],
+    "quadrature_nodes": 128,
+    "maps": [
+      "affine",
+      "nonlinear"
+    ],
+    "heads": [
+      "affine",
+      "spline"
+    ],
+    "level_weights": [
+      0.1,
+      1.0,
+      10.0
+    ],
+    "validation_rank_weight": 1.0,
+    "validation_level_weight": 1.0,
+    "kappa_base": 0.6,
+    "kappa_amplitude": 0.2,
+    "kappa_time_shift": 0.5,
+    "restarts": 3,
+    "threads": 1,
+    "workers": 8,
+    "baseline": {
+      "adam_steps": 3000,
+      "lr": 0.01,
+      "check_every": 10,
+      "patience": 20,
+      "lbfgs_steps": 400,
+      "lbfgs_chunk": 10,
+      "lbfgs_patience": 10
+    },
+    "head_training": {
+      "steps": 600,
+      "lr": 0.02,
+      "check_every": 10,
+      "patience": 20,
+      "knots": [
+        0.2,
+        0.5,
+        0.8
+      ],
+      "kappa_G": 0.01,
+      "pool_relative": 10.0
+    },
+    "joint": {
+      "steps": 600,
+      "scorer_lr": 0.001,
+      "head_lr": 0.01,
+      "check_every": 10,
+      "patience": 20
+    },
+    "oracle_R": {
+      "enabled": true,
+      "steps": 600,
+      "lr": 0.001
+    },
+    "min_delta": 1e-05
+  },
+  "sources": {
+    "ordinal_mc/__init__.py": "10f9a05ce7562a4b394bffd9307ecdbbac6901e56b6697f1685cb8a7292ec9e2",
+    "ordinal_mc/__main__.py": "0f3fe6c1a389fd8a0cc132e4d42b5de21f536c79227c7b13bacd871a24dea5ca",
+    "ordinal_mc/change.py": "0bf168d416582cfeed27e7ba2f98ef1b52b76b3c7420ce4d8c376f4d93c67893",
+    "ordinal_mc/checks.py": "83f5123df6ff5ebd2ef09f7a976a6423089cdd44f10ab98781d1809767f48052",
+    "ordinal_mc/config.py": "fbbb04c90e5923af154c781e887fa2c15c68f0b83744347a7b0d2deedbff7056",
+    "ordinal_mc/core.py": "b3d66a58ceb2a5beb44de45350f3db371087ffe1afb921ae505cf125a5161d58",
+    "ordinal_mc/design.py": "5d41373358a415f1942f3468ac1d43a5da52987bbcfe52f8457a79e4407ffaa6",
+    "ordinal_mc/execution.py": "c25fd087ad446f843c578d70a9503fa4dc209bd57e2365c667c1ad73c95ae35c",
+    "ordinal_mc/experiments.py": "691aad5a3969574893e872445c829d2686c78752c6d39b87bbc95e8de1d19458",
+    "ordinal_mc/likelihood.py": "05b15ab6d238f41f66dcebca7f493aaad1242c004f99b93bd983f4f1fab35f4f",
+    "ordinal_mc/report.py": "baef29b43ddb3d65552ff58a73fb58e880996173cd5f5323be015b3c8d072d19",
+    "ordinal_mc/runner.py": "cc00955b90b290f0ecb60a2ae0d6aac14191c7667f5c653d4f3bd527eddfcd26",
+    "ordinal_mc/e6/__init__.py": "4bd5e38b1bbf3caaaf4df8c8d4dc40586ff4da3b5c17b2bc5a4dad1fcfd376b4",
+    "ordinal_mc/e6/config.py": "1466d7d3f796bb243d87a2ef60e4b19d1e9197ada94cb8d8c42ad979859542bb",
+    "ordinal_mc/e6/data.py": "1c00e9873a1bbcbf80cc008142fc69eed47b300d59fbaa5c11c09f558808a09e",
+    "ordinal_mc/e6/evaluation.py": "82f68a609ac283809da927047462421e1866a63ad762bd3de9695997f1bfa2fb",
+    "ordinal_mc/e6/experiment.py": "fc410705d8e8c014cbb8e52d12f26bf6cfdec032286bba2c9687e8464c61ed9e",
+    "ordinal_mc/e6/heads.py": "5116aee8be87aa3e381bb30949f15149326bdb97218bf67c89f14eeda729c00b",
+    "ordinal_mc/e6/report.py": "54ebdaff2b7572aa5afce8b1072d8944d83570eb30792af45f1716a921043e7b",
+    "ordinal_mc/e6/runner.py": "79ef51a8b3e39a51a8980edabfa45b2959a3f37cacfc4d873b95fb6cb859598b",
+    "ordinal_mc/e6/training.py": "4bef3fd2410cc4ef3159be3cfa635ed2a5d7970f9aceabca49e8616a23c90d7e",
+    "run_e6.py": "84b0937686ddd03e7d49e2b4aa7c7b570d32322740a21a5f7a8234882d1b0bc4"
+  },
+  "coefficient_ranges": {
+    "formulas": {
+      "a": "3*Z[c,0] + t",
+      "b": "1.5 + exp(0.2*Z[c,1])",
+      "kappa": "kappa_base + kappa_amplitude*tanh(Z[c,0] + kappa_time_shift*t)"
+    },
+    "theoretical": {
+      "a": "unbounded; finite Gaussian moments",
+      "b": "(1.5, infinity); finite lognormal moments",
+      "kappa": [
+        0.39999999999999997,
+        0.8
+      ]
+    },
+    "realized": {
+      "a": {
+        "min": -10.17739577241384,
+        "max": 11.492838626918358
+      },
+      "b": {
+        "min": 1.9402664771333327,
+        "max": 3.7648977028479322
+      },
+      "kappa": {
+        "min": 0.4004517637036613,
+        "max": 0.7998652182149553
+      }
+    },
+    "realized_unseen": {
+      "a": {
+        "min": -9.966064728283492,
+        "max": 10.356247098662354
+      },
+      "b": {
+        "min": 2.025054682419369,
+        "max": 3.6829757764741258
+      },
+      "kappa": {
+        "min": 0.4005200244174174,
+        "max": 0.7997125632287175
+      }
+    },
+    "monotonicity": "Psi_prime=b*(1+kappa*sech(R)^2)>0; affine derivative=b>0",
+    "finite_second_moments": "Gumbel R has finite second moment; tanh is bounded; Gaussian/lognormal cell coefficients have finite moments"
+  },
+  "runtime": {
+    "python": "3.10.20",
+    "torch": "2.5.1",
+    "numpy": "2.2.6",
+    "scipy": "1.15.2"
+  },
+  "target": "latent within-tract changes; outcome calibration is a separate target"
+}

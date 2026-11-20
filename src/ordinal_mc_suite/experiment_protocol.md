@@ -1,3 +1,12 @@
+# November 2, 2026 extension
+
+New runs add a correctly specified, oracle-nuisance conditional-ML benchmark to
+every experiment and add E5 matched-tract change recovery. See the beginning of
+`README.md` for the exact information granted to ML, the matched-panel design,
+stable-only cutoff calibration, scale conventions, and new run commands.
+The historical snapshot and protocol below describe the earlier saved runs;
+they do not contain the new benchmark or E5 results.
+
 # Exact protocol for the focused E1, E3 and E4 Monte Carlo battery
 
 This document describes the **overnight configurations delivered in this conversation**, including multicore execution and the zero-dispersion recovery repair. It distinguishes those configurations from the much broader experiments supported by the package.

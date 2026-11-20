@@ -1,0 +1,10 @@
+{
+  "executed_scorer_updates": 6500,
+  "elapsed_seconds": 39.37298677599756,
+  "replay": {
+    "anchor_identical": true,
+    "anchor_fixed_identical": true,
+    "continuation_selected_identical": true,
+    "continuation_fixed_identical": true
+  }
+}

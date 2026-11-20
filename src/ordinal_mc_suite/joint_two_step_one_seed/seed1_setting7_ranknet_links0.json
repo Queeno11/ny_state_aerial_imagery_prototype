@@ -1,0 +1,436 @@
+{
+  "stem": "seed1_setting7_ranknet_links0",
+  "elapsed_seconds": 9.367706891993294,
+  "provenance": {
+    "setting": 7,
+    "shape": "quadratic",
+    "map": "M3",
+    "change_mechanism": "nonlinear",
+    "rho": 0.0,
+    "rejection_rate": 0.8962617769222976,
+    "rejection_attempts": 9871,
+    "endpoint_min": [
+      -1.7280522063884018,
+      -1.7316494897711157,
+      -1.729498236834416
+    ],
+    "endpoint_max": [
+      1.7312157525152112,
+      1.727007963543235,
+      1.726966140699504
+    ],
+    "empirical_residual_corr": 0.044047929772961125,
+    "vstar": 13.7855438846675,
+    "effective_coefficients": {
+      "levels": {
+        "average": 0.036269878372815444,
+        "difference": 0.009067469593203861
+      },
+      "changes": {
+        "average": 0.014507951349126174,
+        "difference": 0.01450795134912618
+      }
+    }
+  },
+  "arms": {
+    "A": {
+      "selected_step": 400,
+      "validation": 0.44888990150020397,
+      "validation_trace": [
+        {
+          "step": 0,
+          "value": 0.672511736247901
+        },
+        {
+          "step": 25,
+          "value": 0.6506208468280766
+        },
+        {
+          "step": 50,
+          "value": 0.611843143789339
+        },
+        {
+          "step": 75,
+          "value": 0.5629994155093343
+        },
+        {
+          "step": 100,
+          "value": 0.52385570703811
+        },
+        {
+          "step": 125,
+          "value": 0.49831069696624974
+        },
+        {
+          "step": 150,
+          "value": 0.4773782600476134
+        },
+        {
+          "step": 175,
+          "value": 0.4640713384317231
+        },
+        {
+          "step": 200,
+          "value": 0.4554335874162752
+        },
+        {
+          "step": 225,
+          "value": 0.4519444101864546
+        },
+        {
+          "step": 250,
+          "value": 0.45136530329325664
+        },
+        {
+          "step": 275,
+          "value": 0.45037923914895966
+        },
+        {
+          "step": 300,
+          "value": 0.45000825938821665
+        },
+        {
+          "step": 325,
+          "value": 0.4496298204476994
+        },
+        {
+          "step": 350,
+          "value": 0.44905469098736905
+        },
+        {
+          "step": 375,
+          "value": 0.4486506886034815
+        },
+        {
+          "step": 400,
+          "value": 0.44888990150020397
+        }
+      ],
+      "updates": 400,
+      "gradients": [
+        {
+          "step": 1,
+          "rank_norm": 0.11816420486912461,
+          "weighted_temporal_norm": 0.7512406594431275,
+          "weighted_cross_norm": 0.0,
+          "ordinal_norm": 0.7712204681587992,
+          "cardinal_norm": 0.0,
+          "ordinal_cardinal_cosine": null,
+          "temporal_cardinal_cosine": null,
+          "cross_cardinal_cosine": null,
+          "rank_temporal_cosine": 0.09268755309308462
+        },
+        {
+          "step": 200,
+          "rank_norm": 0.07245503659140128,
+          "weighted_temporal_norm": 0.005454764450810572,
+          "weighted_cross_norm": 0.0,
+          "ordinal_norm": 0.07327608998944692,
+          "cardinal_norm": 0.0,
+          "ordinal_cardinal_cosine": null,
+          "temporal_cardinal_cosine": null,
+          "cross_cardinal_cosine": null,
+          "rank_temporal_cosine": 0.11373084389212398
+        },
+        {
+          "step": 400,
+          "rank_norm": 0.0731877703465836,
+          "weighted_temporal_norm": 0.007328828802516317,
+          "weighted_cross_norm": 0.0,
+          "ordinal_norm": 0.072748692807651,
+          "cardinal_norm": 0.0,
+          "ordinal_cardinal_cosine": null,
+          "temporal_cardinal_cosine": null,
+          "cross_cardinal_cosine": null,
+          "rank_temporal_cosine": -0.10979996859212224
+        }
+      ],
+      "convergence": "fixed-budget endpoint"
+    },
+    "B": {
+      "success": true,
+      "solver": "BVLS segment-slope fallback",
+      "iterations": 2,
+      "projected_gradient": 1.114672052329083e-13,
+      "projected_gradient_tolerance": 9.775481635789282e-06,
+      "minimum_slope": 1e-05,
+      "objective": 0.09465030383157262,
+      "slsqp_message": "Iteration limit reached",
+      "slsqp_iterations": 300
+    },
+    "C": {
+      "selected_step": 200,
+      "validation": 0.6570193456129403,
+      "validation_trace": [
+        {
+          "step": 0,
+          "value": 0.6597163845743934
+        },
+        {
+          "step": 25,
+          "value": 0.6582938445849185
+        },
+        {
+          "step": 50,
+          "value": 0.6597147577249991
+        },
+        {
+          "step": 75,
+          "value": 0.6579213422302912
+        },
+        {
+          "step": 100,
+          "value": 0.6603939906537571
+        },
+        {
+          "step": 125,
+          "value": 0.6567431761255582
+        },
+        {
+          "step": 150,
+          "value": 0.6573360582043577
+        },
+        {
+          "step": 175,
+          "value": 0.6573424730293798
+        },
+        {
+          "step": 200,
+          "value": 0.6570193456129403
+        }
+      ],
+      "updates": 200,
+      "gradients": [
+        {
+          "step": 1,
+          "rank_norm": 0.0670688866504788,
+          "weighted_temporal_norm": 0.00748488560568332,
+          "weighted_cross_norm": 0.0,
+          "ordinal_norm": 0.06726399485183158,
+          "cardinal_norm": 0.12511877986139242,
+          "ordinal_cardinal_cosine": 0.38684223227617276,
+          "temporal_cardinal_cosine": -0.008645805963921158,
+          "cross_cardinal_cosine": null,
+          "rank_temporal_cosine": -0.029695110334973195
+        },
+        {
+          "step": 100,
+          "rank_norm": 0.07316536307688482,
+          "weighted_temporal_norm": 0.007918412474220139,
+          "weighted_cross_norm": 0.0,
+          "ordinal_norm": 0.07477965955413998,
+          "cardinal_norm": 0.09017439801437907,
+          "ordinal_cardinal_cosine": 0.41614766113670454,
+          "temporal_cardinal_cosine": -0.045358588184811005,
+          "cross_cardinal_cosine": null,
+          "rank_temporal_cosine": 0.15200207261489412
+        },
+        {
+          "step": 200,
+          "rank_norm": 0.07429870257404836,
+          "weighted_temporal_norm": 0.007565979940439104,
+          "weighted_cross_norm": 0.0,
+          "ordinal_norm": 0.07535750195581005,
+          "cardinal_norm": 0.11946172015046318,
+          "ordinal_cardinal_cosine": 0.3306478484298279,
+          "temporal_cardinal_cosine": -0.04877780857607303,
+          "cross_cardinal_cosine": null,
+          "rank_temporal_cosine": 0.09002329977233728
+        }
+      ],
+      "convergence": "fixed-budget endpoint"
+    },
+    "D": {
+      "selected_step": 200,
+      "validation": 0.6650866870373493,
+      "validation_trace": [
+        {
+          "step": 0,
+          "value": 0.6675856572209118
+        },
+        {
+          "step": 25,
+          "value": 0.6663315938139415
+        },
+        {
+          "step": 50,
+          "value": 0.6664011529381817
+        },
+        {
+          "step": 75,
+          "value": 0.6658928244289298
+        },
+        {
+          "step": 100,
+          "value": 0.6683923255141997
+        },
+        {
+          "step": 125,
+          "value": 0.664580596847983
+        },
+        {
+          "step": 150,
+          "value": 0.6644106199217176
+        },
+        {
+          "step": 175,
+          "value": 0.6645170191431339
+        },
+        {
+          "step": 200,
+          "value": 0.6650866870373493
+        }
+      ],
+      "updates": 200,
+      "gradients": [
+        {
+          "step": 1,
+          "rank_norm": 0.0670688866504788,
+          "weighted_temporal_norm": 0.00748488560568332,
+          "weighted_cross_norm": 0.0,
+          "ordinal_norm": 0.06726399485183158,
+          "cardinal_norm": 0.05845973336162487,
+          "ordinal_cardinal_cosine": 0.5398420228043079,
+          "temporal_cardinal_cosine": -0.00393427194681643,
+          "cross_cardinal_cosine": null,
+          "rank_temporal_cosine": -0.029695110334973195
+        },
+        {
+          "step": 100,
+          "rank_norm": 0.0735872981338573,
+          "weighted_temporal_norm": 0.007836495743938814,
+          "weighted_cross_norm": 0.0,
+          "ordinal_norm": 0.07497562744986994,
+          "cardinal_norm": 0.06728898821654779,
+          "ordinal_cardinal_cosine": 0.5046491429891586,
+          "temporal_cardinal_cosine": -0.05686607726817393,
+          "cross_cardinal_cosine": null,
+          "rank_temporal_cosine": 0.1255869615281527
+        },
+        {
+          "step": 200,
+          "rank_norm": 0.07327523710610526,
+          "weighted_temporal_norm": 0.00607883161249883,
+          "weighted_cross_norm": 0.0,
+          "ordinal_norm": 0.07309004260016928,
+          "cardinal_norm": 0.056871156071164955,
+          "ordinal_cardinal_cosine": 0.5474349813293184,
+          "temporal_cardinal_cosine": -0.15725318596221577,
+          "cross_cardinal_cosine": null,
+          "rank_temporal_cosine": -0.07190641833087323
+        }
+      ],
+      "convergence": "fixed-budget endpoint"
+    },
+    "O": {
+      "selected_step": 200,
+      "validation": 0.44674831015914196,
+      "validation_trace": [
+        {
+          "step": 0,
+          "value": 0.44888990150020397
+        },
+        {
+          "step": 25,
+          "value": 0.44797598725781174
+        },
+        {
+          "step": 50,
+          "value": 0.4487020575997912
+        },
+        {
+          "step": 75,
+          "value": 0.4476354162478907
+        },
+        {
+          "step": 100,
+          "value": 0.4493128943074798
+        },
+        {
+          "step": 125,
+          "value": 0.4471608789905912
+        },
+        {
+          "step": 150,
+          "value": 0.4471476765710337
+        },
+        {
+          "step": 175,
+          "value": 0.44755985085461514
+        },
+        {
+          "step": 200,
+          "value": 0.44674831015914196
+        }
+      ],
+      "updates": 200,
+      "gradients": [
+        {
+          "step": 1,
+          "rank_norm": 0.0670688866504788,
+          "weighted_temporal_norm": 0.00748488560568332,
+          "weighted_cross_norm": 0.0,
+          "ordinal_norm": 0.06726399485183158,
+          "cardinal_norm": 0.0,
+          "ordinal_cardinal_cosine": null,
+          "temporal_cardinal_cosine": null,
+          "cross_cardinal_cosine": null,
+          "rank_temporal_cosine": -0.029695110334973195
+        },
+        {
+          "step": 100,
+          "rank_norm": 0.07405873785871443,
+          "weighted_temporal_norm": 0.0056987412026591475,
+          "weighted_cross_norm": 0.0,
+          "ordinal_norm": 0.07459175234648603,
+          "cardinal_norm": 0.0,
+          "ordinal_cardinal_cosine": null,
+          "temporal_cardinal_cosine": null,
+          "cross_cardinal_cosine": null,
+          "rank_temporal_cosine": 0.05539408404309797
+        },
+        {
+          "step": 200,
+          "rank_norm": 0.07745073770746483,
+          "weighted_temporal_norm": 0.005282086626783263,
+          "weighted_cross_norm": 0.0,
+          "ordinal_norm": 0.07798048791784928,
+          "cardinal_norm": 0.0,
+          "ordinal_cardinal_cosine": null,
+          "temporal_cardinal_cosine": null,
+          "cross_cardinal_cosine": null,
+          "rank_temporal_cosine": 0.0665351808293876
+        }
+      ],
+      "convergence": "fixed-budget endpoint"
+    }
+  },
+  "links": {
+    "temporal_pairs": 1024,
+    "cross_pairs": 0,
+    "cross_origin_cities": 0,
+    "cross_destination_cities": 0,
+    "cross_coverage": 0.0,
+    "cross_graph_components": 16,
+    "cross_graph_connected": false
+  },
+  "frozen_heads": {
+    "A": {
+      "success": true,
+      "solver": "SLSQP",
+      "iterations": 172,
+      "objective": 0.09800848494586242
+    },
+    "B": {
+      "success": true,
+      "solver": "BVLS segment-slope fallback",
+      "iterations": 2,
+      "projected_gradient": 1.114672052329083e-13,
+      "projected_gradient_tolerance": 9.775481635789282e-06,
+      "minimum_slope": 1e-05,
+      "objective": 0.09465030383157262,
+      "slsqp_message": "Iteration limit reached",
+      "slsqp_iterations": 300
+    }
+  }
+}

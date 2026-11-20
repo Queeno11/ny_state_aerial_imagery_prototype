@@ -1,0 +1,81 @@
+{
+  "elapsed_seconds": 782.6257406889927,
+  "executed_scorer_updates": 57000,
+  "replications": [
+    {
+      "role": "replay",
+      "rep": 201,
+      "elapsed_seconds": 126.69315863202792,
+      "executed_scorer_updates": 9500,
+      "profile_head_solves": 4004,
+      "historical_equivalence": {
+        "anchor": true,
+        "anchor_fixed": true,
+        "ordinal_fixed": true,
+        "ordinal_historical_selected": true,
+        "legacy_fixed": true,
+        "legacy_historical_selected": true,
+        "legacy_fixed_head": true,
+        "legacy_historical_native_head": true
+      }
+    },
+    {
+      "role": "replay",
+      "rep": 202,
+      "elapsed_seconds": 115.7488065380021,
+      "executed_scorer_updates": 9500,
+      "profile_head_solves": 4004,
+      "historical_equivalence": {
+        "anchor": true,
+        "anchor_fixed": true,
+        "ordinal_fixed": true,
+        "ordinal_historical_selected": true,
+        "legacy_fixed": true,
+        "legacy_historical_selected": true,
+        "legacy_fixed_head": true,
+        "legacy_historical_native_head": true
+      }
+    },
+    {
+      "role": "replay",
+      "rep": 203,
+      "elapsed_seconds": 116.15979557996616,
+      "executed_scorer_updates": 9500,
+      "profile_head_solves": 4004,
+      "historical_equivalence": {
+        "anchor": true,
+        "anchor_fixed": true,
+        "ordinal_fixed": true,
+        "ordinal_historical_selected": true,
+        "legacy_fixed": true,
+        "legacy_historical_selected": true,
+        "legacy_fixed_head": true,
+        "legacy_historical_native_head": true
+      }
+    },
+    {
+      "role": "confirmation",
+      "rep": 301,
+      "elapsed_seconds": 184.05231153499335,
+      "executed_scorer_updates": 9500,
+      "profile_head_solves": 4004,
+      "historical_equivalence": {}
+    },
+    {
+      "role": "confirmation",
+      "rep": 302,
+      "elapsed_seconds": 129.4820557970088,
+      "executed_scorer_updates": 9500,
+      "profile_head_solves": 4004,
+      "historical_equivalence": {}
+    },
+    {
+      "role": "confirmation",
+      "rep": 303,
+      "elapsed_seconds": 110.11729846597882,
+      "executed_scorer_updates": 9500,
+      "profile_head_solves": 4004,
+      "historical_equivalence": {}
+    }
+  ]
+}

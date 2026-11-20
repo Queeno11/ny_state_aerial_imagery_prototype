@@ -84,6 +84,9 @@ def alter_links(h,rng,scenario,dgp,truth,cfg):
     if kind=='exact': return h.copy(),np.zeros(len(h),bool)
     if kind=='drift': return np.clip(h+level*direction,dgp.hlow,dgp.hhigh),np.zeros(len(h),bool)
     if kind=='random_false': return np.where(selected[:,None],replacement,h),selected
+    if kind=='changed':
+        changed = change_h(h,rng,scenario['change_strength'],dgp,truth)
+        return np.where(selected[:,None],changed,h),selected
     if kind=='systematic_false':
         g=structural_gradient(h,truth,dgp)
         g/=np.maximum(np.linalg.norm(g,axis=1,keepdims=True),1e-12)
@@ -95,6 +98,30 @@ def alter_links(h,rng,scenario,dgp,truth,cfg):
             best[improve]=candidate[improve]; bestf[improve]=score[improve]
         return best,selected
     raise ValueError(kind)
+
+
+def change_h(h,rng,strength,dgp,truth):
+    """Equal-probability improvement/decline along the true local gradient."""
+    g=structural_gradient(h,truth,dgp)
+    g/=np.maximum(np.linalg.norm(g,axis=1,keepdims=True),1e-12)
+    direction=rng.choice([-1.,1.],len(h))
+    return np.clip(h+strength*direction[:,None]*g,dgp.hlow,dgp.hhigh)
+
+
+def matched_panel(seed,contexts,cfg,dgp,truth,strength,changed_share):
+    rng=np.random.default_rng(seed)
+    c=np.repeat(np.arange(len(contexts)),cfg.test_per_city)
+    h=dgp.draw_h(rng,contexts[c,0]); after=change_h(h,rng,strength,dgp,truth)
+    # Fixed counts give every city stable controls, even in small smoke runs.
+    changed=np.zeros(len(h),bool)
+    for city in range(len(contexts)):
+        loc=np.flatnonzero(c==city)
+        changed[rng.permutation(loc)[:int(round(len(loc)*changed_share))]]=True
+    after=np.where(changed[:,None],after,h)
+    x0=make_inputs(h,c,np.zeros(len(c),int),contexts,rng,cfg,dgp)
+    x1=make_inputs(after,c,np.ones(len(c),int),contexts,rng,cfg,dgp)
+    return dict(x_before=x0,x_after=x1,delta_f=dgp.score(after,truth)-dgp.score(h,truth),
+                assigned_changed=changed)
 
 def make_design(cfg,dgp,rep,n,truth,scenario):
     dgp.configure(truth,scenario['composition'])
@@ -126,13 +153,17 @@ def make_design(cfg,dgp,rep,n,truth,scenario):
             link_stats[arm]=dict(link_count=len(edges),link_gap_rms=float(np.sqrt(np.mean(gap**2))),
                 link_gap_abs=float(np.mean(abs(gap))),link_false_share=float(false[b].mean()),
                 link_h_max=float(np.linalg.norm(hh[b]-hh[a],axis=1).max()),link_upward_share=float(np.mean(gap>1e-12)))
-    tests={}
+    tests={}; change_tests={}
     for name in ('seen','unseen'):
         trng=np.random.default_rng(seed_for(seed,name))
         cx=contexts if name=='seen' else trng.normal(size=(max(4,cfg.cities//2),2))
         zz=cell_z if name=='seen' else trng.normal(size=(len(cx),2))
         data=panel(seed_for(seed,'panel',name),cx,zz,cfg.test_per_city,cfg,dgp,truth,scenario)
         tests[name]=(data,{kind:pair_indices(data,trng,cfg.test_pairs,kind) for kind in ('within','cross_city','across_time')})
+        change_tests[name]=matched_panel(seed_for(seed,'matched',name),cx,cfg,dgp,truth,
+            scenario['change_strength'],cfg.experiment5['changed_share'])
+    calibration_contexts=np.random.default_rng(seed_for(seed,'calibration_contexts')).normal(size=(max(4,cfg.cities),2))
+    change_calibration=matched_panel(seed_for(seed,'stable_calibration'),calibration_contexts,cfg,dgp,truth,0.,0.)
     if cfg.pair_mode=='all':
         ii=[]; jj=[]; ww=[]
         for cell in np.unique(train['cell']):
@@ -144,7 +175,8 @@ def make_design(cfg,dgp,rep,n,truth,scenario):
         pair_weights=np.full(len(pairs[0]),1/len(pairs[0]))
     return dict(train=train,val=val,x=np.vstack(xs),pairs=pairs,pair_weights=pair_weights,
         val_pairs=pair_indices(val,np.random.default_rng(seed_for(seed,'valpairs')),cfg.test_pairs),links=links,link_stats=link_stats,
-        tests=tests,n_fit=count,n_val=len(val['x']),budget=budget,contexts=contexts,seed=seed,noise_sd_effective=dgp.noise_sd,baseline_oracle_risk=dgp.baseline_oracle_risk)
+        tests=tests,change_tests=change_tests,change_calibration=change_calibration,
+        n_fit=count,n_val=len(val['x']),budget=budget,contexts=contexts,cell_z=cell_z,seed=seed,noise_sd_effective=dgp.noise_sd,baseline_oracle_risk=dgp.baseline_oracle_risk)
 
 def level_target(method,design,cfg,scenario):
     tr=design['train']; w=tr['w']; diagnostics={}

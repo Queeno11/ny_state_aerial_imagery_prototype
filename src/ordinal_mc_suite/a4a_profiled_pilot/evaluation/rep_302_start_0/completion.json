@@ -1,0 +1,8 @@
+{
+  "role": "confirmation",
+  "rep": 302,
+  "elapsed_seconds": 129.4820557970088,
+  "executed_scorer_updates": 9500,
+  "profile_head_solves": 4004,
+  "historical_equivalence": {}
+}

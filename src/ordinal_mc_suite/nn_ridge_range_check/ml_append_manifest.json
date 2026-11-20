@@ -1,0 +1,10 @@
+{
+  "original_csv_sha256": "3c4921787423b03d8b327262b2daadce721e5f6e0c888444c8650f2dfbbb0887",
+  "original_fits": 40,
+  "added_ml_fits": 20,
+  "replay_checks": 190,
+  "ml_not_converged": 0,
+  "original_estimators_rerun": 0,
+  "original_checkpoint_modified": false,
+  "ml_information": "known structural basis, input map, measurement map, error law and scale; fitted coefficients"
+}

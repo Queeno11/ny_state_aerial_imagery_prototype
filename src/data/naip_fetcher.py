@@ -164,7 +164,38 @@ _FETCH_STATS = {"ok": 0, "no_items": 0, "no_year_match": 0, "asset_missing": 0,
                 "search_error": 0, "nir_padded": 0, "partial_coverage": 0,
                 "search_cache_hit": 0, "search_cache_miss": 0,
                 "search_cache_expand": 0, "search_cache_disk_hit": 0,
-                "search_cache_circuit_breaker": 0}
+                "search_cache_circuit_breaker": 0, "transform_fallback": 0}
+
+
+# First few distinct exception messages per failure mode, so a halt can say
+# WHY reads failed instead of only "read_error" (the exception is otherwise
+# swallowed into a retryable failure code).
+_ERROR_EXAMPLES: dict = {}
+_MAX_EXAMPLES_PER_MODE = 3
+
+
+def record_error_example(mode: str, exc: BaseException, context: str = "") -> None:
+    """Keep the message, the frame that raised it, and optional context."""
+    import traceback
+    frames = traceback.extract_tb(exc.__traceback__) if exc.__traceback__ else []
+    where = (f" at {Path(frames[-1].filename).name}:{frames[-1].lineno} "
+             f"in {frames[-1].name}") if frames else ""
+    msg = f"{type(exc).__name__}: {str(exc)[:200]}{where}" + (f" [{context}]" if context else "")
+    with _STATS_LOCK:
+        seen = _ERROR_EXAMPLES.setdefault(mode, [])
+        if msg not in seen and len(seen) < _MAX_EXAMPLES_PER_MODE:
+            seen.append(msg)
+
+
+def get_error_examples() -> dict:
+    """{failure mode: [first distinct exception messages]} for this process."""
+    with _STATS_LOCK:
+        return {k: list(v) for k, v in _ERROR_EXAMPLES.items()}
+
+
+def reset_error_examples() -> None:
+    with _STATS_LOCK:
+        _ERROR_EXAMPLES.clear()
 
 
 def get_fetch_stats() -> dict:
@@ -616,19 +647,35 @@ def resolve_naip_item(
     return NaipItemRef(item.id, asset.href, use_cache, actual_year, bbox, None)
 
 
+# GDAL caches the outcome of opening a /vsicurl/ URL — failures included — for
+# the life of the process, and ``planetary_computer`` reuses one SAS token (so
+# the identical signed URL) until it nears expiry. A transient HTTP error on
+# the first open therefore replays instantly, with no network request, on every
+# later open of that URL: retries never reach Azure. Measured: a 403 open took
+# 0.44 s, the next two identical opens 0.00 s. Retry passes open with the URL
+# cache bypassed so they make real requests; the first pass keeps it (speed).
+GDAL_ENV_UNCACHED = dict(GDAL_ENV, CPL_VSIL_CURL_NON_CACHED="/vsicurl/https://")
+
+
 @contextmanager
-def open_naip_src(href: str, use_cache: bool):
+def open_naip_src(href: str, use_cache: bool, uncached: bool = False):
     """Open a NAIP COG for reading, signing the href iff it came from the cache.
 
     A context manager so one handle can serve many :func:`read_naip_crop_from_src`
     calls (the point of the split). Cached items carry unsigned hrefs (SAS tokens
     would expire); sign here, at read time — the token is cached client-side by
-    ``planetary_computer``, so this is not an extra round-trip.
+    ``planetary_computer``, so this is not an extra round-trip. ``uncached=True``
+    bypasses GDAL's per-URL cache (see :data:`GDAL_ENV_UNCACHED`) — for retries.
     """
     signed = planetary_computer.sign(href) if use_cache else href
-    with rasterio.Env(**GDAL_ENV):
+    with rasterio.Env(**(GDAL_ENV_UNCACHED if uncached else GDAL_ENV)):
         with rasterio.open(signed) as src:
             yield src
+
+
+def open_naip_src_uncached(href: str, use_cache: bool):
+    """:func:`open_naip_src` with GDAL's URL cache bypassed (retry passes)."""
+    return open_naip_src(href, use_cache, uncached=True)
 
 
 def _bbox_to_native(bbox: list[float], dst_crs) -> tuple:
@@ -654,6 +701,40 @@ def _bbox_to_native(bbox: list[float], dst_crs) -> tuple:
     return min(xs), min(ys), max(xs), max(ys)
 
 
+_PYPROJ_BROKEN_CRS: set = set()   # CRSs where pyproj returned non-finite output once
+
+
+def bbox_to_native_checked(bbox: list[float], dst_crs) -> tuple:
+    """:func:`_bbox_to_native`, guarded against non-finite output.
+
+    A failed PROJ operation returns ``inf``; ``from_bounds`` then yields a NaN
+    window and the read dies with "cannot convert float NaN to integer" —
+    deterministic for the affected locations, so retries cannot help. Retry
+    the envelope through GDAL's own transformer; if that is non-finite too,
+    raise with the inputs so the failure is diagnosable.
+    """
+    from rasterio.warp import transform_bounds
+    key = str(dst_crs)
+    if key not in _PYPROJ_BROKEN_CRS:
+        native = _bbox_to_native(bbox, dst_crs)
+        if all(np.isfinite(native)):
+            return native
+        # Observed: PROJ logs a non-UTF-8 message, pyproj's log callback dies
+        # decoding it (UnicodeDecodeError in pyproj_log_function) and the
+        # transform returns inf for every crop. Stop asking pyproj for this CRS.
+        _PYPROJ_BROKEN_CRS.add(key)
+        print(f"  ⚠️ pyproj returned non-finite coordinates for {key}; using GDAL's "
+              f"transformer for this CRS from now on")
+    _count("transform_fallback")
+    native = transform_bounds("EPSG:4326", dst_crs, *bbox)
+    if all(np.isfinite(native)):
+        return native
+    import pyproj
+    raise ValueError(f"non-finite native bbox {native} for EPSG:4326 bbox {list(bbox)} "
+                     f"into {dst_crs} (pyproj network enabled: "
+                     f"{pyproj.network.is_network_enabled()})")
+
+
 def read_naip_crop_from_src(src, bbox: list[float], nbands: int, out_pixels: int):
     """Read one crop window from an already-open rasterio dataset.
 
@@ -663,8 +744,9 @@ def read_naip_crop_from_src(src, bbox: list[float], nbands: int, out_pixels: int
     ``read_error`` on failure. ``src`` lifecycle is the caller's, so a whole
     DOQQ's crops can be read from a single open handle.
     """
+    native_bb = None
     try:
-        native_bb = _bbox_to_native(bbox, src.crs)
+        native_bb = bbox_to_native_checked(bbox, src.crs)
         window = from_bounds(*native_bb, transform=src.transform)
 
         # If the window sticks out of the raster, a plain read would clip it
@@ -697,8 +779,12 @@ def read_naip_crop_from_src(src, bbox: list[float], nbands: int, out_pixels: int
 
         _count("ok")
         return crop, nir_padded, partial, None
-    except Exception:
+    except Exception as exc:
         _count("read_error")
+        record_error_example("read_error", exc, context=(
+            f"bbox={[round(float(v), 6) for v in bbox]} crs={getattr(src, 'crs', None)} "
+            f"native={None if native_bb is None else [round(float(v), 1) for v in native_bb]} "
+            f"raster={getattr(src, 'width', None)}x{getattr(src, 'height', None)}"))
         return None, False, False, "read_error"
 
 

@@ -1,0 +1,20 @@
+{
+  "seed": 2026110917,
+  "replications": [1, 2, 3, 4, 5],
+  "calibration_replication": 101,
+  "cities": 20,
+  "paired_tracts": 200,
+  "fit_tracts": 160,
+  "test_tracts": 256,
+  "stability_views": 2,
+  "lambda_S": 0.3,
+  "tau": 0.1,
+  "gradient_budgets": [0.0, 0.1, 1.0],
+  "additional_gradient_budgets": [[10.0, 0.0], [10.0, 10.0]],
+  "level_change_ratios": [0.1, 1.0],
+  "curvature_per_level": 0.001,
+  "sphere_grid": 48,
+  "optimizer_maxiter": 130,
+  "test_doses": [-0.4, -0.15, -0.05, 0.0, 0.05, 0.15, 0.4],
+  "cutoff_quantile": 0.95
+}

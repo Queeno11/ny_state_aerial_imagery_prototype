@@ -1,0 +1,17 @@
+{
+  "role": "replay",
+  "rep": 202,
+  "elapsed_seconds": 115.7488065380021,
+  "executed_scorer_updates": 9500,
+  "profile_head_solves": 4004,
+  "historical_equivalence": {
+    "anchor": true,
+    "anchor_fixed": true,
+    "ordinal_fixed": true,
+    "ordinal_historical_selected": true,
+    "legacy_fixed": true,
+    "legacy_historical_selected": true,
+    "legacy_fixed_head": true,
+    "legacy_historical_native_head": true
+  }
+}

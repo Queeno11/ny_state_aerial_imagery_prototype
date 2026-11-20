@@ -1,0 +1,78 @@
+{
+  "preset": "full144",
+  "self_check": false,
+  "smoke": false,
+  "seeds": 1,
+  "seed": 271828,
+  "cities": 16,
+  "target_cities": 4,
+  "n": 128,
+  "eval_n": 64,
+  "ord_steps": 400,
+  "joint_steps": 200,
+  "benchmark_steps": 160,
+  "check_every": 25,
+  "lr": 0.001,
+  "head_lr": 0.003,
+  "lambda_t": 0.3,
+  "lambda_c": 0.3,
+  "kappa": 1.0,
+  "q_levels": 0.5,
+  "q_changes": 0.8,
+  "tau": 0.3,
+  "sigma": 0.8,
+  "device": "cuda",
+  "output": "ordinal_mc_suite/joint_two_step_one_seed",
+  "settings": [
+    [
+      "linear",
+      "M1",
+      "simple",
+      0.0
+    ],
+    [
+      "linear",
+      "M2",
+      "simple",
+      0.0
+    ],
+    [
+      "linear",
+      "M3",
+      "simple",
+      0.0
+    ],
+    [
+      "quadratic",
+      "M1",
+      "simple",
+      0.0
+    ],
+    [
+      "quadratic",
+      "M2",
+      "simple",
+      0.0
+    ],
+    [
+      "quadratic",
+      "M3",
+      "simple",
+      0.0
+    ],
+    [
+      "quadratic",
+      "M3",
+      "nonlinear",
+      0.0
+    ],
+    [
+      "quadratic",
+      "M3",
+      "nonlinear",
+      0.9
+    ]
+  ],
+  "device_used": "cuda",
+  "source_sha256": "bbae88d0ba935d7ef4c70f6b2fc44f494fa38a219812d67eaf2c8431f52162e0"
+}

@@ -1,0 +1,11 @@
+{
+  "original_metrics_sha256": "c693fe1a4a27647468b2a530190b6e5cd4326b6257403db6a8d0f0a4eb001463",
+  "original_fits": 6,
+  "added_ml_fits": 2,
+  "ml_not_converged": 0,
+  "original_estimators_rerun": 0,
+  "sample_replay_verified": true,
+  "max_truth_replay_error": 7.040552663095667e-08,
+  "truth_replay_atol": 1e-07,
+  "truth_replay_rtol": 1e-07
+}

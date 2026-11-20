@@ -1158,3 +1158,108 @@ def test_default_modal_share_sits_inside_the_measured_safe_band():
     default must not drift to either edge of that gap."""
     assert 0.25 <= prediction.BLANK_MODAL_SHARE_DEFAULT <= 0.75
     assert prediction.BLANK_MIN_TRACT_BUILDINGS >= 10
+
+
+# ─── GDAL URL-cache replay on retries ─────────────────────────────────────────
+
+def test_retry_passes_bypass_gdal_url_cache(monkeypatch):
+    # The default opener keeps failing DOQQ "0" (as GDAL replays a cached failed
+    # open of the same signed URL); retries must switch to the uncached opener,
+    # which reaches the server and succeeds.
+    df = make_df(8)
+    cached = FakeOpen(fail_hrefs={"href-0"})
+    uncached = FakeOpen()
+    monkeypatch.setattr(prediction, "open_naip_src", cached)
+    monkeypatch.setattr(prediction, "open_naip_src_uncached", uncached)
+    crops, _, failures = _grouped_chunk(df, FakeResolve(group_size=4), cached, FakeRead(),
+                                        max_workers=1, max_passes=3)
+    assert all(c is not None for c in crops) and all(f is None for f in failures)
+    assert "href-0" in uncached.opens                      # the retry went uncached
+    assert cached.opens.count("href-0") == 1               # cached opener: first pass only
+
+
+def test_custom_opener_is_kept_on_retries():
+    df = make_df(4)
+    opener = FakeOpen(fail_hrefs={"href-0"})
+    with pytest.raises(RuntimeError):
+        _grouped_chunk(df, FakeResolve(group_size=4), opener, FakeRead(),
+                       max_workers=1, max_passes=3)
+    assert opener.opens.count("href-0") == 3               # same opener every pass
+
+
+def test_halt_message_names_the_underlying_error():
+    from src.data import naip_fetcher as nf
+    nf.reset_error_examples()
+    df = make_df(4)
+    with pytest.raises(RuntimeError, match=r"Underlying errors: .*open failed: href-0"):
+        _grouped_chunk(df, FakeResolve(group_size=4), FakeOpen(fail_hrefs={"href-0"}),
+                       FakeRead(), max_workers=1, max_passes=2)
+
+
+def test_error_examples_dedup_and_cap():
+    from src.data import naip_fetcher as nf
+    nf.reset_error_examples()
+    for msg in ["a", "a", "b", "c", "d"]:
+        nf.record_error_example("read_error", IOError(msg))
+    assert nf.get_error_examples()["read_error"] == ["OSError: a", "OSError: b", "OSError: c"]
+    nf.reset_error_examples()
+    assert nf.get_error_examples() == {}
+
+
+def test_open_naip_src_uncached_env(monkeypatch):
+    from src.data import naip_fetcher as nf
+    seen = []
+
+    class _Env:
+        def __init__(self, **kw):
+            seen.append(kw)
+        def __enter__(self):
+            return self
+        def __exit__(self, *a):
+            return False
+
+    @contextmanager
+    def _open(href):
+        yield href
+
+    monkeypatch.setattr(nf.rasterio, "Env", _Env)
+    monkeypatch.setattr(nf.rasterio, "open", _open)
+    with nf.open_naip_src("https://x/y.tif", use_cache=False) as s:
+        assert s == "https://x/y.tif"
+    with nf.open_naip_src_uncached("https://x/y.tif", use_cache=False):
+        pass
+    assert "CPL_VSIL_CURL_NON_CACHED" not in seen[0]
+    assert seen[1]["CPL_VSIL_CURL_NON_CACHED"] == "/vsicurl/https://"
+    assert seen[1]["GDAL_HTTP_TIMEOUT"] == nf.GDAL_ENV["GDAL_HTTP_TIMEOUT"]
+
+
+def test_bbox_to_native_checked_falls_back_then_raises(monkeypatch):
+    from src.data import naip_fetcher as nf
+    import rasterio.warp
+    inf = float("inf")
+    monkeypatch.setattr(nf, "_PYPROJ_BROKEN_CRS", set())
+    calls = []
+    monkeypatch.setattr(nf, "_bbox_to_native",
+                        lambda bbox, crs: calls.append(1) or (inf, 0.0, inf, 1.0))
+    monkeypatch.setattr(rasterio.warp, "transform_bounds", lambda *a: (1.0, 2.0, 3.0, 4.0))
+    assert nf.bbox_to_native_checked([0, 0, 1, 1], "EPSG:26918") == (1.0, 2.0, 3.0, 4.0)
+    assert nf.bbox_to_native_checked([0, 0, 1, 1], "EPSG:26918") == (1.0, 2.0, 3.0, 4.0)
+    assert len(calls) == 1                     # pyproj not retried for a broken CRS
+    monkeypatch.setattr(rasterio.warp, "transform_bounds", lambda *a: (inf, 2.0, inf, 4.0))
+    with pytest.raises(ValueError, match="non-finite native bbox"):
+        nf.bbox_to_native_checked([0, 0, 1, 1], "EPSG:26918")
+
+
+def test_read_error_example_carries_location_and_context():
+    from src.data import naip_fetcher as nf
+    nf.reset_error_examples()
+
+    class _BadSrc:
+        crs = "EPSG:26918"
+        width = height = 10
+        transform = None          # from_bounds on a None transform raises
+
+    crop, _, _, failure = nf.read_naip_crop_from_src(_BadSrc(), [-73.86, 40.83, -73.85, 40.84], 3, 8)
+    assert crop is None and failure == "read_error"
+    (msg,) = nf.get_error_examples()["read_error"]
+    assert " at " in msg and "bbox=[-73.86" in msg and "crs=EPSG:26918" in msg

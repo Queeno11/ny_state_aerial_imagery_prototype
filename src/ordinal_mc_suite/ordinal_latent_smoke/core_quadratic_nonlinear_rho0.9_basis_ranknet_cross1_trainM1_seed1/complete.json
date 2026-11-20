@@ -1,0 +1,8 @@
+{
+  "last_checkpoint": 2,
+  "metric_files": [
+    "metrics_00000001.csv",
+    "metrics_00000002.csv"
+  ],
+  "status": "complete"
+}

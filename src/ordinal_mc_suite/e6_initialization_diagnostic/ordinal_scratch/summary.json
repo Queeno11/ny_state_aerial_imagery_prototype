@@ -1,0 +1,20 @@
+{
+  "path": "ordinal_scratch",
+  "selected_step": 1130,
+  "selected_validation": 0.41997037925693514,
+  "patience_stop_step": 1330,
+  "validation_selection": "rank logistic",
+  "executed_scorer_updates": 3000,
+  "executed_head_updates": 3000,
+  "inherited_scorer_updates_executed": 0,
+  "inherited_selected_scorer_ancestry": 0,
+  "total_scorer_updates_executed": 3000,
+  "selected_scorer_ancestry": 1130,
+  "fixed_endpoint_scorer_ancestry": 3000,
+  "scorer_initial_hash": "ae6012432665bcee59ec3fcb7787409867fa3cb9b8c04af26617d8bc9dac957c",
+  "head_initial_hash": "6d78212f30f03798c0a53a02a3f0aeb87e4c052ce489a3201b8529701c8149b7",
+  "wall_seconds": 648.5111949239799,
+  "scorer_clipped_updates": 0,
+  "head_clipped_updates": 959,
+  "selected_at_budget_boundary": false
+}

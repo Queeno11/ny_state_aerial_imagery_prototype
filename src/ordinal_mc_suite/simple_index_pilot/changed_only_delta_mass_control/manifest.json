@@ -1,0 +1,65 @@
+{
+  "config": {
+    "seed": 2026110917,
+    "replications": [
+      1,
+      2,
+      3,
+      4,
+      5
+    ],
+    "calibration_replication": 101,
+    "cities": 20,
+    "paired_tracts": 200,
+    "fit_tracts": 160,
+    "test_tracts": 256,
+    "stability_views": 2,
+    "lambda_S": 0.3,
+    "tau": 0.1,
+    "gradient_budgets": [
+      0.0,
+      0.1,
+      1.0
+    ],
+    "additional_gradient_budgets": [
+      [
+        10.0,
+        0.0
+      ],
+      [
+        10.0,
+        10.0
+      ]
+    ],
+    "level_change_ratios": [
+      0.1,
+      1.0
+    ],
+    "curvature_per_level": 0.001,
+    "sphere_grid": 48,
+    "optimizer_maxiter": 130,
+    "test_doses": [
+      -0.4,
+      -0.15,
+      -0.05,
+      0.0,
+      0.05,
+      0.15,
+      0.4
+    ],
+    "cutoff_quantile": 0.95
+  },
+  "script_sha256": "d4e58443f6fa2c5bf7aae476ae38717fb21a867837280f4371e0fbce0ad7e694",
+  "source_sha256": {
+    "ordinal_mc_suite\\simple_index_pilot\\run_5rep\\manifest.json": "bd4d7591043d84bb718d13c872447f53f3eb450dcaef1083b55035741a5c9a04",
+    "ordinal_mc_suite\\simple_index_pilot\\changed_only_delta\\manifest.json": "dbe927d5e8bfe2cc6152e58228529b9ad83a6a121885e8accd57465c5a284bcc",
+    "ordinal_mc_suite\\simple_index_pilot\\changed_only_delta\\audit.json": "f3a87c0cd9601d4bd4db6b02d6cfe2d7878071e81d88cca8c670faf8663a4914",
+    "ordinal_mc_suite\\simple_index_pilot\\calibration_10pct\\manifest.json": "d37dbdd09dbf537649f9927f289e799ef74c170d3aa7e5eb6045a0c885f87d8e"
+  },
+  "new_scorer_fits": 15,
+  "coefficient_rule": "old delta coefficient times actual fraction of fitting pairs with true change != 0",
+  "training_level_weight": "same frozen Ordinal_L2_S level weight",
+  "curvature": 0.0,
+  "difference_loss": "all-pair mean; original all-pair variance denominator; no selective mask",
+  "role": "supplementary total difference-loss mass control"
+}

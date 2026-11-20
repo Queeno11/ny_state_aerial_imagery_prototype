@@ -1,0 +1,112 @@
+{
+  "overnight_measurement": {
+    "original_csv_sha256": "2b7a8f0d5cb8e4b989fcc692ae41b48cf8b04ac11ebc6b53d00b50266f08a4fd",
+    "original_fits": 1440,
+    "added_ml_fits": 480,
+    "replay_checks": 18720,
+    "ml_not_converged": 0,
+    "original_estimators_rerun": 0,
+    "original_checkpoint_modified": false,
+    "ml_information": "known structural basis, input map, measurement map, error law and scale; fitted coefficients"
+  },
+  "overnight_nn": {
+    "original_csv_sha256": "f4770d3633a08e61695fc599f281e6d10019a464f8876ad3f21e5b9705e52763",
+    "original_fits": 480,
+    "added_ml_fits": 240,
+    "replay_checks": 6240,
+    "ml_not_converged": 0,
+    "original_estimators_rerun": 0,
+    "original_checkpoint_modified": false,
+    "ml_information": "known structural basis, input map, measurement map, error law and scale; fitted coefficients"
+  },
+  "linear_extended": {
+    "original_csv_sha256": "60d4cee5345b8b6c9fe3b00205f2c779510fa4e4971f2658ef9b71b283b6921f",
+    "original_fits": 400,
+    "added_ml_fits": 200,
+    "replay_checks": 5200,
+    "ml_not_converged": 0,
+    "original_estimators_rerun": 0,
+    "original_checkpoint_modified": false,
+    "ml_information": "known structural basis, input map, measurement map, error law and scale; fitted coefficients"
+  },
+  "overnight_links": {
+    "original_csv_sha256": "1c1dd89353c8dfced9ffcdd7be0aa83a03029aa637ea46bcedd3b2da7208dbfb",
+    "original_fits": 360,
+    "added_ml_fits": 120,
+    "replay_checks": 3690,
+    "ml_not_converged": 0,
+    "original_estimators_rerun": 0,
+    "original_checkpoint_modified": false,
+    "ml_information": "known structural basis, input map, measurement map, error law and scale; fitted coefficients"
+  },
+  "diagnostic_linear": {
+    "original_csv_sha256": "80afa6d893592f48f6ed6bc2f35ce149e99833290484f352e67fd93d18a6cbbf",
+    "original_fits": 60,
+    "added_ml_fits": 30,
+    "replay_checks": 780,
+    "ml_not_converged": 0,
+    "original_estimators_rerun": 0,
+    "original_checkpoint_modified": false,
+    "ml_information": "known structural basis, input map, measurement map, error law and scale; fitted coefficients"
+  },
+  "nn_reference_small": {
+    "original_csv_sha256": "345e7b96f59d86efc7de394bbb0da1d931e7d271292fada20721df33b127ada5",
+    "original_fits": 20,
+    "added_ml_fits": 10,
+    "replay_checks": 150,
+    "ml_not_converged": 0,
+    "original_estimators_rerun": 0,
+    "original_checkpoint_modified": false,
+    "ml_information": "known structural basis, input map, measurement map, error law and scale; fitted coefficients"
+  },
+  "nn_reference_wide": {
+    "original_csv_sha256": "e7cc26d73bd8d9077800e76f2a3efdc6b8a7bf08e02f767e3de4fbfd2aaa0da3",
+    "original_fits": 20,
+    "added_ml_fits": 10,
+    "replay_checks": 40,
+    "ml_not_converged": 0,
+    "original_estimators_rerun": 0,
+    "original_checkpoint_modified": false,
+    "ml_information": "known structural basis, input map, measurement map, error law and scale; fitted coefficients"
+  },
+  "nn_ridge_range_check": {
+    "original_csv_sha256": "3c4921787423b03d8b327262b2daadce721e5f6e0c888444c8650f2dfbbb0887",
+    "original_fits": 40,
+    "added_ml_fits": 20,
+    "replay_checks": 190,
+    "ml_not_converged": 0,
+    "original_estimators_rerun": 0,
+    "original_checkpoint_modified": false,
+    "ml_information": "known structural basis, input map, measurement map, error law and scale; fitted coefficients"
+  },
+  "nn_small_sample_tuning": {
+    "original_csv_sha256": "d7c68de2082027e968acec93e3b04f2e0f528ef0e610cb1e42d828f1c82b2bfa",
+    "original_fits": 6,
+    "added_ml_fits": 3,
+    "replay_checks": 12,
+    "ml_not_converged": 0,
+    "original_estimators_rerun": 0,
+    "original_checkpoint_modified": false,
+    "ml_information": "known structural basis, input map, measurement map, error law and scale; fitted coefficients"
+  },
+  "smoke_all_v2": {
+    "original_csv_sha256": "0834892e0395b33b980d013f2d69d671b63a2191e5aaf19eee58d3b60b22447e",
+    "original_fits": 414,
+    "added_ml_fits": 68,
+    "replay_checks": 2104,
+    "ml_not_converged": 0,
+    "original_estimators_rerun": 0,
+    "original_checkpoint_modified": false,
+    "ml_information": "known structural basis, input map, measurement map, error law and scale; fitted coefficients"
+  },
+  "temporal_focus_v2": {
+    "original_csv_sha256": "565206d81a4c112bdbde42e5b780796312605d12eb2ad84dbc6596a2750b6b76",
+    "original_fits": 240,
+    "added_ml_fits": 120,
+    "replay_checks": 2240,
+    "ml_not_converged": 0,
+    "original_estimators_rerun": 0,
+    "original_checkpoint_modified": false,
+    "ml_information": "known structural basis, input map, measurement map, error law and scale; fitted coefficients"
+  }
+}

@@ -1,0 +1,10 @@
+{
+  "executed_scorer_updates": 4500,
+  "elapsed_seconds": 16.555937147000805,
+  "old_reference_equality": {
+    "known_ordinal_selected": true,
+    "known_ordinal_fixed": true,
+    "direct_f_selected": true,
+    "direct_f_fixed": true
+  }
+}

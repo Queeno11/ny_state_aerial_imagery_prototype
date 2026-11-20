@@ -1,0 +1,17 @@
+{
+  "reps": 1, "models": ["linear"], "truths": ["linear"],
+  "city_grid": [2], "cities": 2, "n": [16], "views": 1,
+  "test_per_city": 24, "test_pairs": 128,
+  "epochs": 10, "lbfgs_steps": 10, "audit_steps": 3, "restarts": 1,
+  "experiment1": {
+    "cases": [["common", 0.0], ["shape", 1.0]], "composition_grid": [0.0],
+    "losses": ["common_logit"], "methods": ["rank_common", "raw_levels"]
+  },
+  "experiment2": {"losses": ["common_logit"], "arms": ["none"],
+    "cases": [["gumbel", 0.0], ["normal", 0.0], ["student", 5.0], ["chi2", 4.0],
+              ["mixture", 1.0], ["cell_scale", 0.7], ["feature_scale", 0.7], ["median_violation", 0.7]]},
+  "experiment3": {"losses": ["common_logit"], "arms": ["none", "temporal"], "nuisance_cases": [[1.0, 1.0]]},
+  "experiment4": {"losses": ["common_logit"], "arms": ["temporal"], "cases": [["exact", 0.0], ["random_false", 0.2]]},
+  "experiment5": {"losses": ["common_logit"], "arms": ["none", "temporal", "both"],
+    "change_strength_grid": [0.0, 0.4, 0.8], "contamination_grid": [0.0, 0.5]}
+}

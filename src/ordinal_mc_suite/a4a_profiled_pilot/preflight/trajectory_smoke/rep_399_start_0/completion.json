@@ -1,0 +1,8 @@
+{
+  "role": "smoke",
+  "rep": 399,
+  "elapsed_seconds": 3.133435145020485,
+  "executed_scorer_updates": 108,
+  "profile_head_solves": 52,
+  "historical_equivalence": {}
+}

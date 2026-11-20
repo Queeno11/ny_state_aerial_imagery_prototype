@@ -1,0 +1,35 @@
+{
+  "rho_full": {
+    "original_metrics_sha256": "2b7499c2a5b60302ad917b0e86eff8d576edd9f9d1921a6e01cdd223b7b9664f",
+    "original_fits": 1,
+    "added_ml_fits": 1,
+    "ml_not_converged": 0,
+    "original_estimators_rerun": 0,
+    "sample_replay_verified": true,
+    "max_truth_replay_error": 7.040552663095667e-08,
+    "truth_replay_atol": 1e-07,
+    "truth_replay_rtol": 1e-07
+  },
+  "rho_full_10": {
+    "original_metrics_sha256": "e88d5e55da7358ee2fe02598befe85b63d7426f2ee0e0568b0bdb2742663f472",
+    "original_fits": 60,
+    "added_ml_fits": 20,
+    "ml_not_converged": 0,
+    "original_estimators_rerun": 0,
+    "sample_replay_verified": true,
+    "max_truth_replay_error": 7.043270783269051e-08,
+    "truth_replay_atol": 1e-07,
+    "truth_replay_rtol": 1e-07
+  },
+  "rho_quick": {
+    "original_metrics_sha256": "c693fe1a4a27647468b2a530190b6e5cd4326b6257403db6a8d0f0a4eb001463",
+    "original_fits": 6,
+    "added_ml_fits": 2,
+    "ml_not_converged": 0,
+    "original_estimators_rerun": 0,
+    "sample_replay_verified": true,
+    "max_truth_replay_error": 7.040552663095667e-08,
+    "truth_replay_atol": 1e-07,
+    "truth_replay_rtol": 1e-07
+  }
+}

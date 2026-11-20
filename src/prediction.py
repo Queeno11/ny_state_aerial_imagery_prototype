@@ -73,9 +73,12 @@ from src.data.naip_fetcher import (
     TractSearchCache,
     backoff_sleep,
     fetch_naip,
+    get_error_examples,
     get_fetch_stats,
     open_naip_src,
+    open_naip_src_uncached,
     read_naip_crop_from_src,
+    record_error_example,
     record_failure,
     resolve_naip_item,
 )
@@ -662,9 +665,10 @@ def _grouped_fetch_pass(
                         cm = open_fn(refs[group[0]].href, refs[group[0]].use_cache)
                         src = cm.__enter__()
                         cur_id = item_id
-                    except Exception:
+                    except Exception as exc:
                         # Open failed before any per-window read counted it —
                         # fail this group's rows as a retryable read_error.
+                        record_error_example("read_error", exc)
                         _close()
                         for i in group:
                             record_failure("read_error")
@@ -784,12 +788,12 @@ def fetch_prediction_chunk(
         with ThreadPoolExecutor(max_workers=min(max_workers, len(pending))) as pool:
             return dict(pool.map(_fetch_one, pending))
 
-    def _run_pass(pending):
+    def _run_pass(pending, opener):
         if fetch_fn is not None:
             return _perrow_pass(pending)
         return _grouped_fetch_pass(
             pending, records, to_4326, crop_size_meters, nbands, out_pixels,
-            search_cache, resolve_fn, open_fn, read_fn, max_workers,
+            search_cache, resolve_fn, opener, read_fn, max_workers,
             grid_meters, exact_year)
 
     # Failure triage: a SMALL fraction of transient failures is almost never
@@ -817,7 +821,12 @@ def fetch_prediction_chunk(
                 fast_retries += 1
             else:
                 backoff_sleep(pass_idx - 1, backoff_base_s, backoff_cap_s, sleep_fn)
-        results = _run_pass(pending)
+        # Retries must reach the server: GDAL replays a failed open of the same
+        # signed URL from its cache (see naip_fetcher.GDAL_ENV_UNCACHED), which
+        # turned transient errors into identical failures on every pass.
+        opener = (open_naip_src_uncached if pass_idx > 0 and open_fn is open_naip_src
+                  else open_fn)
+        results = _run_pass(pending, opener)
         still_pending = []
         for i in pending:
             crop, actual_year, failure = results[i]
@@ -838,11 +847,13 @@ def fetch_prediction_chunk(
         modes = dict(Counter(failures[i] for i in pending))
         sample = next((str(df_chunk.iloc[i].get("GEOID")) for i in pending
                        if df_chunk.iloc[i].get("GEOID") is not None), "?")
+        examples = {m: get_error_examples().get(m, []) for m in modes}
         raise RuntimeError(
             f"Planetary Computer still failing on {len(pending)}/{n} rows "
             f"({len(pending) / n:.0%}) after {max_passes} passes with cooldowns "
             f"— halting as sustained exhaustion. Failure modes: {modes}. "
-            f"Example GEOID: {sample}. Restart later; the run resumes at this chunk."
+            f"Example GEOID: {sample}. Underlying errors: {examples}. "
+            f"Restart later; the run resumes at this chunk."
         )
     return crops, actual_years, failures
 
@@ -857,12 +868,31 @@ def fetch_prediction_chunk(
 _OOM_BATCH_CAP = {"cap": None}
 
 
+def covariate_rows(df: pd.DataFrame, year, params: dict):
+    """(n, k) float32 ACS covariates for ``df``'s rows at ``year`` when the run
+    fuses covariates (``params['covariates']``, model ``scalemae_cov``); None
+    for imagery-only runs. Rows are aligned with ``df``."""
+    names = params.get("covariates")
+    if not names:
+        return None
+    from src.data.covariates import load_lookup
+    lookup = load_lookup(names)
+    geoids = df["GEOID"].astype(str).to_numpy()
+    years = np.full(len(df), int(year))
+    cov = lookup.coverage(geoids, years)
+    print(f"  ACS covariates {tuple(names)} for {year}: {cov:.1%} of rows matched "
+          f"(unmatched -> 0 = CBSA-year mean)")
+    return lookup.lookup(geoids, years)
+
+
 def predict_chunk_rows(model, crops: list, dist_to_center: list, device,
                        eval_transform, batch_size: int) -> np.ndarray:
     """Model predictions for a list of successfully fetched crops.
 
     ``crops`` must contain only valid (C, H, W) uint8 arrays; alignment with
-    failed rows is the caller's job.
+    failed rows is the caller's job. ``dist_to_center`` is the per-crop
+    metadata: one scalar per crop (legacy, ignored by imagery-only models) or
+    one covariate vector per crop (``scalemae_cov``).
 
     Same math as the legacy consumer (stack uint8 -> scale + ImageNet
     normalize -> autocast (cuda only) -> ``model(batch, metadata=metas)``) but
@@ -897,9 +927,11 @@ def predict_chunk_rows(model, crops: list, dist_to_center: list, device,
                 if use_cuda:
                     batch = batch.pin_memory()
                 batch = eval_transform(batch.to(device, non_blocking=use_cuda))
-                metas = torch.tensor(dist_to_center[s:s + bs],
-                                     dtype=torch.float32).unsqueeze(1).to(
-                                         device, non_blocking=use_cuda)
+                metas = torch.as_tensor(np.asarray(dist_to_center[s:s + bs],
+                                                   dtype="float32"))
+                if metas.dim() == 1:
+                    metas = metas.unsqueeze(1)
+                metas = metas.to(device, non_blocking=use_cuda)
                 if use_cuda:
                     with torch.autocast(device_type="cuda"):
                         out = model(batch, metadata=metas)
@@ -1105,6 +1137,7 @@ def predict_year_chunked(
     # usually a DOQQ), so the TractSearchCache answers almost every STAC search
     # from one coarse-grid query, and each shared DOQQ is opened once per tract.
     df = df.sort_values("GEOID", kind="stable").reset_index(drop=True)
+    cov_rows = covariate_rows(df, year, params)   # (n, k) for scalemae_cov, else None
 
     n = len(df)
     chunk_size = int(params.get("predict_chunk_size", 4096))
@@ -1205,10 +1238,13 @@ def predict_year_chunked(
                 _t = time.perf_counter()
                 chunk = df.iloc[s:e]
                 ok_idx = [i for i, c in enumerate(crops) if c is not None]
+                if cov_rows is not None:
+                    metas_ok = cov_rows[s:e][ok_idx]
+                else:
+                    metas_ok = [float(chunk.iloc[i].get("dist_to_center", 0.0) or 0.0)
+                                for i in ok_idx]
                 preds = predict_chunk_rows(
-                    model, [crops[i] for i in ok_idx],
-                    [float(chunk.iloc[i].get("dist_to_center", 0.0) or 0.0)
-                     for i in ok_idx],
+                    model, [crops[i] for i in ok_idx], metas_ok,
                     device, eval_transform, batch_size,
                 )
                 pred_full = np.full(len(chunk), np.nan, dtype="float32")

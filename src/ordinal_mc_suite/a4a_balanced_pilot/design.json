@@ -1,0 +1,12 @@
+{
+  "base_config": "../a4a_change_pilot/config.json",
+  "calibration_reps": [101, 102],
+  "replay_reps": [1, 2, 3],
+  "confirmation_reps": [201, 202, 203],
+  "gradient_budgets": [0.0, 0.1, 0.3, 1.0],
+  "old_weights": [0.1, 0.1, 0.0],
+  "old_curvature": 0.01,
+  "gamma_grid": [0.0, 0.001, 0.01, 0.1],
+  "tie_tolerance": 0.000001,
+  "adam_checkpoints": [25, 250, 1000]
+}

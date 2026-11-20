@@ -1,0 +1,54 @@
+{
+  "passed": true,
+  "main": [
+    {
+      "rep": "rep_1_start_0",
+      "elapsed_seconds": 36.6804300849908,
+      "executed_scorer_updates": 6500,
+      "max_cpu_gpu_score_error": 1.0722475536351084e-06,
+      "max_cpu_gpu_outcome_error": 4.935125041516386e-06,
+      "max_head_projected_gradient": 1.0648569215288006e-06,
+      "max_fresh_head_prediction_change": 9.549484715876131e-06
+    },
+    {
+      "rep": "rep_2_start_0",
+      "elapsed_seconds": 39.04632118699374,
+      "executed_scorer_updates": 6500,
+      "max_cpu_gpu_score_error": 9.64223145327736e-07,
+      "max_cpu_gpu_outcome_error": 9.607024457736202e-06,
+      "max_head_projected_gradient": 1.447698217749149e-06,
+      "max_fresh_head_prediction_change": 3.796369182318404e-05
+    },
+    {
+      "rep": "rep_3_start_0",
+      "elapsed_seconds": 37.18352638598299,
+      "executed_scorer_updates": 6500,
+      "max_cpu_gpu_score_error": 9.32068835890476e-07,
+      "max_cpu_gpu_outcome_error": 4.733332778172894e-06,
+      "max_head_projected_gradient": 1.5410646065916469e-06,
+      "max_fresh_head_prediction_change": 1.855307647868898e-05
+    }
+  ],
+  "known": [
+    {
+      "case": "noise_0.8_start_0",
+      "elapsed_seconds": 14.152416991011705,
+      "executed_scorer_updates": 3000
+    },
+    {
+      "case": "noise_0.8_start_1",
+      "elapsed_seconds": 14.03271429502638,
+      "executed_scorer_updates": 3000
+    },
+    {
+      "case": "noise_0_start_0",
+      "elapsed_seconds": 18.980535239039455,
+      "executed_scorer_updates": 4500
+    },
+    {
+      "case": "noise_0_start_1",
+      "elapsed_seconds": 17.32053344004089,
+      "executed_scorer_updates": 4500
+    }
+  ]
+}

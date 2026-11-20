@@ -1,0 +1,99 @@
+{
+  "config": {
+    "seed": 2026110917,
+    "replications": [
+      1,
+      2,
+      3,
+      4,
+      5
+    ],
+    "calibration_replication": 101,
+    "cities": 20,
+    "paired_tracts": 200,
+    "fit_tracts": 160,
+    "test_tracts": 256,
+    "stability_views": 2,
+    "lambda_S": 0.3,
+    "tau": 0.1,
+    "gradient_budgets": [
+      0.0,
+      0.1,
+      1.0
+    ],
+    "additional_gradient_budgets": [
+      [
+        10.0,
+        0.0
+      ],
+      [
+        10.0,
+        10.0
+      ]
+    ],
+    "level_change_ratios": [
+      0.1,
+      1.0
+    ],
+    "curvature_per_level": 0.001,
+    "sphere_grid": 48,
+    "optimizer_maxiter": 130,
+    "test_doses": [
+      -0.4,
+      -0.15,
+      -0.05,
+      0.0,
+      0.05,
+      0.15,
+      0.4
+    ],
+    "cutoff_quantile": 0.95
+  },
+  "training_weights": {
+    "A": [
+      1.0,
+      0.3,
+      0.024206216757598244,
+      0.23284880848124456,
+      0.0
+    ],
+    "B": [
+      1.0,
+      0.3,
+      0.020129411876543463,
+      0.306904746781791,
+      0.0
+    ],
+    "C": [
+      1.0,
+      0.3,
+      0.02534467929171982,
+      0.4288638959333151,
+      0.0
+    ]
+  },
+  "new_scorer_fits": 30,
+  "source_run_manifest_sha256": "bd4d7591043d84bb718d13c872447f53f3eb450dcaef1083b55035741a5c9a04",
+  "shared_calibration_manifest_sha256": "d37dbdd09dbf537649f9927f289e799ef74c170d3aa7e5eb6045a0c885f87d8e",
+  "script_sha256": "5131c8a3509eca604a42a2d22c4c1dc5b384357f58c3466626f984925e12ea66",
+  "source_model_sha256": {
+    "ordinal_mc_suite\\simple_index_pilot\\run_5rep\\rep_1\\case_A_models.json": "79b57e43fc22f3b97d367dcd60ea71b7ee308d712d7481750e2bb00905a5c468",
+    "ordinal_mc_suite\\simple_index_pilot\\run_5rep\\rep_1\\case_B_models.json": "89120488b8fdce1fe212463cdb147a53b9a3368383a083806bffcf196a063aff",
+    "ordinal_mc_suite\\simple_index_pilot\\run_5rep\\rep_1\\case_C_models.json": "a0bcecbb941a73b6d3e2009588f6cf08765570088f5364b7c19f5c1f9abdce94",
+    "ordinal_mc_suite\\simple_index_pilot\\run_5rep\\rep_2\\case_A_models.json": "89228079612ff2bb49a6f3e5ea9a74343688ff254665dcddd2096094ab480d70",
+    "ordinal_mc_suite\\simple_index_pilot\\run_5rep\\rep_2\\case_B_models.json": "9287a068488a93a0548a10639da48ffeaee9bc98dc26f3ad0ee1c84a7ecc8d2c",
+    "ordinal_mc_suite\\simple_index_pilot\\run_5rep\\rep_2\\case_C_models.json": "be7d144d2503d8bbac94691e7b700030006351b5a02ce7b510cc17b7516774c6",
+    "ordinal_mc_suite\\simple_index_pilot\\run_5rep\\rep_3\\case_A_models.json": "ac721897a8676b2440138eb61f88c4d0db8221d9efab967d531eb3c4b1f455ea",
+    "ordinal_mc_suite\\simple_index_pilot\\run_5rep\\rep_3\\case_B_models.json": "dd258f232379a8f232f9258f0b05143dd39d982173b212ab8c5671ea67f8aca4",
+    "ordinal_mc_suite\\simple_index_pilot\\run_5rep\\rep_3\\case_C_models.json": "2e3ad95736f7bfabc3767a5fbfb575581679e8b9e5dcc78f0acb28b9ea5b2519",
+    "ordinal_mc_suite\\simple_index_pilot\\run_5rep\\rep_4\\case_A_models.json": "6bdb02b7992d67c214e64600dd452c37e65ff6332adcec3054f2a401a7bd354a",
+    "ordinal_mc_suite\\simple_index_pilot\\run_5rep\\rep_4\\case_B_models.json": "ce1a8a24ac0aa604d4bf352c8a3f10ae8feb2675ab699272520b334bc05ca08f",
+    "ordinal_mc_suite\\simple_index_pilot\\run_5rep\\rep_4\\case_C_models.json": "45d34fa8bdfb5090910c82b84275f91d6c04e550487e378f8d3897f7b1246fce",
+    "ordinal_mc_suite\\simple_index_pilot\\run_5rep\\rep_5\\case_A_models.json": "a72224e610b7935095cbb6bf2b3039b84b9beea53e7866b01cc549eb3757ef75",
+    "ordinal_mc_suite\\simple_index_pilot\\run_5rep\\rep_5\\case_B_models.json": "c0bd6382f89d4325c008469b27c7070727065ec27cc683dafa1392551ec90c0b",
+    "ordinal_mc_suite\\simple_index_pilot\\run_5rep\\rep_5\\case_C_models.json": "6d897883f5b04cf78409e9850356ba322755cabc1ade3e1d84f5dca17f2eddeb"
+  },
+  "changed_status": "oracle simulation true_change != 0, never observed outcome threshold",
+  "masked_loss": "mean over ALL fitting pairs of changed_mask*(predicted_delta_W-observed_delta_W)^2, divided by original all-pair fitting delta_W variance",
+  "calibration": "same saved seed namespace, 28 fitting pairs and 252 disjoint test pairs per city, unpenalized least squares with same A/B/C families"
+}

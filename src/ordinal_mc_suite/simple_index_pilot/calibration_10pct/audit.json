@@ -1,0 +1,20 @@
+{
+  "passed": true,
+  "scorer_fits": 0,
+  "original_scorers_verified": 175,
+  "calibration_head_sets": 350,
+  "separate_true_f_head_sets": 30,
+  "exact_f_and_delta_f_score_freeze_checks": 350,
+  "original_seed_count": 72,
+  "distinct_new_panel_seeds": 25,
+  "original_fit_has_only_structural_metrics": true,
+  "calibration_test_tract_ids_disjoint": true,
+  "exact_calibration_fraction": 0.1,
+  "calibration_tracts_per_city": 28,
+  "test_tracts_per_city": 252,
+  "same_calibration_data_across_methods": true,
+  "test_outcomes_used_for_fitting": false,
+  "city_metric_rows": 70000,
+  "summary_rows": 700,
+  "max_calibration_kkt_gradient": 3.584434336646934e-14
+}

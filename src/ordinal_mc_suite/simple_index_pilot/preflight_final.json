@@ -1,0 +1,83 @@
+{
+  "numerical": {
+    "A": {
+      "derivative_error": 3.127440858369246e-10,
+      "conditional_ml": {
+        "objective": -0.0025401739891576236,
+        "min_tangent_grad": 1.3699726602031965e-08,
+        "starts": 4,
+        "successful_starts": 4,
+        "evaluations": 58,
+        "start_best_spread": 1.1102230246251565e-16
+      },
+      "fe_fitted_value_max_difference": 1.7763568394002505e-15
+    },
+    "B": {
+      "derivative_error": 2.84738385647465e-10,
+      "conditional_ml": {
+        "objective": -0.007845503706240486,
+        "grid_min": 0.44372434224305035,
+        "evaluations": 39,
+        "min_tangent_grad": 1.0989234812401401e-10,
+        "any_success": true,
+        "successful_starts": 4,
+        "starts": 4,
+        "start_best_spread": 1.449737733612082
+      }
+    },
+    "C": {
+      "derivative_error": 8.853623389981635e-11,
+      "conditional_ml": {
+        "objective": -0.02684752963754672,
+        "grid_min": 0.43949119370324385,
+        "evaluations": 39,
+        "min_tangent_grad": 5.467713569389223e-10,
+        "any_success": true,
+        "successful_starts": 4,
+        "starts": 4,
+        "start_best_spread": 1.5146312472286627
+      },
+      "noiseless_cubic_head_coefficient_error": 1.9984014443252818e-15
+    }
+  },
+  "actual_size": {
+    "fit_endpoints": 6400,
+    "unordered_pairs": 508800,
+    "mean_eval_seconds": 0.007519669993780553,
+    "rank_grid_seconds": 0.20735689997673035,
+    "four_start_profile_seconds": 0.3229964002966881,
+    "profile": {
+      "objective": 0.2325494483228878,
+      "grid_min": 0.29790385399064856,
+      "evaluations": 58,
+      "min_tangent_grad": 2.0451402452361253e-09,
+      "any_success": true,
+      "successful_starts": 4,
+      "starts": 4,
+      "start_best_spread": 9.742207041085749e-15
+    },
+    "mixed_b_seconds": 0.02334669977426529,
+    "mixed_b": {
+      "converged": true,
+      "specification": "index",
+      "llf": -9206.605967915475,
+      "residual_scale": 1.0001918599041255,
+      "covariance_eigen_min": 0.07396534748722192,
+      "covariance_eigen_max": 0.28208313039331745,
+      "covariance_rank": 2,
+      "warnings": "",
+      "random_effect_dimension": 2,
+      "random_index_direction": [
+        0.8894459134843796,
+        0.4569774627580142,
+        -0.007587194289421084
+      ],
+      "blup_matches_package": true
+    },
+    "statsmodels": "0.14.5",
+    "baseline_f_variance": 1.0,
+    "case_c_gaussian_variance_ratio": 1.0,
+    "case_c_linear_projection_factor_formula": "(1+3k)/sqrt(1+6k+15k^2)",
+    "date_1_f_variance": 1.045625
+  }
+}
